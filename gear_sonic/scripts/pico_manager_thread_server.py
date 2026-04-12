@@ -24,6 +24,7 @@
 
 from collections import defaultdict, deque
 from enum import Enum, IntEnum
+import glob
 import os
 import subprocess
 import threading
@@ -129,6 +130,7 @@ class StreamMode(Enum):
     PLANNER_FROZEN_UPPER_BODY = 3
     POSE_PAUSE = 4
     PLANNER_VR_3PT = 5
+    REPLAY = 6
 
 
 ### Parse 3 point pose from SMPL
@@ -1264,6 +1266,74 @@ class PoseStreamer:
         self.buffer_cleared = True
         self.step = 0
 
+    def append_frame_to_buffer(
+        self,
+        *,
+        use_pose: np.ndarray,
+        use_joints: np.ndarray,
+        use_body_quat: np.ndarray,
+        joint_pos: np.ndarray,
+    ) -> None:
+        self.frame_buffer["smpl_pose"].append(use_pose)
+        self.frame_buffer["smpl_joints"].append(use_joints)
+        self.frame_buffer["body_quat_w"].append(use_body_quat)
+        self.frame_buffer["frame_index"].append(int(self.step))
+        self.frame_buffer["joint_pos"].append(joint_pos)
+
+    def build_numpy_data(
+        self,
+        *,
+        vr_3pt_pose: np.ndarray,
+        left_trigger: float,
+        right_trigger: float,
+        left_grip: float,
+        right_grip: float,
+        pico_dt: float,
+        pico_fps: float,
+        timestamp_realtime: float,
+        timestamp_monotonic: float,
+        left_hand_joints: np.ndarray,
+        right_hand_joints: np.ndarray,
+        toggle_data_collection: bool,
+        toggle_data_abort: bool,
+    ) -> dict[str, np.ndarray]:
+        N = len(self.frame_buffer["frame_index"])
+
+        return {
+            "smpl_pose": np.stack((self.frame_buffer["smpl_pose"]), axis=0),
+            "smpl_joints": np.stack((self.frame_buffer["smpl_joints"]), axis=0),
+            "body_quat_w": np.stack((self.frame_buffer["body_quat_w"]), axis=0),
+            "joint_pos": np.stack((self.frame_buffer["joint_pos"]), axis=0),
+            "joint_vel": np.zeros((N, 29)),
+            "vr_position": vr_3pt_pose[:, :3].flatten(),
+            "vr_orientation": vr_3pt_pose[:, 3:].flatten(),
+            "frame_index": np.array((self.frame_buffer["frame_index"]), dtype=np.int64),
+            "left_trigger": np.array([left_trigger], dtype=np.float32),
+            "right_trigger": np.array([right_trigger], dtype=np.float32),
+            "left_grip": np.array([left_grip], dtype=np.float32),
+            "right_grip": np.array([right_grip], dtype=np.float32),
+            "pico_dt": np.array([pico_dt], dtype=np.float32),
+            "pico_fps": np.array([pico_fps], dtype=np.float32),
+            "timestamp_realtime": np.array([timestamp_realtime], dtype=np.float64),
+            "timestamp_monotonic": np.array([timestamp_monotonic], dtype=np.float64),
+            "left_hand_joints": left_hand_joints.reshape(-1).astype(np.float32),
+            "right_hand_joints": right_hand_joints.reshape(-1).astype(np.float32),
+            "toggle_data_collection": np.array([toggle_data_collection], dtype=bool),
+            "toggle_data_abort": np.array([toggle_data_abort], dtype=bool),
+            "heading_increment": np.array(
+                [self.yaw_accumulator.yaw_angle_change()], dtype=np.float32
+            ),
+        }
+
+    def send_pose_numpy_data(self, numpy_data: dict[str, np.ndarray], record: bool = False) -> None:
+        packed_message = pack_pose_message(numpy_data, topic="pose")
+        self.socket.send(packed_message)
+
+        if record and self.record_dir:
+            out_path = os.path.join(self.record_dir, f"pose_{self.record_idx:06d}.npz")
+            np.savez_compressed(out_path, **numpy_data)
+            self.record_idx += 1
+
     def run_once(self):
         """Execute one iteration of the pose streaming loop."""
         sample = self.reader.get_latest()
@@ -1340,7 +1410,6 @@ class PoseStreamer:
         use_body_quat = _quat_lerp_normalized(self.prev_body_quat_np, body_quat_np, alpha).astype(
             np.float32
         )
-        N = len(self.frame_buffer["frame_index"])
 
         ##### From @Jiefeng for directly setting the joint position ######
         joint_pos = np.zeros(29)
@@ -1413,15 +1482,14 @@ class PoseStreamer:
             sample["body_poses_np"], smpl_joints_local=smpl_joints_for_vis
         )
         ##### From @Jiefeng for directly setting the joint position ######
-
-        self.frame_buffer["smpl_pose"].append(use_pose)
-        self.frame_buffer["smpl_joints"].append(use_joints)
-        self.frame_buffer["body_quat_w"].append(use_body_quat)
-        self.frame_buffer["frame_index"].append(int(self.step))
-        self.frame_buffer["joint_pos"].append(joint_pos)
+        self.append_frame_to_buffer(
+            use_pose=use_pose,
+            use_joints=use_joints,
+            use_body_quat=use_body_quat,
+            joint_pos=joint_pos,
+        )
         pico_dt = float(sample.get("dt", 0.0))
         pico_fps = float(sample.get("fps", 0.0))
-        N = len(self.frame_buffer["frame_index"])
 
         # Wait for buffer to be completely filled before sending first message after clearing
         buffer_is_full = len(self.frame_buffer["frame_index"]) >= self.num_frames_to_send
@@ -1435,43 +1503,22 @@ class PoseStreamer:
 
         # Only send if buffer is full and we're not waiting for fresh data
         if buffer_is_full and not self.buffer_cleared:
-            numpy_data = {
-                "smpl_pose": np.stack((self.frame_buffer["smpl_pose"]), axis=0),
-                "smpl_joints": np.stack((self.frame_buffer["smpl_joints"]), axis=0),
-                "body_quat_w": np.stack((self.frame_buffer["body_quat_w"]), axis=0),
-                "joint_pos": np.stack((self.frame_buffer["joint_pos"]), axis=0),
-                "joint_vel": np.zeros((N, 29)),
-                "vr_position": vr_3pt_pose[:, :3].flatten(),
-                "vr_orientation": vr_3pt_pose[:, 3:].flatten(),
-                "frame_index": np.array((self.frame_buffer["frame_index"]), dtype=np.int64),
-                "left_trigger": np.array([left_trigger], dtype=np.float32),
-                "right_trigger": np.array([right_trigger], dtype=np.float32),
-                "left_grip": np.array([left_grip], dtype=np.float32),
-                "right_grip": np.array([right_grip], dtype=np.float32),
-                "pico_dt": np.array([pico_dt], dtype=np.float32),
-                "pico_fps": np.array([pico_fps], dtype=np.float32),
-                "timestamp_realtime": np.array(
-                    [sample.get("timestamp_realtime", 0.0)], dtype=np.float64
-                ),
-                "timestamp_monotonic": np.array(
-                    [sample.get("timestamp_monotonic", 0.0)], dtype=np.float64
-                ),
-                "left_hand_joints": left_hand_joints.reshape(-1).astype(np.float32),
-                "right_hand_joints": right_hand_joints.reshape(-1).astype(np.float32),
-                "toggle_data_collection": np.array([toggle_data_collection], dtype=bool),
-                "toggle_data_abort": np.array([toggle_data_abort], dtype=bool),
-                "heading_increment": np.array(
-                    [self.yaw_accumulator.yaw_angle_change()], dtype=np.float32
-                ),
-            }
-
-            packed_message = pack_pose_message(numpy_data, topic="pose")
-            self.socket.send(packed_message)
-
-            if self.record_dir:
-                out_path = os.path.join(self.record_dir, f"pose_{self.record_idx:06d}.npz")
-                np.savez_compressed(out_path, **numpy_data)
-                self.record_idx += 1
+            numpy_data = self.build_numpy_data(
+                vr_3pt_pose=vr_3pt_pose,
+                left_trigger=left_trigger,
+                right_trigger=right_trigger,
+                left_grip=left_grip,
+                right_grip=right_grip,
+                pico_dt=pico_dt,
+                pico_fps=pico_fps,
+                timestamp_realtime=float(sample.get("timestamp_realtime", 0.0)),
+                timestamp_monotonic=float(sample.get("timestamp_monotonic", 0.0)),
+                left_hand_joints=left_hand_joints,
+                right_hand_joints=right_hand_joints,
+                toggle_data_collection=toggle_data_collection,
+                toggle_data_abort=toggle_data_abort,
+            )
+            self.send_pose_numpy_data(numpy_data, record=True)
 
         self.step += 1
         self.next_target_ns += step_ns
@@ -1490,6 +1537,141 @@ class PoseStreamer:
         if elapsed < self.frame_time:
             time.sleep(self.frame_time - elapsed)
         self.frame_start = time.time()
+
+
+class ReplayPoseStreamer:
+    """Replay recorded pose npz batches through the existing pose sender."""
+
+    def __init__(
+        self,
+        pose_streamer: PoseStreamer,
+        replay_dir: str = "",
+        log_prefix: str = "ReplayLoop",
+    ):
+        self.pose_streamer = pose_streamer
+        self.replay_dir = replay_dir
+        self.log_prefix = log_prefix
+        self.entries: list[tuple[str, float | None]] = []
+        self.current_idx = 0
+        self.next_send_deadline: float | None = None
+        self.active = False
+        self.finished = False
+        self.fallback_dt = 1.0 / max(1, self.pose_streamer.target_fps)
+
+    @staticmethod
+    def _extract_timestamp(npz_data) -> float | None:
+        if "timestamp_monotonic" not in npz_data:
+            return None
+        timestamp = np.asarray(npz_data["timestamp_monotonic"]).reshape(-1)
+        if timestamp.size == 0:
+            return None
+        value = float(timestamp[0])
+        return value if np.isfinite(value) else None
+
+    def _scan_entries(self) -> list[tuple[str, float | None]]:
+        if not self.replay_dir:
+            print(f"[{self.log_prefix}] Replay disabled: --replay_dir not provided")
+            return []
+
+        pattern = os.path.join(self.replay_dir, "pose_*.npz")
+        paths = sorted(glob.glob(pattern))
+        if not paths:
+            print(f"[{self.log_prefix}] No replay files found under: {self.replay_dir}")
+            return []
+
+        entries = []
+        for path in paths:
+            try:
+                with np.load(path, allow_pickle=False) as data:
+                    entries.append((path, self._extract_timestamp(data)))
+            except Exception as e:
+                print(f"[{self.log_prefix}] Skipping unreadable replay file {path}: {e}")
+        return entries
+
+    def start(self) -> bool:
+        self.stop(log_stop=False)
+        self.entries = self._scan_entries()
+        if not self.entries:
+            return False
+        self.current_idx = 0
+        self.next_send_deadline = time.monotonic()
+        self.active = True
+        self.finished = False
+        print(
+            f"[{self.log_prefix}] Starting replay from {self.replay_dir} "
+            f"with {len(self.entries)} files"
+        )
+        return True
+
+    def stop(self, log_stop: bool = True) -> None:
+        if log_stop and self.active:
+            print(f"[{self.log_prefix}] Replay stopped at file index {self.current_idx}")
+        self.entries = []
+        self.current_idx = 0
+        self.next_send_deadline = None
+        self.active = False
+        self.finished = False
+
+    def _load_numpy_data(self, path: str) -> dict[str, np.ndarray]:
+        with np.load(path, allow_pickle=False) as data:
+            return {key: np.array(data[key]) for key in data.files}
+
+    def _compute_next_delay(self, current_timestamp: float | None, next_timestamp: float | None) -> float:
+        if current_timestamp is not None and next_timestamp is not None:
+            delay = next_timestamp - current_timestamp
+            if np.isfinite(delay) and delay >= 0.0:
+                return delay
+            print(
+                f"[{self.log_prefix}] Invalid replay timestamp delta {delay:.6f}s, "
+                f"falling back to {self.fallback_dt:.6f}s"
+            )
+        return self.fallback_dt
+
+    def run_once(self) -> bool:
+        if not self.active:
+            return False
+
+        if self.next_send_deadline is not None:
+            remaining = self.next_send_deadline - time.monotonic()
+            if remaining > 0.0:
+                time.sleep(min(0.005, remaining))
+                return True
+
+        if self.current_idx >= len(self.entries):
+            self.active = False
+            self.finished = True
+            print(f"[{self.log_prefix}] Replay finished")
+            return False
+
+        path, current_timestamp = self.entries[self.current_idx]
+        try:
+            numpy_data = self._load_numpy_data(path)
+        except Exception as e:
+            print(f"[{self.log_prefix}] Failed to load replay file {path}: {e}")
+            self.current_idx += 1
+            if self.current_idx >= len(self.entries):
+                self.active = False
+                self.finished = True
+                print(f"[{self.log_prefix}] Replay finished")
+                return False
+            self.next_send_deadline = time.monotonic() + self.fallback_dt
+            return True
+
+        self.pose_streamer.send_pose_numpy_data(numpy_data, record=False)
+        self.current_idx += 1
+
+        if self.current_idx >= len(self.entries):
+            self.active = False
+            self.finished = True
+            self.next_send_deadline = None
+            print(f"[{self.log_prefix}] Replay finished")
+            return False
+
+        next_timestamp = self.entries[self.current_idx][1]
+        self.next_send_deadline = time.monotonic() + self._compute_next_delay(
+            current_timestamp, next_timestamp
+        )
+        return True
 
 
 def run_pico(
@@ -1807,6 +1989,7 @@ def run_pico_manager(
     target_fps: int = 50,
     use_cuda: bool = False,
     record_dir: str = "",
+    replay_dir: str = "",
     record_format: str = "npz",
     zmq_feedback_host: str = "localhost",
     zmq_feedback_port: int = 5557,
@@ -1819,6 +2002,7 @@ def run_pico_manager(
     Manager: creates shared PUB socket and runs pose/planner streamers based on current mode.
     Controller input:
       A+X: Toggle between planner and pose mode
+      RIGHT-STICK in POSE: Toggle replay mode using recorded pose npz files
       A+B+X+Y: Toggle policy start/stop
     """
     if xrt is None:
@@ -1877,6 +2061,11 @@ def run_pico_manager(
         zmq_feedback_host=zmq_feedback_host,
         zmq_feedback_port=zmq_feedback_port,
     )
+    replay_streamer = ReplayPoseStreamer(
+        pose_streamer=pose_streamer,
+        replay_dir=replay_dir,
+        log_prefix="ReplayLoop",
+    )
 
     # State machine diagram:
     #
@@ -1890,10 +2079,13 @@ def run_pico_manager(
     #                                                        |
     #                                                   (ax)--> POSE
     #
+    #   POSE sub-mode by right_axis_click:
+    #     POSE <--(right_axis_click)--> REPLAY
+    #
     #   Emergency stop from any mode: A+B+X+Y (start_combo) --> OFF
     #   POSE_PAUSE: left_menu_button held --> POSE_PAUSE, released --> POSE
     #
-    print("Manager controls: A+X=toggle mode, A+B+X+Y=start/stop policy")
+    print("Manager controls: A+X=toggle mode, RIGHT-STICK in POSE=replay, A+B+X+Y=start/stop policy")
     current_mode = StreamMode.OFF
     # Track which mode VR_3PT was entered from, so left_axis_click returns to it.
     # Will be either PLANNER or PLANNER_FROZEN_UPPER_BODY.
@@ -1903,13 +2095,14 @@ def run_pico_manager(
         prev_by_pressed = False
         prev_start_combo = False
         prev_left_axis_click = False
+        prev_right_axis_click = False
         while True:
             # Poll Pico controller for buttons/axes
             a_pressed, b_pressed, x_pressed, y_pressed = get_abxy_buttons()
 
             left_menu_button, _, _, _, _ = get_controller_inputs()
 
-            left_axis_click, _ = get_axis_clicks()
+            left_axis_click, right_axis_click = get_axis_clicks()
 
             # Rising edge: A+X pressed together -> toggle POSE/PLANNER mode
             ax_pressed = (a_pressed) and (x_pressed)
@@ -1948,6 +2141,8 @@ def run_pico_manager(
                     new_mode = StreamMode.PLANNER  # Enter chain 2
                 elif by_pressed and not prev_by_pressed:
                     new_mode = StreamMode.PLANNER_FROZEN_UPPER_BODY  # Enter chain 1
+                elif right_axis_click and not prev_right_axis_click:
+                    new_mode = StreamMode.REPLAY
                 elif left_menu_button:
                     new_mode = StreamMode.POSE_PAUSE
 
@@ -1980,17 +2175,30 @@ def run_pico_manager(
                 elif by_pressed and not prev_by_pressed:
                     new_mode = StreamMode.POSE
 
+            elif current_mode == StreamMode.REPLAY:
+                if start_combo and not prev_start_combo:
+                    new_mode = StreamMode.OFF
+                elif right_axis_click and not prev_right_axis_click:
+                    new_mode = StreamMode.POSE
+
+            if new_mode == StreamMode.REPLAY and current_mode != StreamMode.REPLAY:
+                if not replay_streamer.start():
+                    new_mode = current_mode
+
             # Handle mode transitions before running loop
             if new_mode != current_mode:
                 if current_mode == StreamMode.POSE:
                     pose_streamer.on_mode_exit()
+                elif current_mode == StreamMode.REPLAY:
+                    pose_streamer.on_mode_exit()
+                    replay_streamer.stop()
 
                 # Track parent when entering VR_3PT
                 if new_mode == StreamMode.PLANNER_VR_3PT:
                     vr3pt_parent_mode = current_mode
                     print(f"[Manager] VR_3PT parent: {vr3pt_parent_mode.name}")
 
-                if new_mode == StreamMode.POSE:
+                if new_mode == StreamMode.POSE and current_mode != StreamMode.REPLAY:
                     pose_streamer.reset_yaw()
                 elif new_mode == StreamMode.PLANNER and current_mode != StreamMode.PLANNER_VR_3PT:
                     # Only reset yaw when freshly entering PLANNER from POSE,
@@ -2012,6 +2220,12 @@ def run_pico_manager(
             # Run one iteration of the new mode
             if new_mode == StreamMode.POSE:
                 pose_streamer.run_once()
+            elif new_mode == StreamMode.REPLAY:
+                replay_streamer.run_once()
+                if replay_streamer.finished:
+                    replay_streamer.stop(log_stop=False)
+                    pose_streamer.on_mode_exit()
+                    new_mode = StreamMode.POSE
             elif (
                 new_mode == StreamMode.PLANNER
                 or new_mode == StreamMode.PLANNER_FROZEN_UPPER_BODY
@@ -2030,7 +2244,7 @@ def run_pico_manager(
                     or new_mode == StreamMode.PLANNER_VR_3PT
                 ):
                     socket.send(build_command_message(start=True, stop=False, planner=True))
-                elif new_mode == StreamMode.POSE:
+                elif new_mode == StreamMode.POSE or new_mode == StreamMode.REPLAY:
                     socket.send(build_command_message(start=True, stop=False, planner=False))
 
                 print(f"[Manager] StreamMode switch: {current_mode.name} -> {new_mode.name}")
@@ -2040,6 +2254,7 @@ def run_pico_manager(
             prev_by_pressed = by_pressed
             prev_start_combo = start_combo
             prev_left_axis_click = left_axis_click
+            prev_right_axis_click = right_axis_click
 
     except KeyboardInterrupt:
         print("\nStopping manager...")
@@ -2071,6 +2286,12 @@ if __name__ == "__main__":
         type=str,
         default="",
         help="Directory to save sent batches (default: disabled)",
+    )
+    parser.add_argument(
+        "--replay_dir",
+        type=str,
+        default="",
+        help="Directory containing recorded pose_*.npz files for replay in POSE mode",
     )
     parser.add_argument(
         "--record_format",
@@ -2169,6 +2390,7 @@ if __name__ == "__main__":
             target_fps=args.target_fps,
             use_cuda=args.cuda,
             record_dir=args.record_dir,
+            replay_dir=args.replay_dir,
             record_format=args.record_format,
             zmq_feedback_host=args.zmq_feedback_host,
             zmq_feedback_port=args.zmq_feedback_port,
