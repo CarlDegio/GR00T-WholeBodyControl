@@ -24,6 +24,7 @@
 
 from collections import defaultdict, deque
 from enum import Enum, IntEnum
+import glob
 import os
 import subprocess
 import threading
@@ -129,6 +130,7 @@ class StreamMode(Enum):
     PLANNER_FROZEN_UPPER_BODY = 3
     POSE_PAUSE = 4
     PLANNER_VR_3PT = 5
+    REPLAY = 6
 
 
 ### Parse 3 point pose from SMPL
@@ -1800,6 +1802,129 @@ class PlannerStreamer:
         self.last_send = time.time()
 
 
+class ReplayStreamer:
+    """Replays recorded pose topic payloads back to the ZMQ manager."""
+
+    def __init__(self, socket, replay_source: str):
+        self.socket = socket
+        self.replay_source = replay_source
+        self.records = self._load_records(replay_source) if replay_source else []
+        self.active = False
+        self.finished = False
+        self.record_idx = 0
+
+    def _resolve_record_paths(self, replay_source: str) -> list[str]:
+        if not replay_source:
+            return []
+
+        if any(ch in replay_source for ch in "*?[]"):
+            return sorted(
+                path for path in glob.glob(replay_source) if path.endswith(".npz") and os.path.isfile(path)
+            )
+
+        if os.path.isdir(replay_source):
+            pose_paths = sorted(glob.glob(os.path.join(replay_source, "pose_*.npz")))
+            if pose_paths:
+                return pose_paths
+            return sorted(glob.glob(os.path.join(replay_source, "*.npz")))
+
+        if os.path.isfile(replay_source):
+            return [replay_source]
+
+        return []
+
+    @staticmethod
+    def _extract_timestamp(numpy_data: dict) -> float | None:
+        for key in ("timestamp_monotonic", "timestamp_realtime"):
+            value = numpy_data.get(key)
+            if value is None:
+                continue
+            flat = np.asarray(value).reshape(-1)
+            if flat.size == 0:
+                continue
+            timestamp = float(flat[0])
+            if np.isfinite(timestamp) and timestamp > 0.0:
+                return timestamp
+        return None
+
+    def _load_records(self, replay_source: str) -> list[dict]:
+        record_paths = self._resolve_record_paths(replay_source)
+        if not record_paths:
+            print(f"[Replay] WARNING: no replay files found for '{replay_source}'")
+            return []
+
+        records = []
+        for path in record_paths:
+            with np.load(path) as data:
+                numpy_data = {key: np.array(data[key], copy=True) for key in data.files}
+            records.append(
+                {
+                    "path": path,
+                    "timestamp": self._extract_timestamp(numpy_data),
+                    "numpy_data": numpy_data,
+                }
+            )
+
+        print(f"[Replay] Loaded {len(records)} record(s) from '{replay_source}'")
+        return records
+
+    def enter(self) -> bool:
+        if self.replay_source:
+            self.records = self._load_records(self.replay_source)
+
+        if not self.records:
+            print("[Replay] WARNING: replay requested but no recordings are available")
+            self.finished = True
+            self.active = False
+            return False
+
+        self.record_idx = 0
+        self.active = True
+        self.finished = False
+        print(f"[Replay] Starting replay from '{self.replay_source}'")
+        return True
+
+    def stop(self):
+        if self.active:
+            print("[Replay] Replay stopped")
+        self.active = False
+        self.finished = False
+        self.record_idx = 0
+
+    def is_finished(self) -> bool:
+        return self.finished
+
+    def run_once(self):
+        if not self.active or self.finished:
+            return
+
+        if self.record_idx >= len(self.records):
+            self.active = False
+            self.finished = True
+            print("[Replay] Replay finished")
+            return
+
+        current_record = self.records[self.record_idx]
+        self.socket.send(pack_pose_message(current_record["numpy_data"], topic="pose"))
+        self.record_idx += 1
+
+        if self.record_idx >= len(self.records):
+            self.active = False
+            self.finished = True
+            print("[Replay] Replay finished")
+            return
+
+        next_record = self.records[self.record_idx]
+        current_ts = current_record["timestamp"]
+        next_ts = next_record["timestamp"]
+        if current_ts is None or next_ts is None:
+            return
+
+        sleep_t = max(0.0, next_ts - current_ts)
+        if sleep_t > 0.0:
+            time.sleep(sleep_t)
+
+
 def run_pico_manager(
     port: int = 5556,
     buffer_size: int = 15,
@@ -1808,6 +1933,7 @@ def run_pico_manager(
     use_cuda: bool = False,
     record_dir: str = "",
     record_format: str = "npz",
+    replay_file: str = "",
     zmq_feedback_host: str = "localhost",
     zmq_feedback_port: int = 5557,
     enable_vis_vr3pt: bool = False,
@@ -1877,6 +2003,7 @@ def run_pico_manager(
         zmq_feedback_host=zmq_feedback_host,
         zmq_feedback_port=zmq_feedback_port,
     )
+    replay_streamer = ReplayStreamer(socket=socket, replay_source=replay_file)
 
     # State machine diagram:
     #
@@ -1893,7 +2020,7 @@ def run_pico_manager(
     #   Emergency stop from any mode: A+B+X+Y (start_combo) --> OFF
     #   POSE_PAUSE: left_menu_button held --> POSE_PAUSE, released --> POSE
     #
-    print("Manager controls: A+X=toggle mode, A+B+X+Y=start/stop policy")
+    print("Manager controls: A+X=toggle mode, RIGHT-STICK=planner replay toggle, A+B+X+Y=start/stop policy")
     current_mode = StreamMode.OFF
     # Track which mode VR_3PT was entered from, so left_axis_click returns to it.
     # Will be either PLANNER or PLANNER_FROZEN_UPPER_BODY.
@@ -1905,13 +2032,14 @@ def run_pico_manager(
         prev_by_pressed = False
         prev_start_combo = False
         prev_left_axis_click = False
+        prev_right_axis_click = False
         while True:
             # Poll Pico controller for buttons/axes
             a_pressed, b_pressed, x_pressed, y_pressed = get_abxy_buttons()
 
             left_menu_button, _, _, left_grip_mgr, _ = get_controller_inputs()
 
-            left_axis_click, _ = get_axis_clicks()
+            left_axis_click, right_axis_click = get_axis_clicks()
 
             # Rising edge: A+X pressed together -> toggle POSE/PLANNER mode
             ax_pressed = (a_pressed) and (x_pressed)
@@ -1942,6 +2070,8 @@ def run_pico_manager(
                     new_mode = StreamMode.POSE
                 elif left_axis_click and not prev_left_axis_click:
                     new_mode = StreamMode.PLANNER_VR_3PT
+                elif right_axis_click and not prev_right_axis_click:
+                    new_mode = StreamMode.REPLAY
 
             elif current_mode == StreamMode.POSE:
                 if start_combo and not prev_start_combo:
@@ -1981,16 +2111,28 @@ def run_pico_manager(
                     new_mode = StreamMode.POSE
                 elif by_pressed and not prev_by_pressed:
                     new_mode = StreamMode.POSE
+            elif current_mode == StreamMode.REPLAY:
+                if start_combo and not prev_start_combo:
+                    new_mode = StreamMode.OFF
+                elif right_axis_click and not prev_right_axis_click:
+                    new_mode = StreamMode.PLANNER
+                elif replay_streamer.is_finished():
+                    new_mode = StreamMode.PLANNER
 
             # Handle mode transitions before running loop
             if new_mode != current_mode:
                 if current_mode == StreamMode.POSE:
                     pose_streamer.on_mode_exit()
+                elif current_mode == StreamMode.REPLAY:
+                    replay_streamer.stop()
 
                 # Track parent when entering VR_3PT
                 if new_mode == StreamMode.PLANNER_VR_3PT:
                     vr3pt_parent_mode = current_mode
                     print(f"[Manager] VR_3PT parent: {vr3pt_parent_mode.name}")
+                elif new_mode == StreamMode.REPLAY:
+                    if not replay_streamer.enter():
+                        new_mode = current_mode
 
                 if new_mode == StreamMode.POSE:
                     pose_streamer.reset_yaw()
@@ -2020,6 +2162,8 @@ def run_pico_manager(
                 or new_mode == StreamMode.PLANNER_VR_3PT
             ):
                 planner_streamer.run_once(new_mode)
+            elif new_mode == StreamMode.REPLAY:
+                replay_streamer.run_once()
 
             # Make sure to send command messages after loop iteration to ensure data arrives before mode switch
             if new_mode != current_mode:
@@ -2032,7 +2176,7 @@ def run_pico_manager(
                     or new_mode == StreamMode.PLANNER_VR_3PT
                 ):
                     socket.send(build_command_message(start=True, stop=False, planner=True))
-                elif new_mode == StreamMode.POSE:
+                elif new_mode == StreamMode.POSE or new_mode == StreamMode.REPLAY:
                     socket.send(build_command_message(start=True, stop=False, planner=False))
 
                 print(f"[Manager] StreamMode switch: {current_mode.name} -> {new_mode.name}")
@@ -2060,6 +2204,7 @@ def run_pico_manager(
             prev_by_pressed = by_pressed
             prev_start_combo = start_combo
             prev_left_axis_click = left_axis_click
+            prev_right_axis_click = right_axis_click
 
     except KeyboardInterrupt:
         print("\nStopping manager...")
@@ -2097,6 +2242,12 @@ if __name__ == "__main__":
         type=str,
         default="npz",
         help="Recording format: 'npz' or 'bin' (default: npz)",
+    )
+    parser.add_argument(
+        "--replay_file",
+        type=str,
+        default="",
+        help="Replay source: a single .npz, a directory containing pose_*.npz, or a glob pattern",
     )
     parser.add_argument(
         "--manager",
@@ -2190,6 +2341,7 @@ if __name__ == "__main__":
             use_cuda=args.cuda,
             record_dir=args.record_dir,
             record_format=args.record_format,
+            replay_file=args.replay_file,
             zmq_feedback_host=args.zmq_feedback_host,
             zmq_feedback_port=args.zmq_feedback_port,
             enable_vis_vr3pt=args.vis_vr3pt,
