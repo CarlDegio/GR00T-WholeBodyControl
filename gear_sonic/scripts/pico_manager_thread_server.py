@@ -506,10 +506,17 @@ def generate_finger_data(hand: str, trigger: float, grip: float) -> np.ndarray:
 
     thumb = 0
     middle = 10
-    # Control thumb based on shoulder button state (index 4 is thumb tip)
-    fingertips[4 + thumb, 0, 3] = 1.0  # open thumb
-    if trigger > 0.5:
-        fingertips[4 + middle, 0, 3] = 1.0  # close middle
+
+    # Map trigger continuously to a synthetic thumb-middle pinch distance.
+    # The hand IK interprets thumb-middle distance as a grip amount:
+    #   trigger=0.0 -> open, trigger>=0.9 -> fully closed.
+    close_amount = float(np.clip(trigger / 0.9, 0.0, 1.0))
+
+    # Keep thumb fixed at x=1.0 and move the synthetic middle fingertip from
+    # x=0.0 (open) to x=1.0 (fully pinched). This yields a continuous grip
+    # value after the downstream distance-to-joint interpolation.
+    fingertips[4 + thumb, 0, 3] = 1.0
+    fingertips[4 + middle, 0, 3] = close_amount
 
     return fingertips
 
