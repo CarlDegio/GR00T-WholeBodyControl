@@ -45,9 +45,10 @@ class RealSenseSensor(Sensor, SensorServer):
         port: int = 5555,
         config: RealSenseConfig = RealSenseConfig(),
         id: int = 0,
+        device_id: str | None = None,
         mount_position: str = CameraMountPosition.EGO_VIEW.value,
     ):
-        devices = rs.context().query_devices()
+        devices = list(rs.context().query_devices())
         if len(devices) == 0:
             raise RuntimeError("No RealSense devices found")
 
@@ -59,7 +60,8 @@ class RealSenseSensor(Sensor, SensorServer):
         self.pipeline = rs.pipeline()
         self.config = rs.config()
         devices = sorted(devices, key=lambda x: x.get_info(rs.camera_info.serial_number))
-        self.config.enable_device(devices[id].get_info(rs.camera_info.serial_number))
+        selected_serial = self._select_device_serial(devices=devices, device_id=device_id, id=id)
+        self.config.enable_device(selected_serial)
 
         try:
             self.config.enable_stream(
@@ -86,9 +88,29 @@ class RealSenseSensor(Sensor, SensorServer):
         if self._run_as_server:
             self.start_server(port)
         print(
-            f"Done initializing RealSense sensor: "
-            f"{devices[id].get_info(rs.camera_info.serial_number)}"
+            f"Done initializing RealSense sensor for {mount_position}: {selected_serial}"
         )
+
+    @staticmethod
+    def _select_device_serial(devices: list[Any], device_id: str | None, id: int) -> str:
+        available_serials = [
+            device.get_info(rs.camera_info.serial_number) for device in devices
+        ]
+
+        if device_id is not None:
+            if device_id in available_serials:
+                return device_id
+            raise ValueError(
+                f"RealSense device with serial '{device_id}' not found. "
+                f"Available devices: {available_serials}"
+            )
+
+        if id < 0 or id >= len(devices):
+            raise IndexError(
+                f"RealSense device index {id} out of range for {len(devices)} devices: "
+                f"{available_serials}"
+            )
+        return available_serials[id]
 
     def read(self) -> dict[str, Any] | None:
         try:
