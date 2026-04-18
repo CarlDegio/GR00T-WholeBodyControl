@@ -94,8 +94,8 @@ class ComposedCameraConfig:
     test_latency: bool = False
     """Decode QR-code timestamps in each frame to measure latency."""
 
-    queue_size: int = 3
-    """Per-camera image queue depth."""
+    queue_size: int = 1
+    """Per-camera latest-frame buffer depth. Keep this at 1 to retain only the newest frame."""
 
     use_mjpeg: bool = False
     """Use on-device MJPEG encoding on OAK cameras to reduce USB bandwidth."""
@@ -419,7 +419,13 @@ class ComposedCameraSensor(Sensor, SensorServer):
                 raise RuntimeError(error_msg)
 
     def read(self):
-        """Read frames from all cameras. Returns None unless ALL cameras have frames."""
+        """Read the latest cached frame from each camera.
+
+        The per-camera worker keeps overwriting old frames when a newer one arrives.
+        The composer only peeks the most recent cached frame instead of consuming it,
+        so a temporary phase mismatch between cameras does not cause the whole
+        composed message to disappear for a cycle.
+        """
         self._check_for_errors()
 
         expected_cameras = set(self.camera_queues.keys())
@@ -435,13 +441,12 @@ class ComposedCameraSensor(Sensor, SensorServer):
         return None
 
     def _get_latest_from_queue(self, camera_queue: queue.Queue) -> dict[str, Any] | None:
-        latest = None
-        try:
-            while True:
-                latest = camera_queue.get_nowait()
-        except queue.Empty:
-            pass
-        return latest
+        # Peek instead of draining so each camera always exposes its latest frame
+        # until the producer overwrites it with a newer one.
+        with camera_queue.mutex:
+            if not camera_queue.queue:
+                return None
+            return camera_queue.queue[-1]
 
     def close(self):
         for shutdown_event in self.shutdown_events.values():

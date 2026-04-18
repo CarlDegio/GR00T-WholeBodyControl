@@ -1,0 +1,13 @@
+
+head: 347522071257
+
+right: 352122270966
+
+left: 218622279421
+
+
+python -m gear_sonic.camera.composed_camera \
+    --ego-view-camera oak --ego-view-device-id <EGO_MXID> \
+    --left-wrist-camera oak --left-wrist-device-id <LEFT_WRIST_MXID> \
+    --right-wrist-camera oak --right-wrist-device-id <RIGHT_WRIST_MXID> \
+    --port 5555
