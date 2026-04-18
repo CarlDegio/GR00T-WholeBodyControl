@@ -79,6 +79,9 @@ class ComposedCameraConfig:
     fps: int = 30
     """Publish rate.  OAK cameras run at 30 FPS; lower values add latency."""
 
+    realsense_enable_depth: bool = False
+    """Whether RealSense cameras should publish depth alongside color."""
+
     run_as_server: bool = True
     """Run as ZMQ PUB server (set False for in-process usage)."""
 
@@ -373,13 +376,20 @@ class ComposedCameraSensor(Sensor, SensorServer):
             return OAKSensor(config=oak_config, mount_position=mount_position, device_id=device_id)
 
         elif camera_type == "realsense":
-            from gear_sonic.camera.drivers.realsense import RealSenseSensor
+            from gear_sonic.camera.drivers.realsense import RealSenseConfig, RealSenseSensor
 
             print(
                 f"Initializing RealSense sensor for camera type: {camera_type}, "
                 f"device: {device_id}"
             )
-            return RealSenseSensor(mount_position=mount_position, device_id=device_id)
+            realsense_config = RealSenseConfig()
+            realsense_config.fps = self.config.fps
+            realsense_config.enable_depth = self.config.realsense_enable_depth
+            return RealSenseSensor(
+                config=realsense_config,
+                mount_position=mount_position,
+                device_id=device_id,
+            )
 
         elif camera_type.endswith(".mp4"):
             from gear_sonic.camera.drivers.dummy import ReplayDummySensor
