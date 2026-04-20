@@ -72,6 +72,46 @@ G1_BODY_JOINT_NAMES_ISAACLAB = [
     "right_wrist_yaw_joint",
 ]
 
+# Body joint order used by deploy-side outputs such as `body_q_target/body_q_measured`
+# and by `action.wbc` body-actuated joints before converting to IsaacLab order.
+G1_BODY_JOINT_NAMES_MUJOCO = [
+    "left_hip_pitch_joint",
+    "left_hip_roll_joint",
+    "left_hip_yaw_joint",
+    "left_knee_joint",
+    "left_ankle_pitch_joint",
+    "left_ankle_roll_joint",
+    "right_hip_pitch_joint",
+    "right_hip_roll_joint",
+    "right_hip_yaw_joint",
+    "right_knee_joint",
+    "right_ankle_pitch_joint",
+    "right_ankle_roll_joint",
+    "waist_yaw_joint",
+    "waist_roll_joint",
+    "waist_pitch_joint",
+    "left_shoulder_pitch_joint",
+    "left_shoulder_roll_joint",
+    "left_shoulder_yaw_joint",
+    "left_elbow_joint",
+    "left_wrist_roll_joint",
+    "left_wrist_pitch_joint",
+    "left_wrist_yaw_joint",
+    "right_shoulder_pitch_joint",
+    "right_shoulder_roll_joint",
+    "right_shoulder_yaw_joint",
+    "right_elbow_joint",
+    "right_wrist_roll_joint",
+    "right_wrist_pitch_joint",
+    "right_wrist_yaw_joint",
+]
+
+# `policy_parameters.hpp -> mujoco_to_isaaclab`
+MUJOCO_TO_ISAACLAB_BODY_DOF = [
+    0, 6, 12, 1, 7, 13, 2, 8, 14, 3, 9, 15, 22, 4, 10,
+    16, 23, 5, 11, 17, 24, 18, 25, 19, 26, 20, 27, 21, 28,
+]
+
 # Deploy-side Dex3 hand order. This is the order consumed by
 # InputInterface::GetHandPose() and sent to dex3_hands_.setAllJointsCommand().
 G1_LEFT_HAND_JOINT_NAMES_DEPLOY = [
@@ -94,7 +134,9 @@ G1_RIGHT_HAND_JOINT_NAMES_DEPLOY = [
     "right_hand_middle_1_joint",
 ]
 
-# Recorded `action.wbc` order from the Sonic VLA dataset / robot model joint_names.
+# Recorded `action.wbc` full-43DOF order from Sonic VLA dataset / RobotModel joint_names:
+# [29D body in MuJoCo/body-actuated order, with left-hand 7D inserted before right arm,
+#  then right-hand 7D at the tail].
 ACTION_WBC_FALLBACK_NAMES = [
     "left_hip_pitch_joint",
     "left_hip_roll_joint",
@@ -253,11 +295,12 @@ def _split_wbc_action(
                 f"action.wbc {source_label} has {len(source_names)} names but data has "
                 f"{action_wbc.shape[1]} dims"
             )
-        body_indices = _indices_from_names(
+        body_mujoco_indices = _indices_from_names(
             source_names,
-            G1_BODY_JOINT_NAMES_ISAACLAB,
+            G1_BODY_JOINT_NAMES_MUJOCO,
             feature_key="action.wbc",
         )
+        body_effective_indices = [body_mujoco_indices[index] for index in MUJOCO_TO_ISAACLAB_BODY_DOF]
         left_hand_indices = _indices_from_names(
             source_names,
             G1_LEFT_HAND_JOINT_NAMES_DEPLOY,
@@ -270,11 +313,13 @@ def _split_wbc_action(
         )
         print(
             "[Dataset] action.wbc remap "
-            f"({source_label}): body indices={body_indices}, "
+            f"({source_label}): body_mujoco_indices={body_mujoco_indices}, "
+            f"mujoco_to_isaaclab={MUJOCO_TO_ISAACLAB_BODY_DOF}, "
+            f"body_effective_indices={body_effective_indices}, "
             f"left hand indices={left_hand_indices}, right hand indices={right_hand_indices}"
         )
         return (
-            action_wbc[:, body_indices],
+            action_wbc[:, body_effective_indices],
             action_wbc[:, left_hand_indices],
             action_wbc[:, right_hand_indices],
         )
