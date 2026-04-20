@@ -206,6 +206,9 @@ class ReplayConfig:
     state_zmq_port: int = 5557
     speed_scale: float = 1.0
     log_every: int = 25
+    packet_debug: bool = False
+    packet_debug_every: int = 1
+    packet_debug_dims: int = 5
 
 
 def _coerce_vector(value, dtype: np.dtype | type = np.float64) -> np.ndarray:
@@ -722,6 +725,63 @@ def _format_range(action: ReplayAction) -> str:
     return f"dataset[{action.dataset_start}:{action.dataset_stop}) session={action.session_frame}"
 
 
+def _preview_array(name: str, value: np.ndarray | None, max_dims: int) -> str:
+    if value is None:
+        return f"{name}=None"
+    arr = np.asarray(value)
+    if arr.ndim == 0:
+        return f"{name} scalar={arr.item()}"
+    if arr.ndim == 1:
+        preview = np.array2string(arr[:max_dims], precision=4, suppress_small=False)
+        return f"{name} shape={arr.shape} head={preview}"
+    row_preview = np.array2string(arr[0, :max_dims], precision=4, suppress_small=False)
+    tail = ""
+    if arr.shape[0] > 1:
+        last_preview = np.array2string(arr[-1, :max_dims], precision=4, suppress_small=False)
+        tail = f", tail={last_preview}"
+    return f"{name} shape={arr.shape} head={row_preview}{tail}"
+
+
+def _print_packet_debug(
+    action: ReplayAction,
+    observation: dict | None,
+    *,
+    max_dims: int,
+) -> None:
+    print(f"[ReplayDebug] OUT {action.protocol} {_format_range(action)}")
+    for key in (
+        "joint_pos",
+        "joint_vel",
+        "body_quat_w",
+        "frame_index",
+        "left_hand_joints",
+        "right_hand_joints",
+        "token_state",
+    ):
+        if key in action.payload:
+            print(f"[ReplayDebug]   {_preview_array(key, action.payload[key], max_dims)}")
+
+    if observation is None:
+        print("[ReplayDebug] IN  none (enable `--state-feedback` to compare g1_debug)")
+        return
+
+    print("[ReplayDebug] IN  g1_debug")
+    for key in (
+        "last_action",
+        "body_q_target",
+        "body_q",
+        "body_q_measured",
+        "left_hand_q",
+        "right_hand_q",
+        "last_left_hand_action",
+        "last_right_hand_action",
+        "base_quat_target",
+        "base_quat",
+    ):
+        if key in observation:
+            print(f"[ReplayDebug]   {_preview_array(key, observation[key], max_dims)}")
+
+
 def main(config: ReplayConfig) -> None:
     if config.protocol == "v4":
         config.chunk_size = 1
@@ -827,6 +887,16 @@ def main(config: ReplayConfig) -> None:
                 observation = env.step(action)
                 sent_count += 1
 
+                if config.packet_debug and (
+                    sent_count == 1
+                    or sent_count % max(1, config.packet_debug_every) == 0
+                ):
+                    _print_packet_debug(
+                        action,
+                        observation,
+                        max_dims=max(1, config.packet_debug_dims),
+                    )
+
                 if sent_count == 1 or sent_count % max(1, config.log_every) == 0:
                     obs_suffix = ""
                     if observation is not None:
@@ -867,6 +937,9 @@ if __name__ == "__main__":
     parser.add_argument("--state-zmq-port", type=int, default=5557)
     parser.add_argument("--speed-scale", type=float, default=1.0)
     parser.add_argument("--log-every", type=int, default=25)
+    parser.add_argument("--packet-debug", action="store_true")
+    parser.add_argument("--packet-debug-every", type=int, default=1)
+    parser.add_argument("--packet-debug-dims", type=int, default=5)
     args = parser.parse_args()
     main(
         ReplayConfig(
@@ -890,5 +963,8 @@ if __name__ == "__main__":
             state_zmq_port=args.state_zmq_port,
             speed_scale=args.speed_scale,
             log_every=args.log_every,
+            packet_debug=args.packet_debug,
+            packet_debug_every=args.packet_debug_every,
+            packet_debug_dims=args.packet_debug_dims,
         )
     )
