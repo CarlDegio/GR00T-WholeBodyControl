@@ -211,6 +211,7 @@ class ReplayConfig:
     packet_debug: bool = False
     packet_debug_every: int = 1
     packet_debug_dims: int = 5
+    packet_debug_dir: str = "logs/replay_debug"
 
 
 def _coerce_vector(value, dtype: np.dtype | type = np.float64) -> np.ndarray:
@@ -760,64 +761,65 @@ def _preview_array(name: str, value: np.ndarray | None, max_dims: int) -> str:
     return f"{name} shape={arr.shape} head={row_preview}{tail}"
 
 
-def _print_packet_debug(
-    action: ReplayAction,
-    observation: dict | None,
-    *,
-    sent_count: int,
-    max_dims: int,
-    state_feedback_enabled: bool,
-    state_feedback_timeout_sec: float,
-) -> None:
-    window_len = action.dataset_stop - action.dataset_start
-    overlap = max(0, window_len - action.stride)
-    print(
-        f"[ReplayDebug] OUT send#{sent_count} {action.protocol} {_format_range(action)} "
-        f"window={window_len}, stride={action.stride}, overlap={overlap}"
+def _format_full_array(name: str, value: np.ndarray | None) -> str:
+    if value is None:
+        return f"{name}=None"
+    arr = np.asarray(value)
+    return (
+        f"{name} shape={arr.shape}\n"
+        f"{np.array2string(arr, precision=6, suppress_small=False, threshold=arr.size + 1)}"
     )
-    for key in (
-        "joint_pos",
-        "joint_vel",
-        "body_quat_w",
-        "frame_index",
-        "left_hand_joints",
-        "right_hand_joints",
-        "token_state",
-    ):
-        if key in action.payload:
-            print(f"[ReplayDebug]   {_preview_array(key, action.payload[key], max_dims)}")
 
-    if observation is None:
-        if state_feedback_enabled:
-            print(
-                "[ReplayDebug] IN  none "
-                f"(no g1_debug within {state_feedback_timeout_sec:.3f}s; "
-                "check deploy --output-type zmq, --zmq-out-port/topic, and --state-zmq-host)"
-            )
-        else:
-            print("[ReplayDebug] IN  none (enable `--state-feedback` to compare g1_debug)")
-        return
 
-    print(f"[ReplayDebug] IN  g1_debug keys={len(observation)}")
-    printed_any = False
-    for key in (
-        "last_action",
-        "body_q_target",
-        "body_q",
-        "body_q_measured",
-        "left_hand_q",
-        "right_hand_q",
-        "last_left_hand_action",
-        "last_right_hand_action",
-        "base_quat_target",
-        "base_quat",
-    ):
-        if key in observation:
-            print(f"[ReplayDebug]   {_preview_array(key, observation[key], max_dims)}")
-            printed_any = True
-    if not printed_any:
-        keys_preview = ", ".join(sorted(observation.keys())[:16])
-        print(f"[ReplayDebug]   available_keys={keys_preview}")
+class PacketDebugLogger:
+    def __init__(self, log_dir: str, protocol: str):
+        timestamp = time.strftime("%Y%m%d_%H%M%S")
+        self.log_dir = Path(log_dir)
+        self.log_dir.mkdir(parents=True, exist_ok=True)
+        self.path = self.log_dir / f"replay_{protocol}_{timestamp}.log"
+        self._file = open(self.path, "a", encoding="utf-8")
+
+    def log(
+        self,
+        action: ReplayAction,
+        observation: dict | None,
+        *,
+        sent_count: int,
+        state_feedback_enabled: bool,
+        state_feedback_timeout_sec: float,
+    ) -> None:
+        window_len = action.dataset_stop - action.dataset_start
+        overlap = max(0, window_len - action.stride)
+        self._file.write("=" * 100 + "\n")
+        self._file.write(
+            f"send#{sent_count} protocol={action.protocol} {_format_range(action)} "
+            f"window={window_len} stride={action.stride} overlap={overlap}\n"
+        )
+        self._file.write(
+            _format_full_array("joint_pos", action.payload.get("joint_pos")) + "\n"
+        )
+        self._file.write(
+            _format_full_array("frame_index", action.payload.get("frame_index")) + "\n"
+        )
+
+        if observation is None:
+            if state_feedback_enabled:
+                self._file.write(
+                    "g1_debug=None "
+                    f"(no message within {state_feedback_timeout_sec:.3f}s)\n"
+                )
+            else:
+                self._file.write("g1_debug=None (state feedback disabled)\n")
+            self._file.flush()
+            return
+
+        self._file.write(f"g1_debug_keys={len(observation)}\n")
+        for key in ("last_action", "body_q_target"):
+            self._file.write(_format_full_array(key, observation.get(key)) + "\n")
+        self._file.flush()
+
+    def close(self) -> None:
+        self._file.close()
 
 
 def main(config: ReplayConfig) -> None:
@@ -844,6 +846,7 @@ def main(config: ReplayConfig) -> None:
     should_quit = False
     observation = None
     sent_count = 0
+    packet_debug_logger: PacketDebugLogger | None = None
     speed_scale = max(1e-3, config.speed_scale)
     period_sec = 1.0 / current_episode.fps
 
@@ -857,6 +860,9 @@ def main(config: ReplayConfig) -> None:
             f"[Replay] V1 window config: chunk_size={config.chunk_size}, "
             f"stride={config.stride}, overlap={overlap}"
         )
+    if config.packet_debug:
+        packet_debug_logger = PacketDebugLogger(config.packet_debug_dir, config.protocol)
+        print(f"[ReplayDebug] Writing detailed packet logs to {packet_debug_logger.path}")
     _print_controls()
     print("[Replay] Start deploy with `--input-type zmq` and press ENTER there to enable streaming.")
 
@@ -937,11 +943,11 @@ def main(config: ReplayConfig) -> None:
                     sent_count == 1
                     or sent_count % max(1, config.packet_debug_every) == 0
                 ):
-                    _print_packet_debug(
+                    assert packet_debug_logger is not None
+                    packet_debug_logger.log(
                         action,
                         observation,
                         sent_count=sent_count,
-                        max_dims=max(1, config.packet_debug_dims),
                         state_feedback_enabled=config.state_feedback,
                         state_feedback_timeout_sec=config.state_feedback_timeout_sec,
                     )
@@ -959,6 +965,8 @@ def main(config: ReplayConfig) -> None:
                 else:
                     next_tick = time.monotonic()
     finally:
+        if packet_debug_logger is not None:
+            packet_debug_logger.close()
         env.close()
 
 
@@ -991,6 +999,7 @@ if __name__ == "__main__":
     parser.add_argument("--packet-debug", action="store_true")
     parser.add_argument("--packet-debug-every", type=int, default=1)
     parser.add_argument("--packet-debug-dims", type=int, default=5)
+    parser.add_argument("--packet-debug-dir", default="logs/replay_debug")
     args = parser.parse_args()
     main(
         ReplayConfig(
@@ -1019,5 +1028,6 @@ if __name__ == "__main__":
             packet_debug=args.packet_debug,
             packet_debug_every=args.packet_debug_every,
             packet_debug_dims=args.packet_debug_dims,
+            packet_debug_dir=args.packet_debug_dir,
         )
     )
