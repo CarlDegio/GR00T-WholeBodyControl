@@ -39,6 +39,59 @@ LEFT_HAND_DIM = 7
 RIGHT_HAND_DIM = 7
 DEFAULT_DATA_PATH = "data/chunk-{episode_chunk:03d}/episode_{episode_index:06d}.parquet"
 
+# Deploy-side Protocol v1 expects body joints in this IsaacLab order.
+G1_BODY_JOINT_NAMES_ISAACLAB = [
+    "left_hip_pitch_joint",
+    "right_hip_pitch_joint",
+    "waist_yaw_joint",
+    "left_hip_roll_joint",
+    "right_hip_roll_joint",
+    "waist_roll_joint",
+    "left_hip_yaw_joint",
+    "right_hip_yaw_joint",
+    "waist_pitch_joint",
+    "left_knee_joint",
+    "right_knee_joint",
+    "left_shoulder_pitch_joint",
+    "right_shoulder_pitch_joint",
+    "left_ankle_pitch_joint",
+    "right_ankle_pitch_joint",
+    "left_shoulder_roll_joint",
+    "right_shoulder_roll_joint",
+    "left_ankle_roll_joint",
+    "right_ankle_roll_joint",
+    "left_shoulder_yaw_joint",
+    "right_shoulder_yaw_joint",
+    "left_elbow_joint",
+    "right_elbow_joint",
+    "left_wrist_roll_joint",
+    "right_wrist_roll_joint",
+    "left_wrist_pitch_joint",
+    "right_wrist_pitch_joint",
+    "left_wrist_yaw_joint",
+    "right_wrist_yaw_joint",
+]
+
+G1_LEFT_HAND_JOINT_NAMES = [
+    "left_hand_index_0_joint",
+    "left_hand_index_1_joint",
+    "left_hand_middle_0_joint",
+    "left_hand_middle_1_joint",
+    "left_hand_thumb_0_joint",
+    "left_hand_thumb_1_joint",
+    "left_hand_thumb_2_joint",
+]
+
+G1_RIGHT_HAND_JOINT_NAMES = [
+    "right_hand_index_0_joint",
+    "right_hand_index_1_joint",
+    "right_hand_middle_0_joint",
+    "right_hand_middle_1_joint",
+    "right_hand_thumb_0_joint",
+    "right_hand_thumb_1_joint",
+    "right_hand_thumb_2_joint",
+]
+
 
 @dataclass
 class ReplayConfig:
@@ -109,6 +162,84 @@ def _get_parquet_path(dataset_path: Path, info: dict, episode_index: int) -> Pat
     )
 
 
+def _get_feature_names(info: dict, feature_key: str) -> list[str] | None:
+    feature = info.get("features", {}).get(feature_key, {})
+    names = feature.get("names")
+    if not isinstance(names, list):
+        return None
+    if not all(isinstance(name, str) for name in names):
+        return None
+    return names
+
+
+def _indices_from_names(
+    source_names: list[str],
+    target_names: list[str],
+    *,
+    feature_key: str,
+) -> list[int]:
+    source_index = {name: index for index, name in enumerate(source_names)}
+    missing = [name for name in target_names if name not in source_index]
+    if missing:
+        missing_preview = ", ".join(missing[:8])
+        raise ValueError(
+            f"{feature_key} metadata is missing required joints: {missing_preview}"
+        )
+    return [source_index[name] for name in target_names]
+
+
+def _split_wbc_action(
+    action_wbc: np.ndarray,
+    wbc_names: list[str] | None,
+) -> tuple[np.ndarray, np.ndarray | None, np.ndarray | None]:
+    if wbc_names is not None:
+        if len(wbc_names) != action_wbc.shape[1]:
+            raise ValueError(
+                f"action.wbc metadata has {len(wbc_names)} names but data has "
+                f"{action_wbc.shape[1]} dims"
+            )
+        body_indices = _indices_from_names(
+            wbc_names,
+            G1_BODY_JOINT_NAMES_ISAACLAB,
+            feature_key="action.wbc",
+        )
+        left_hand_indices = _indices_from_names(
+            wbc_names,
+            G1_LEFT_HAND_JOINT_NAMES,
+            feature_key="action.wbc",
+        )
+        right_hand_indices = _indices_from_names(
+            wbc_names,
+            G1_RIGHT_HAND_JOINT_NAMES,
+            feature_key="action.wbc",
+        )
+        return (
+            action_wbc[:, body_indices],
+            action_wbc[:, left_hand_indices],
+            action_wbc[:, right_hand_indices],
+        )
+
+    if action_wbc.shape[1] < BODY_JOINT_DIM:
+        raise ValueError(
+            f"action.wbc has {action_wbc.shape[1]} dims, expected at least {BODY_JOINT_DIM}"
+        )
+
+    body_action = action_wbc[:, :BODY_JOINT_DIM]
+    left_hand_action = None
+    right_hand_action = None
+    if action_wbc.shape[1] >= BODY_JOINT_DIM + LEFT_HAND_DIM + RIGHT_HAND_DIM:
+        left_start = BODY_JOINT_DIM
+        left_end = left_start + LEFT_HAND_DIM
+        right_end = left_end + RIGHT_HAND_DIM
+        left_hand_action = action_wbc[:, left_start:left_end]
+        right_hand_action = action_wbc[:, left_end:right_end]
+        print(
+            "[Dataset] action.wbc has no joint names; assuming layout "
+            "[29 body IsaacLab, 7 left hand, 7 right hand]."
+        )
+    return body_action, left_hand_action, right_hand_action
+
+
 def _finite_difference(values: np.ndarray, fps: float) -> np.ndarray:
     velocities = np.zeros_like(values, dtype=np.float64)
     if len(values) <= 1:
@@ -170,24 +301,23 @@ class DatasetEpisodeReader:
         )
         motion_token = _stack_vector_column(frame_table, "action.motion_token", dtype=np.float64)
 
-        if action_wbc.shape[1] < BODY_JOINT_DIM:
-            raise ValueError(
-                f"action.wbc has {action_wbc.shape[1]} dims, expected at least {BODY_JOINT_DIM}"
-            )
         if root_orientation.shape[1] != 4:
             raise ValueError(
                 f"observation.root_orientation has shape {root_orientation.shape}, expected [T, 4]"
             )
 
-        body_action = action_wbc[:, :BODY_JOINT_DIM]
-        left_hand_action = None
-        right_hand_action = None
-        if action_wbc.shape[1] >= BODY_JOINT_DIM + LEFT_HAND_DIM + RIGHT_HAND_DIM:
-            left_start = BODY_JOINT_DIM
-            left_end = left_start + LEFT_HAND_DIM
-            right_end = left_end + RIGHT_HAND_DIM
-            left_hand_action = action_wbc[:, left_start:left_end]
-            right_hand_action = action_wbc[:, left_end:right_end]
+        wbc_names = _get_feature_names(self.info, "action.wbc")
+        body_action, left_hand_action, right_hand_action = _split_wbc_action(
+            action_wbc,
+            wbc_names,
+        )
+        if wbc_names is not None:
+            print(
+                "[Dataset] action.wbc remapped by joint names: "
+                f"{action_wbc.shape[1]} dims -> body {body_action.shape[1]}, "
+                f"left hand {0 if left_hand_action is None else left_hand_action.shape[1]}, "
+                f"right hand {0 if right_hand_action is None else right_hand_action.shape[1]}."
+            )
 
         body_velocity = _finite_difference(body_action, self.fps)
 
@@ -335,6 +465,14 @@ class TokenReplayPolicyV4(ReplayPolicyBase):
         }
         if self.include_body_quat:
             payload["body_quat_w"] = self.episode.root_orientation[index].astype(
+                np.float32, copy=False
+            )
+        if self.episode.left_hand_action is not None:
+            payload["left_hand_joints"] = self.episode.left_hand_action[index].astype(
+                np.float32, copy=False
+            )
+        if self.episode.right_hand_action is not None:
+            payload["right_hand_joints"] = self.episode.right_hand_action[index].astype(
                 np.float32, copy=False
             )
 

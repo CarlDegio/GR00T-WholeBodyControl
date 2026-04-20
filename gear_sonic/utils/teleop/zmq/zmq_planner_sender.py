@@ -196,6 +196,8 @@ def pack_pose_message(pose_data: dict, topic: str = "pose", version: int = 3) ->
                 dtype_str = "i32"
             elif value.dtype == np.int64:
                 dtype_str = "i64"
+            elif value.dtype == np.uint8:
+                dtype_str = "u8"
             elif value.dtype == bool:
                 dtype_str = "bool"
             else:
