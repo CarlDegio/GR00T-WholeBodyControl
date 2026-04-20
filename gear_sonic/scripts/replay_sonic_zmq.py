@@ -112,6 +112,18 @@ MUJOCO_TO_ISAACLAB_BODY_DOF = [
     16, 23, 5, 11, 17, 24, 18, 25, 19, 26, 20, 27, 21, 28,
 ]
 
+# `policy_parameters.hpp -> default_angles`
+DEFAULT_ANGLES_MUJOCO = np.asarray(
+    [
+        -0.312, 0.0, 0.0, 0.669, -0.363, 0.0,
+        -0.312, 0.0, 0.0, 0.669, -0.363, 0.0,
+        0.0, 0.0, 0.0,
+        0.2, 0.2, 0.0, 0.6, 0.0, 0.0, 0.0,
+        0.2, -0.2, 0.0, 0.6, 0.0, 0.0, 0.0,
+    ],
+    dtype=np.float64,
+)
+
 # Deploy-side Dex3 hand order. This is the order consumed by
 # InputInterface::GetHandPose() and sent to dex3_hands_.setAllJointsCommand().
 G1_LEFT_HAND_JOINT_NAMES_DEPLOY = [
@@ -301,6 +313,8 @@ def _split_wbc_action(
             feature_key="action.wbc",
         )
         body_effective_indices = [body_mujoco_indices[index] for index in MUJOCO_TO_ISAACLAB_BODY_DOF]
+        body_action_mujoco = action_wbc[:, body_mujoco_indices] - DEFAULT_ANGLES_MUJOCO.reshape(1, -1)
+        body_action_isaaclab = body_action_mujoco[:, MUJOCO_TO_ISAACLAB_BODY_DOF]
         left_hand_indices = _indices_from_names(
             source_names,
             G1_LEFT_HAND_JOINT_NAMES_DEPLOY,
@@ -314,12 +328,13 @@ def _split_wbc_action(
         print(
             "[Dataset] action.wbc remap "
             f"({source_label}): body_mujoco_indices={body_mujoco_indices}, "
+            "subtract_default_angles=True, "
             f"mujoco_to_isaaclab={MUJOCO_TO_ISAACLAB_BODY_DOF}, "
             f"body_effective_indices={body_effective_indices}, "
             f"left hand indices={left_hand_indices}, right hand indices={right_hand_indices}"
         )
         return (
-            action_wbc[:, body_effective_indices],
+            body_action_isaaclab,
             action_wbc[:, left_hand_indices],
             action_wbc[:, right_hand_indices],
         )
@@ -362,6 +377,7 @@ class EpisodeData:
     right_hand_action: np.ndarray | None
     body_velocity: np.ndarray
     root_orientation: np.ndarray
+    stream_body_quat: np.ndarray
     motion_token: np.ndarray
     fps: float
 
@@ -395,6 +411,18 @@ class DatasetEpisodeReader:
             frame_table, "observation.root_orientation", dtype=np.float64
         )
         motion_token = _stack_vector_column(frame_table, "action.motion_token", dtype=np.float64)
+        if "teleop.body_quat_w" in frame_table.columns:
+            stream_body_quat = _stack_vector_column(
+                frame_table, "teleop.body_quat_w", dtype=np.float64
+            )
+            if stream_body_quat.shape[1] != 4:
+                raise ValueError(
+                    f"teleop.body_quat_w has shape {stream_body_quat.shape}, expected [T, 4]"
+                )
+            print("[Dataset] Using `teleop.body_quat_w` as replay body quaternion.")
+        else:
+            stream_body_quat = root_orientation
+            print("[Dataset] `teleop.body_quat_w` missing; falling back to `observation.root_orientation`.")
 
         if root_orientation.shape[1] != 4:
             raise ValueError(
@@ -424,6 +452,7 @@ class DatasetEpisodeReader:
             right_hand_action=right_hand_action,
             body_velocity=body_velocity,
             root_orientation=root_orientation,
+            stream_body_quat=stream_body_quat,
             motion_token=motion_token,
             fps=self.fps,
         )
@@ -503,7 +532,7 @@ class WBCReplayPolicyV1(ReplayPolicyBase):
         payload = {
             "joint_pos": self.episode.body_action[start:stop].astype(np.float32, copy=False),
             "joint_vel": self.episode.body_velocity[start:stop].astype(np.float32, copy=False),
-            "body_quat_w": self.episode.root_orientation[start:stop].astype(
+            "body_quat_w": self.episode.stream_body_quat[start:stop].astype(
                 np.float32, copy=False
             ),
             "frame_index": frame_index,
@@ -559,7 +588,7 @@ class TokenReplayPolicyV4(ReplayPolicyBase):
             "frame_index": np.asarray([self.session_frame], dtype=np.int64),
         }
         if self.include_body_quat:
-            payload["body_quat_w"] = self.episode.root_orientation[index].astype(
+            payload["body_quat_w"] = self.episode.stream_body_quat[index].astype(
                 np.float32, copy=False
             )
         if self.episode.left_hand_action is not None:
