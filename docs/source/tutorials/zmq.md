@@ -59,6 +59,34 @@ bash deploy.sh --input-type zmq \
 **Build your own streaming source.** The ZMQ stream protocol documented below is self-contained — any publisher that sends messages in this format can drive the robot. You can write your own motion capture retargeting pipeline, simulator bridge, or any other source that produces the required fields. No PICO hardware is needed.
 ```
 
+## Replaying Recorded Datasets
+
+You can replay a recorded Sonic VLA dataset back into the deploy-side `--input-type zmq`
+interface with:
+
+```bash
+python gear_sonic/scripts/replay_sonic_zmq.py \
+  --dataset-path outputs/my_dataset \
+  --protocol v1
+```
+
+Or replay motion tokens directly:
+
+```bash
+python gear_sonic/scripts/replay_sonic_zmq.py \
+  --dataset-path outputs/my_dataset \
+  --protocol v4
+```
+
+The replay script keeps the protocol fixed for the whole run. If you switch between
+`v1` and `v4`, restart the replay script and re-enter ZMQ streaming mode on the deploy
+side by pressing **`ENTER`** in the C++ terminal.
+
+- `v1` replays `action.wbc` as sliding joint-motion chunks.
+- `v4` replays `action.motion_token` one token vector per step.
+- Optional state feedback can be enabled with `--state-feedback`, which subscribes to
+  the deploy-side `g1_debug` topic and returns the latest robot state to the replay loop.
+
 ## Using with PICO VR Teleop
 
 You can use `--input-type zmq` with the PICO teleop streamer for a simple, streaming-only whole-body teleoperation setup. In this mode, the PICO streams full-body SMPL poses over ZMQ and the deployment side tracks them directly — no locomotion planner, no PICO-button mode switching. All control is done from the keyboard.

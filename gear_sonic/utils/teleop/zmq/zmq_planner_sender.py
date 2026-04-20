@@ -222,3 +222,79 @@ def pack_pose_message(pose_data: dict, topic: str = "pose", version: int = 3) ->
 
     packed_message = topic_bytes + header_bytes + data_bytes
     return packed_message
+
+
+def pack_pose_v1_message(
+    joint_pos: np.ndarray,
+    joint_vel: np.ndarray,
+    body_quat_w: np.ndarray,
+    frame_index: np.ndarray,
+    *,
+    catch_up: bool = False,
+    left_hand_joints: np.ndarray | None = None,
+    right_hand_joints: np.ndarray | None = None,
+    topic: str = "pose",
+) -> bytes:
+    """
+    Pack a Protocol v1 joint-motion message for the `pose` topic.
+
+    Args:
+        joint_pos: `[N, 29]` joint positions in IsaacLab order.
+        joint_vel: `[N, 29]` joint velocities in IsaacLab order.
+        body_quat_w: `[N, 4]` body quaternion(s) in wxyz order.
+        frame_index: `[N]` monotonically increasing frame indices.
+        catch_up: Whether deploy-side catch-up reset is enabled.
+        left_hand_joints: Optional left-hand 7-DOF joint vector.
+        right_hand_joints: Optional right-hand 7-DOF joint vector.
+        topic: Topic prefix string.
+
+    Returns:
+        Packed single-part ZMQ payload.
+    """
+    joint_pos = np.asarray(joint_pos, dtype=np.float32)
+    joint_vel = np.asarray(joint_vel, dtype=np.float32)
+    body_quat_w = np.asarray(body_quat_w, dtype=np.float32)
+    frame_index = np.asarray(frame_index, dtype=np.int64)
+    catch_up_value = np.asarray([catch_up], dtype=np.uint8)
+
+    if joint_pos.ndim != 2:
+        raise ValueError(f"joint_pos must have shape [N, 29], got {joint_pos.shape}")
+    if joint_vel.ndim != 2:
+        raise ValueError(f"joint_vel must have shape [N, 29], got {joint_vel.shape}")
+    if joint_pos.shape != joint_vel.shape:
+        raise ValueError(
+            f"joint_pos and joint_vel must match, got {joint_pos.shape} and {joint_vel.shape}"
+        )
+    if joint_pos.shape[1] != 29:
+        raise ValueError(f"Protocol v1 expects 29 body joints, got {joint_pos.shape[1]}")
+    if body_quat_w.shape != (joint_pos.shape[0], 4):
+        raise ValueError(
+            f"body_quat_w must have shape {(joint_pos.shape[0], 4)}, got {body_quat_w.shape}"
+        )
+    if frame_index.shape != (joint_pos.shape[0],):
+        raise ValueError(
+            f"frame_index must have shape {(joint_pos.shape[0],)}, got {frame_index.shape}"
+        )
+
+    pose_data = {
+        "joint_pos": joint_pos,
+        "joint_vel": joint_vel,
+        "body_quat_w": body_quat_w,
+        "frame_index": frame_index,
+        "catch_up": catch_up_value,
+    }
+    if left_hand_joints is not None:
+        left_hand_joints = np.asarray(left_hand_joints, dtype=np.float32).reshape(-1)
+        if left_hand_joints.shape != (7,):
+            raise ValueError(
+                f"left_hand_joints must have shape (7,), got {left_hand_joints.shape}"
+            )
+        pose_data["left_hand_joints"] = left_hand_joints
+    if right_hand_joints is not None:
+        right_hand_joints = np.asarray(right_hand_joints, dtype=np.float32).reshape(-1)
+        if right_hand_joints.shape != (7,):
+            raise ValueError(
+                f"right_hand_joints must have shape (7,), got {right_hand_joints.shape}"
+            )
+        pose_data["right_hand_joints"] = right_hand_joints
+    return pack_pose_message(pose_data, topic=topic, version=1)
