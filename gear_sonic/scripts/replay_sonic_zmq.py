@@ -72,7 +72,52 @@ G1_BODY_JOINT_NAMES_ISAACLAB = [
     "right_wrist_yaw_joint",
 ]
 
-G1_LEFT_HAND_JOINT_NAMES = [
+# Deploy-side Dex3 hand order. This is the order consumed by
+# InputInterface::GetHandPose() and sent to dex3_hands_.setAllJointsCommand().
+G1_LEFT_HAND_JOINT_NAMES_DEPLOY = [
+    "left_hand_thumb_0_joint",
+    "left_hand_thumb_1_joint",
+    "left_hand_thumb_2_joint",
+    "left_hand_index_0_joint",
+    "left_hand_index_1_joint",
+    "left_hand_middle_0_joint",
+    "left_hand_middle_1_joint",
+]
+
+G1_RIGHT_HAND_JOINT_NAMES_DEPLOY = [
+    "right_hand_thumb_0_joint",
+    "right_hand_thumb_1_joint",
+    "right_hand_thumb_2_joint",
+    "right_hand_index_0_joint",
+    "right_hand_index_1_joint",
+    "right_hand_middle_0_joint",
+    "right_hand_middle_1_joint",
+]
+
+# Recorded `action.wbc` order from the Sonic VLA dataset / robot model joint_names.
+ACTION_WBC_FALLBACK_NAMES = [
+    "left_hip_pitch_joint",
+    "left_hip_roll_joint",
+    "left_hip_yaw_joint",
+    "left_knee_joint",
+    "left_ankle_pitch_joint",
+    "left_ankle_roll_joint",
+    "right_hip_pitch_joint",
+    "right_hip_roll_joint",
+    "right_hip_yaw_joint",
+    "right_knee_joint",
+    "right_ankle_pitch_joint",
+    "right_ankle_roll_joint",
+    "waist_yaw_joint",
+    "waist_roll_joint",
+    "waist_pitch_joint",
+    "left_shoulder_pitch_joint",
+    "left_shoulder_roll_joint",
+    "left_shoulder_yaw_joint",
+    "left_elbow_joint",
+    "left_wrist_roll_joint",
+    "left_wrist_pitch_joint",
+    "left_wrist_yaw_joint",
     "left_hand_index_0_joint",
     "left_hand_index_1_joint",
     "left_hand_middle_0_joint",
@@ -80,9 +125,13 @@ G1_LEFT_HAND_JOINT_NAMES = [
     "left_hand_thumb_0_joint",
     "left_hand_thumb_1_joint",
     "left_hand_thumb_2_joint",
-]
-
-G1_RIGHT_HAND_JOINT_NAMES = [
+    "right_shoulder_pitch_joint",
+    "right_shoulder_roll_joint",
+    "right_shoulder_yaw_joint",
+    "right_elbow_joint",
+    "right_wrist_roll_joint",
+    "right_wrist_pitch_joint",
+    "right_wrist_yaw_joint",
     "right_hand_index_0_joint",
     "right_hand_index_1_joint",
     "right_hand_middle_0_joint",
@@ -192,26 +241,37 @@ def _split_wbc_action(
     action_wbc: np.ndarray,
     wbc_names: list[str] | None,
 ) -> tuple[np.ndarray, np.ndarray | None, np.ndarray | None]:
-    if wbc_names is not None:
-        if len(wbc_names) != action_wbc.shape[1]:
+    source_names = wbc_names
+    source_label = "metadata"
+    if source_names is None and action_wbc.shape[1] == len(ACTION_WBC_FALLBACK_NAMES):
+        source_names = ACTION_WBC_FALLBACK_NAMES
+        source_label = "built-in Sonic VLA 43DOF fallback"
+
+    if source_names is not None:
+        if len(source_names) != action_wbc.shape[1]:
             raise ValueError(
-                f"action.wbc metadata has {len(wbc_names)} names but data has "
+                f"action.wbc {source_label} has {len(source_names)} names but data has "
                 f"{action_wbc.shape[1]} dims"
             )
         body_indices = _indices_from_names(
-            wbc_names,
+            source_names,
             G1_BODY_JOINT_NAMES_ISAACLAB,
             feature_key="action.wbc",
         )
         left_hand_indices = _indices_from_names(
-            wbc_names,
-            G1_LEFT_HAND_JOINT_NAMES,
+            source_names,
+            G1_LEFT_HAND_JOINT_NAMES_DEPLOY,
             feature_key="action.wbc",
         )
         right_hand_indices = _indices_from_names(
-            wbc_names,
-            G1_RIGHT_HAND_JOINT_NAMES,
+            source_names,
+            G1_RIGHT_HAND_JOINT_NAMES_DEPLOY,
             feature_key="action.wbc",
+        )
+        print(
+            "[Dataset] action.wbc remap "
+            f"({source_label}): body indices={body_indices}, "
+            f"left hand indices={left_hand_indices}, right hand indices={right_hand_indices}"
         )
         return (
             action_wbc[:, body_indices],
@@ -219,25 +279,15 @@ def _split_wbc_action(
             action_wbc[:, right_hand_indices],
         )
 
-    if action_wbc.shape[1] < BODY_JOINT_DIM:
+    if action_wbc.shape[1] != BODY_JOINT_DIM:
         raise ValueError(
-            f"action.wbc has {action_wbc.shape[1]} dims, expected at least {BODY_JOINT_DIM}"
+            f"action.wbc has {action_wbc.shape[1]} dims but no usable joint names. "
+            f"Expected {BODY_JOINT_DIM} dims for an already-remapped body-only action "
+            f"or {len(ACTION_WBC_FALLBACK_NAMES)} dims for Sonic VLA full-q fallback."
         )
 
-    body_action = action_wbc[:, :BODY_JOINT_DIM]
-    left_hand_action = None
-    right_hand_action = None
-    if action_wbc.shape[1] >= BODY_JOINT_DIM + LEFT_HAND_DIM + RIGHT_HAND_DIM:
-        left_start = BODY_JOINT_DIM
-        left_end = left_start + LEFT_HAND_DIM
-        right_end = left_end + RIGHT_HAND_DIM
-        left_hand_action = action_wbc[:, left_start:left_end]
-        right_hand_action = action_wbc[:, left_end:right_end]
-        print(
-            "[Dataset] action.wbc has no joint names; assuming layout "
-            "[29 body IsaacLab, 7 left hand, 7 right hand]."
-        )
-    return body_action, left_hand_action, right_hand_action
+    print("[Dataset] action.wbc has no joint names; assuming body-only IsaacLab 29DOF.")
+    return action_wbc, None, None
 
 
 def _finite_difference(values: np.ndarray, fps: float) -> np.ndarray:
