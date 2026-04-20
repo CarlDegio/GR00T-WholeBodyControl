@@ -204,6 +204,8 @@ class ReplayConfig:
     state_feedback: bool = False
     state_zmq_host: str = "localhost"
     state_zmq_port: int = 5557
+    state_zmq_topic: str = "g1_debug"
+    state_feedback_timeout_sec: float = 0.02
     speed_scale: float = 1.0
     log_every: int = 25
     packet_debug: bool = False
@@ -357,6 +359,7 @@ class ReplayAction:
     dataset_start: int
     dataset_stop: int
     session_frame: int
+    stride: int
 
 
 @dataclass
@@ -543,6 +546,7 @@ class WBCReplayPolicyV1(ReplayPolicyBase):
             dataset_start=start,
             dataset_stop=stop,
             session_frame=self.session_frame,
+            stride=self.stride,
         )
         self.cursor += self.stride
         self.session_frame += self.stride
@@ -597,6 +601,7 @@ class TokenReplayPolicyV4(ReplayPolicyBase):
             dataset_start=index,
             dataset_stop=index + 1,
             session_frame=self.session_frame,
+            stride=1,
         )
         self.cursor += 1
         self.session_frame += 1
@@ -614,14 +619,21 @@ class ZMQReplayEnv:
         state_feedback: bool,
         state_zmq_host: str,
         state_zmq_port: int,
+        state_zmq_topic: str,
+        state_feedback_timeout_sec: float,
     ):
         self.topic = topic
+        self._state_feedback_timeout_sec = max(0.0, state_feedback_timeout_sec)
         self._ctx = zmq.Context()
         self._socket = self._ctx.socket(zmq.PUB)
         self._socket.setsockopt(zmq.SNDHWM, 1)
         self._socket.bind(f"tcp://{host}:{port}")
         self._state_subscriber = (
-            ZMQStateSubscriber(host=state_zmq_host, port=state_zmq_port)
+            ZMQStateSubscriber(
+                host=state_zmq_host,
+                port=state_zmq_port,
+                topic=state_zmq_topic,
+            )
             if state_feedback
             else None
         )
@@ -649,7 +661,13 @@ class ZMQReplayEnv:
 
         if self._state_subscriber is None:
             return None
-        return self._state_subscriber.get_msg(clear=True)
+
+        deadline = time.monotonic() + self._state_feedback_timeout_sec
+        latest = self._state_subscriber.get_msg(clear=True)
+        while latest is None and time.monotonic() < deadline:
+            time.sleep(0.001)
+            latest = self._state_subscriber.get_msg(clear=True)
+        return latest
 
     def close(self) -> None:
         if self._state_subscriber is not None:
@@ -746,9 +764,17 @@ def _print_packet_debug(
     action: ReplayAction,
     observation: dict | None,
     *,
+    sent_count: int,
     max_dims: int,
+    state_feedback_enabled: bool,
+    state_feedback_timeout_sec: float,
 ) -> None:
-    print(f"[ReplayDebug] OUT {action.protocol} {_format_range(action)}")
+    window_len = action.dataset_stop - action.dataset_start
+    overlap = max(0, window_len - action.stride)
+    print(
+        f"[ReplayDebug] OUT send#{sent_count} {action.protocol} {_format_range(action)} "
+        f"window={window_len}, stride={action.stride}, overlap={overlap}"
+    )
     for key in (
         "joint_pos",
         "joint_vel",
@@ -762,10 +788,18 @@ def _print_packet_debug(
             print(f"[ReplayDebug]   {_preview_array(key, action.payload[key], max_dims)}")
 
     if observation is None:
-        print("[ReplayDebug] IN  none (enable `--state-feedback` to compare g1_debug)")
+        if state_feedback_enabled:
+            print(
+                "[ReplayDebug] IN  none "
+                f"(no g1_debug within {state_feedback_timeout_sec:.3f}s; "
+                "check deploy --output-type zmq, --zmq-out-port/topic, and --state-zmq-host)"
+            )
+        else:
+            print("[ReplayDebug] IN  none (enable `--state-feedback` to compare g1_debug)")
         return
 
-    print("[ReplayDebug] IN  g1_debug")
+    print(f"[ReplayDebug] IN  g1_debug keys={len(observation)}")
+    printed_any = False
     for key in (
         "last_action",
         "body_q_target",
@@ -780,6 +814,10 @@ def _print_packet_debug(
     ):
         if key in observation:
             print(f"[ReplayDebug]   {_preview_array(key, observation[key], max_dims)}")
+            printed_any = True
+    if not printed_any:
+        keys_preview = ", ".join(sorted(observation.keys())[:16])
+        print(f"[ReplayDebug]   available_keys={keys_preview}")
 
 
 def main(config: ReplayConfig) -> None:
@@ -798,6 +836,8 @@ def main(config: ReplayConfig) -> None:
         state_feedback=config.state_feedback,
         state_zmq_host=config.state_zmq_host,
         state_zmq_port=config.state_zmq_port,
+        state_zmq_topic=config.state_zmq_topic,
+        state_feedback_timeout_sec=config.state_feedback_timeout_sec,
     )
 
     paused = False
@@ -811,6 +851,12 @@ def main(config: ReplayConfig) -> None:
         f"[Replay] Loaded episode {current_episode.episode_index}/{dataset_reader.num_episodes - 1}, "
         f"frames={current_episode.length}, protocol={config.protocol}, fps={current_episode.fps:.2f}"
     )
+    if config.protocol == "v1":
+        overlap = max(0, config.chunk_size - config.stride)
+        print(
+            f"[Replay] V1 window config: chunk_size={config.chunk_size}, "
+            f"stride={config.stride}, overlap={overlap}"
+        )
     _print_controls()
     print("[Replay] Start deploy with `--input-type zmq` and press ENTER there to enable streaming.")
 
@@ -894,7 +940,10 @@ def main(config: ReplayConfig) -> None:
                     _print_packet_debug(
                         action,
                         observation,
+                        sent_count=sent_count,
                         max_dims=max(1, config.packet_debug_dims),
+                        state_feedback_enabled=config.state_feedback,
+                        state_feedback_timeout_sec=config.state_feedback_timeout_sec,
                     )
 
                 if sent_count == 1 or sent_count % max(1, config.log_every) == 0:
@@ -935,6 +984,8 @@ if __name__ == "__main__":
     parser.add_argument("--state-feedback", action="store_true")
     parser.add_argument("--state-zmq-host", default="localhost")
     parser.add_argument("--state-zmq-port", type=int, default=5557)
+    parser.add_argument("--state-zmq-topic", default="g1_debug")
+    parser.add_argument("--state-feedback-timeout-sec", type=float, default=0.02)
     parser.add_argument("--speed-scale", type=float, default=1.0)
     parser.add_argument("--log-every", type=int, default=25)
     parser.add_argument("--packet-debug", action="store_true")
@@ -961,6 +1012,8 @@ if __name__ == "__main__":
             state_feedback=args.state_feedback,
             state_zmq_host=args.state_zmq_host,
             state_zmq_port=args.state_zmq_port,
+            state_zmq_topic=args.state_zmq_topic,
+            state_feedback_timeout_sec=args.state_feedback_timeout_sec,
             speed_scale=args.speed_scale,
             log_every=args.log_every,
             packet_debug=args.packet_debug,
