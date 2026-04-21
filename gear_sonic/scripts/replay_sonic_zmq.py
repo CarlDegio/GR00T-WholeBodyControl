@@ -285,42 +285,44 @@ def _indices_from_names(
     return [source_index[name] for name in target_names]
 
 
-def _split_wbc_action(
-    action_wbc: np.ndarray,
-    wbc_names: list[str] | None,
+def _split_joint_configuration(
+    joint_values: np.ndarray,
+    joint_names: list[str] | None,
+    *,
+    feature_key: str,
 ) -> tuple[np.ndarray, np.ndarray | None, np.ndarray | None]:
-    source_names = wbc_names
+    source_names = joint_names
     source_label = "metadata"
-    if source_names is None and action_wbc.shape[1] == len(ACTION_WBC_FALLBACK_NAMES):
+    if source_names is None and joint_values.shape[1] == len(ACTION_WBC_FALLBACK_NAMES):
         source_names = ACTION_WBC_FALLBACK_NAMES
         source_label = "built-in Sonic VLA 43DOF fallback"
 
     if source_names is not None:
-        if len(source_names) != action_wbc.shape[1]:
+        if len(source_names) != joint_values.shape[1]:
             raise ValueError(
-                f"action.wbc {source_label} has {len(source_names)} names but data has "
-                f"{action_wbc.shape[1]} dims"
+                f"{feature_key} {source_label} has {len(source_names)} names but data has "
+                f"{joint_values.shape[1]} dims"
             )
         body_mujoco_indices = _indices_from_names(
             source_names,
             G1_BODY_JOINT_NAMES_MUJOCO,
-            feature_key="action.wbc",
+            feature_key=feature_key,
         )
         body_effective_indices = [body_mujoco_indices[index] for index in MUJOCO_TO_ISAACLAB_BODY_DOF]
-        body_action_mujoco = action_wbc[:, body_mujoco_indices]
+        body_action_mujoco = joint_values[:, body_mujoco_indices]
         body_action_isaaclab = body_action_mujoco[:, MUJOCO_TO_ISAACLAB_BODY_DOF]
         left_hand_indices = _indices_from_names(
             source_names,
             G1_LEFT_HAND_JOINT_NAMES_DEPLOY,
-            feature_key="action.wbc",
+            feature_key=feature_key,
         )
         right_hand_indices = _indices_from_names(
             source_names,
             G1_RIGHT_HAND_JOINT_NAMES_DEPLOY,
-            feature_key="action.wbc",
+            feature_key=feature_key,
         )
         print(
-            "[Dataset] action.wbc remap "
+            f"[Dataset] {feature_key} remap "
             f"({source_label}): body_mujoco_indices={body_mujoco_indices}, "
             "subtract_default_angles=False, "
             f"mujoco_to_isaaclab={MUJOCO_TO_ISAACLAB_BODY_DOF}, "
@@ -329,19 +331,19 @@ def _split_wbc_action(
         )
         return (
             body_action_isaaclab,
-            action_wbc[:, left_hand_indices],
-            action_wbc[:, right_hand_indices],
+            joint_values[:, left_hand_indices],
+            joint_values[:, right_hand_indices],
         )
 
-    if action_wbc.shape[1] != BODY_JOINT_DIM:
+    if joint_values.shape[1] != BODY_JOINT_DIM:
         raise ValueError(
-            f"action.wbc has {action_wbc.shape[1]} dims but no usable joint names. "
+            f"{feature_key} has {joint_values.shape[1]} dims but no usable joint names. "
             f"Expected {BODY_JOINT_DIM} dims for an already-remapped body-only action "
             f"or {len(ACTION_WBC_FALLBACK_NAMES)} dims for Sonic VLA full-q fallback."
         )
 
-    print("[Dataset] action.wbc has no joint names; assuming body-only IsaacLab 29DOF.")
-    return action_wbc, None, None
+    print(f"[Dataset] {feature_key} has no joint names; assuming body-only IsaacLab 29DOF.")
+    return joint_values, None, None
 
 
 def _finite_difference(values: np.ndarray, fps: float) -> np.ndarray:
@@ -366,7 +368,7 @@ class ReplayAction:
 @dataclass
 class EpisodeData:
     episode_index: int
-    action_wbc: np.ndarray
+    joint_source: np.ndarray
     body_action: np.ndarray
     left_hand_action: np.ndarray | None
     right_hand_action: np.ndarray | None
@@ -401,7 +403,7 @@ class DatasetEpisodeReader:
             raise FileNotFoundError(f"Episode parquet not found: {parquet_path}")
 
         frame_table = pd.read_parquet(parquet_path)
-        action_wbc = _stack_vector_column(frame_table, "action.wbc", dtype=np.float64)
+        joint_source = _stack_vector_column(frame_table, "observation.state", dtype=np.float64)
         root_orientation = _stack_vector_column(
             frame_table, "observation.root_orientation", dtype=np.float64
         )
@@ -424,15 +426,16 @@ class DatasetEpisodeReader:
                 f"observation.root_orientation has shape {root_orientation.shape}, expected [T, 4]"
             )
 
-        wbc_names = _get_feature_names(self.info, "action.wbc")
-        body_action, left_hand_action, right_hand_action = _split_wbc_action(
-            action_wbc,
-            wbc_names,
+        source_names = _get_feature_names(self.info, "observation.state")
+        body_action, left_hand_action, right_hand_action = _split_joint_configuration(
+            joint_source,
+            source_names,
+            feature_key="observation.state",
         )
-        if wbc_names is not None:
+        if source_names is not None:
             print(
-                "[Dataset] action.wbc remapped by joint names: "
-                f"{action_wbc.shape[1]} dims -> body {body_action.shape[1]}, "
+                "[Dataset] observation.state remapped by joint names: "
+                f"{joint_source.shape[1]} dims -> body {body_action.shape[1]}, "
                 f"left hand {0 if left_hand_action is None else left_hand_action.shape[1]}, "
                 f"right hand {0 if right_hand_action is None else right_hand_action.shape[1]}."
             )
@@ -441,7 +444,7 @@ class DatasetEpisodeReader:
 
         return EpisodeData(
             episode_index=episode_index,
-            action_wbc=action_wbc,
+            joint_source=joint_source,
             body_action=body_action,
             left_hand_action=left_hand_action,
             right_hand_action=right_hand_action,
