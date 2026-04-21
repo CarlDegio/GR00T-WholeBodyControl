@@ -530,7 +530,7 @@ class WBCReplayPolicyV1(ReplayPolicyBase):
         payload = {
             "joint_pos": self.episode.body_action[start:stop].astype(np.float32, copy=False),
             "joint_vel": self.episode.body_velocity[start:stop].astype(np.float32, copy=False),
-            "body_quat_w": self.episode.stream_body_quat[start:stop].astype(
+            "body_quat_w": self.episode.root_orientation[start:stop].astype(
                 np.float32, copy=False
             ),
             "frame_index": frame_index,
