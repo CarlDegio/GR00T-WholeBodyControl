@@ -211,6 +211,11 @@ show_usage() {
     echo "  --input-type TYPE       Set the input type (default: zmq_manager)"
     echo "  --output-type TYPE      Set the output type (default: ros2)"
     echo "  --zmq-host HOST         Set the ZMQ host (default: localhost)"
+    echo "  --hand-type TYPE        Set hand backend: dex3, dex1, or none (default: dex3)"
+    echo "  --dex1-open-q VALUE     Dex1 open position in rad (forwarded to deploy binary)"
+    echo "  --dex1-close-q VALUE    Dex1 close position in rad (forwarded to deploy binary)"
+    echo "  --dex1-kp VALUE         Dex1 position gain (forwarded to deploy binary)"
+    echo "  --dex1-kd VALUE         Dex1 damping gain (forwarded to deploy binary)"
     echo ""
     echo "Interface modes:"
     echo "  sim              Use loopback interface for simulation (MuJoCo)"
@@ -251,6 +256,7 @@ MOTION_DATA="$MOTION_DATA_DEFAULT"
 INPUT_TYPE="$INPUT_TYPE_DEFAULT"
 OUTPUT_TYPE="$OUTPUT_TYPE_DEFAULT"
 ZMQ_HOST="$ZMQ_HOST_DEFAULT"
+EXTRA_PASSTHROUGH_ARGS=()
 
 # Parse arguments
 while [[ $# -gt 0 ]]; do
@@ -313,6 +319,14 @@ while [[ $# -gt 0 ]]; do
                 exit 1
             fi
             ZMQ_HOST="$2"
+            shift 2
+            ;;
+        --hand-type|--dex1-open-q|--dex1-close-q|--dex1-kp|--dex1-kd)
+            if [[ -z "$2" ]]; then
+                echo -e "${RED}Error: $1 requires a value argument${NC}" >&2
+                exit 1
+            fi
+            EXTRA_PASSTHROUGH_ARGS+=("$1" "$2")
             shift 2
             ;;
         sim|real)
@@ -518,6 +532,9 @@ echo -e "  ZMQ Host:           ${GREEN}$ZMQ_HOST${NC}"
 if [[ -n "$EXTRA_ARGS" ]]; then
 echo -e "  Extra Args:         ${GREEN}$EXTRA_ARGS${NC}"
 fi
+if [[ ${#EXTRA_PASSTHROUGH_ARGS[@]} -gt 0 ]]; then
+echo -e "  Passthrough Args:   ${GREEN}${EXTRA_PASSTHROUGH_ARGS[*]}${NC}"
+fi
 echo ""
 echo -e "${CYAN}═══════════════════════════════════════════════════════════════════════${NC}"
 echo ""
@@ -532,6 +549,9 @@ echo -e "${BLUE}    --output-type $OUTPUT_TYPE \\${NC}"
 echo -e "${BLUE}    --zmq-host $ZMQ_HOST${NC}"
 if [[ -n "$EXTRA_ARGS" ]]; then
 echo -e "${BLUE}    $EXTRA_ARGS${NC}"
+fi
+if [[ ${#EXTRA_PASSTHROUGH_ARGS[@]} -gt 0 ]]; then
+echo -e "${BLUE}    ${EXTRA_PASSTHROUGH_ARGS[*]}${NC}"
 fi
 echo ""
 echo -e "${CYAN}═══════════════════════════════════════════════════════════════════════${NC}"
@@ -560,7 +580,8 @@ if [[ "$confirm" =~ ^[Yy]$ ]] || [[ -z "$confirm" ]]; then
             --input-type "$INPUT_TYPE" \
             --output-type "$OUTPUT_TYPE" \
             --zmq-host "$ZMQ_HOST" \
-            $EXTRA_ARGS
+            $EXTRA_ARGS \
+            "${EXTRA_PASSTHROUGH_ARGS[@]}"
     else
         just run g1_deploy_onnx_ref "$TARGET" "$CHECKPOINT_DECODER" "$MOTION_DATA" \
             --obs-config "$OBS_CONFIG" \
@@ -568,7 +589,8 @@ if [[ "$confirm" =~ ^[Yy]$ ]] || [[ -z "$confirm" ]]; then
             --planner-file "$PLANNER" \
             --input-type "$INPUT_TYPE" \
             --output-type "$OUTPUT_TYPE" \
-            --zmq-host "$ZMQ_HOST"
+            --zmq-host "$ZMQ_HOST" \
+            "${EXTRA_PASSTHROUGH_ARGS[@]}"
     fi
 else
     echo ""

@@ -65,6 +65,7 @@
 #include <chrono>
 #include <algorithm>
 #include <numeric>
+#include <atomic>
 
 // DDS
 #include <unitree/robot/channel/channel_publisher.hpp>
@@ -74,6 +75,8 @@
 #include <unitree/idl/hg/IMUState_.hpp>
 #include <unitree/idl/hg/LowCmd_.hpp>
 #include <unitree/idl/hg/LowState_.hpp>
+#include <unitree/idl/go2/MotorCmds_.hpp>
+#include <unitree/idl/go2/MotorStates_.hpp>
 #include <unitree/robot/b2/motion_switcher/motion_switcher_client.hpp>
 
 // TRTInference
@@ -166,6 +169,7 @@ class G1Deploy {
   private:
     /// State machine for the control loop lifecycle.
     enum class ProgramState { INIT, WAIT_FOR_CONTROL, CONTROL };
+    enum class HandType { DEX3, DEX1, NONE };
     
     // =========================================================================
     // Core timing, mode, and counters
@@ -278,8 +282,22 @@ class G1Deploy {
     // =========================================================================
     std::unique_ptr<unitree::robot::b2::MotionSwitcherClient> msc_;
     
-    // Dex3 hands manager
+    // Hand managers
     Dex3Hands dex3_hands_;
+    HandType hand_type_ = HandType::DEX3;
+
+    ChannelPublisherPtr<unitree_go::msg::dds_::MotorCmds_> dex1_left_publisher_;
+    ChannelPublisherPtr<unitree_go::msg::dds_::MotorCmds_> dex1_right_publisher_;
+    ChannelSubscriberPtr<unitree_go::msg::dds_::MotorStates_> dex1_left_subscriber_;
+    ChannelSubscriberPtr<unitree_go::msg::dds_::MotorStates_> dex1_right_subscriber_;
+    DataBuffer<unitree_go::msg::dds_::MotorStates_> dex1_left_state_buffer_;
+    DataBuffer<unitree_go::msg::dds_::MotorStates_> dex1_right_state_buffer_;
+    std::atomic<double> dex1_left_target_q_{0.0};
+    std::atomic<double> dex1_right_target_q_{0.0};
+    double dex1_open_q_ = 5.5;
+    double dex1_close_q_ = 0.5;
+    double dex1_kp_ = 5.0;
+    double dex1_kd_ = 0.05;
 
     // Motor error monitor (tracks fault state transitions)
     ErrorMonitor error_monitor_;
@@ -2123,6 +2141,111 @@ class G1Deploy {
       return false;
     }
 
+    static HandType ParseHandType(const std::string& hand_type) {
+      if (hand_type == "dex3") { return HandType::DEX3; }
+      if (hand_type == "dex1") { return HandType::DEX1; }
+      if (hand_type == "none") { return HandType::NONE; }
+      throw std::runtime_error("invalid --hand-type (should be dex3, dex1, or none): " + hand_type);
+    }
+
+    static const char* HandTypeName(HandType hand_type) {
+      switch (hand_type) {
+        case HandType::DEX3: return "dex3";
+        case HandType::DEX1: return "dex1";
+        case HandType::NONE: return "none";
+      }
+      return "unknown";
+    }
+
+    void InitializeDex1Hands() {
+      dex1_left_publisher_.reset(new unitree::robot::ChannelPublisher<unitree_go::msg::dds_::MotorCmds_>("rt/dex1/left/cmd"));
+      dex1_right_publisher_.reset(new unitree::robot::ChannelPublisher<unitree_go::msg::dds_::MotorCmds_>("rt/dex1/right/cmd"));
+      dex1_left_subscriber_.reset(new unitree::robot::ChannelSubscriber<unitree_go::msg::dds_::MotorStates_>("rt/dex1/left/state"));
+      dex1_right_subscriber_.reset(new unitree::robot::ChannelSubscriber<unitree_go::msg::dds_::MotorStates_>("rt/dex1/right/state"));
+
+      dex1_left_publisher_->InitChannel();
+      dex1_right_publisher_->InitChannel();
+      dex1_left_subscriber_->InitChannel(
+        [this](const void* message) { this->OnDex1State(true, message); }, 1);
+      dex1_right_subscriber_->InitChannel(
+        [this](const void* message) { this->OnDex1State(false, message); }, 1);
+
+      std::cout << "[Dex1] Initialized DDS bridge topics: rt/dex1/{left,right}/{cmd,state}" << std::endl;
+      std::cout << "[Dex1] open_q=" << dex1_open_q_ << ", close_q=" << dex1_close_q_
+                << ", kp=" << dex1_kp_ << ", kd=" << dex1_kd_ << std::endl;
+      std::cout << "[Dex1] Ensure dex1_1_gripper_server is running on the Orin USB host." << std::endl;
+    }
+
+    void OnDex1State(bool is_left, const void* message) {
+      const auto* incoming = static_cast<const unitree_go::msg::dds_::MotorStates_*>(message);
+      if (is_left) {
+        dex1_left_state_buffer_.SetData(*incoming);
+      } else {
+        dex1_right_state_buffer_.SetData(*incoming);
+      }
+    }
+
+    static double Dex3JointsToCloseRatio(const std::array<double, 7>& joints, bool is_left) {
+      const std::array<double, 7> closed = is_left
+        ? std::array<double, 7>{0.0, 0.0,  1.75, -1.57, -1.75, -1.57, -1.75}
+        : std::array<double, 7>{0.0, 0.0, -1.75,  1.57,  1.75,  1.57,  1.75};
+
+      double sum = 0.0;
+      int count = 0;
+      for (int i = 2; i < 7; ++i) {
+        if (std::abs(closed[i]) < 1e-6) { continue; }
+        sum += std::clamp(joints[i] / closed[i], 0.0, 1.0);
+        ++count;
+      }
+      return count > 0 ? sum / static_cast<double>(count) : 0.0;
+    }
+
+    double Dex1QFromCloseRatio(double close_ratio) const {
+      const double limited_ratio = std::clamp(close_ratio * input_interface_->GetMaxCloseRatio(), 0.0, 1.0);
+      const double q = dex1_open_q_ + limited_ratio * (dex1_close_q_ - dex1_open_q_);
+      return std::clamp(q, std::min(dex1_open_q_, dex1_close_q_), std::max(dex1_open_q_, dex1_close_q_));
+    }
+
+    void UpdateDex1TargetFromDex3Joints(bool is_left, bool has_hand_data, const std::array<double, 7>& joints) {
+      if (!has_hand_data) {
+        return;  // Hold the previous target instead of mapping InputInterface's Dex3 default pose.
+      }
+      const double q = Dex1QFromCloseRatio(Dex3JointsToCloseRatio(joints, is_left));
+      if (is_left) {
+        dex1_left_target_q_.store(q, std::memory_order_relaxed);
+      } else {
+        dex1_right_target_q_.store(q, std::memory_order_relaxed);
+      }
+    }
+
+    void SetDex1TargetOpen() {
+      dex1_left_target_q_.store(dex1_open_q_, std::memory_order_relaxed);
+      dex1_right_target_q_.store(dex1_open_q_, std::memory_order_relaxed);
+    }
+
+    void SetDex1TargetClose() {
+      dex1_left_target_q_.store(dex1_close_q_, std::memory_order_relaxed);
+      dex1_right_target_q_.store(dex1_close_q_, std::memory_order_relaxed);
+    }
+
+    void PublishDex1Hands() {
+      auto publish_one = [this](const ChannelPublisherPtr<unitree_go::msg::dds_::MotorCmds_>& publisher, double q) {
+        if (!publisher) { return; }
+        unitree_go::msg::dds_::MotorCmds_ cmd;
+        cmd.cmds().resize(1);
+        cmd.cmds()[0].mode() = 1;
+        cmd.cmds()[0].q() = static_cast<float>(q);
+        cmd.cmds()[0].dq() = 0.0f;
+        cmd.cmds()[0].tau() = 0.0f;
+        cmd.cmds()[0].kp() = static_cast<float>(dex1_kp_);
+        cmd.cmds()[0].kd() = static_cast<float>(dex1_kd_);
+        publisher->Write(cmd);
+      };
+
+      publish_one(dex1_left_publisher_, dex1_left_target_q_.load(std::memory_order_relaxed));
+      publish_one(dex1_right_publisher_, dex1_right_target_q_.load(std::memory_order_relaxed));
+    }
+
 
 
   public:
@@ -2156,7 +2279,12 @@ class G1Deploy {
       std::string zmq_out_topic = "g1_debug",
       bool enable_motion_recording = false,
       std::array<double, 3> initial_compliance = {0.05, 0.05, 0.0},
-      double initial_max_close_ratio = 1.0)
+      double initial_max_close_ratio = 1.0,
+      std::string hand_type = "dex3",
+      double dex1_open_q = 5.5,
+      double dex1_close_q = 0.5,
+      double dex1_kp = 5.0,
+      double dex1_kd = 0.05)
       : time_(0.0),
         publish_dt_(0.002),
         control_dt_(0.02),
@@ -2181,8 +2309,20 @@ class G1Deploy {
       // Initialize ChannelFactory
       ChannelFactory::Instance()->Init(0, networkInterface);
 
-      // Initialize Dex3 hands (ChannelFactory already initialized above)
-      dex3_hands_.initialize("");
+      hand_type_ = ParseHandType(hand_type);
+      dex1_open_q_ = dex1_open_q;
+      dex1_close_q_ = dex1_close_q;
+      dex1_kp_ = dex1_kp;
+      dex1_kd_ = dex1_kd;
+      dex1_left_target_q_.store(dex1_open_q_, std::memory_order_relaxed);
+      dex1_right_target_q_.store(dex1_open_q_, std::memory_order_relaxed);
+
+      // Initialize the selected hand backend (ChannelFactory already initialized above).
+      if (hand_type_ == HandType::DEX3) {
+        dex3_hands_.initialize("");
+      } else if (hand_type_ == HandType::DEX1) {
+        InitializeDex1Hands();
+      }
 
       audio_thread_ = std::make_unique<AudioThread>();
 
@@ -2515,11 +2655,14 @@ class G1Deploy {
         input_interface_->SetVR3PointCompliance(initial_vr_3point_compliance_);
         // Set initial max close ratio for hands (keyboard-controlled: X/C keys)
         input_interface_->SetMaxCloseRatio(initial_max_close_ratio_);
-        dex3_hands_.SetMaxCloseRatio(initial_max_close_ratio_);
+        if (hand_type_ == HandType::DEX3) {
+          dex3_hands_.SetMaxCloseRatio(initial_max_close_ratio_);
+        }
         std::cout << "[INFO] Initial VR 3-point compliance: ["
                   << initial_vr_3point_compliance_[0] << ", "
                   << initial_vr_3point_compliance_[1] << ", "
                   << initial_vr_3point_compliance_[2] << "]" << std::endl;
+        std::cout << "[INFO] Hand type: " << HandTypeName(hand_type_) << std::endl;
         std::cout << "[INFO] Initial hand max close ratio: " << initial_max_close_ratio_ 
                   << " (1.0 = full closure allowed, 0.2 = limited)" << std::endl;
         std::cout << "[INFO] Keyboard controls: g/h = left hand +/- 0.1, b/v = right hand +/- 0.1 (range: 0.01-0.5)" << std::endl;
@@ -2675,8 +2818,12 @@ class G1Deploy {
         lowcmd_publisher_->Write(dds_low_command);
       }
 
-      // Publish Dex3 hand commands at the same publish cadence
-      dex3_hands_.writeOnce();
+      // Publish hand commands at the same publish cadence
+      if (hand_type_ == HandType::DEX3) {
+        dex3_hands_.writeOnce();
+      } else if (hand_type_ == HandType::DEX1) {
+        PublishDex1Hands();
+      }
     }
 
     /// Gracefully stop all threads and send a damping-only command.
@@ -2745,12 +2892,20 @@ class G1Deploy {
           motor_command_tmp.q_target.at(i) =
               static_cast<float>(current_pos * (1.0 - ratio) + default_angles[i] * ratio);
         }
-        dex3_hands_.close(true);
-        dex3_hands_.close(false);
+        if (hand_type_ == HandType::DEX3) {
+          dex3_hands_.close(true);
+          dex3_hands_.close(false);
+        } else if (hand_type_ == HandType::DEX1) {
+          SetDex1TargetClose();
+        }
       } else {
         program_state_ = ProgramState::WAIT_FOR_CONTROL;
-        dex3_hands_.open(true);
-        dex3_hands_.open(false);
+        if (hand_type_ == HandType::DEX3) {
+          dex3_hands_.open(true);
+          dex3_hands_.open(false);
+        } else if (hand_type_ == HandType::DEX1) {
+          SetDex1TargetOpen();
+        }
         std::cout << "Init Done" << std::endl;
       }
       motor_command_buffer_.SetData(motor_command_tmp);
@@ -2903,19 +3058,32 @@ class G1Deploy {
       std::array<double, 7> right_hand_q = {0.0};
       std::array<double, 7> right_hand_dq = {0.0};
       
-      auto left_hand_state_ptr = dex3_hands_.getState(true);
-      if (left_hand_state_ptr) {
-        for (int i = 0; i < 7; ++i) {
-          left_hand_q[i] = left_hand_state_ptr->motor_state()[i].q();
-          left_hand_dq[i] = left_hand_state_ptr->motor_state()[i].dq();
+      if (hand_type_ == HandType::DEX3) {
+        auto left_hand_state_ptr = dex3_hands_.getState(true);
+        if (left_hand_state_ptr) {
+          for (int i = 0; i < 7; ++i) {
+            left_hand_q[i] = left_hand_state_ptr->motor_state()[i].q();
+            left_hand_dq[i] = left_hand_state_ptr->motor_state()[i].dq();
+          }
         }
-      }
-      
-      auto right_hand_state_ptr = dex3_hands_.getState(false);
-      if (right_hand_state_ptr) {
-        for (int i = 0; i < 7; ++i) {
-          right_hand_q[i] = right_hand_state_ptr->motor_state()[i].q();
-          right_hand_dq[i] = right_hand_state_ptr->motor_state()[i].dq();
+        
+        auto right_hand_state_ptr = dex3_hands_.getState(false);
+        if (right_hand_state_ptr) {
+          for (int i = 0; i < 7; ++i) {
+            right_hand_q[i] = right_hand_state_ptr->motor_state()[i].q();
+            right_hand_dq[i] = right_hand_state_ptr->motor_state()[i].dq();
+          }
+        }
+      } else if (hand_type_ == HandType::DEX1) {
+        auto left_dex1_state = dex1_left_state_buffer_.GetDataWithTime().data;
+        if (left_dex1_state && !left_dex1_state->states().empty()) {
+          left_hand_q[0] = left_dex1_state->states()[0].q();
+          left_hand_dq[0] = left_dex1_state->states()[0].dq();
+        }
+        auto right_dex1_state = dex1_right_state_buffer_.GetDataWithTime().data;
+        if (right_dex1_state && !right_dex1_state->states().empty()) {
+          right_hand_q[0] = right_dex1_state->states()[0].q();
+          right_hand_dq[0] = right_dex1_state->states()[0].dq();
         }
       }
 
@@ -3947,12 +4115,17 @@ class G1Deploy {
           }
           auto motor_command_end_time = std::chrono::steady_clock::now();
 
-          // Update Dex3 hands max close ratio from keyboard-controlled value (X/C keys)
-          dex3_hands_.SetMaxCloseRatio(input_interface_->GetMaxCloseRatio());
-          
-          // set hand poses (use buffered data for consistency)
-          dex3_hands_.setAllJointsCommand(true, left_hand_joint_buffer_);
-          dex3_hands_.setAllJointsCommand(false, right_hand_joint_buffer_);
+          if (hand_type_ == HandType::DEX3) {
+            // Update Dex3 hands max close ratio from keyboard-controlled value (X/C keys)
+            dex3_hands_.SetMaxCloseRatio(input_interface_->GetMaxCloseRatio());
+            
+            // set hand poses (use buffered data for consistency)
+            dex3_hands_.setAllJointsCommand(true, left_hand_joint_buffer_);
+            dex3_hands_.setAllJointsCommand(false, right_hand_joint_buffer_);
+          } else if (hand_type_ == HandType::DEX1) {
+            UpdateDex1TargetFromDex3Joints(true, has_left_hand_data_, left_hand_joint_buffer_);
+            UpdateDex1TargetFromDex3Joints(false, has_right_hand_data_, right_hand_joint_buffer_);
+          }
           
           // Update last hand actions for logging (use buffered data)
           for (int i = 0; i < 7; ++i) {
@@ -4069,7 +4242,12 @@ class G1Deploy {
             }
             
             // Print hand max close ratio (keyboard-controlled via X/C keys)
-            std::cout << " | HandCloseRatio: " << dex3_hands_.GetMaxCloseRatio();
+            std::cout << " | HandCloseRatio: " << input_interface_->GetMaxCloseRatio();
+            if (hand_type_ == HandType::DEX1) {
+              std::cout << " | Dex1Target(L/R): "
+                        << dex1_left_target_q_.load(std::memory_order_relaxed) << "/"
+                        << dex1_right_target_q_.load(std::memory_order_relaxed);
+            }
             
             std::cout << std::endl;
           }
@@ -4134,6 +4312,11 @@ int main(int argc, char const* argv[]) {
     std::cout << "  --max-close-ratio <value>: set initial hand max close ratio (0.2-1.0; default: 1.0 = full closure)" << std::endl;
     std::cout << "                             0.2 = limited (80% open), 1.0 = full closure allowed" << std::endl;
     std::cout << "                             Keyboard controls: x/c = +/- 0.1 (always available)" << std::endl;
+    std::cout << "  --hand-type <dex3|dex1|none>: select hand backend (default: dex3)" << std::endl;
+    std::cout << "  --dex1-open-q <value>: Dex1 open position in rad (default: 5.5)" << std::endl;
+    std::cout << "  --dex1-close-q <value>: Dex1 close position in rad (default: 0.5)" << std::endl;
+    std::cout << "  --dex1-kp <value>: Dex1 command kp (default: 5.0)" << std::endl;
+    std::cout << "  --dex1-kd <value>: Dex1 command kd (default: 0.05)" << std::endl;
     std::cout << "\nExamples:" << std::endl;
     std::cout << "  " << argv[0] << " enp5s0 policy/single_frame/model.onnx reference/bones_072925_test/ --planner-file policy/planner.onnx --obs-config policy/single_frame/observation_config.yaml --disable-crc-check" << std::endl;
     std::cout << "  " << argv[0] << " enp5s0 policy/token/model.onnx reference/bones_072925_test/ --obs-config policy/token/observation_config.yaml --encoder-file policy/token/encoder.onnx" << std::endl;
@@ -4177,6 +4360,11 @@ int main(int argc, char const* argv[]) {
   std::string zmq_out_topic = "g1_debug";
   std::array<double, 3> initial_compliance = {0.5, 0.5, 0.0}; // initial compliance is 0.5 for both hands (keyboard controllable)
   double initial_max_close_ratio = 1.0; // default allows full closure, use --max-close-ratio to limit
+  std::string hand_type = "dex3";
+  double dex1_open_q = 5.5;
+  double dex1_close_q = 0.5;
+  double dex1_kp = 5.0;
+  double dex1_kd = 0.05;
   for (int i = 4; i < argc; i++) {
     if (std::string(argv[i]) == "--disable-crc-check") {
       disableCrcCheck = true;
@@ -4406,6 +4594,55 @@ int main(int argc, char const* argv[]) {
         std::cerr << "Error: --max-close-ratio requires a value argument" << std::endl;
         exit(1);
       }
+    } else if (std::string(argv[i]) == "--hand-type") {
+      if (i + 1 < argc) {
+        hand_type = argv[i + 1];
+        if (hand_type != "dex3" && hand_type != "dex1" && hand_type != "none") {
+          std::cerr << "Error: --hand-type must be dex3, dex1, or none" << std::endl;
+          exit(1);
+        }
+        std::cout << "[INFO] Hand type set to: " << hand_type << std::endl;
+        i++;
+      } else {
+        std::cerr << "Error: --hand-type requires a value argument" << std::endl;
+        exit(1);
+      }
+    } else if (std::string(argv[i]) == "--dex1-open-q") {
+      if (i + 1 < argc) {
+        dex1_open_q = std::stod(argv[i + 1]);
+        std::cout << "[INFO] Dex1 open q set to: " << dex1_open_q << std::endl;
+        i++;
+      } else {
+        std::cerr << "Error: --dex1-open-q requires a value argument" << std::endl;
+        exit(1);
+      }
+    } else if (std::string(argv[i]) == "--dex1-close-q") {
+      if (i + 1 < argc) {
+        dex1_close_q = std::stod(argv[i + 1]);
+        std::cout << "[INFO] Dex1 close q set to: " << dex1_close_q << std::endl;
+        i++;
+      } else {
+        std::cerr << "Error: --dex1-close-q requires a value argument" << std::endl;
+        exit(1);
+      }
+    } else if (std::string(argv[i]) == "--dex1-kp") {
+      if (i + 1 < argc) {
+        dex1_kp = std::stod(argv[i + 1]);
+        std::cout << "[INFO] Dex1 kp set to: " << dex1_kp << std::endl;
+        i++;
+      } else {
+        std::cerr << "Error: --dex1-kp requires a value argument" << std::endl;
+        exit(1);
+      }
+    } else if (std::string(argv[i]) == "--dex1-kd") {
+      if (i + 1 < argc) {
+        dex1_kd = std::stod(argv[i + 1]);
+        std::cout << "[INFO] Dex1 kd set to: " << dex1_kd << std::endl;
+        i++;
+      } else {
+        std::cerr << "Error: --dex1-kd requires a value argument" << std::endl;
+        exit(1);
+      }
     }
   }
 
@@ -4438,7 +4675,12 @@ int main(int argc, char const* argv[]) {
     zmq_out_topic,
     enableMotionRecording,
     initial_compliance,
-    initial_max_close_ratio
+    initial_max_close_ratio,
+    hand_type,
+    dex1_open_q,
+    dex1_close_q,
+    dex1_kp,
+    dex1_kd
   );
   std::cout << "[DEBUG] G1Deploy object created successfully!" << std::endl;
   
@@ -4465,4 +4707,3 @@ int main(int argc, char const* argv[]) {
   std::cout << "[DEBUG] Program exiting normally..." << std::endl;
   return 0;
 }
-
