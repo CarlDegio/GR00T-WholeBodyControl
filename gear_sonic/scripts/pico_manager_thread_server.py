@@ -695,15 +695,11 @@ def get_abxy_buttons():
 def compute_hand_joints_from_inputs(
     left_solver, right_solver, left_trigger, left_grip, right_trigger, right_grip
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Compute left/right hand joints using IK solvers, or zeros if unavailable."""
-    if left_solver is not None and right_solver is not None:
-        left_finger_data = generate_finger_data("left", left_trigger, left_grip)
-        right_finger_data = generate_finger_data("right", right_trigger, right_grip)
-        left_hand_joints = left_solver({"position": left_finger_data})
-        right_hand_joints = right_solver({"position": right_finger_data})
-    else:
-        left_hand_joints = np.zeros((1, 7), dtype=np.float32)
-        right_hand_joints = np.zeros((1, 7), dtype=np.float32)
+    """Encode Pico triggers as Dex1 close ratios in the existing 7-DOF hand fields."""
+    left_hand_joints = np.zeros((1, 7), dtype=np.float32)
+    right_hand_joints = np.zeros((1, 7), dtype=np.float32)
+    left_hand_joints[0, 0] = float(np.clip(left_trigger / 0.9, 0.0, 1.0))
+    right_hand_joints[0, 0] = float(np.clip(right_trigger / 0.9, 0.0, 1.0))
     return left_hand_joints, right_hand_joints
 
 
@@ -1740,19 +1736,9 @@ class PlannerStreamer:
                 left_hand_position = self.feedback_reader.left_hand_position_target
                 right_hand_position = self.feedback_reader.right_hand_position_target
 
-            vr_3pt_position = None
-            vr_3pt_orientation = None
-            vr_3pt_compliance = None
-            if stream_mode == StreamMode.PLANNER_VR_3PT:
-                sample = self.reader.get_latest()
-                if sample is not None:
-                    print("[PlannerLoop] Sending VR 3-point pose as target")
-                    vr_3pt_pose = self.three_point.process_smpl_pose(sample["body_poses_np"])
-                    vr_3pt_position = (vr_3pt_pose[:, :3].flatten()).tolist()
-                    vr_3pt_orientation = vr_3pt_pose[:, 3:].flatten().tolist()
-
-                # Compute hand joints from trigger/grip inputs so operator can
-                # control hand open/close while in VR 3PT mode
+            # Always include hand joints in planner messages so trigger/grip can
+            # drive Dex hand control even when locomotion mode is IDLE/PLANNER.
+            if left_hand_position is None or right_hand_position is None:
                 (
                     left_menu_button,
                     left_trigger,
@@ -1770,6 +1756,17 @@ class PlannerStreamer:
                 )
                 left_hand_position = lh_joints.reshape(-1).astype(np.float32).tolist()
                 right_hand_position = rh_joints.reshape(-1).astype(np.float32).tolist()
+
+            vr_3pt_position = None
+            vr_3pt_orientation = None
+            vr_3pt_compliance = None
+            if stream_mode == StreamMode.PLANNER_VR_3PT:
+                sample = self.reader.get_latest()
+                if sample is not None:
+                    print("[PlannerLoop] Sending VR 3-point pose as target")
+                    vr_3pt_pose = self.three_point.process_smpl_pose(sample["body_poses_np"])
+                    vr_3pt_position = (vr_3pt_pose[:, :3].flatten()).tolist()
+                    vr_3pt_orientation = vr_3pt_pose[:, 3:].flatten().tolist()
 
             msg = build_planner_message(
                 mode_to_send.value,
