@@ -295,9 +295,9 @@ class G1Deploy {
     std::atomic<double> dex1_left_target_q_{0.0};
     std::atomic<double> dex1_right_target_q_{0.0};
     double dex1_open_q_ = 5.5;
-    double dex1_close_q_ = 0.5;
+    double dex1_close_q_ = 0.05;
     double dex1_kp_ = 5.0;
-    double dex1_kd_ = 0.05;
+    double dex1_kd_ = 0.5;
 
     // Motor error monitor (tracks fault state transitions)
     ErrorMonitor error_monitor_;
@@ -2185,19 +2185,9 @@ class G1Deploy {
       }
     }
 
-    static double Dex3JointsToCloseRatio(const std::array<double, 7>& joints, bool is_left) {
-      const std::array<double, 7> closed = is_left
-        ? std::array<double, 7>{0.0, 0.0,  1.75, -1.57, -1.75, -1.57, -1.75}
-        : std::array<double, 7>{0.0, 0.0, -1.75,  1.57,  1.75,  1.57,  1.75};
-
-      double sum = 0.0;
-      int count = 0;
-      for (int i = 2; i < 7; ++i) {
-        if (std::abs(closed[i]) < 1e-6) { continue; }
-        sum += std::clamp(joints[i] / closed[i], 0.0, 1.0);
-        ++count;
-      }
-      return count > 0 ? sum / static_cast<double>(count) : 0.0;
+    static double Dex1CloseRatioFromHandJoints(const std::array<double, 7>& joints) {
+      // In Dex1 mode, the existing 7-DOF hand field carries a scalar close ratio in slot 0.
+      return std::clamp(joints[0], 0.0, 1.0);
     }
 
     double Dex1QFromCloseRatio(double close_ratio) const {
@@ -2206,11 +2196,11 @@ class G1Deploy {
       return std::clamp(q, std::min(dex1_open_q_, dex1_close_q_), std::max(dex1_open_q_, dex1_close_q_));
     }
 
-    void UpdateDex1TargetFromDex3Joints(bool is_left, bool has_hand_data, const std::array<double, 7>& joints) {
+    void UpdateDex1TargetFromHandJoints(bool is_left, bool has_hand_data, const std::array<double, 7>& joints) {
       if (!has_hand_data) {
-        return;  // Hold the previous target instead of mapping InputInterface's Dex3 default pose.
+        return;  // Hold the previous target until an explicit close-ratio command arrives.
       }
-      const double q = Dex1QFromCloseRatio(Dex3JointsToCloseRatio(joints, is_left));
+      const double q = Dex1QFromCloseRatio(Dex1CloseRatioFromHandJoints(joints));
       if (is_left) {
         dex1_left_target_q_.store(q, std::memory_order_relaxed);
       } else {
@@ -2282,9 +2272,9 @@ class G1Deploy {
       double initial_max_close_ratio = 1.0,
       std::string hand_type = "dex3",
       double dex1_open_q = 5.5,
-      double dex1_close_q = 0.5,
+      double dex1_close_q = 0.05,
       double dex1_kp = 5.0,
-      double dex1_kd = 0.05)
+      double dex1_kd = 0.5)
       : time_(0.0),
         publish_dt_(0.002),
         control_dt_(0.02),
@@ -4123,8 +4113,8 @@ class G1Deploy {
             dex3_hands_.setAllJointsCommand(true, left_hand_joint_buffer_);
             dex3_hands_.setAllJointsCommand(false, right_hand_joint_buffer_);
           } else if (hand_type_ == HandType::DEX1) {
-            UpdateDex1TargetFromDex3Joints(true, has_left_hand_data_, left_hand_joint_buffer_);
-            UpdateDex1TargetFromDex3Joints(false, has_right_hand_data_, right_hand_joint_buffer_);
+            UpdateDex1TargetFromHandJoints(true, has_left_hand_data_, left_hand_joint_buffer_);
+            UpdateDex1TargetFromHandJoints(false, has_right_hand_data_, right_hand_joint_buffer_);
           }
           
           // Update last hand actions for logging (use buffered data)
@@ -4314,9 +4304,9 @@ int main(int argc, char const* argv[]) {
     std::cout << "                             Keyboard controls: x/c = +/- 0.1 (always available)" << std::endl;
     std::cout << "  --hand-type <dex3|dex1|none>: select hand backend (default: dex3)" << std::endl;
     std::cout << "  --dex1-open-q <value>: Dex1 open position in rad (default: 5.5)" << std::endl;
-    std::cout << "  --dex1-close-q <value>: Dex1 close position in rad (default: 0.5)" << std::endl;
+    std::cout << "  --dex1-close-q <value>: Dex1 close position in rad (default: 0.05)" << std::endl;
     std::cout << "  --dex1-kp <value>: Dex1 command kp (default: 5.0)" << std::endl;
-    std::cout << "  --dex1-kd <value>: Dex1 command kd (default: 0.05)" << std::endl;
+    std::cout << "  --dex1-kd <value>: Dex1 command kd (default: 0.5)" << std::endl;
     std::cout << "\nExamples:" << std::endl;
     std::cout << "  " << argv[0] << " enp5s0 policy/single_frame/model.onnx reference/bones_072925_test/ --planner-file policy/planner.onnx --obs-config policy/single_frame/observation_config.yaml --disable-crc-check" << std::endl;
     std::cout << "  " << argv[0] << " enp5s0 policy/token/model.onnx reference/bones_072925_test/ --obs-config policy/token/observation_config.yaml --encoder-file policy/token/encoder.onnx" << std::endl;
@@ -4362,9 +4352,9 @@ int main(int argc, char const* argv[]) {
   double initial_max_close_ratio = 1.0; // default allows full closure, use --max-close-ratio to limit
   std::string hand_type = "dex3";
   double dex1_open_q = 5.5;
-  double dex1_close_q = 0.5;
+  double dex1_close_q = 0.05;
   double dex1_kp = 5.0;
-  double dex1_kd = 0.05;
+  double dex1_kd = 0.5;
   for (int i = 4; i < argc; i++) {
     if (std::string(argv[i]) == "--disable-crc-check") {
       disableCrcCheck = true;
