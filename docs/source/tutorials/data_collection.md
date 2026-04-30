@@ -475,6 +475,11 @@ Each frame contains:
 | `action.body_rotation_6d` | `(6,)` | Teleop target body rotation |
 | `annotation.human.action.task_description` | string | Task prompt for this frame |
 
+For the SONIC exporter, the main joint-position tensors are written with explicit dataset keys:
+`observation.state`, `action.wbc`, and `action.target_q`. The new
+`action.target_q` channel is sourced from `g1_debug.body_q_target` and expanded to the
+same full-joint ordering used by `action.wbc`.
+
 ---
 
 ## Post-Processing Datasets

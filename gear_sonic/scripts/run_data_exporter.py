@@ -586,6 +586,11 @@ class GrootDataCollector:
             left_hand_actuated_joint_values=proprio["last_left_hand_action"],
             right_hand_actuated_joint_values=proprio["last_right_hand_action"],
         )
+        whole_action_target_q = self.robot_model.get_configuration_from_actuated_joints(
+            body_actuated_joint_values=proprio["body_q_target"],
+            left_hand_actuated_joint_values=proprio["last_left_hand_action"],
+            right_hand_actuated_joint_values=proprio["last_right_hand_action"],
+        )
 
         self.robot_model.cache_forward_kinematics(whole_q)
         eef_parts = []
@@ -602,6 +607,7 @@ class GrootDataCollector:
             "observation.state": whole_q,
             "observation.eef_state": observation_eef_state,
             "action.wbc": whole_action_wbc,
+            "action.target_q": whole_action_target_q,
         }
 
         self._add_cpp_state_features(frame_data, proprio)

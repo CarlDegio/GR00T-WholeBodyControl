@@ -200,7 +200,6 @@ class ReplayConfig:
     chunk_size: int = 5
     stride: int = 1
     catch_up: bool = False
-    include_body_quat_v4: bool = True
     state_feedback: bool = False
     state_zmq_host: str = "localhost"
     state_zmq_port: int = 5557
@@ -374,9 +373,9 @@ class EpisodeData:
     right_hand_action: np.ndarray | None
     body_velocity: np.ndarray
     root_orientation: np.ndarray
-    stream_body_quat: np.ndarray
     motion_token: np.ndarray
     fps: float
+    hand_action_source: str
 
     @property
     def length(self) -> int:
@@ -408,18 +407,6 @@ class DatasetEpisodeReader:
             frame_table, "observation.root_orientation", dtype=np.float64
         )
         motion_token = _stack_vector_column(frame_table, "action.motion_token", dtype=np.float64)
-        if "teleop.body_quat_w" in frame_table.columns:
-            stream_body_quat = _stack_vector_column(
-                frame_table, "teleop.body_quat_w", dtype=np.float64
-            )
-            if stream_body_quat.shape[1] != 4:
-                raise ValueError(
-                    f"teleop.body_quat_w has shape {stream_body_quat.shape}, expected [T, 4]"
-                )
-            print("[Dataset] Using `teleop.body_quat_w` as replay body quaternion.")
-        else:
-            stream_body_quat = root_orientation
-            print("[Dataset] `teleop.body_quat_w` missing; falling back to `observation.root_orientation`.")
 
         if root_orientation.shape[1] != 4:
             raise ValueError(
@@ -427,7 +414,7 @@ class DatasetEpisodeReader:
             )
 
         source_names = _get_feature_names(self.info, "observation.state")
-        body_action, left_hand_action, right_hand_action = _split_joint_configuration(
+        body_action, left_hand_action_obs, right_hand_action_obs = _split_joint_configuration(
             joint_source,
             source_names,
             feature_key="observation.state",
@@ -436,9 +423,24 @@ class DatasetEpisodeReader:
             print(
                 "[Dataset] observation.state remapped by joint names: "
                 f"{joint_source.shape[1]} dims -> body {body_action.shape[1]}, "
-                f"left hand {0 if left_hand_action is None else left_hand_action.shape[1]}, "
-                f"right hand {0 if right_hand_action is None else right_hand_action.shape[1]}."
+                f"left hand {0 if left_hand_action_obs is None else left_hand_action_obs.shape[1]}, "
+                f"right hand {0 if right_hand_action_obs is None else right_hand_action_obs.shape[1]}."
             )
+
+        left_hand_action = left_hand_action_obs
+        right_hand_action = right_hand_action_obs
+        hand_action_source = "observation.state"
+        if "teleop.left_hand_joints" in frame_table.columns and "teleop.right_hand_joints" in frame_table.columns:
+            left_hand_action = _stack_vector_column(
+                frame_table, "teleop.left_hand_joints", dtype=np.float64
+            )
+            right_hand_action = _stack_vector_column(
+                frame_table, "teleop.right_hand_joints", dtype=np.float64
+            )
+            hand_action_source = "teleop.left/right_hand_joints"
+            print("[Dataset] Using `teleop.left_hand_joints/right_hand_joints` for replay hand commands.")
+        else:
+            print("[Dataset] `teleop.left/right_hand_joints` missing; falling back to hand data from `observation.state`.")
 
         body_velocity = _finite_difference(body_action, self.fps)
 
@@ -450,9 +452,9 @@ class DatasetEpisodeReader:
             right_hand_action=right_hand_action,
             body_velocity=body_velocity,
             root_orientation=root_orientation,
-            stream_body_quat=stream_body_quat,
             motion_token=motion_token,
             fps=self.fps,
+            hand_action_source=hand_action_source,
         )
 
 
@@ -566,7 +568,6 @@ class TokenReplayPolicyV4(ReplayPolicyBase):
         *,
         start_frame: int,
         end_frame: int | None,
-        include_body_quat: bool,
         session_frame_start: int = 0,
     ):
         super().__init__(
@@ -575,7 +576,6 @@ class TokenReplayPolicyV4(ReplayPolicyBase):
             end_frame=end_frame,
             session_frame_start=session_frame_start,
         )
-        self.include_body_quat = include_body_quat
 
     def act(self, observation: dict | None = None) -> ReplayAction | None:
         if self.is_finished():
@@ -584,12 +584,11 @@ class TokenReplayPolicyV4(ReplayPolicyBase):
         index = self.cursor
         payload = {
             "token_state": self.episode.motion_token[index].astype(np.float32, copy=False),
+            "body_quat_w": self.episode.root_orientation[index].astype(
+                np.float32, copy=False
+            ),
             "frame_index": np.asarray([self.session_frame], dtype=np.int64),
         }
-        if self.include_body_quat:
-            payload["body_quat_w"] = self.episode.stream_body_quat[index].astype(
-                np.float32, copy=False
-            )
         if self.episode.left_hand_action is not None:
             payload["left_hand_joints"] = self.episode.left_hand_action[index].astype(
                 np.float32, copy=False
@@ -733,7 +732,6 @@ def _build_policy(
             episode,
             start_frame=config.start_frame,
             end_frame=config.end_frame,
-            include_body_quat=config.include_body_quat_v4,
             session_frame_start=session_frame_start,
         )
     raise ValueError(f"Unsupported protocol: {config.protocol}")
@@ -991,7 +989,6 @@ if __name__ == "__main__":
     parser.add_argument("--chunk-size", type=int, default=5)
     parser.add_argument("--stride", type=int, default=1)
     parser.add_argument("--catch-up", action="store_true")
-    parser.add_argument("--include-body-quat-v4", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--state-feedback", action="store_true")
     parser.add_argument("--state-zmq-host", default="localhost")
     parser.add_argument("--state-zmq-port", type=int, default=5557)
@@ -1020,7 +1017,6 @@ if __name__ == "__main__":
             chunk_size=args.chunk_size,
             stride=args.stride,
             catch_up=args.catch_up,
-            include_body_quat_v4=args.include_body_quat_v4,
             state_feedback=args.state_feedback,
             state_zmq_host=args.state_zmq_host,
             state_zmq_port=args.state_zmq_port,
