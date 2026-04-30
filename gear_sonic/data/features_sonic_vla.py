@@ -236,6 +236,11 @@ def get_features_sonic_vla(robot_model: RobotModel) -> dict:
             "shape": (num_joints,),
             "names": joint_names,
         },
+        "action.target_q": {
+            "dtype": "float64",
+            "shape": (num_joints,),
+            "names": joint_names,
+        },
         "observation.root_orientation": {
             "dtype": "float64",
             "shape": (4,),
