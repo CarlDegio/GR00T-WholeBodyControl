@@ -296,8 +296,8 @@ class G1Deploy {
     std::atomic<double> dex1_right_target_q_{0.0};
     double dex1_open_q_ = 5.5;
     double dex1_close_q_ = 0.0;
-    double dex1_kp_ = 5.0;
-    double dex1_kd_ = 0.05;
+    double dex1_kp_ = 1.0;
+    double dex1_kd_ = 0.01;
 
     // Motor error monitor (tracks fault state transitions)
     ErrorMonitor error_monitor_;
@@ -2273,8 +2273,8 @@ class G1Deploy {
       std::string hand_type = "dex3",
       double dex1_open_q = 5.5,
       double dex1_close_q = 0.0,
-      double dex1_kp = 5.0,
-      double dex1_kd = 0.05)
+      double dex1_kp = 1.0,
+      double dex1_kd = 0.01)
       : time_(0.0),
         publish_dt_(0.002),
         control_dt_(0.02),
@@ -4305,8 +4305,8 @@ int main(int argc, char const* argv[]) {
     std::cout << "  --hand-type <dex3|dex1|none>: select hand backend (default: dex3)" << std::endl;
     std::cout << "  --dex1-open-q <value>: Dex1 open position in rad (default: 5.5)" << std::endl;
     std::cout << "  --dex1-close-q <value>: Dex1 close position in rad (default: 0.0)" << std::endl;
-    std::cout << "  --dex1-kp <value>: Dex1 command kp (default: 5.0)" << std::endl;
-    std::cout << "  --dex1-kd <value>: Dex1 command kd (default: 0.05)" << std::endl;
+    std::cout << "  --dex1-kp <value>: Dex1 command kp (default: 1.0)" << std::endl;
+    std::cout << "  --dex1-kd <value>: Dex1 command kd (default: 0.01)" << std::endl;
     std::cout << "\nExamples:" << std::endl;
     std::cout << "  " << argv[0] << " enp5s0 policy/single_frame/model.onnx reference/bones_072925_test/ --planner-file policy/planner.onnx --obs-config policy/single_frame/observation_config.yaml --disable-crc-check" << std::endl;
     std::cout << "  " << argv[0] << " enp5s0 policy/token/model.onnx reference/bones_072925_test/ --obs-config policy/token/observation_config.yaml --encoder-file policy/token/encoder.onnx" << std::endl;
@@ -4353,8 +4353,8 @@ int main(int argc, char const* argv[]) {
   std::string hand_type = "dex3";
   double dex1_open_q = 5.5;
   double dex1_close_q = 0.0;
-  double dex1_kp = 5.0;
-  double dex1_kd = 0.05;
+  double dex1_kp = 1.0;
+  double dex1_kd = 0.01;
   for (int i = 4; i < argc; i++) {
     if (std::string(argv[i]) == "--disable-crc-check") {
       disableCrcCheck = true;
