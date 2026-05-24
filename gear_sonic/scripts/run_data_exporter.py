@@ -105,6 +105,12 @@ class SonicDataExporterConfig:
     record_chest_camera: bool = False
     """Record the chest camera stream (chest_view). Requires the camera to be available."""
 
+    defer_video_encoding: bool = True
+    """Keep encoded camera frames in memory and encode videos when saving the episode."""
+
+    video_encoder_threads: int = 16
+    """Maximum encoder threads used while saving each deferred video."""
+
     text_to_speech: bool = True
     """Use text-to-speech voice feedback."""
 
@@ -232,6 +238,7 @@ class GrootDataCollector:
         sonic_data_zmq_port: int = 5556,
         state_zmq_host: str = "localhost",
         state_zmq_port: int = 5557,
+        decode_camera_images: bool = True,
     ):
         self.text_to_speech = text_to_speech
         self.frequency = frequency
@@ -242,7 +249,11 @@ class GrootDataCollector:
         self._episode_state = EpisodeState()
         self._keyboard_listener = ZMQKeyboardSubscriber()
 
-        self._image_subscriber = ComposedCameraClientSensor(server_ip=camera_host, port=camera_port)
+        self._image_subscriber = ComposedCameraClientSensor(
+            server_ip=camera_host,
+            port=camera_port,
+            decode_images=decode_camera_images,
+        )
 
         self.obs_act_buffer = deque(maxlen=100)
         self.latest_image_msg = None
@@ -957,12 +968,21 @@ def main(config: SonicDataExporterConfig):
         features=dataset_features,
         modality_config=modality_config,
         task=config.task_prompt,
+        defer_video_encoding=config.defer_video_encoding,
+        video_encoder_threads=config.video_encoder_threads,
         script_config={
             **robot_config,
             "record_wrist_cameras": config.record_wrist_cameras,
             "record_chest_camera": config.record_chest_camera,
+            "defer_video_encoding": config.defer_video_encoding,
+            "video_encoder_threads": config.video_encoder_threads,
         },
     )
+    if config.defer_video_encoding:
+        print(
+            "[Camera] Deferred video encoding enabled — caching encoded frames in memory "
+            f"and using up to {config.video_encoder_threads} encoder threads when saving"
+        )
 
     data_collector = GrootDataCollector(
         frequency=config.data_collection_frequency,
@@ -975,6 +995,7 @@ def main(config: SonicDataExporterConfig):
         sonic_data_zmq_port=config.sonic_zmq_port,
         state_zmq_host=config.state_zmq_host,
         state_zmq_port=config.state_zmq_port,
+        decode_camera_images=not config.defer_video_encoding,
     )
     data_collector.run()
 

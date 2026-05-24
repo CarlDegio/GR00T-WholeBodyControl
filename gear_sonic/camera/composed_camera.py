@@ -560,8 +560,14 @@ class ComposedCameraSensor(Sensor, SensorServer):
 class ComposedCameraClientSensor(Sensor, SensorClient):
     """ZMQ client that deserializes merged camera frames from the server."""
 
-    def __init__(self, server_ip: str = "localhost", port: int = 5555):
+    def __init__(
+        self,
+        server_ip: str = "localhost",
+        port: int = 5555,
+        decode_images: bool = True,
+    ):
         self.start_client(server_ip, port)
+        self.decode_images = decode_images
 
         self._latest_message = None
         self._avg_time_per_frame: deque = deque(maxlen=20)
@@ -588,7 +594,9 @@ class ComposedCameraClientSensor(Sensor, SensorClient):
 
         if message is not None:
             self.idx += 1
-            self._latest_message = ImageMessageSchema.deserialize(message).asdict()
+            self._latest_message = ImageMessageSchema.deserialize(
+                message, decode_images=self.decode_images
+            ).asdict()
             self._last_new_message_time = current_time
 
             if self.idx % 300 == 0:

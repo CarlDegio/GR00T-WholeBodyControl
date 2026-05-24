@@ -113,7 +113,7 @@ class ImageMessageSchema:
     """
 
     timestamps: dict[str, float]
-    images: dict[str, np.ndarray]
+    images: dict[str, Any]
 
     def serialize(self) -> dict[str, Any]:
         serialized_msg: dict[str, Any] = {"timestamps": self.timestamps, "images": {}}
@@ -125,10 +125,14 @@ class ImageMessageSchema:
         return serialized_msg
 
     @staticmethod
-    def deserialize(data: dict[str, Any]) -> "ImageMessageSchema":
+    def deserialize(data: dict[str, Any], decode_images: bool = True) -> "ImageMessageSchema":
         timestamps = data.get("timestamps", {})
         images = {}
         for key, value in data.get("images", {}).items():
+            if not decode_images:
+                images[key] = value
+                continue
+
             if isinstance(value, bytes | bytearray):
                 mat = cv2.imdecode(np.frombuffer(value, dtype=np.uint8), cv2.IMREAD_COLOR)
                 images[key] = mat[..., ::-1]  # BGR -> RGB

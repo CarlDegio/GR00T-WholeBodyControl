@@ -31,6 +31,7 @@ from PIL import Image as PILImage
 import torch
 from torchvision import transforms
 
+from gear_sonic.data.deferred_video_writer import DeferredEncodedVideoWriter
 from gear_sonic.data.video_writer import VideoWriter
 
 disable_progress_bars()
@@ -187,6 +188,8 @@ class Gr00tDataExporter(LeRobotDataset):
         tolerance_s: float = 1e-4,
         vcodec: str = "h264",
         overwrite_existing: bool = False,
+        defer_video_encoding: bool = False,
+        video_encoder_threads: int = 16,
     ) -> "Gr00tDataExporter":
         if script_config is None:
             script_config = {}
@@ -230,6 +233,8 @@ class Gr00tDataExporter(LeRobotDataset):
         obj.tolerance_s = tolerance_s
         obj.video_backend = "pyav"
         obj.vcodec = vcodec
+        obj.defer_video_encoding = defer_video_encoding
+        obj.video_encoder_threads = video_encoder_threads
         obj.task = task
         obj.image_writer = None
 
@@ -244,18 +249,42 @@ class Gr00tDataExporter(LeRobotDataset):
         obj.video_writers = obj.create_video_writer()
         return obj
 
-    def create_video_writer(self) -> dict[str, VideoWriter]:
+    def create_video_writer(self) -> dict[str, VideoWriter | DeferredEncodedVideoWriter]:
         video_writers = {}
+        defer_video_encoding = getattr(self, "defer_video_encoding", False)
+        video_encoder_threads = getattr(self, "video_encoder_threads", 16)
         for key in self.meta.video_keys:
-            video_writers[key] = VideoWriter(
+            writer_cls = DeferredEncodedVideoWriter if defer_video_encoding else VideoWriter
+            writer_kwargs = {}
+            if defer_video_encoding:
+                writer_kwargs["encoder_threads"] = video_encoder_threads
+
+            video_writers[key] = writer_cls(
                 self.root
                 / self.meta.get_video_file_path(self.episode_buffer["episode_index"], key),
                 self.meta.shapes[key][1],
                 self.meta.shapes[key][0],
                 self.fps,
                 self.vcodec,
+                **writer_kwargs,
             )
         return video_writers
+
+    def _validate_frame(self, frame: dict) -> None:
+        if not self.defer_video_encoding:
+            validate_frame(frame, self.features)
+            return
+
+        video_keys = {
+            key
+            for key, feature in self.features.items()
+            if feature.get("dtype") in ["image", "video"]
+        }
+        non_video_frame = {key: value for key, value in frame.items() if key not in video_keys}
+        non_video_features = {
+            key: value for key, value in self.features.items() if key not in video_keys
+        }
+        validate_frame(non_video_frame, non_video_features)
 
     def add_frame(self, frame: dict) -> None:
         """Add a frame to the episode buffer. Videos are handled by the video_writer."""
@@ -266,7 +295,7 @@ class Gr00tDataExporter(LeRobotDataset):
             if isinstance(frame[name], torch.Tensor):
                 frame[name] = frame[name].numpy()
 
-        validate_frame(frame, self.features)
+        self._validate_frame(frame)
 
         if self.episode_buffer is None:
             self.episode_buffer = self.create_episode_buffer()
