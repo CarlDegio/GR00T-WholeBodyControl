@@ -240,6 +240,8 @@ def prepare_observation_from_sensors(
     )
 
     video = {"ego_view": cam_img[np.newaxis, np.newaxis]}
+    if "chest_view" in camera_msg["images"]:
+        video["chest_view"] = camera_msg["images"]["chest_view"][np.newaxis, np.newaxis]
     if "left_wrist" in camera_msg["images"]:
         video["left_wrist"] = camera_msg["images"]["left_wrist"][np.newaxis, np.newaxis]
     if "right_wrist" in camera_msg["images"]:

@@ -17,6 +17,8 @@ from gear_sonic.data.robot_model import RobotModel
 
 EGO_VIEW_HEIGHT: int = 480
 EGO_VIEW_WIDTH: int = 640
+CHEST_VIEW_HEIGHT: int = 480
+CHEST_VIEW_WIDTH: int = 640
 WRIST_VIEW_HEIGHT: int = 480
 WRIST_VIEW_WIDTH: int = 640
 FPS: int = 50
@@ -390,12 +392,32 @@ def get_wrist_camera_features() -> dict:
     }
 
 
+def get_chest_camera_features() -> dict:
+    """Features for the optional chest camera."""
+    return {
+        "observation.images.chest_view": {
+            "dtype": "video",
+            "shape": [CHEST_VIEW_HEIGHT, CHEST_VIEW_WIDTH, 3],
+            "names": ["height", "width", "channel"],
+        },
+    }
+
+
 def get_wrist_camera_modality_config() -> dict:
     """Modality config entries for optional wrist cameras."""
     return {
         "video": {
             "left_wrist": {"original_key": "observation.images.left_wrist"},
             "right_wrist": {"original_key": "observation.images.right_wrist"},
+        },
+    }
+
+
+def get_chest_camera_modality_config() -> dict:
+    """Modality config entry for the optional chest camera."""
+    return {
+        "video": {
+            "chest_view": {"original_key": "observation.images.chest_view"},
         },
     }
 

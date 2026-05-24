@@ -215,6 +215,7 @@ class SensorClient:
 class CameraMountPosition(Enum):
     EGO_VIEW = "ego_view"
     HEAD = "head"
+    CHEST_VIEW = "chest_view"
     LEFT_WRIST = "left_wrist"
     RIGHT_WRIST = "right_wrist"
 

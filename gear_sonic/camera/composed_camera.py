@@ -64,6 +64,12 @@ class ComposedCameraConfig:
     head_device_id: str | None = None
     """Device ID for head camera."""
 
+    chest_camera: str | None = None
+    """Camera type for chest view."""
+
+    chest_device_id: str | None = None
+    """Device ID for chest camera."""
+
     left_wrist_camera: str | None = None
     """Camera type for left wrist view."""
 
@@ -174,6 +180,12 @@ class ComposedCameraSensor(Sensor, SensorServer):
             camera_configs[CameraMountPosition.HEAD.value] = {
                 "camera_type": self.config.head_camera,
                 "device_id": self.config.head_device_id,
+            }
+
+        if self.config.chest_camera is not None:
+            camera_configs[CameraMountPosition.CHEST_VIEW.value] = {
+                "camera_type": self.config.chest_camera,
+                "device_id": self.config.chest_device_id,
             }
 
         if self.config.left_wrist_camera is not None:
@@ -644,6 +656,7 @@ class ComposedCameraHttpClient:
 
     DEFAULT_NAME_MAP = {
         "center": "ego_view",
+        "chest": "chest_view",
         "left": "left_wrist",
         "right": "right_wrist",
     }

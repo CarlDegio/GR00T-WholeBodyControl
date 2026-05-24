@@ -146,6 +146,9 @@ class InferenceLaunchConfig:
     data_exporter_frequency: int = 50
     """Data collection frequency (Hz) for the data exporter."""
 
+    record_chest_camera: bool = False
+    """Record chest camera stream (chest_view) in the dataset."""
+
     task_prompt: str = ""
     """Task prompt for the data exporter. Defaults to the inference prompt if empty."""
 
@@ -273,6 +276,7 @@ def main(config: InferenceLaunchConfig):
     if config.data_exporter:
         print(f"    DC frequency:  {config.data_exporter_frequency} Hz")
         print(f"    Task prompt:   {exporter_prompt}")
+        print(f"    Chest camera:  {'Yes' if config.record_chest_camera else 'No'}")
     print(f"  PC IP:           {_get_local_ip()}")
     print("=" * 60)
 
@@ -368,6 +372,8 @@ def main(config: InferenceLaunchConfig):
         )
         if config.dataset_name:
             exporter_cmd += f" --dataset-name '{config.dataset_name}'"
+        if config.record_chest_camera:
+            exporter_cmd += " --record-chest-camera"
 
         print("Starting data exporter (pane 3)...")
         _send_to_pane(3, exporter_cmd, wait=2.0)
