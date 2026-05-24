@@ -260,6 +260,8 @@ class GrootDataCollector:
         self.latest_proprio_msg = None
         self.latest_sonic_msg = None
         self.latest_planner_msg = None
+        self.latest_state_latency_ms = None
+        self._state_message_count = 0
 
         self.current_stream_mode = 0
 
@@ -310,14 +312,36 @@ class GrootDataCollector:
         else:
             print(message)
 
+    def _print_and_say_yellow(self, message: str, say: bool = True, blocking: bool = False):
+        print(f"\033[93m{message}\033[0m")
+        if say and self.text_to_speech is not None:
+            self.text_to_speech.say(message, blocking=blocking)
+
     def _poll_state_zmq(self):
         """Poll the ``g1_debug`` ZMQ topic for robot state (non-blocking)."""
         msg = self._state_subscriber.get_msg(clear=True)
         if msg is None:
             return
 
+        receive_time = time.time()
+        ros_timestamp = msg.get("ros_timestamp", 0.0)
+        try:
+            ros_timestamp = float(ros_timestamp)
+        except (TypeError, ValueError):
+            ros_timestamp = 0.0
+
+        self.latest_state_latency_ms = (
+            (receive_time - ros_timestamp) * 1000 if ros_timestamp != 0.0 else None
+        )
+        self._state_message_count += 1
+        if self._state_message_count % 500 == 0:
+            if self.latest_state_latency_ms is None:
+                print("[State Latency] n/a")
+            else:
+                print(f"[State Latency] {self.latest_state_latency_ms:.1f}ms")
+
         if msg.get("ros_timestamp", 0.0) == 0.0:
-            msg["ros_timestamp"] = time.time()
+            msg["ros_timestamp"] = receive_time
 
         self.latest_proprio_msg = msg
 
@@ -336,7 +360,7 @@ class GrootDataCollector:
             self._episode_state.change_state()
             if self._episode_state.get_state() == self._episode_state.RECORDING:
                 self._initial_yaw = None
-                self._print_and_say(
+                self._print_and_say_yellow(
                     f"Started recording {self.current_episode_index}", blocking=False
                 )
             elif self._episode_state.get_state() == self._episode_state.NEED_TO_SAVE:
@@ -348,7 +372,7 @@ class GrootDataCollector:
                 self.data_exporter.save_episode_as_discarded()
                 self._episode_state.reset_state()
                 self._initial_yaw = None
-                self._print_and_say("Discarded episode", blocking=False)
+                self._print_and_say_yellow("Discarded episode", blocking=False)
 
     def _poll_sonic_zmq_messages(self):
         """Poll ZMQ for pose, planner, and manager_state messages (non-blocking)."""

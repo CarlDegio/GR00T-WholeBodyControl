@@ -600,9 +600,12 @@ class ComposedCameraClientSensor(Sensor, SensorClient):
             self._last_new_message_time = current_time
 
             if self.idx % 300 == 0:
+                latency_parts = []
+                log_time = time.time()
                 for image_key, image_time in self._latest_message["timestamps"].items():
-                    image_latency = (time.time() - image_time) * 1000
-                    print(f"Image latency for {image_key}: {image_latency:.2f} ms")
+                    image_latency = (log_time - image_time) * 1000
+                    latency_parts.append(f"{image_key}={image_latency:.2f}ms")
+                print(f"[Image Latency] {', '.join(latency_parts)}")
 
             self._msg_received_time = time.time()
             self._avg_time_per_frame.append(self._msg_received_time - self._start_time)
