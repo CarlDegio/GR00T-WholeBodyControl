@@ -1,20 +1,23 @@
 #!/usr/bin/env python3
-"""Simultaneously test three RealSense cameras and report frame-read stats.
+"""Simultaneously test four RealSense cameras and report frame-read stats.
 
-This script opens three RealSense color streams at 640x480@30 FPS, continuously
+This script opens four RealSense color streams at 640x480@30 FPS, continuously
 reads frames without displaying them, and prints per-camera statistics so it is
 easy to spot the case where a device enumerates successfully but never returns
 images.
 
-By default it tries to load ``head``, ``left``, and ``right`` serial numbers
-from ``camera_serial_num.txt`` in the repository root. All serials can also be
-overridden from the command line.
+By default it tries to load ``head``, ``chest``, ``left``, and ``right`` serial
+numbers from ``camera_serial_num.txt`` next to this script. All serials can
+also be overridden from the command line.
 
 Example:
     python test_3camera.py
 
+    python test_3camera.py --cameras head left right
+
     python test_3camera.py \
         --head-serial 347522071257 \
+        --chest-serial 408122070390 \
         --left-serial 218622279421 \
         --right-serial 352122270966
 """
@@ -35,18 +38,27 @@ import pyrealsense2 as rs
 
 REPO_ROOT = Path(__file__).resolve().parent
 DEFAULT_SERIAL_FILE = REPO_ROOT / "camera_serial_num.txt"
+CAMERA_NAMES = ("head", "chest", "left", "right")
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Open three RealSense color streams at the same time and report "
+            "Open four RealSense color streams at the same time and report "
             "per-camera frame-read statistics."
         )
     )
     parser.add_argument("--head-serial", default=None, help="Head camera RealSense serial")
+    parser.add_argument("--chest-serial", default=None, help="Chest camera RealSense serial")
     parser.add_argument("--left-serial", default=None, help="Left camera RealSense serial")
     parser.add_argument("--right-serial", default=None, help="Right camera RealSense serial")
+    parser.add_argument(
+        "--cameras",
+        nargs="+",
+        choices=CAMERA_NAMES,
+        default=list(CAMERA_NAMES),
+        help="Cameras to open, defaults to all four",
+    )
     parser.add_argument(
         "--serial-file",
         default=str(DEFAULT_SERIAL_FILE),
@@ -109,11 +121,13 @@ def list_connected_devices() -> list[dict[str, str]]:
 
 def resolve_selected_serials(args: argparse.Namespace) -> dict[str, str]:
     file_mapping = load_serial_mapping(Path(args.serial_file))
-    serials = {
+    all_serials = {
         "head": args.head_serial or file_mapping.get("head"),
+        "chest": args.chest_serial or file_mapping.get("chest"),
         "left": args.left_serial or file_mapping.get("left"),
         "right": args.right_serial or file_mapping.get("right"),
     }
+    serials = {name: all_serials[name] for name in args.cameras}
 
     missing = [name for name, serial in serials.items() if not serial]
     if missing:
@@ -271,11 +285,10 @@ def print_device_list(devices: list[dict[str, str]]) -> None:
         )
 
 
-def print_selected_mapping(serials: dict[str, str]) -> None:
+def print_selected_mapping(serials: dict[str, str], camera_names: list[str]) -> None:
     print("Selected camera mapping:")
-    print(f"  head  -> {serials['head']}")
-    print(f"  left  -> {serials['left']}")
-    print(f"  right -> {serials['right']}")
+    for name in camera_names:
+        print(f"  {name:<5} -> {serials[name]}")
 
 
 def render_snapshot_line(
@@ -312,6 +325,7 @@ def render_snapshot_line(
 
 def main() -> int:
     args = parse_args()
+    camera_names = list(dict.fromkeys(args.cameras))
     serials = resolve_selected_serials(args)
     devices = list_connected_devices()
 
@@ -325,14 +339,15 @@ def main() -> int:
         name: serial for name, serial in serials.items() if serial not in connected_serials
     }
     if missing_serials:
-        print_selected_mapping(serials)
+        print_selected_mapping(serials, camera_names)
         for name, serial in missing_serials.items():
             print(f"Missing device for {name}: serial={serial}")
         return 1
 
-    print_selected_mapping(serials)
+    print_selected_mapping(serials, camera_names)
     print(
-        f"Starting 3-camera test with color stream {args.width}x{args.height}@{args.fps}fps, "
+        f"Starting {len(camera_names)}-camera test with color stream "
+        f"{args.width}x{args.height}@{args.fps}fps, "
         f"timeout={args.timeout_ms}ms"
     )
     print("Press Ctrl-C to stop.")
@@ -350,7 +365,7 @@ def main() -> int:
     signal.signal(signal.SIGTERM, _handle_signal)
 
     threads = []
-    for name in ("head", "left", "right"):
+    for name in camera_names:
         thread = threading.Thread(
             target=camera_worker,
             args=(
@@ -387,7 +402,7 @@ def main() -> int:
 
             print("")
             print(f"=== {elapsed + args.report_interval:.1f}s ===")
-            for name in ("head", "left", "right"):
+            for name in camera_names:
                 snapshot = stats[name].snapshot()
                 print(
                     render_snapshot_line(
@@ -404,7 +419,7 @@ def main() -> int:
 
         print("")
         print("=== final summary ===")
-        for name in ("head", "left", "right"):
+        for name in camera_names:
             snapshot = stats[name].snapshot()
             print(
                 render_snapshot_line(
