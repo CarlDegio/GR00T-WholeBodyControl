@@ -334,6 +334,7 @@ def main(config: DataCollectionLaunchConfig):
         f"./deploy.sh "
         f"--input-type {config.deploy_input_type} "
         f"--zmq-host {config.deploy_zmq_host} "
+        f"--hand-type dex1 "
     )
     if config.deploy_checkpoint:
         deploy_cmd += f"--cp {config.deploy_checkpoint} "
