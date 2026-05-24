@@ -565,11 +565,9 @@ class ComposedCameraClientSensor(Sensor, SensorClient):
         server_ip: str = "localhost",
         port: int = 5555,
         decode_images: bool = True,
-        log_image_latency: bool = True,
     ):
         self.start_client(server_ip, port)
         self.decode_images = decode_images
-        self.log_image_latency = log_image_latency
 
         self._latest_message = None
         self._avg_time_per_frame: deque = deque(maxlen=20)
@@ -601,13 +599,10 @@ class ComposedCameraClientSensor(Sensor, SensorClient):
             ).asdict()
             self._last_new_message_time = current_time
 
-            if self.log_image_latency and self.idx % 300 == 0:
-                current_time = time.time()
-                parts = []
+            if self.idx % 300 == 0:
                 for image_key, image_time in self._latest_message["timestamps"].items():
-                    image_latency = (current_time - image_time) * 1000
-                    parts.append(f"{image_key}={image_latency:.2f}ms")
-                print(f"Image latency: {', '.join(parts)}")
+                    image_latency = (time.time() - image_time) * 1000
+                    print(f"Image latency for {image_key}: {image_latency:.2f} ms")
 
             self._msg_received_time = time.time()
             self._avg_time_per_frame.append(self._msg_received_time - self._start_time)
