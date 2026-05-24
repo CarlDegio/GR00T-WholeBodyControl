@@ -253,6 +253,7 @@ class GrootDataCollector:
             server_ip=camera_host,
             port=camera_port,
             decode_images=decode_camera_images,
+            log_image_latency=False,
         )
 
         self.obs_act_buffer = deque(maxlen=100)
@@ -316,8 +317,13 @@ class GrootDataCollector:
         if msg is None:
             return
 
+        receive_time = time.time()
+        msg["receive_timestamp"] = receive_time
         if msg.get("ros_timestamp", 0.0) == 0.0:
-            msg["ros_timestamp"] = time.time()
+            msg["ros_timestamp"] = receive_time
+            msg["_ros_timestamp_fallback"] = True
+        else:
+            msg["_ros_timestamp_fallback"] = False
 
         self.latest_proprio_msg = msg
 
@@ -529,13 +535,42 @@ class GrootDataCollector:
     def _log_latency_periodic(
         self,
         sonic_latency_ms: float | None = None,
+        proprio_msg: dict | None = None,
     ):
         current_time = time.time()
         if current_time - self._last_latency_log_time >= 1.0:
             self._last_latency_log_time = current_time
             parts = []
+            if proprio_msg is not None:
+                ros_timestamp = proprio_msg.get("ros_timestamp")
+                if ros_timestamp is not None and not proprio_msg.get(
+                    "_ros_timestamp_fallback", False
+                ):
+                    state_latency_ms = (current_time - ros_timestamp) * 1000
+                    parts.append(f"State: {state_latency_ms:.1f}ms")
+                else:
+                    parts.append("State: n/a")
+
             if sonic_latency_ms is not None:
                 parts.append(f"Sonic Pose: {sonic_latency_ms:.1f}ms")
+
+            if self.latest_image_msg is not None:
+                image_timestamps = self.latest_image_msg.get("timestamps", {})
+                image_parts = []
+                name_map = {
+                    "ego_view": "ego",
+                    "chest_view": "chest",
+                    "left_wrist": "left",
+                    "right_wrist": "right",
+                }
+                for key, image_time in image_timestamps.items():
+                    image_latency_ms = (current_time - image_time) * 1000
+                    image_parts.append(
+                        f"{name_map.get(key, key)}={image_latency_ms:.1f}ms"
+                    )
+                if image_parts:
+                    parts.append(f"Images: {' '.join(image_parts)}")
+
             if parts:
                 print(f"[Latency] {', '.join(parts)}")
 
@@ -632,7 +667,7 @@ class GrootDataCollector:
 
         self._add_images_to_frame_data(frame_data)
 
-        self._log_latency_periodic(sonic_latency_ms)
+        self._log_latency_periodic(sonic_latency_ms, proprio)
 
         self.data_exporter.add_frame(frame_data)
         return self._finalize_frame(t_start)
