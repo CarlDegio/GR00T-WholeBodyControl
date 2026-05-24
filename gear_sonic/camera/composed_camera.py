@@ -103,6 +103,9 @@ class ComposedCameraConfig:
     queue_size: int = 1
     """Per-camera latest-frame buffer depth. Keep this at 1 to retain only the newest frame."""
 
+    stale_frame_warning_count: int = 10
+    """Warn after this many server reads reuse the same per-camera frame timestamp."""
+
     use_mjpeg: bool = False
     """Use on-device MJPEG encoding on OAK cameras to reduce USB bandwidth."""
 
@@ -124,6 +127,8 @@ class ComposedCameraSensor(Sensor, SensorServer):
         self.error_events: dict[str, threading.Event] = {}
         self.error_messages: dict[str, str] = {}
         self._observation_spaces: dict[str, Any] = {}
+        self._last_frame_timestamps: dict[str, float] = {}
+        self._stale_frame_counts: dict[str, int] = {}
 
         camera_configs = self._get_camera_configs()
 
@@ -446,11 +451,36 @@ class ComposedCameraSensor(Sensor, SensorServer):
         for mount_position, camera_queue in self.camera_queues.items():
             frame = self._get_latest_from_queue(camera_queue)
             if frame is not None:
+                self._track_stale_frame(mount_position, frame)
                 message[mount_position] = frame
 
         if set(message.keys()) == expected_cameras:
             return message
         return None
+
+    def _track_stale_frame(self, mount_position: str, frame: dict[str, Any]) -> None:
+        timestamps = frame.get("timestamps", {})
+        timestamp = timestamps.get(mount_position)
+        if timestamp is None and timestamps:
+            timestamp = max(timestamps.values())
+        if timestamp is None:
+            return
+
+        last_timestamp = self._last_frame_timestamps.get(mount_position)
+        if last_timestamp is None or timestamp > last_timestamp:
+            self._last_frame_timestamps[mount_position] = timestamp
+            self._stale_frame_counts[mount_position] = 0
+            return
+
+        stale_count = self._stale_frame_counts.get(mount_position, 0) + 1
+        if stale_count >= self.config.stale_frame_warning_count:
+            print(
+                f"\033[93m[WARNING] Camera '{mount_position}' reused the same frame timestamp "
+                f"for {stale_count} consecutive server reads. "
+                "This camera may be dropping frames or stalled.\033[0m"
+            )
+            stale_count = 0
+        self._stale_frame_counts[mount_position] = stale_count
 
     def _get_latest_from_queue(self, camera_queue: queue.Queue) -> dict[str, Any] | None:
         # Peek instead of draining so each camera always exposes its latest frame
