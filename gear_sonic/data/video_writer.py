@@ -8,6 +8,14 @@ import av
 import numpy as np
 
 
+KEYFRAME_INTERVAL = 50
+VIDEO_CODEC_OPTIONS = {
+    "g": str(KEYFRAME_INTERVAL),
+    "keyint_min": str(KEYFRAME_INTERVAL),
+    "sc_threshold": "0",
+}
+
+
 class VideoWriter:
     def __init__(
         self,
@@ -27,7 +35,7 @@ class VideoWriter:
 
         self.queue = queue.Queue(maxsize=buffer_size)
         self.container = av.open(output_path, mode="w")
-        self.stream = self.container.add_stream(codec, rate=fps)
+        self.stream = self.container.add_stream(codec, rate=fps, options=VIDEO_CODEC_OPTIONS)
         self.stream.width = width
         self.stream.height = height
         thread = threading.Thread(target=self._writer_worker, daemon=True)

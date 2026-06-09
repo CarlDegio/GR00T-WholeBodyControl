@@ -21,6 +21,14 @@ import numpy as np
 from gear_sonic.camera.sensor_server import ImageUtils
 
 
+KEYFRAME_INTERVAL = 50
+VIDEO_CODEC_OPTIONS = {
+    "g": str(KEYFRAME_INTERVAL),
+    "keyint_min": str(KEYFRAME_INTERVAL),
+    "sc_threshold": "0",
+}
+
+
 class DeferredEncodedVideoWriter:
     """Store encoded image payloads in memory and write video on ``stop()``."""
 
@@ -98,14 +106,15 @@ class DeferredEncodedVideoWriter:
     def stop(self) -> str:
         """Decode cached frames, encode the MP4, and return the output path."""
         container = av.open(self.output_path, mode="w")
-        stream = container.add_stream(self.codec, rate=self.fps)
+        stream = container.add_stream(self.codec, rate=self.fps, options=VIDEO_CODEC_OPTIONS)
         stream.width = self.width
         stream.height = self.height
         self._configure_encoder_threads(stream)
 
         print(
             f"[DeferredVideoWriter] Encoding {len(self.frames)} frames to "
-            f"{self.output_path} with codec={self.codec}, threads={self.encoder_threads}"
+            f"{self.output_path} with codec={self.codec}, "
+            f"keyframe_interval={KEYFRAME_INTERVAL}, threads={self.encoder_threads}"
         )
 
         try:
