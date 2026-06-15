@@ -34,6 +34,7 @@ import tyro
 
 
 MOTION_TOKEN_COLUMN = "action.motion_token"
+KEYFRAME_INTERVAL = 50
 
 
 def load_json(path: Path) -> dict[str, Any]:
@@ -182,6 +183,12 @@ def trim_video_ffmpeg(
         str(fps),
         "-c:v",
         "libx264",
+        "-g",
+        str(KEYFRAME_INTERVAL),
+        "-keyint_min",
+        str(KEYFRAME_INTERVAL),
+        "-sc_threshold",
+        "0",
         "-pix_fmt",
         "yuv420p",
         str(dst_video_path),
