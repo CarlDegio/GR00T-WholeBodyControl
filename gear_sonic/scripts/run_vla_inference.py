@@ -227,11 +227,12 @@ def prepare_observation_from_sensors(
             print("[DEBUG] prepare_observation: waiting for state msg..", flush=True)
         return None
 
-    cam_img = camera_msg["images"]["ego_view"]
+    required_image_keys = ("ego_view", "chest_view", "left_wrist", "right_wrist")
+    missing_image_keys = [key for key in required_image_keys if key not in camera_msg["images"]]
+    if missing_image_keys:
+        raise ValueError(f"Missing required camera images: {missing_image_keys}")
 
-    # Copy index finger data to middle finger (hardware coupling)
-    state_msg["left_hand_q"][5] = state_msg["left_hand_q"][3]
-    state_msg["left_hand_q"][6] = state_msg["left_hand_q"][4]
+    cam_img = camera_msg["images"]["ego_view"]
 
     qpos = robot_model.get_configuration_from_actuated_joints(
         body_actuated_joint_values=state_msg["body_q"],
@@ -239,13 +240,12 @@ def prepare_observation_from_sensors(
         right_hand_actuated_joint_values=state_msg["right_hand_q"],
     )
 
-    video = {"ego_view": cam_img[np.newaxis, np.newaxis]}
-    if "chest_view" in camera_msg["images"]:
-        video["chest_view"] = camera_msg["images"]["chest_view"][np.newaxis, np.newaxis]
-    if "left_wrist" in camera_msg["images"]:
-        video["left_wrist"] = camera_msg["images"]["left_wrist"][np.newaxis, np.newaxis]
-    if "right_wrist" in camera_msg["images"]:
-        video["wrist_view"] = camera_msg["images"]["right_wrist"][np.newaxis, np.newaxis]
+    video = {
+        "ego_view": cam_img[np.newaxis, np.newaxis],
+        "chest_view": camera_msg["images"]["chest_view"][np.newaxis, np.newaxis],
+        "left_wrist": camera_msg["images"]["left_wrist"][np.newaxis, np.newaxis],
+        "right_wrist": camera_msg["images"]["right_wrist"][np.newaxis, np.newaxis],
+    }
 
     observation = {
         "video": video,
