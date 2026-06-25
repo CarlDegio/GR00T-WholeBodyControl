@@ -28,6 +28,7 @@ import queue
 import threading
 import time
 
+import cv2
 import numpy as np
 import tyro
 import zmq
@@ -121,6 +122,43 @@ class InferenceConfig:
 
 def print_green(x):
     print(f"\033[92m{x}\033[0m")
+
+
+JPEG_VIDEO_MARKER = "__opencv_jpeg_rgb__"
+JPEG_VIDEO_QUALITY = 95
+
+
+def encode_rgb_video_frame_as_jpeg(image: np.ndarray) -> dict:
+    """Encode a single RGB video frame as JPEG while preserving original shape metadata."""
+    array = np.asarray(image)
+    if array.dtype != np.uint8:
+        raise ValueError(f"JPEG video encoding expects uint8 images, got {array.dtype}")
+
+    if array.ndim == 5 and array.shape[0] == 1 and array.shape[1] == 1:
+        frame = array[0, 0]
+    elif array.ndim == 3:
+        frame = array
+    else:
+        raise ValueError(f"JPEG video encoding expects HWC or [1, 1, H, W, C], got {array.shape}")
+
+    if frame.ndim != 3 or frame.shape[-1] != 3:
+        raise ValueError(f"JPEG video encoding expects RGB HWC images, got {frame.shape}")
+
+    frame_bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+    ok, encoded = cv2.imencode(
+        ".jpg",
+        frame_bgr,
+        [int(cv2.IMWRITE_JPEG_QUALITY), JPEG_VIDEO_QUALITY],
+    )
+    if not ok:
+        raise RuntimeError("cv2.imencode failed for video frame")
+
+    return {
+        JPEG_VIDEO_MARKER: True,
+        "shape": array.shape,
+        "dtype": str(array.dtype),
+        "data": encoded.tobytes(),
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -241,10 +279,16 @@ def prepare_observation_from_sensors(
     )
 
     video = {
-        "ego_view": cam_img[np.newaxis, np.newaxis],
-        "chest_view": camera_msg["images"]["chest_view"][np.newaxis, np.newaxis],
-        "left_wrist": camera_msg["images"]["left_wrist"][np.newaxis, np.newaxis],
-        "right_wrist": camera_msg["images"]["right_wrist"][np.newaxis, np.newaxis],
+        "ego_view": encode_rgb_video_frame_as_jpeg(cam_img[np.newaxis, np.newaxis]),
+        "chest_view": encode_rgb_video_frame_as_jpeg(
+            camera_msg["images"]["chest_view"][np.newaxis, np.newaxis]
+        ),
+        "left_wrist": encode_rgb_video_frame_as_jpeg(
+            camera_msg["images"]["left_wrist"][np.newaxis, np.newaxis]
+        ),
+        "right_wrist": encode_rgb_video_frame_as_jpeg(
+            camera_msg["images"]["right_wrist"][np.newaxis, np.newaxis]
+        ),
     }
 
     observation = {
