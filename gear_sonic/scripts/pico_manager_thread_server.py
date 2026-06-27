@@ -131,6 +131,26 @@ class StreamMode(Enum):
     PLANNER_VR_3PT = 5
 
 
+PICO_STOP_DELAY_SECONDS = 10.0
+PICO_STOP_WARNING_TEXT = "warning: g1 stop"
+PICO_STOP_WARNING_INTERVAL_SECONDS = 3.0
+PICO_STOP_WARNING_REPEAT_COUNT = 3
+
+
+def speak_warning_on_pc(message: str = PICO_STOP_WARNING_TEXT):
+    """Best-effort local PC voice warning."""
+    for command in (["espeak", message], ["spd-say", message]):
+        try:
+            subprocess.Popen(command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            return
+        except FileNotFoundError:
+            continue
+        except Exception as exc:
+            print(f"[Manager] WARNING: Failed to run {' '.join(command)}: {exc}")
+            return
+    print(f"[Manager] WARNING: No local TTS command found. Message: {message}")
+
+
 ### Parse 3 point pose from SMPL
 #
 # OFFSETS: Rotation corrections applied to each keypoint to align SMPL joint frames
@@ -1892,6 +1912,10 @@ def run_pico_manager(
     #
     print("Manager controls: A+X=toggle mode, A+B+X+Y=start/stop policy")
     current_mode = StreamMode.OFF
+    stop_pending = False
+    stop_deadline = 0.0
+    stop_warning_count = 0
+    next_stop_warning_time = 0.0
     # Track which mode VR_3PT was entered from, so left_axis_click returns to it.
     # Will be either PLANNER or PLANNER_FROZEN_UPPER_BODY.
     vr3pt_parent_mode = StreamMode.PLANNER
@@ -1918,6 +1942,38 @@ def run_pico_manager(
 
             # Rising edge: A+B+X+Y pressed together -> toggle policy start/stop (planner=True)
             start_combo = (a_pressed) and (b_pressed) and (x_pressed) and (y_pressed)
+
+            if stop_pending:
+                now = time.monotonic()
+                if now >= stop_deadline:
+                    print("[Manager] Delayed stop elapsed; sending stop command")
+                    socket.send(build_command_message(start=False, stop=True, planner=True))
+                    break
+
+                if (
+                    stop_warning_count < PICO_STOP_WARNING_REPEAT_COUNT
+                    and now >= next_stop_warning_time
+                ):
+                    speak_warning_on_pc()
+                    stop_warning_count += 1
+                    next_stop_warning_time = now + PICO_STOP_WARNING_INTERVAL_SECONDS
+
+                socket.send(
+                    pack_pose_message(
+                        {
+                            "stream_mode": np.array([StreamMode.OFF.value], dtype=np.int32),
+                            "toggle_data_collection": np.array([False], dtype=bool),
+                            "toggle_data_abort": np.array([False], dtype=bool),
+                        },
+                        topic="manager_state",
+                    )
+                )
+                prev_ax_pressed = ax_pressed
+                prev_by_pressed = by_pressed
+                prev_start_combo = start_combo
+                prev_left_axis_click = left_axis_click
+                time.sleep(0.02)
+                continue
 
             new_mode = current_mode
             if current_mode == StreamMode.OFF:
@@ -2021,8 +2077,25 @@ def run_pico_manager(
             # Make sure to send command messages after loop iteration to ensure data arrives before mode switch
             if new_mode != current_mode:
                 if new_mode == StreamMode.OFF:
-                    socket.send(build_command_message(start=False, stop=True, planner=True))
-                    exit()
+                    stop_pending = True
+                    now = time.monotonic()
+                    stop_deadline = now + PICO_STOP_DELAY_SECONDS
+                    stop_warning_count = 0
+                    next_stop_warning_time = now
+                    socket.send(build_command_message(start=True, stop=False, planner=True))
+                    socket.send(
+                        build_planner_message(
+                            LocomotionMode.IDLE.value,
+                            [0.0, 0.0, 0.0],
+                            [1.0, 0.0, 0.0],
+                            -1.0,
+                            -1.0,
+                        )
+                    )
+                    print(
+                        "[Manager] Stop requested; holding planner IDLE for "
+                        f"{PICO_STOP_DELAY_SECONDS:.1f}s before sending stop"
+                    )
                 elif (
                     new_mode == StreamMode.PLANNER
                     or new_mode == StreamMode.PLANNER_FROZEN_UPPER_BODY
