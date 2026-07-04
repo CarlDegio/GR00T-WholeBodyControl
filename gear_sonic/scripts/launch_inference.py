@@ -129,7 +129,7 @@ class InferenceLaunchConfig:
     action_publish_rate: int = 50
     """Rate at which individual actions are published to the C++ control loop (Hz)."""
 
-    action_horizon: int = 40
+    action_horizon: int = 70
     """Action horizon of the VLA policy."""
 
     # Camera

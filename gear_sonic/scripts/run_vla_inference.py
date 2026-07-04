@@ -76,7 +76,7 @@ class InferenceConfig:
     action_horizon: int = 70
     """Action horizon of the VLA policy (number of future actions per inference)."""
 
-    rate: float = 1 / 0.5
+    rate: float = 1 / 0.6
     """Rate at which we run the forward pass of the VLA policy (Hz)."""
 
     # Camera
