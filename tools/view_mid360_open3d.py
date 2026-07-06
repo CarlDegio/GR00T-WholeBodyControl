@@ -554,7 +554,7 @@ def create_argument_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--pool-seconds",
         type=float,
-        default=0.0,
+        default=0.5,
         help="Display a sliding time pool of points received in the last N seconds; <=0 disables.",
     )
     parser.add_argument(
@@ -576,7 +576,7 @@ def create_argument_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--color-mode",
         choices=("intensity", "white", "none"),
-        default="intensity",
+        default="white",
         help="Point color mode: intensity grayscale, fixed white occupancy, or Open3D default.",
     )
     parser.add_argument("--no-color", action="store_true", help="Deprecated alias for --color-mode none")
@@ -584,13 +584,13 @@ def create_argument_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--axis-size",
         type=float,
-        default=1.0,
+        default=1.5,
         help="Robot/lidar frame axis length in meters. X=red, Y=green, Z=blue.",
     )
     parser.add_argument(
         "--axis-line-width",
         type=float,
-        default=8.0,
+        default=1.0,
         help="Displayed XYZ axis line width. Open3D/backend support for thick lines may vary.",
     )
     parser.add_argument("--hide-axis", action="store_true", help="Hide the robot/lidar XYZ coordinate frame.")
@@ -614,13 +614,29 @@ def create_argument_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--flip-y",
+        dest="flip_y",
         action="store_true",
+        default=True,
         help="Flip displayed point-cloud Y coordinates only; the green Y axis stays in the original direction.",
     )
     parser.add_argument(
+        "--no-flip-y",
+        dest="flip_y",
+        action="store_false",
+        help="Do not flip displayed point-cloud Y coordinates.",
+    )
+    parser.add_argument(
         "--flip-z",
+        dest="flip_z",
         action="store_true",
+        default=True,
         help="Flip displayed point-cloud Z coordinates only; the blue Z axis stays in the original direction.",
+    )
+    parser.add_argument(
+        "--no-flip-z",
+        dest="flip_z",
+        action="store_false",
+        help="Do not flip displayed point-cloud Z coordinates.",
     )
     parser.add_argument(
         "--z-axis-angle",
