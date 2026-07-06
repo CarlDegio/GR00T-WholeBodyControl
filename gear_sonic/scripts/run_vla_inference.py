@@ -4,22 +4,28 @@ VLA inference runner — NO ROS 2 DEPENDENCY.
 Runs an Isaac-GR00T VLA policy against the Sonic whole-body control stack.
 All communication uses ZMQ:
   1. Robot state  -> ZMQ SUB on ``g1_debug`` topic (from C++ zmq_output_handler)
-  2. Actions out  -> ZMQ PUB (latent protocol v4: motion token + hand joints)
+  2. Actions out  -> ZMQ PUB (latent protocol v4: motion token + hand joints or planner commands)
   3. Camera       -> ZMQ/TCP via ComposedCameraClientSensor
   4. Keyboard     -> ZMQ SUB via ZMQKeyboardSubscriber
+  5. Planner relay -> ZMQ SUB ``planner`` topic (port 5558) from
+     ``keyboard_planner_thread_server.py``; bytes forward to :5556
+
+``command`` topic (start/stop/mode) is sent only by this script (``k``/``i``/``o``).
+The keyboard planner sidecar sends ``planner`` topic only — no ``command`` overlap.
 
 Uses the Isaac-GR00T PolicyClient (ZMQ REQ/REP) to communicate with a
 running PolicyServer.
 
 Keyboard commands (received via ZMQ from the standalone keyboard publisher):
-  p  -> pause / resume the policy loop
-  k  -> start / stop the C++ control loop
-  i  -> send initial pose and switch to POSE mode
+  k  -> start / stop the C++ control loop (start defaults to PLANNER mode)
+  o  -> switch to PLANNER mode (enables relay of WASD sidecar on :5558)
+  i  -> switch to POSE mode (VLA latent actions; relay disabled)
+  p  -> pause / resume the policy loop (POSE mode only)
   t  -> change prompt at runtime (publisher sends ``prompt:<text>``)
   [  -> toggle left hand open/closed for initial pose
   ]  -> toggle right hand open/closed for initial pose
   c  -> start recording (handled by data exporter if running)
-  s  -> stop recording success (handled by data exporter)
+  e  -> stop recording success (handled by data exporter)
   f  -> stop recording failure (handled by data exporter)
 """
 
@@ -107,6 +113,13 @@ class InferenceConfig:
     keyboard_zmq_port: int = DEFAULT_ZMQ_KEYBOARD_PORT
     """ZMQ port for keyboard input."""
 
+    # ZMQ: Planner relay (run_planner_keyboard sidecar -> forward to action port)
+    planner_relay_zmq_host: str = "localhost"
+    """Host for the planner relay SUB socket (sidecar PUB connects here)."""
+
+    planner_relay_zmq_port: int = 5558
+    """Port for the planner relay SUB socket."""
+
     # Embodiment
     embodiment_tag: str = "unitree_g1_sonic"
     """Embodiment tag for policy inference."""
@@ -144,7 +157,7 @@ def encode_rgb_video_frame_as_jpeg(image: np.ndarray) -> dict:
     if frame.ndim != 3 or frame.shape[-1] != 3:
         raise ValueError(f"JPEG video encoding expects RGB HWC images, got {frame.shape}")
 
-    frame_bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+    frame_bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR) 
     ok, encoded = cv2.imencode(
         ".jpg",
         frame_bgr,
@@ -440,6 +453,19 @@ def main(config: InferenceConfig):
         port=config.keyboard_zmq_port, host=config.keyboard_zmq_host
     )
 
+    planner_relay_sub = zmq_context.socket(zmq.SUB)
+    planner_relay_sub.setsockopt_string(zmq.SUBSCRIBE, "planner")
+    planner_relay_sub.setsockopt(zmq.RCVTIMEO, 0)
+    planner_relay_sub.connect(
+        f"tcp://{config.planner_relay_zmq_host}:{config.planner_relay_zmq_port}"
+    )
+    print_green(
+        "Planner relay SUB connected to "
+        f"tcp://{config.planner_relay_zmq_host}:{config.planner_relay_zmq_port} "
+        f"with topic filter: planner"
+        f"(forwarding to tcp://{config.action_zmq_host}:{config.action_zmq_port})"
+    )
+
     telemetry = Telemetry(window_size=100)
 
     loop_rate = config.action_publish_rate
@@ -530,8 +556,8 @@ def main(config: InferenceConfig):
 
         if key == "c":
             print("Keyboard: 'c' (start recording -- handled by data exporter)")
-        elif key == "s":
-            print("Keyboard: 's' (stop recording success -- handled by data exporter)")
+        elif key == "e":
+            print("Keyboard: 'e' (stop recording success -- handled by data exporter)")
         elif key == "f":
             print("Keyboard: 'f' (stop recording failure -- handled by data exporter)")
         elif key == "i":
@@ -570,12 +596,16 @@ def main(config: InferenceConfig):
             else:
                 print("Warning: C++ loop is not running")
         elif key == "p":
-            pause_loop = not pause_loop
-            print(f"{'Paused' if pause_loop else 'Resumed'} policy loop")
-            if pause_loop:
-                print("Policy loop paused (C++ loop still running - press 'k' to stop)")
+            if cpp_mode == "PLANNER":
+                print("Warning: C++ loop is in PLANNER mode - press 'i' to switch to POSE mode")
             else:
-                print("Policy loop resumed")
+                pause_loop = not pause_loop
+                print(f"{'Paused' if pause_loop else 'Resumed'} policy loop")
+                if pause_loop:
+                    print("Policy loop paused (C++ loop still running - press 'k' to stop)")
+                else:
+                    print("Policy loop resumed (C++ loop still running - press 'k' to stop)")
+
         elif key == "k":
             if cpp_loop_running:
                 current_planner = cpp_mode == "PLANNER"
@@ -669,6 +699,13 @@ def main(config: InferenceConfig):
                 except queue.Full:
                     pass
 
+            if cpp_loop_running and cpp_mode == "PLANNER":
+                _relay_planner_messages(planner_relay_sub, zmq_socket)
+                print("In Planner mode...", end="", flush=True)
+                _sleep_remaining(t_start, loop_period)
+                print(".", end="", flush=True)
+                continue
+
             if pause_loop:
                 print("Pausing...", end="", flush=True)
                 time.sleep(0.2)
@@ -754,12 +791,22 @@ def main(config: InferenceConfig):
     finally:
         inference_stop_event.set()
         inference_worker_thread.join(timeout=1.0)
+        planner_relay_sub.close()
         zmq_socket.close()
         zmq_context.term()
         state_subscriber.close()
         keyboard_listener.close()
         print("Shutdown complete.")
 
+
+def _relay_planner_messages(planner_relay_sub: zmq.Socket, action_pub: zmq.Socket) -> int:
+    """Forward all pending planner-sidecar messages from :5558 SUB to :5556 PUB."""
+    relayed = 0
+    while planner_relay_sub.poll(0):
+        message = planner_relay_sub.recv(zmq.NOBLOCK)
+        action_pub.send(message)
+        relayed += 1
+    return relayed
 
 def _sleep_remaining(t_start: float, loop_period: float):
     """Sleep for the remainder of the loop period."""

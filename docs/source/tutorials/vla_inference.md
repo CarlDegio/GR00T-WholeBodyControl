@@ -121,7 +121,7 @@ Type these keys in the **Keyboard Publisher** pane (pane 1):
 | `]` | Toggle right hand open/closed (initial pose) |
 | `t <text>` | Change the inference prompt (e.g., `t pick up the cup`) |
 | `c` | Start recording an episode (data exporter) |
-| `s` | Stop recording — success (data exporter) |
+| `e` | Stop recording — success (data exporter) |
 | `f` | Stop recording — failure / discard (data exporter) |
 
 ### Typical Workflow

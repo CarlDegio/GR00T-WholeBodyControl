@@ -8,11 +8,17 @@ Starts the inference stack in a single tmux session:
     │ Pane 0: C++ Deploy    │ Pane 1: VLA Inference │
     │ (gear_sonic_deploy)   │ (.venv_inference)     │
     ├───────────────────────┼───────────────────────┤
-    │ Pane 2: Keyboard Pub  │ Pane 3: Data Exporter │
-    │ (.venv_inference)     │ (.venv_data_collection)│
+    │ Pane 2: Keyboard Pub  │ Pane 3: Keyboard Planner │
+    │ (.venv_inference)     │ (.venv_inference)│
     └───────────────────────┴───────────────────────┘
 
-    Window 1 — sim  (only when --sim is passed):
+    Window 1 — keyboard planner (only when --keyboard-planner is passed):
+    ┌─────────────────────────────────────────────────┐
+    │ Keyboard Planner (keyboard_planner_thread_server.py)│
+    │ (.venv_inference)                                 │
+    └─────────────────────────────────────────────────┘
+
+    Window 2 — sim  (only when --sim is passed):
     ┌─────────────────────────────────────────────────┐
     │ MuJoCo Simulator (run_sim_loop.py)              │
     │ (.venv_sim)                                     │
@@ -138,6 +144,18 @@ class InferenceLaunchConfig:
 
     camera_port: int = 5555
     """Camera server port."""
+
+    keyboard_planner: bool = True
+    """Start the keyboard planner sidecar for planning during inference."""
+
+    keyboard_planner_port: int = 5558
+    """Keyboard planner sidecar port."""
+
+    keyboard_planner_publish_rate: int = 20
+    """Keyboard planner publish rate (Hz)."""
+
+    keyboard_planner_host: str = "localhost"
+    """Keyboard planner sidecar host."""
 
     # Data exporter (optional recording during inference)
     data_exporter: bool = True
@@ -335,6 +353,24 @@ def main(config: InferenceLaunchConfig):
     if not _check_pane_alive(0):
         print("WARNING: C++ deploy pane may have failed to start.")
 
+    # --- Pane 1 (top-right): VLA Inference ---
+    inference_cmd = (
+        f"cd {repo_root} && "
+        f"source .venv_inference/bin/activate && "
+        f"python gear_sonic/scripts/run_vla_inference.py "
+        f"--host {config.policy_host} "
+        f"--port {config.policy_port} "
+        f"--embodiment-tag {config.embodiment_tag} "
+        f"--prompt '{config.prompt}' "
+        f"--action-publish-rate {config.action_publish_rate} "
+        f"--action-horizon {config.action_horizon} "
+        f"--camera-host {config.camera_host} "
+        f"--camera-port {config.camera_port}"
+    )
+
+    print("Starting VLA inference (pane 1)...")
+    _send_to_pane(2, inference_cmd, wait=1.0)
+
     # --- Pane 2 (bottom-left): Keyboard Publisher ---
     keyboard_script = textwrap.dedent("""\
         import zmq, time
@@ -363,7 +399,23 @@ def main(config: InferenceLaunchConfig):
     _send_to_pane(1, keyboard_cmd, wait=2.0)
 
     # --- Pane 3 (bottom-right): Data Exporter (optional) ---
+    if config.keyboard_planner:
+        planner_cmd = (
+            f"cd {repo_root} && "
+            f"source .venv_inference/bin/activate && "
+            f"python gear_sonic/scripts/keyboard_planner_thread_server.py "
+            f"--port {config.keyboard_planner_port} "
+            f"--hz {config.keyboard_planner_publish_rate} "
+            f"--host {config.keyboard_planner_host} "
+        )
+        print("Starting keyboard planner sidecar (pane 3)...")
+        _send_to_pane(3, planner_cmd, wait=2.0)
+
+
     if config.data_exporter:
+        subprocess.run(
+            ["tmux", "new-window", "-t", SESSION_NAME, "-n", "data_exporter"],
+        )
         exporter_cmd = (
             f"cd {repo_root} && "
             f"source .venv_data_collection/bin/activate && "
@@ -377,32 +429,15 @@ def main(config: InferenceLaunchConfig):
             exporter_cmd += f" --dataset-name '{config.dataset_name}'"
         if config.record_chest_camera:
             exporter_cmd += " --record-chest-camera"
+        subprocess.run(
+            ["tmux", "send-keys", "-t", f"{SESSION_NAME}:data_exporter", exporter_cmd, "C-m"],
+        )
+        print("Starting data exporter (window: data_exporter)...")
+        time.sleep(2.0)
+        subprocess.run(
+            ["tmux", "select-window", "-t", f"{SESSION_NAME}:inference"],
+        )
 
-        print("Starting data exporter (pane 3)...")
-        _send_to_pane(3, exporter_cmd, wait=2.0)
-
-    # --- Pane 1 (top-right): VLA Inference ---
-    inference_cmd = (
-        f"cd {repo_root} && "
-        f"source .venv_inference/bin/activate && "
-        f"python gear_sonic/scripts/run_vla_inference.py "
-        f"--host {config.policy_host} "
-        f"--port {config.policy_port} "
-        f"--embodiment-tag {config.embodiment_tag} "
-        f"--prompt '{config.prompt}' "
-        f"--action-publish-rate {config.action_publish_rate} "
-        f"--action-horizon {config.action_horizon} "
-        f"--camera-host {config.camera_host} "
-        f"--camera-port {config.camera_port}"
-    )
-
-    print("Starting VLA inference (pane 1)...")
-    _send_to_pane(2, inference_cmd, wait=1.0)
-
-    # Select the VLA inference pane
-    subprocess.run(
-        ["tmux", "select-pane", "-t", f"{SESSION_NAME}:0.2"],
-    )
 
     print()
     print("=" * 60)
@@ -418,12 +453,19 @@ def main(config: InferenceLaunchConfig):
     print("    Pane 0 (top-left):     C++ Deploy")
     print("    Pane 1 (bottom-left):  Keyboard Publisher")
     print("    Pane 2 (top-right):    VLA Inference  <-- you are here")
+    print("    Pane 3 (bottom-right): Keyboard Planner")
     if config.data_exporter:
-        print("    Pane 3 (bottom-right): Data Exporter")
+        print("    Window 'data_exporter':")
+        print("      Data Exporter (.venv_data_collection)")
+        print()
     print()
     print("  ** deploy.sh (pane 0) is waiting for confirmation --")
     print("     click on pane 0 and press Enter to proceed **")
     print()
+    print("  Planner workflow:")
+    print("    1. In pane 1: k (start) -> o (PLANNER mode)")
+    print("    2. In pane 3: W/S/A/D for locomotion")
+    print("    3. In pane 1: i (POSE mode)")
     print("  Keyboard controls (type in pane 1):")
     print("    p        - Pause / resume inference")
     print("    k        - Start / stop C++ control loop")
@@ -433,12 +475,12 @@ def main(config: InferenceLaunchConfig):
     print("    t <text> - Change inference prompt")
     if config.data_exporter:
         print("    c        - Start recording episode")
-        print("    s        - Stop recording (success)")
+        print("    e        - Stop recording (success)")
         print("    f        - Stop recording (failure)")
     print()
     print("  Navigation:")
     print("    Ctrl+b, arrow keys  - Switch between panes")
-    if config.sim:
+    if config.sim or config.data_exporter:
         print("    Ctrl+b, n / p       - Next / previous window")
     print("    Ctrl+b, d           - Detach from session")
     print("    Ctrl+\\              - Kill entire session")
