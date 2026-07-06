@@ -535,20 +535,40 @@ def main(config: InferenceConfig):
         elif key == "f":
             print("Keyboard: 'f' (stop recording failure -- handled by data exporter)")
         elif key == "i":
-            print("Moving to initial pose")
+            print("Switch to pose mode")
             zmq_frame_counter = 0
             print("Reset ZMQ frame counter")
-            publish_initial_pose()
+            #publish_initial_pose() # BUG: This is not working as expected
             cached_action_chunk = None
             action_chunk_index = 0
             print("Cleared cached action chunk")
-            if cpp_loop_running and cpp_mode == "PLANNER":
+            if cpp_mode == "PLANNER":
+                print("Switching to POSE mode")
                 if send_cpp_control_command(start=True, planner=False):
                     print("Switched to POSE mode (from PLANNER mode)")
                 else:
                     print("Warning: Failed to switch to POSE mode")
-            elif not cpp_loop_running:
-                print("Note: C++ loop not running - press 'k' to start")
+            elif cpp_mode == "POSE":
+                print("Warning: C++ loop is already in POSE mode")
+            else:
+                print("Warning: C++ loop is not running")
+        elif key == "o":
+            print("Switch to planner mode")
+            zmq_frame_counter = 0
+            print("Reset ZMQ frame counter")
+            cached_action_chunk = None
+            action_chunk_index = 0
+            print("Cleared cached action chunk")
+            if cpp_mode == "POSE":
+                print("Switching to PLANNER mode")
+                if send_cpp_control_command(start=True, planner=True):
+                    print("Switched to PLANNER mode (from POSE mode)")
+                else:
+                    print("Warning: Failed to switch to PLANNER mode")          
+            elif cpp_mode == "PLANNER":
+                print("Warning: C++ loop is already in PLANNER mode")
+            else:
+                print("Warning: C++ loop is not running")
         elif key == "p":
             pause_loop = not pause_loop
             print(f"{'Paused' if pause_loop else 'Resumed'} policy loop")
