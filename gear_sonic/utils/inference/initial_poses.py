@@ -30,3 +30,29 @@ LATENT_INITIAL_MOTION_TOKEN = np.array(
     ],
     dtype=np.float32,
 )
+
+VLA_INITIAL_UPPER_BODY_RAD: list[float] = [
+    0.0, 0.0, 0.0,
+    0.0, 0.0,  # shoulder_pitch
+    0.2, -0.2, # shoulder_roll
+    0.0, 0.0, # shoulder_yaw
+    0.0, 0.0, 
+    0.0, 0.0,
+    0.0, 0.0,
+    0.0, 0.0,
+]
+
+SONIC_STAND_UPPER_BODY_RAD: list[float] = [
+    0.0, 0.0, 0.0,
+    0.2, 0.2,
+    0.2, -0.2,
+    0.0, 0.0,
+    0.6, 0.6,
+    0.0, 0.0,
+    0.0, 0.0,
+    0.0, 0.0,
+]
+
+UPPER_BODY_MUJOCO_INDICES = [
+    12, 13, 14, 15, 22, 16, 23, 17, 24, 18, 25, 19, 26, 20, 27, 21, 28
+]

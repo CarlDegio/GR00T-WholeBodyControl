@@ -48,7 +48,7 @@ from gear_sonic.utils.data_collection.keyboard_subscriber import (
 from gear_sonic.utils.data_collection.telemetry import Telemetry
 from gear_sonic.utils.data_collection.transforms import compute_projected_gravity
 from gear_sonic.utils.data_collection.zmq_state_subscriber import ZMQStateSubscriber
-from gear_sonic.utils.inference.initial_poses import LATENT_INITIAL_MOTION_TOKEN
+from gear_sonic.utils.inference.initial_poses import SONIC_STAND_UPPER_BODY_RAD, VLA_INITIAL_UPPER_BODY_RAD, UPPER_BODY_MUJOCO_INDICES
 from gear_sonic.utils.inference.vla_utils import (
     calculate_latency_compensated_index,
     concat_action,
@@ -61,6 +61,7 @@ from gear_sonic.utils.teleop.solver.hand.g1_gripper_ik_solver import (
 from gear_sonic.utils.teleop.zmq.zmq_planner_sender import (
     build_command_message,
     pack_pose_message,
+    build_planner_message
 )
 
 
@@ -479,9 +480,33 @@ def main(config: InferenceConfig):
     initial_pose_left_hand_closed = False
     initial_pose_right_hand_closed = False
 
+    def _current_upper_body_planner_order(body_q: np.ndarray) -> np.ndarray:
+        return np.array([body_q[i] for i in UPPER_BODY_MUJOCO_INDICES], dtype=np.float32)
+
     def publish_initial_pose():
-        """Publish initial pose command to move robot to starting position."""
-        print("Moving to initial pose")
+        # Initial pose publishing in PLANNER mode
+        if cpp_mode != "PLANNER" or not cpp_loop_running:
+            print("Warning: Cannot publish initial pose in non-PLANNER mode or if C++ loop is not running")
+            return False
+        
+        duration = 3.0
+        hz = 50
+        period = 1.0 / hz
+        
+        zero_vel = np.zeros(17, dtype=np.float32)
+        target_ub = np.array(VLA_INITIAL_UPPER_BODY_RAD, dtype=np.float32)
+
+        state_msg = state_subscriber.get_msg(clear=False)
+        start_ub = None
+        if state_msg is not None and "body_q" in state_msg:
+            body_q = np.asarray(state_msg["body_q"], dtype=np.float32)
+            assert body_q.shape[0] == 29, "body_q must have shape (29,)"
+            start_ub = _current_upper_body_planner_order(body_q)        
+
+        if start_ub is None:
+            print("Error: Cannot read current body_q for initial pose ramp. Aborting.")
+            return False
+
         left_hand = (
             _compute_closed_hand_joints("L")
             if initial_pose_left_hand_closed
@@ -492,16 +517,55 @@ def main(config: InferenceConfig):
             if initial_pose_right_hand_closed
             else np.zeros(7, dtype=np.float32)
         )
-        zmq_message = pack_latent_action_message(
-            motion_token=LATENT_INITIAL_MOTION_TOKEN,
-            frame_index=np.array([0], dtype=np.int64),
-            left_hand_joints=left_hand,
-            right_hand_joints=right_hand,
-        )
-        zmq_socket.send(zmq_message)
-        print_green("Sent latent initial pose via ZMQ")
-        time.sleep(1.0)
-        print("Initial pose done.")
+
+        print(f"Moving to initial pose (PLANNER upper body ramp)...")
+        t0 = time.monotonic()
+
+        while True:
+            loop_t0 = time.monotonic()
+            elapsed = loop_t0 - t0
+            if elapsed >= duration:
+                break
+            
+            t = min(max(elapsed / duration, 0.0), 1.0)
+            alpha = t * t * (3.0 - 2.0 * t)
+            q_cmd = (1.0 - alpha) * start_ub + alpha * target_ub
+            zmq_socket.send(
+                build_planner_message(
+                    0,
+                    [0.0, 0.0, 0.0],
+                    [1.0, 0.0, 0.0],
+                    speed=-1.0,
+                    height=-1.0,
+                    upper_body_position=q_cmd.tolist(),
+                    upper_body_velocity=zero_vel.tolist(),
+                    left_hand_position=left_hand.tolist(),
+                    right_hand_position=right_hand.tolist(),
+                )
+            )
+            remaining = period - (time.monotonic() - loop_t0)
+            if remaining > 0:
+                time.sleep(remaining)
+
+        for _ in range(5):
+            zmq_socket.send(
+                build_planner_message(
+                    0,
+                    [0.0, 0.0, 0.0],
+                    [1.0, 0.0, 0.0],
+                    speed=-1.0,
+                    height=-1.0,
+                    upper_body_position=target_ub.tolist(),
+                    upper_body_velocity=zero_vel.tolist(),
+                    left_hand_position=left_hand.tolist(),
+                    right_hand_position=right_hand.tolist(),
+                )
+            )
+            time.sleep(0.02)
+
+
+        print_green("Initial pose published")
+        return True
 
     def send_cpp_control_command(start: bool, planner: bool = False):
         """Send C++ control loop start/stop commands via ZMQ."""
@@ -564,7 +628,7 @@ def main(config: InferenceConfig):
             print("Switch to pose mode")
             zmq_frame_counter = 0
             print("Reset ZMQ frame counter")
-            #publish_initial_pose() # BUG: This is not working as expected
+            publish_initial_pose()
             cached_action_chunk = None
             action_chunk_index = 0
             print("Cleared cached action chunk")

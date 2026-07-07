@@ -48,7 +48,7 @@ from gear_sonic.utils.teleop.zmq.zmq_planner_sender import build_planner_message
 LOCOMOTION_MODE_SLOW_WALK = 1
 LOCOMOTION_MODE_IDLE = 0
 
-HEADING_STEP = math.pi / 6.0
+HEADING_STEP = math.pi / 12.0
 # cbreak has no key-up; bridge Linux key-repeat delay (~500 ms) for W/S hold.
 MOVEMENT_KEY_HOLD_TIMEOUT_SEC = 0.55
 STDIN_KEY_DEBOUNCE_SEC = 0.12
@@ -79,6 +79,7 @@ class WASDKeyboardHandler:
     """Track WASD from terminal stdin (cbreak). Works in tmux on Wayland/X11."""
 
     TRACKED_KEYS = frozenset({"w", "a", "s", "d"})
+    HEADING_KEYS = frozenset({"a", "d"})
 
     def __init__(
         self,
@@ -113,7 +114,6 @@ class WASDKeyboardHandler:
         return os.read(self._fd, 1).decode(errors="ignore")
 
     def poll(self) -> tuple[int, int]:
-        """Drain stdin; return (left_heading_steps, right_heading_steps) for this poll."""
         now = time.monotonic()
         heading_left = 0
         heading_right = 0
@@ -124,17 +124,23 @@ class WASDKeyboardHandler:
             normalized = key_char.lower()
             if normalized not in self.TRACKED_KEYS:
                 continue
-
+            # A/D: 离散转向，不做 debounce，每轮 poll 最多一步
+            if normalized in self.HEADING_KEYS:
+                if heading_left or heading_right:
+                    continue  # 本轮已处理过一个转向键，忽略 repeat
+                if normalized == "a":
+                    heading_right = 1
+                else:  # "d"
+                    heading_left = 1
+                if self._debug:
+                    print(f"[KeyboardPlanner] heading key: {normalized!r}")
+                continue
+            # W/S: 保留 debounce + hold 逻辑
             last_accept = self._last_accept_time.get(normalized, 0.0)
             if now - last_accept < self._debounce_sec:
                 continue
-
             self._last_accept_time[normalized] = now
             self._key_times[normalized] = now
-            if normalized == "a":
-                heading_right += 1
-            elif normalized == "d":
-                heading_left += 1
             if self._debug:
                 print(f"[KeyboardPlanner] key: {normalized!r}")
         return heading_left, heading_right
