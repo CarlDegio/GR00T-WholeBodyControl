@@ -5,6 +5,7 @@ commands, steps physics, and publishes observations back via the SDK bridge.
 BaseSimulator wraps DefaultEnv with rate-limiting and viewer/image update loops.
 """
 
+import json
 import os
 import pathlib
 from pathlib import Path
@@ -18,6 +19,7 @@ import xml.etree.ElementTree as ET
 import mujoco
 import mujoco.viewer
 import numpy as np
+import zmq
 from scipy.spatial.transform import Rotation
 from unitree_sdk2py.core.channel import ChannelFactoryInitialize
 
@@ -40,6 +42,9 @@ class DefaultEnv:
         onscreen: bool = False,
         offscreen: bool = False,
         enable_image_publish: bool = False,
+        show_smpl_tracking: bool = False,
+        smpl_tracking_host: str = "localhost",
+        smpl_tracking_port: int = 5556,
     ):
         self.config = config
         self.env_name = env_name
@@ -60,8 +65,24 @@ class DefaultEnv:
         self.reward_lock = Lock()
         self.unitree_bridge = None
         self.onscreen = onscreen
+        self.show_smpl_tracking = show_smpl_tracking
+        self._smpl_socket = None
+        self._smpl_joints = None
+        self._smpl_frame_received = False
 
         self.init_scene()
+        if self.show_smpl_tracking:
+            if not self.onscreen:
+                raise ValueError("show_smpl_tracking requires an onscreen MuJoCo viewer")
+            self._smpl_context = zmq.Context()
+            self._smpl_socket = self._smpl_context.socket(zmq.SUB)
+            self._smpl_socket.setsockopt_string(zmq.SUBSCRIBE, "pose")
+            self._smpl_socket.setsockopt(zmq.CONFLATE, 1)
+            self._smpl_socket.connect(f"tcp://{smpl_tracking_host}:{smpl_tracking_port}")
+            print(
+                "SMPL tracking overlay enabled: "
+                f"tcp://{smpl_tracking_host}:{smpl_tracking_port}"
+            )
         self.last_reward = 0
 
         self.offscreen = offscreen
@@ -454,7 +475,68 @@ class DefaultEnv:
 
     def update_viewer(self):
         if self.viewer is not None:
+            self._update_smpl_tracking_overlay()
             self.viewer.sync()
+
+    def _update_smpl_tracking_overlay(self):
+        """Read the latest PICO pose and draw its 24 SMPL joints in MuJoCo."""
+        if self._smpl_socket is None:
+            return
+
+        try:
+            while self._smpl_socket.poll(timeout=0):
+                message = self._smpl_socket.recv(zmq.NOBLOCK)
+                topic_size = len(b"pose")
+                header_size = 1280
+                header_raw = message[topic_size : topic_size + header_size]
+                header_raw = header_raw.split(b"\x00", 1)[0]
+                header = json.loads(header_raw.decode("utf-8"))
+                offset = topic_size + header_size
+                dtype_map = {
+                    "f32": np.float32,
+                    "f64": np.float64,
+                    "i32": np.int32,
+                    "i64": np.int64,
+                    "u8": np.uint8,
+                    "bool": np.bool_,
+                }
+                for field in header.get("fields", []):
+                    dtype = np.dtype(dtype_map.get(field["dtype"], np.float32))
+                    shape = tuple(field["shape"])
+                    size = int(np.prod(shape)) * dtype.itemsize
+                    if field["name"] == "smpl_joints":
+                        values = np.frombuffer(message, dtype=dtype, count=int(np.prod(shape)), offset=offset)
+                        joints = values.reshape(shape)
+                        self._smpl_joints = np.asarray(joints[-1], dtype=np.float64)
+                        if not self._smpl_frame_received:
+                            print(f"Received first SMPL tracking frame: {joints.shape}")
+                            self._smpl_frame_received = True
+                    offset += size
+        except (ValueError, KeyError, json.JSONDecodeError, zmq.ZMQError) as exc:
+            print(f"Warning: failed to decode SMPL tracking frame: {exc}")
+
+        self.viewer.user_scn.ngeom = 0
+        if self._smpl_joints is None or self._smpl_joints.shape != (24, 3):
+            return
+
+        pelvis_id = self.mj_model.body("pelvis").id
+        pelvis_position = self.mj_data.xpos[pelvis_id]
+        pelvis_rotation = self.mj_data.xmat[pelvis_id].reshape(3, 3)
+        points_robot = self._smpl_joints - self._smpl_joints[0]
+        points = points_robot @ pelvis_rotation.T + pelvis_position
+        for point in points:
+            geom_index = self.viewer.user_scn.ngeom
+            if geom_index >= self.viewer.user_scn.maxgeom:
+                break
+            mujoco.mjv_initGeom(
+                self.viewer.user_scn.geoms[geom_index],
+                type=mujoco.mjtGeom.mjGEOM_SPHERE,
+                size=np.array([0.025, 0.0, 0.0]),
+                pos=point,
+                mat=np.eye(3).reshape(-1),
+                rgba=np.array([0.1, 0.8, 1.0, 0.9]),
+            )
+            self.viewer.user_scn.ngeom += 1
 
     def update_viewer_camera(self):
         if self.viewer is not None:
@@ -525,6 +607,12 @@ class DefaultEnv:
 
     def reset(self):
         mujoco.mj_resetData(self.mj_model, self.mj_data)
+
+    def close(self):
+        if self._smpl_socket is not None:
+            self._smpl_socket.close(linger=0)
+            self._smpl_socket = None
+            self._smpl_context.term()
 
 
 class BaseSimulator:
@@ -645,6 +733,7 @@ class BaseSimulator:
     def close(self):
         self._running = False
         try:
+            self.sim_env.close()
             if self.sim_env.image_publish_process is not None:
                 self.sim_env.image_publish_process.stop()
             if self.sim_env.viewer is not None:

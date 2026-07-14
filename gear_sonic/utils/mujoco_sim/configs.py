@@ -342,5 +342,14 @@ class SimLoopConfig(BaseConfig):
     camera_port: int = 5555
     """Camera port for image publishing"""
 
+    show_smpl_tracking: bool = False
+    """Overlay live PICO SMPL tracking joints in the MuJoCo viewer."""
+
+    smpl_tracking_host: str = "localhost"
+    """Host running the PICO pose publisher."""
+
+    smpl_tracking_port: int = 5556
+    """Port of the PICO pose publisher."""
+
     verbose: bool = False
     """Verbose output, override the base config verbose"""

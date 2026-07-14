@@ -367,6 +367,11 @@ class GrootDataCollector:
                 self._print_and_say("Stopping recording, preparing to save", blocking=False)
             elif self._episode_state.get_state() == self._episode_state.IDLE:
                 self._print_and_say("Saved episode and back to idle state", blocking=False)
+        elif key == "e":
+            if self._episode_state.get_state() == self._episode_state.RECORDING:
+                self._episode_state.change_state()  # → NEED_TO_SAVE
+                self._print_and_say("Stopping recording, preparing to save", blocking=False)
+        
         elif key == "x":
             if self._episode_state.get_state() == self._episode_state.RECORDING:
                 self.data_exporter.save_episode_as_discarded()

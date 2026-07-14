@@ -49,13 +49,16 @@ echo "[OK] uv $(uv --version)"
 # ── 2. Install a uv-managed Python 3.10 (includes dev headers / Python.h) ────
 echo "[INFO] Installing uv-managed Python 3.10 (includes development headers) …"
 uv python install 3.10
-MANAGED_PY="$(uv python find --no-project 3.10)"
-echo "[OK] Using Python: $MANAGED_PY"
 
 # ── 3. Clean previous venv (if any) ──────────────────────────────────────────
 cd "$REPO_ROOT"
 echo "[INFO] Removing old .venv_data_collection (if present) …"
 rm -rf .venv_data_collection
+
+# Resolve the managed interpreter after removing the old venv so uv does not
+# pick up a stale .venv_data_collection/bin/python path.
+MANAGED_PY="$(uv python find --no-project 3.10)"
+echo "[OK] Using Python: $MANAGED_PY"
 
 # ── 4. Create venv & install data_collection extra ───────────────────────────
 echo "[INFO] Creating .venv_data_collection with uv-managed Python 3.10 …"
