@@ -206,10 +206,10 @@ def validate_script_configs(dataset_paths: list[Path]) -> dict | None:
     if not configs:
         return None
 
-    canonical = json.dumps(next(iter(configs.values())), sort_keys=True)
+    canonical = next(iter(configs.values()))
     mismatched = []
     for name, cfg in configs.items():
-        if json.dumps(cfg, sort_keys=True) != canonical:
+        if cfg != canonical:
             mismatched.append(name)
 
     if mismatched:
