@@ -52,7 +52,7 @@ import time
 
 
 def _bootstrap_venv():
-    """Re-exec with the .venv_inference Python if tyro is not available."""
+    """Re-exec with the inference Python if tyro is not available."""
     try:
         import tyro  # noqa: F401
         return
@@ -146,7 +146,7 @@ class InferenceLaunchConfig:
     """Camera server port."""
 
     keyboard_planner: bool = True
-    """Start the keyboard planner sidecar for planning during inference."""
+    """Start the REASEN keyboard, Filter planner, and MID-360 sidecars."""
 
     keyboard_planner_port: int = 5558
     """Keyboard planner sidecar port."""
@@ -156,6 +156,21 @@ class InferenceLaunchConfig:
 
     keyboard_planner_host: str = "localhost"
     """Keyboard planner sidecar host."""
+
+    reasan_ray_port: int = 5562
+    """MID-360 ActorRay publisher port."""
+
+    reasan_planner_port: int = 5563
+    """Filtered SONIC planner publisher port consumed by VLA inference."""
+
+    reasan_radar_interface: str = "enx6c1ff7bed314"
+    """Network interface connected to the G1 MID-360."""
+
+    reasan_filter_onnx: str = (
+        "/home/user/Project/REASAN/training/logs/rsl_rl/g1_filter/"
+        "g1_filter_bigger_z_speed/exported/filter_g1_model_19998.onnx"
+    )
+    """G1 REASEN Filter ONNX path."""
 
     # Data exporter (optional recording during inference)
     data_exporter: bool = True
@@ -190,6 +205,11 @@ def _check_prerequisites(config: InferenceLaunchConfig):
         errors.append(
             ".venv_inference not found. Run: bash install_scripts/install_inference.sh"
         )
+    if not (repo_root / ".venv_teleop" / "bin" / "activate").exists():
+        errors.append(".venv_teleop not found. Run: bash install_scripts/install_pico.sh")
+
+    if config.keyboard_planner and not Path(config.reasan_filter_onnx).is_file():
+        errors.append(f"REASEN Filter ONNX not found: {config.reasan_filter_onnx}")
 
     deploy_dir = repo_root / "gear_sonic_deploy"
     if not (deploy_dir / "deploy.sh").exists():
@@ -226,8 +246,12 @@ def _kill_existing_session():
 
 
 def _create_tmux_session():
+    bash = shutil.which("bash") or "/bin/bash"
     subprocess.run(
-        ["tmux", "new-session", "-d", "-s", SESSION_NAME],
+        [
+            "tmux", "new-session", "-d", "-x", "240", "-y", "60",
+            "-s", SESSION_NAME, bash, "--noprofile", "--norc",
+        ],
         check=True,
     )
     subprocess.run(
@@ -240,16 +264,33 @@ def _create_tmux_session():
         ["tmux", "rename-window", "-t", f"{SESSION_NAME}:0", "inference"],
     )
 
-    # Split into 4 panes: 0|1 / 2|3
-    subprocess.run(
-        ["tmux", "split-window", "-t", f"{SESSION_NAME}:0", "-h"],
-    )
-    subprocess.run(
-        ["tmux", "split-window", "-t", f"{SESSION_NAME}:0.0", "-v"],
-    )
-    subprocess.run(
-        ["tmux", "split-window", "-t", f"{SESSION_NAME}:0.2", "-v"],
-    )
+    # Build two rows first, then split each row into three columns. This also
+    # works when the detached tmux server initially reports a short terminal.
+    top_pane = subprocess.run(
+        ["tmux", "display-message", "-p", "-t", f"{SESSION_NAME}:0.0", "#{pane_id}"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    bottom_pane = subprocess.run(
+        [
+            "tmux", "split-window", "-v", "-t", top_pane, "-P", "-F", "#{pane_id}",
+            bash, "--noprofile", "--norc",
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    for row_pane in (top_pane, bottom_pane):
+        for _ in range(2):
+            subprocess.run(
+                [
+                    "tmux", "split-window", "-h", "-t", row_pane,
+                    bash, "--noprofile", "--norc",
+                ],
+                check=True,
+            )
+    subprocess.run(["tmux", "select-layout", "-t", f"{SESSION_NAME}:0", "tiled"], check=True)
 
     time.sleep(5)
 
@@ -365,7 +406,9 @@ def main(config: InferenceLaunchConfig):
         f"--action-publish-rate {config.action_publish_rate} "
         f"--action-horizon {config.action_horizon} "
         f"--camera-host {config.camera_host} "
-        f"--camera-port {config.camera_port}"
+        f"--camera-port {config.camera_port} "
+        f"--planner-relay-zmq-host localhost "
+        f"--planner-relay-zmq-port {config.reasan_planner_port}"
     )
 
     print("Starting VLA inference (pane 1)...")
@@ -391,25 +434,48 @@ def main(config: InferenceLaunchConfig):
     encoded = base64.b64encode(keyboard_script.encode()).decode()
     keyboard_cmd = (
         f"cd {repo_root} && "
-        f"source .venv_inference/bin/activate && "
+        f"source .venv_teleop/bin/activate && "
         f"python -c \"import base64;exec(base64.b64decode('{encoded}'))\""
     )
 
     print("Starting keyboard publisher (pane 2)...")
     _send_to_pane(1, keyboard_cmd, wait=2.0)
 
-    # --- Pane 3 (bottom-right): Data Exporter (optional) ---
+    # --- Panes 3-5: REASEN keyboard, Filter planner, and MID-360 ---
     if config.keyboard_planner:
-        planner_cmd = (
+        reasan_keyboard_cmd = (
             f"cd {repo_root} && "
-            f"source .venv_inference/bin/activate && "
+            f"source .venv_teleop/bin/activate && "
             f"python gear_sonic/scripts/keyboard_planner_thread_server.py "
             f"--port {config.keyboard_planner_port} "
             f"--hz {config.keyboard_planner_publish_rate} "
             f"--host {config.keyboard_planner_host} "
         )
-        print("Starting keyboard planner sidecar (pane 3)...")
-        _send_to_pane(3, planner_cmd, wait=2.0)
+        reasan_planner_cmd = (
+            f"cd {repo_root} && "
+            f"source .venv_teleop/bin/activate && "
+            f"python gear_sonic/scripts/reasan_planner.py "
+            f"--filter {config.reasan_filter_onnx} "
+            f"--ray-endpoint tcp://127.0.0.1:{config.reasan_ray_port} "
+            f"--keyboard-endpoint tcp://127.0.0.1:{config.keyboard_planner_port} "
+            f"--output-endpoint 'tcp://*:{config.reasan_planner_port}' "
+            f"--suppress-output-on-zero-input"
+        )
+        radar_cmd = (
+            f"cd {repo_root} && "
+            f"source .venv_teleop/bin/activate && "
+            f"python tools/mid360_reasan_open3d.py "
+            f"--interface {config.reasan_radar_interface} "
+            f"--ray-source direct --min-range 0.3 --filter-ground "
+            f"--ray-median-window 5 "
+            f"--zmq-endpoint 'tcp://*:{config.reasan_ray_port}'"
+        )
+        print("Starting REASEN keyboard (pane 3)...")
+        _send_to_pane(3, reasan_keyboard_cmd, wait=1.0)
+        print("Starting REASEN Filter planner (pane 4)...")
+        _send_to_pane(4, reasan_planner_cmd, wait=1.0)
+        print("Starting MID-360 ActorRay publisher (pane 5)...")
+        _send_to_pane(5, radar_cmd, wait=2.0)
 
 
     if config.data_exporter:
@@ -450,10 +516,12 @@ def main(config: InferenceLaunchConfig):
         print("    MuJoCo Simulator (.venv_sim)")
         print()
     print("  Window 'inference':")
-    print("    Pane 0 (top-left):     C++ Deploy")
-    print("    Pane 1 (bottom-left):  Keyboard Publisher")
-    print("    Pane 2 (top-right):    VLA Inference  <-- you are here")
-    print("    Pane 3 (bottom-right): Keyboard Planner")
+    print("    Pane 0: C++ Deploy")
+    print("    Pane 1: SONIC Keyboard Publisher")
+    print("    Pane 2: VLA Inference")
+    print("    Pane 3: REASEN Keyboard")
+    print("    Pane 4: REASEN Filter ONNX Planner")
+    print("    Pane 5: MID-360 ActorRay/IMU")
     if config.data_exporter:
         print("    Window 'data_exporter':")
         print("      Data Exporter (.venv_data_collection)")
@@ -464,7 +532,7 @@ def main(config: InferenceLaunchConfig):
     print()
     print("  Planner workflow:")
     print("    1. In pane 1: k (start) -> o (PLANNER mode)")
-    print("    2. In pane 3: W/S/A/D for locomotion")
+    print("    2. In pane 3: W/S/A/D/Q/E for filtered locomotion")
     print("    3. In pane 1: i (POSE mode)")
     print("  Keyboard controls (type in pane 1):")
     print("    p        - Pause / resume inference")
