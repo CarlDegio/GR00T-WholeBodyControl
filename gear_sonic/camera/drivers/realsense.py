@@ -80,11 +80,20 @@ class RealSenseSensor(Sensor, SensorServer):
                     rs.format.z16,
                     config.fps,
                 )
-            self.pipeline.start(self.config)
+            pipeline_profile = self.pipeline.start(self.config)
         except Exception as e:
             raise RuntimeError(f"Failed to start RealSense pipeline: {e}")
 
         self._realsense_config = config
+        self._align = None
+        self._depth_scale_m = None
+        if config.enable_depth:
+            self._align = rs.align(rs.stream.color)
+            self._depth_scale_m = (
+                pipeline_profile.get_device()
+                .first_depth_sensor()
+                .get_depth_scale()
+            )
         self._run_as_server = run_as_server
         self.mount_position = mount_position
         if self._run_as_server:
@@ -117,6 +126,8 @@ class RealSenseSensor(Sensor, SensorServer):
     def read(self) -> dict[str, Any] | None:
         try:
             frames = self.pipeline.wait_for_frames()
+            if self._realsense_config.enable_depth:
+                frames = self._align.process(frames)
         except Exception as e:
             print(f"ERROR! Failed to wait for frames: {e}")
             return None
@@ -141,6 +152,7 @@ class RealSenseSensor(Sensor, SensorServer):
         current_time = time.time()
         timestamps = {self.mount_position: current_time}
         images = {self.mount_position: color_image}
+        camera_info = {}
 
         if self._realsense_config.enable_depth:
             if not depth_frame:
@@ -159,11 +171,32 @@ class RealSenseSensor(Sensor, SensorServer):
 
             timestamps[f"{self.mount_position}_depth"] = current_time
             images[f"{self.mount_position}_depth"] = depth_image
+            intrinsics = (
+                color_frame.profile.as_video_stream_profile().intrinsics
+            )
+            camera_info[self.mount_position] = {
+                "fx": float(intrinsics.fx),
+                "fy": float(intrinsics.fy),
+                "cx": float(intrinsics.ppx),
+                "cy": float(intrinsics.ppy),
+                "width": int(intrinsics.width),
+                "height": int(intrinsics.height),
+                "depth_scale_m": float(self._depth_scale_m),
+                "depth_aligned_to": self.mount_position,
+            }
 
-        return {"timestamps": timestamps, "images": images}
+        return {
+            "timestamps": timestamps,
+            "images": images,
+            "camera_info": camera_info,
+        }
 
     def serialize(self, data: dict[str, Any]) -> dict[str, Any]:
-        serialized_msg = ImageMessageSchema(timestamps=data["timestamps"], images=data["images"])
+        serialized_msg = ImageMessageSchema(
+            timestamps=data["timestamps"],
+            images=data["images"],
+            camera_info=data.get("camera_info", {}),
+        )
         return serialized_msg.serialize()
 
     def observation_space(self):

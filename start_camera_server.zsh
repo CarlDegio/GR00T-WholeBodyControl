@@ -5,4 +5,5 @@
     --chest-camera realsense --chest-device-id 408122070390 \
     --left-wrist-camera realsense --left-wrist-device-id 218622279421 \
     --right-wrist-camera realsense --right-wrist-device-id 352122270966 \
+    --realsense-enable-depth \
     --port 5555
