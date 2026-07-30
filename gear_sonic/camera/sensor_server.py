@@ -137,7 +137,10 @@ class ImageMessageSchema:
                 mat = cv2.imdecode(np.frombuffer(value, dtype=np.uint8), cv2.IMREAD_COLOR)
                 images[key] = mat[..., ::-1]  # BGR -> RGB
             elif isinstance(value, str):
-                images[key] = ImageUtils.decode_image(value)
+                if key.endswith("_depth"):
+                    images[key] = ImageUtils.decode_depth_image(value)
+                else:
+                    images[key] = ImageUtils.decode_image(value)
             elif isinstance(value, np.ndarray):
                 images[key] = value
             elif isinstance(value, dict) and b"nd" in value:

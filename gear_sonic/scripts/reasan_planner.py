@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run the G1 REASEN Filter ONNX and publish SONIC planner messages."""
+"""Apply a TTC/distance potential field to ActorRay and publish SONIC planner messages."""
 
 from __future__ import annotations
 
@@ -14,9 +14,7 @@ import time
 from typing import Any
 
 import numpy as np
-import onnxruntime as ort
 import zmq
-
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
@@ -28,12 +26,8 @@ from gear_sonic.utils.teleop.zmq.zmq_planner_sender import (  # noqa: E402
 
 RAY_MESSAGE_TYPE = "reasan_actor_ray"
 COMMAND_MESSAGE_TYPE = "navila_reasan_velocity_command"
-DEFAULT_FILTER = Path(
-    "/home/user/Project/REASAN/training/logs/rsl_rl/g1_filter/"
-    "g1_filter_bigger_z_speed/exported/filter_g1_model_19998.onnx"
-)
-COMMAND_LOWER = np.array([-0.5, -0.15, -1.0], dtype=np.float32)
-COMMAND_UPPER = np.array([1.0, 0.15, 1.0], dtype=np.float32)
+COMMAND_LOWER = np.array([-0.5, -0.3, -1.0], dtype=np.float32)
+COMMAND_UPPER = np.array([1.0, 0.3, 1.0], dtype=np.float32)
 
 
 @dataclass
@@ -57,26 +51,12 @@ def decode_actor_ray(raw: bytes | str) -> dict[str, Any]:
     if not isinstance(message, dict) or message.get("type") != RAY_MESSAGE_TYPE or message.get("version") != 1:
         raise ValueError("unsupported ActorRay message")
     rays = np.asarray(message.get("normalized"), dtype=np.float32)
-    gravity = np.asarray(message.get("projected_gravity"), dtype=np.float32)
-    angular_velocity = np.asarray(message.get("angular_velocity"), dtype=np.float32)
     if rays.shape != (180,) or not np.isfinite(rays).all() or np.any((rays < 0.0) | (rays > 1.0)):
         raise ValueError("ActorRay must contain 180 finite normalized values in [0,1]")
-    if gravity.shape != (3,) or angular_velocity.shape != (3,):
-        raise ValueError("ActorRay message is missing projected_gravity/angular_velocity")
-    if not np.isfinite(gravity).all() or not np.isfinite(angular_velocity).all():
-        raise ValueError("IMU features must be finite")
-    if not bool(message.get("imu_valid", False)):
-        raise ValueError("IMU has not received a valid sample")
-    imu_age = float(message.get("imu_age_s", math.inf))
-    if not math.isfinite(imu_age) or imu_age < 0.0:
-        raise ValueError("invalid IMU age")
     return {
         "sequence": int(message["sequence"]),
         "source": str(message.get("source", "unknown")),
         "rays": rays,
-        "gravity": gravity,
-        "angular_velocity": angular_velocity,
-        "imu_age": imu_age,
     }
 
 
@@ -107,45 +87,102 @@ def decode_velocity_command(raw: bytes | str) -> dict[str, Any]:
     }
 
 
-class ReasanFilterOnnx:
-    def __init__(self, model_path: Path, action_ema_alpha: float) -> None:
-        providers = [p for p in ("CUDAExecutionProvider", "CPUExecutionProvider") if p in ort.get_available_providers()]
-        self.session = ort.InferenceSession(str(model_path), providers=providers)
-        expected_inputs = {"proprio_obs", "ray_obs", "h_in", "c_in"}
-        expected_outputs = {"actions", "h_out", "c_out"}
-        if {item.name for item in self.session.get_inputs()} != expected_inputs:
-            raise ValueError(f"unexpected Filter inputs: {[item.name for item in self.session.get_inputs()]}")
-        if {item.name for item in self.session.get_outputs()} != expected_outputs:
-            raise ValueError(f"unexpected Filter outputs: {[item.name for item in self.session.get_outputs()]}")
-        self.action_ema_alpha = action_ema_alpha
-        self.hidden = np.zeros((1, 1, 256), dtype=np.float32)
-        self.cell = np.zeros((1, 1, 256), dtype=np.float32)
-        self.previous_action = np.zeros(3, dtype=np.float32)
-        print(f"[REASEN Filter] {model_path} | providers={self.session.get_providers()}")
+@dataclass(frozen=True)
+class PotentialFieldResult:
+    velocity: np.ndarray
+    danger: float
+    obstacle_direction: np.ndarray
+    avoidance_side: float
+
+
+class TtcPotentialField:
+    """NumPy equivalent of REASEN's training/play safe-velocity field."""
+
+    def __init__(self, control_dt: float) -> None:
+        if control_dt <= 0.0:
+            raise ValueError("control_dt must be positive")
+        angles = np.arange(180, dtype=np.float32) * (2.0 * np.pi / 180.0) - np.pi
+        self.directions = np.stack((np.cos(angles), np.sin(angles)), axis=-1)
+        self.control_dt = control_dt
+        self.previous_side = 0.0
+        self.yaw_rate = 0.0
 
     def reset(self) -> None:
-        self.hidden.fill(0.0)
-        self.cell.fill(0.0)
-        self.previous_action.fill(0.0)
+        self.previous_side = 0.0
+        self.yaw_rate = 0.0
 
-    def infer(self, command: np.ndarray, ray: dict[str, Any], suppress_zero: bool) -> np.ndarray:
+    def step_normalized(self, command: np.ndarray, normalized_rays: np.ndarray) -> PotentialFieldResult:
+        rays = np.asarray(normalized_rays, dtype=np.float32)
+        if rays.shape != (180,) or not np.isfinite(rays).all():
+            raise ValueError("normalized ActorRay must contain 180 finite values")
+        return self.step(command, np.clip(rays, 0.0, 1.0) * 3.0)
+
+    def step(self, command: np.ndarray, ray_distances: np.ndarray) -> PotentialFieldResult:
         command = np.clip(np.asarray(command, dtype=np.float32), COMMAND_LOWER, COMMAND_UPPER)
-        proprio = np.concatenate(
-            (ray["angular_velocity"] * 0.25, ray["gravity"], command, self.previous_action)
-        )[None].astype(np.float32)
-        actions, self.hidden, self.cell = self.session.run(
-            ["actions", "h_out", "c_out"],
-            {"proprio_obs": proprio, "ray_obs": ray["rays"][None], "h_in": self.hidden, "c_in": self.cell},
-        )
-        action = np.clip(np.asarray(actions, dtype=np.float32).reshape(3), COMMAND_LOWER, COMMAND_UPPER)
-        if suppress_zero and np.all(np.abs(command) <= 1.0e-6):
-            action.fill(0.0)
-            self.previous_action.fill(0.0)
-            return action
-        if self.action_ema_alpha > 0.0:
-            action = self.action_ema_alpha * self.previous_action + (1.0 - self.action_ema_alpha) * action
-        self.previous_action = action.copy()
-        return action
+        distances = np.nan_to_num(np.asarray(ray_distances, dtype=np.float32), posinf=3.0)
+        if distances.shape != (180,):
+            raise ValueError("ray_distances must have shape [180]")
+        distances = np.clip(distances, 0.0, 3.0)
+        command_xy = command[:2]
+        command_speed = float(np.linalg.norm(command_xy))
+        if command_speed <= 1.0e-6:
+            self.reset()
+            return PotentialFieldResult(
+                np.zeros(3, dtype=np.float32), 0.0, np.zeros(2, dtype=np.float32), 0.0
+            )
+
+        command_direction = command_xy / command_speed
+        obstacle_vectors = distances[:, None] * self.directions
+        along = obstacle_vectors @ command_direction
+        lateral_sq = np.maximum(distances**2 - along**2, 0.0)
+        intersects = (along > 0.0) & (lateral_sq < 0.3**2)
+        contact_offset = np.sqrt(np.maximum(0.3**2 - lateral_sq, 0.0))
+        distance_to_contact = np.maximum(along - contact_offset, 0.0)
+        ttc = np.full(180, np.inf, dtype=np.float32)
+        ttc[intersects] = distance_to_contact[intersects] / command_speed
+        ttc_risk = np.clip((3.0 - ttc) / 3.0, 0.0, 1.0) ** 4
+        clearance = np.maximum(distances - 0.3, 0.0)
+        distance_risk = np.clip((1.2 - clearance) / 1.2, 0.0, 1.0) ** 4
+        risk = 0.7 * ttc_risk + 0.3 * distance_risk
+
+        obstacle_sum = np.sum(risk[:, None] * self.directions, axis=0)
+        obstacle_mass = max(float(np.sum(risk)), 1.0e-6)
+        obstacle_norm = float(np.linalg.norm(obstacle_sum))
+        obstacle_direction = obstacle_sum / max(obstacle_norm, 1.0e-6)
+        coherence = float(np.clip(obstacle_norm / obstacle_mass, 0.0, 1.0))
+        danger = float(np.max(risk) * coherence)
+
+        radial_velocity = -0.625 * danger * obstacle_direction
+        closing_speed = max(float(command_xy @ obstacle_direction), 0.0)
+        removed_velocity = command_xy - danger * closing_speed * obstacle_direction
+
+        approach = np.maximum(self.directions @ command_direction, 0.0)
+        cross = command_direction[0] * self.directions[:, 1] - command_direction[1] * self.directions[:, 0]
+        forward = approach > 1.0e-6
+        left = forward & (cross > 1.0e-6)
+        right = forward & (cross < -1.0e-6)
+        left_clearance = float(np.sum(distances[left]) / max(int(np.sum(left)), 1))
+        right_clearance = float(np.sum(distances[right]) / max(int(np.sum(right)), 1))
+        side = float(np.tanh((left_clearance - right_clearance + 0.15 * self.previous_side) / 0.25))
+        self.previous_side = float(np.clip(side, -1.0, 1.0))
+
+        left_tangent = np.array([-obstacle_direction[1], obstacle_direction[0]], dtype=np.float32)
+        tangent_velocity = 0.5 * danger * command_speed * self.previous_side * left_tangent
+        safe_xy = removed_velocity + tangent_velocity + radial_velocity
+        reverse = min(float(safe_xy @ command_direction), 0.0)
+        safe_xy -= reverse * command_direction
+        safe_xy = np.clip(safe_xy, COMMAND_LOWER[:2], COMMAND_UPPER[:2])
+
+        yaw_target = 0.0
+        if float(np.linalg.norm(safe_xy)) < 0.15:
+            safe_xy.fill(0.0)
+            turn_side = float(np.sign(self.previous_side)) or 1.0
+            yaw_target = 0.5 * turn_side
+        max_yaw_delta = 2.0 * self.control_dt
+        self.yaw_rate += float(np.clip(yaw_target - self.yaw_rate, -max_yaw_delta, max_yaw_delta))
+        self.yaw_rate = float(np.clip(self.yaw_rate, COMMAND_LOWER[2], COMMAND_UPPER[2]))
+        velocity = np.array([safe_xy[0], safe_xy[1], self.yaw_rate], dtype=np.float32)
+        return PotentialFieldResult(velocity, danger, obstacle_direction.astype(np.float32), self.previous_side)
 
 
 @dataclass
@@ -166,17 +203,13 @@ class PlannerState:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--filter", type=Path, default=DEFAULT_FILTER)
     parser.add_argument("--ray-endpoint", default="tcp://127.0.0.1:5562")
     parser.add_argument("--keyboard-endpoint", default="tcp://127.0.0.1:5558")
     parser.add_argument("--output-endpoint", default="tcp://*:5563")
-    parser.add_argument("--filter-hz", type=float, default=50.0)
+    parser.add_argument("--control-hz", type=float, default=50.0)
     parser.add_argument("--output-hz", type=float, default=20.0)
     parser.add_argument("--ray-timeout", type=float, default=0.35)
-    parser.add_argument("--imu-timeout", type=float, default=0.15)
     parser.add_argument("--keyboard-timeout", type=float, default=0.7)
-    parser.add_argument("--action-ema-alpha", type=float, default=0.0)
-    parser.add_argument("--suppress-output-on-zero-input", action="store_true")
     parser.add_argument("--status-hz", type=float, default=2.0)
     return parser.parse_args()
 
@@ -192,12 +225,10 @@ def make_latest_subscriber(context: zmq.Context, endpoint: str) -> zmq.Socket:
 
 def main() -> None:
     args = parse_args()
-    positive = (args.filter_hz, args.output_hz, args.ray_timeout, args.imu_timeout, args.keyboard_timeout, args.status_hz)
-    if min(positive) <= 0.0 or not 0.0 <= args.action_ema_alpha < 1.0:
-        raise ValueError("frequencies/timeouts must be positive and EMA alpha must be in [0,1)")
-    if not args.filter.is_file():
-        raise FileNotFoundError(f"Filter ONNX not found: {args.filter}")
-    filter_model = ReasanFilterOnnx(args.filter, args.action_ema_alpha)
+    positive = (args.control_hz, args.output_hz, args.ray_timeout, args.keyboard_timeout, args.status_hz)
+    if min(positive) <= 0.0:
+        raise ValueError("frequencies and timeouts must be positive")
+    potential_field = TtcPotentialField(control_dt=1.0 / args.control_hz)
     context = zmq.Context.instance()
     ray_socket = make_latest_subscriber(context, args.ray_endpoint)
     keyboard_socket = make_latest_subscriber(context, args.keyboard_endpoint)
@@ -210,7 +241,7 @@ def main() -> None:
     latest_ray, latest_command = LatestValue(), LatestValue()
     planner = PlannerState()
     safe_velocity = np.zeros(3, dtype=np.float32)
-    running, healthy_last, turn_bypass_last = True, False, False
+    running, healthy_last = True, False
 
     def stop(_signum=None, _frame=None) -> None:
         nonlocal running
@@ -218,11 +249,13 @@ def main() -> None:
 
     signal.signal(signal.SIGINT, stop)
     signal.signal(signal.SIGTERM, stop)
-    filter_period, output_period = 1.0 / args.filter_hz, 1.0 / args.output_hz
-    next_filter = next_output = next_status = time.monotonic()
+    control_period, output_period = 1.0 / args.control_hz, 1.0 / args.output_hz
+    next_control = next_output = next_status = time.monotonic()
     print(f"[REASEN Planner] rays={args.ray_endpoint} keyboard={args.keyboard_endpoint}")
-    print(f"[REASEN Planner] SONIC PUB={args.output_endpoint}, Filter={args.filter_hz:g} Hz, output={args.output_hz:g} Hz")
-    print(f"[REASEN Planner] EMA={args.action_ema_alpha:g}, suppress-zero={args.suppress_output_on_zero_input}")
+    print(
+        f"[REASEN Planner] SONIC PUB={args.output_endpoint}, TTC/distance field={args.control_hz:g} Hz, "
+        f"output={args.output_hz:g} Hz"
+    )
     try:
         while running:
             events = dict(poller.poll(1))
@@ -239,40 +272,27 @@ def main() -> None:
                     print(f"[REASEN Planner] Ignored keyboard command: {exc}")
 
             ray_ok = latest_ray.age(now) <= args.ray_timeout
-            imu_ok = ray_ok and latest_ray.value["imu_age"] + latest_ray.age(now) <= args.imu_timeout
             command_age = latest_command.age(now)
             command_ok = latest_command.value is not None and command_age <= min(
                 args.keyboard_timeout, latest_command.value["duration"]
             )
-            healthy = bool(ray_ok and imu_ok and latest_command.value is not None)
+            healthy = bool(ray_ok and command_ok)
             command = latest_command.value["velocity"] if command_ok else np.zeros(3, dtype=np.float32)
-            turn_bypass = bool(
-                command_ok
-                and abs(float(command[0])) <= 1.0e-6
-                and abs(float(command[1])) <= 1.0e-6
-                and abs(float(command[2])) > 1.0e-6
-            )
-            if now >= next_filter:
-                if turn_bypass:
-                    if not turn_bypass_last:
-                        filter_model.reset()
-                    safe_velocity = command.copy()
-                elif healthy:
-                    if turn_bypass_last:
-                        filter_model.reset()
-                    safe_velocity = filter_model.infer(command, latest_ray.value, args.suppress_output_on_zero_input)
+            if now >= next_control:
+                if healthy:
+                    field = potential_field.step_normalized(command, latest_ray.value["rays"])
+                    safe_velocity = field.velocity
                 else:
                     safe_velocity.fill(0.0)
-                    if healthy_last or turn_bypass_last:
-                        filter_model.reset()
+                    if healthy_last:
+                        potential_field.reset()
                 healthy_last = healthy
-                turn_bypass_last = turn_bypass
-                next_filter = now + filter_period
+                next_control = now + control_period
             if now >= next_output:
                 output.send(planner.message(safe_velocity, output_period))
                 next_output = now + output_period
             if now >= next_status:
-                status = "TURN-BYPASS" if turn_bypass else ("OK" if healthy else "SAFE-STOP")
+                status = "OK" if healthy else "SAFE-STOP"
                 print(
                     f"[REASEN Planner] {status} ray_age={latest_ray.age(now):.3f}s "
                     f"cmd_age={command_age:.3f}s in={command.tolist()} out={safe_velocity.tolist()}"

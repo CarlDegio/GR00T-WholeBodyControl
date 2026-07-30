@@ -41,6 +41,7 @@ Usage (from repo root — no venv activation needed):
 from dataclasses import dataclass
 from pathlib import Path
 import os
+import shlex
 import shutil
 import signal
 import socket
@@ -49,6 +50,7 @@ import subprocess
 import sys
 import textwrap
 import time
+from typing import Literal
 
 
 def _bootstrap_venv():
@@ -157,6 +159,21 @@ class InferenceLaunchConfig:
     keyboard_planner_host: str = "localhost"
     """Keyboard planner sidecar host."""
 
+    planner_input: Literal["keyboard", "navila"] = "keyboard"
+    """REASEN command source used in pane 3."""
+
+    navila_host: str = "124.220.175.102"
+    """Remote NaVILA PolicyServer host."""
+
+    navila_port: int = 29999
+    """Remote NaVILA REQ/REP policy port."""
+
+    navila_api_token: str = ""
+    """Optional token accepted by the remote NaVILA policy server."""
+
+    navila_instruction: str = "Navigate safely toward the goal."
+    """Instruction sent with each NaVILA camera request."""
+
     reasan_ray_port: int = 5562
     """MID-360 ActorRay publisher port."""
 
@@ -165,12 +182,6 @@ class InferenceLaunchConfig:
 
     reasan_radar_interface: str = "enx6c1ff7bed314"
     """Network interface connected to the G1 MID-360."""
-
-    reasan_filter_onnx: str = (
-        "/home/user/Project/REASAN/training/logs/rsl_rl/g1_filter/"
-        "g1_filter_bigger_z_speed/exported/filter_g1_model_19998.onnx"
-    )
-    """G1 REASEN Filter ONNX path."""
 
     # Data exporter (optional recording during inference)
     data_exporter: bool = True
@@ -208,8 +219,8 @@ def _check_prerequisites(config: InferenceLaunchConfig):
     if not (repo_root / ".venv_teleop" / "bin" / "activate").exists():
         errors.append(".venv_teleop not found. Run: bash install_scripts/install_pico.sh")
 
-    if config.keyboard_planner and not Path(config.reasan_filter_onnx).is_file():
-        errors.append(f"REASEN Filter ONNX not found: {config.reasan_filter_onnx}")
+    if config.keyboard_planner and config.planner_input == "navila" and not config.navila_host:
+        errors.append("--navila-host is required when --planner-input navila")
 
     deploy_dir = repo_root / "gear_sonic_deploy"
     if not (deploy_dir / "deploy.sh").exists():
@@ -443,36 +454,49 @@ def main(config: InferenceLaunchConfig):
 
     # --- Panes 3-5: REASEN keyboard, Filter planner, and MID-360 ---
     if config.keyboard_planner:
-        reasan_keyboard_cmd = (
-            f"cd {repo_root} && "
-            f"source .venv_teleop/bin/activate && "
-            f"python gear_sonic/scripts/keyboard_planner_thread_server.py "
-            f"--port {config.keyboard_planner_port} "
-            f"--hz {config.keyboard_planner_publish_rate} "
-            f"--host {config.keyboard_planner_host} "
-        )
+        if config.planner_input == "navila":
+            reasan_keyboard_cmd = (
+                f"cd {repo_root} && "
+                f"source .venv_inference/bin/activate && "
+                f"python gear_sonic/scripts/navila_planner.py "
+                f"--remote-host {config.navila_host} "
+                f"--remote-port {config.navila_port} "
+                f"--api-token {shlex.quote(config.navila_api_token)} "
+                f"--instruction {shlex.quote(config.navila_instruction)} "
+                f"--camera-host {config.camera_host} "
+                f"--camera-port {config.camera_port} "
+                f"--camera-name chest_view "
+                f"--output-port {config.keyboard_planner_port}"
+            )
+        else:
+            reasan_keyboard_cmd = (
+                f"cd {repo_root} && "
+                f"source .venv_teleop/bin/activate && "
+                f"python gear_sonic/scripts/keyboard_planner_thread_server.py "
+                f"--port {config.keyboard_planner_port} "
+                f"--hz {config.keyboard_planner_publish_rate} "
+                f"--host {config.keyboard_planner_host} "
+            )
         reasan_planner_cmd = (
             f"cd {repo_root} && "
             f"source .venv_teleop/bin/activate && "
             f"python gear_sonic/scripts/reasan_planner.py "
-            f"--filter {config.reasan_filter_onnx} "
             f"--ray-endpoint tcp://127.0.0.1:{config.reasan_ray_port} "
             f"--keyboard-endpoint tcp://127.0.0.1:{config.keyboard_planner_port} "
-            f"--output-endpoint 'tcp://*:{config.reasan_planner_port}' "
-            f"--suppress-output-on-zero-input"
+            f"--output-endpoint 'tcp://*:{config.reasan_planner_port}'"
         )
         radar_cmd = (
             f"cd {repo_root} && "
             f"source .venv_teleop/bin/activate && "
             f"python tools/mid360_reasan_open3d.py "
             f"--interface {config.reasan_radar_interface} "
-            f"--ray-source direct --min-range 0.3 --filter-ground "
+            f"--min-range 0.3 --filter-ground "
             f"--ray-median-window 5 "
             f"--zmq-endpoint 'tcp://*:{config.reasan_ray_port}'"
         )
-        print("Starting REASEN keyboard (pane 3)...")
+        print(f"Starting {'NaVILA bridge' if config.planner_input == 'navila' else 'REASEN keyboard'} (pane 3)...")
         _send_to_pane(3, reasan_keyboard_cmd, wait=1.0)
-        print("Starting REASEN Filter planner (pane 4)...")
+        print("Starting REASEN TTC potential-field planner (pane 4)...")
         _send_to_pane(4, reasan_planner_cmd, wait=1.0)
         print("Starting MID-360 ActorRay publisher (pane 5)...")
         _send_to_pane(5, radar_cmd, wait=2.0)
