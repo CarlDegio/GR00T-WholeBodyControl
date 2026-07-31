@@ -176,7 +176,7 @@ class UniLaviraPlannerExecutor:
         if not math.isfinite(timestamp):
             raise ValueError("now must be finite")
         self._just_completed = False
-        while self._active and timestamp >= self._phase_deadline:
+        while self._active and timestamp + 1e-12 >= self._phase_deadline:
             if self._phase == "rotating":
                 self._phase = "transition_pause"
                 self._phase_deadline += self.transition_pause
@@ -241,3 +241,89 @@ class UniLaviraPlannerExecutor:
             height=-1.0,
             phase=self._phase,
         )
+
+
+class UniLaviraJsonBridge:
+    """Coordinate one REP exchange with the non-blocking planner executor."""
+
+    def __init__(self, socket: Any, executor: UniLaviraPlannerExecutor):
+        self.socket = socket
+        self.executor = executor
+        self.pending_reply = False
+        self._has_output = False
+
+    def step(self, *, now: float, planner_ready: bool) -> PlannerOutput | None:
+        if self.pending_reply:
+            if not planner_ready:
+                return self.abort("left_planner_mode")
+            output = self.executor.tick(now)
+            if self.executor.just_completed:
+                self.socket.send_json(
+                    {
+                        "status": "completed",
+                        "heading_rad": self.executor.heading_rad,
+                    }
+                )
+                self.pending_reply = False
+            return output
+
+        if self.socket.poll(0):
+            try:
+                request = self.socket.recv_json()
+            except Exception as exc:
+                self.socket.send_json(
+                    {
+                        "status": "rejected",
+                        "reason": "invalid_json",
+                        "detail": str(exc),
+                    }
+                )
+                return self._held_output(now, planner_ready)
+
+            if not planner_ready:
+                self.socket.send_json(
+                    {"status": "rejected", "reason": "not_in_planner"}
+                )
+                return self._held_output(now, planner_ready)
+
+            try:
+                output = self.executor.start(request, now)
+            except CommandValidationError as exc:
+                self.socket.send_json(
+                    {
+                        "status": "rejected",
+                        "reason": "invalid_commands",
+                        "detail": str(exc),
+                    }
+                )
+                return self._held_output(now, planner_ready)
+
+            self.pending_reply = True
+            self._has_output = True
+            return output
+
+        return self._held_output(now, planner_ready)
+
+    def abort(self, reason: str) -> PlannerOutput | None:
+        if not self.pending_reply and not self._has_output:
+            return None
+        output = self.executor.abort(reason)
+        if self.pending_reply:
+            self.socket.send_json({"status": "aborted", "reason": str(reason)})
+            self.pending_reply = False
+        return output
+
+    def reset_control_session(self) -> None:
+        if self.pending_reply:
+            self.abort("control_session_reset")
+        elif self.executor.active:
+            self.executor.abort("control_session_reset")
+        self.executor.reset_heading()
+        self._has_output = False
+
+    def _held_output(
+        self, now: float, planner_ready: bool
+    ) -> PlannerOutput | None:
+        if not self._has_output or not planner_ready:
+            return None
+        return self.executor.tick(now)

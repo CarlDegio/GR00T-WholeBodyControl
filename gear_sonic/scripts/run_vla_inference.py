@@ -9,16 +9,19 @@ All communication uses ZMQ:
   4. Keyboard     -> ZMQ SUB via ZMQKeyboardSubscriber
   5. Planner relay -> ZMQ SUB ``planner`` topic (port 5558) from
      ``keyboard_planner_thread_server.py``; bytes forward to :5556
+     OR, with ``--uni-lavira-json``, a mutually exclusive JSON REP endpoint
+     on port 5559 that schedules ObjectNav commands directly.
 
 ``command`` topic (start/stop/mode) is sent only by this script (``k``/``i``/``o``).
 The keyboard planner sidecar sends ``planner`` topic only — no ``command`` overlap.
+Uni-LaViRA JSON mode disables the keyboard planner relay.
 
 Uses the Isaac-GR00T PolicyClient (ZMQ REQ/REP) to communicate with a
 running PolicyServer.
 
 Keyboard commands (received via ZMQ from the standalone keyboard publisher):
   k  -> start / stop the C++ control loop (start defaults to PLANNER mode)
-  o  -> switch to PLANNER mode (enables relay of WASD sidecar on :5558)
+  o  -> switch to PLANNER mode (enables the configured planner input)
   i  -> switch to POSE mode (VLA latent actions; relay disabled)
   p  -> pause / resume the policy loop (POSE mode only)
   t  -> change prompt at runtime (publisher sends ``prompt:<text>``)
@@ -54,6 +57,10 @@ from gear_sonic.utils.inference.vla_utils import (
     concat_action,
     prepare_observation_for_eval,
     should_trigger_new_inference,
+)
+from gear_sonic.utils.inference.uni_lavira_planner import (
+    UniLaviraJsonBridge,
+    UniLaviraPlannerExecutor,
 )
 from gear_sonic.utils.teleop.solver.hand.g1_gripper_ik_solver import (
     G1GripperInverseKinematicsSolver,
@@ -120,6 +127,28 @@ class InferenceConfig:
 
     planner_relay_zmq_port: int = 5558
     """Port for the planner relay SUB socket."""
+
+    # Optional mutually exclusive Uni-LaViRA JSON planner input
+    uni_lavira_json: bool = False
+    """Receive ObjectNav JSON directly instead of relaying port 5558."""
+
+    uni_lavira_json_host: str = "127.0.0.1"
+    """Bind host for the optional Uni-LaViRA JSON REP endpoint."""
+
+    uni_lavira_json_port: int = 5559
+    """Bind port for the optional Uni-LaViRA JSON REP endpoint."""
+
+    uni_lavira_max_speed: float = 0.5
+    """Maximum accepted ObjectNav translation speed in m/s."""
+
+    uni_lavira_max_duration: float = 30.0
+    """Maximum accepted duration for either ObjectNav phase in seconds."""
+
+    uni_lavira_max_yaw: float = 3.141592653589793
+    """Maximum accepted absolute relative yaw in radians."""
+
+    uni_lavira_transition_pause: float = 0.5
+    """Stopped interval between rotation and translation in seconds."""
 
     # Embodiment
     embodiment_tag: str = "unitree_g1_sonic"
@@ -454,18 +483,43 @@ def main(config: InferenceConfig):
         port=config.keyboard_zmq_port, host=config.keyboard_zmq_host
     )
 
-    planner_relay_sub = zmq_context.socket(zmq.SUB)
-    planner_relay_sub.setsockopt_string(zmq.SUBSCRIBE, "planner")
-    planner_relay_sub.setsockopt(zmq.RCVTIMEO, 0)
-    planner_relay_sub.connect(
-        f"tcp://{config.planner_relay_zmq_host}:{config.planner_relay_zmq_port}"
-    )
-    print_green(
-        "Planner relay SUB connected to "
-        f"tcp://{config.planner_relay_zmq_host}:{config.planner_relay_zmq_port} "
-        f"with topic filter: planner"
-        f"(forwarding to tcp://{config.action_zmq_host}:{config.action_zmq_port})"
-    )
+    planner_relay_sub = None
+    uni_lavira_json_rep = None
+    uni_lavira_bridge = None
+    if config.uni_lavira_json:
+        uni_lavira_json_rep = zmq_context.socket(zmq.REP)
+        uni_lavira_json_rep.setsockopt(zmq.LINGER, 0)
+        json_endpoint = (
+            f"tcp://{config.uni_lavira_json_host}:"
+            f"{config.uni_lavira_json_port}"
+        )
+        uni_lavira_json_rep.bind(json_endpoint)
+        uni_lavira_bridge = UniLaviraJsonBridge(
+            uni_lavira_json_rep,
+            UniLaviraPlannerExecutor(
+                transition_pause=config.uni_lavira_transition_pause,
+                max_speed=config.uni_lavira_max_speed,
+                max_duration=config.uni_lavira_max_duration,
+                max_abs_yaw=config.uni_lavira_max_yaw,
+            ),
+        )
+        print_green(
+            f"Uni-LaViRA JSON REP bound to {json_endpoint}; "
+            "keyboard planner relay disabled"
+        )
+    else:
+        planner_relay_sub = zmq_context.socket(zmq.SUB)
+        planner_relay_sub.setsockopt_string(zmq.SUBSCRIBE, "planner")
+        planner_relay_sub.setsockopt(zmq.RCVTIMEO, 0)
+        planner_relay_sub.connect(
+            f"tcp://{config.planner_relay_zmq_host}:{config.planner_relay_zmq_port}"
+        )
+        print_green(
+            "Planner relay SUB connected to "
+            f"tcp://{config.planner_relay_zmq_host}:{config.planner_relay_zmq_port} "
+            f"with topic filter: planner"
+            f"(forwarding to tcp://{config.action_zmq_host}:{config.action_zmq_port})"
+        )
 
     telemetry = Telemetry(window_size=100)
 
@@ -482,6 +536,18 @@ def main(config: InferenceConfig):
 
     def _current_upper_body_planner_order(body_q: np.ndarray) -> np.ndarray:
         return np.array([body_q[i] for i in UPPER_BODY_MUJOCO_INDICES], dtype=np.float32)
+
+    def publish_planner_output(output):
+        """Encode one tested planner state on the existing action PUB."""
+        zmq_socket.send(
+            build_planner_message(
+                output.mode,
+                output.movement,
+                output.facing,
+                speed=output.speed,
+                height=output.height,
+            )
+        )
 
     def publish_initial_pose():
         # Initial pose publishing in PLANNER mode
@@ -571,6 +637,12 @@ def main(config: InferenceConfig):
         """Send C++ control loop start/stop commands via ZMQ."""
         nonlocal cpp_loop_running, cpp_mode
         try:
+            if uni_lavira_bridge is not None and (not start or not planner):
+                reason = "control_stopped" if not start else "pose_mode_requested"
+                stopped = uni_lavira_bridge.abort(reason)
+                if stopped is not None:
+                    publish_planner_output(stopped)
+
             cmd_msg = build_command_message(start=start, stop=not start, planner=planner)
             zmq_socket.send(cmd_msg)
             time.sleep(0.01)
@@ -581,6 +653,8 @@ def main(config: InferenceConfig):
                 cpp_mode = "PLANNER" if planner else "POSE"
             else:
                 cpp_mode = "OFF"
+            if uni_lavira_bridge is not None and start and planner:
+                uni_lavira_bridge.reset_control_session()
             print_green(f"Sent ZMQ command: {action_str} control loop ({mode_str} mode)")
             return True
         except Exception as e:
@@ -626,6 +700,10 @@ def main(config: InferenceConfig):
             print("Keyboard: 'f' (stop recording failure -- handled by data exporter)")
         elif key == "i":
             print("Switch to pose mode")
+            if uni_lavira_bridge is not None:
+                stopped = uni_lavira_bridge.abort("pose_mode_requested")
+                if stopped is not None:
+                    publish_planner_output(stopped)
             zmq_frame_counter = 0
             print("Reset ZMQ frame counter")
             publish_initial_pose()
@@ -733,6 +811,24 @@ def main(config: InferenceConfig):
             t_start = time.monotonic()
             check_keyboard_input()
 
+            if uni_lavira_bridge is not None:
+                planner_ready = cpp_loop_running and cpp_mode == "PLANNER"
+                try:
+                    planner_output = uni_lavira_bridge.step(
+                        now=time.monotonic(),
+                        planner_ready=planner_ready,
+                    )
+                except Exception as exc:
+                    print(f"Warning: Uni-LaViRA planner bridge failed: {exc}")
+                    try:
+                        planner_output = uni_lavira_bridge.abort("internal_error")
+                    except Exception:
+                        planner_output = uni_lavira_bridge.executor.abort(
+                            "internal_error"
+                        )
+                if planner_output is not None and planner_ready:
+                    publish_planner_output(planner_output)
+
             # Consume result first so last_inference_time is fresh before trigger check
             try:
                 processed_action, inference_start_time = result_queue.get_nowait()
@@ -764,7 +860,8 @@ def main(config: InferenceConfig):
                     pass
 
             if cpp_loop_running and cpp_mode == "PLANNER":
-                _relay_planner_messages(planner_relay_sub, zmq_socket)
+                if planner_relay_sub is not None:
+                    _relay_planner_messages(planner_relay_sub, zmq_socket)
                 print("In Planner mode...", end="", flush=True)
                 _sleep_remaining(t_start, loop_period)
                 print(".", end="", flush=True)
@@ -855,7 +952,19 @@ def main(config: InferenceConfig):
     finally:
         inference_stop_event.set()
         inference_worker_thread.join(timeout=1.0)
-        planner_relay_sub.close()
+        if uni_lavira_bridge is not None:
+            try:
+                stopped = uni_lavira_bridge.abort("shutdown")
+                if stopped is not None:
+                    for _ in range(5):
+                        publish_planner_output(stopped)
+                        time.sleep(0.02)
+            except Exception as exc:
+                print(f"Warning: Failed to stop Uni-LaViRA planner: {exc}")
+        if planner_relay_sub is not None:
+            planner_relay_sub.close()
+        if uni_lavira_json_rep is not None:
+            uni_lavira_json_rep.close()
         zmq_socket.close()
         zmq_context.term()
         state_subscriber.close()
