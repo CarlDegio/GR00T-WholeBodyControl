@@ -147,9 +147,6 @@ class InferenceConfig:
     uni_lavira_max_yaw: float = 3.141592653589793
     """Maximum accepted absolute relative yaw in radians."""
 
-    uni_lavira_transition_pause: float = 0.5
-    """Stopped interval between rotation and translation in seconds."""
-
     # Embodiment
     embodiment_tag: str = "unitree_g1_sonic"
     """Embodiment tag for policy inference."""
@@ -497,7 +494,6 @@ def main(config: InferenceConfig):
         uni_lavira_bridge = UniLaviraJsonBridge(
             uni_lavira_json_rep,
             UniLaviraPlannerExecutor(
-                transition_pause=config.uni_lavira_transition_pause,
                 max_speed=config.uni_lavira_max_speed,
                 max_duration=config.uni_lavira_max_duration,
                 max_abs_yaw=config.uni_lavira_max_yaw,
@@ -633,16 +629,36 @@ def main(config: InferenceConfig):
         print_green("Initial pose published")
         return True
 
-    def send_cpp_control_command(start: bool, planner: bool = False):
+    def _abort_uni_lavira(reason: str):
+        """Best-effort JSON abort that never blocks a local operator command."""
+        if uni_lavira_bridge is None:
+            return
+        try:
+            stopped = uni_lavira_bridge.abort(reason)
+        except Exception as exc:
+            print(f"Warning: Failed to reply to Uni-LaViRA abort: {exc}")
+            stopped = uni_lavira_bridge.executor.abort(reason)
+        if stopped is not None:
+            try:
+                publish_planner_output(stopped)
+            except Exception as exc:
+                print(f"Warning: Failed to publish stopped planner output: {exc}")
+
+    def send_cpp_control_command(
+        start: bool, planner: bool = False, *, abort_bridge: bool = True
+    ):
         """Send C++ control loop start/stop commands via ZMQ."""
         nonlocal cpp_loop_running, cpp_mode
-        try:
-            if uni_lavira_bridge is not None and (not start or not planner):
-                reason = "control_stopped" if not start else "pose_mode_requested"
-                stopped = uni_lavira_bridge.abort(reason)
-                if stopped is not None:
-                    publish_planner_output(stopped)
+        was_running = cpp_loop_running
+        if (
+            abort_bridge
+            and uni_lavira_bridge is not None
+            and (not start or not planner)
+        ):
+            reason = "control_stopped" if not start else "pose_mode_requested"
+            _abort_uni_lavira(reason)
 
+        try:
             cmd_msg = build_command_message(start=start, stop=not start, planner=planner)
             zmq_socket.send(cmd_msg)
             time.sleep(0.01)
@@ -653,8 +669,16 @@ def main(config: InferenceConfig):
                 cpp_mode = "PLANNER" if planner else "POSE"
             else:
                 cpp_mode = "OFF"
-            if uni_lavira_bridge is not None and start and planner:
-                uni_lavira_bridge.reset_control_session()
+            if (
+                uni_lavira_bridge is not None
+                and start
+                and planner
+                and not was_running
+            ):
+                try:
+                    uni_lavira_bridge.reset_control_session()
+                except Exception as exc:
+                    print(f"Warning: Failed to reset Uni-LaViRA session: {exc}")
             print_green(f"Sent ZMQ command: {action_str} control loop ({mode_str} mode)")
             return True
         except Exception as e:
@@ -700,10 +724,7 @@ def main(config: InferenceConfig):
             print("Keyboard: 'f' (stop recording failure -- handled by data exporter)")
         elif key == "i":
             print("Switch to pose mode")
-            if uni_lavira_bridge is not None:
-                stopped = uni_lavira_bridge.abort("pose_mode_requested")
-                if stopped is not None:
-                    publish_planner_output(stopped)
+            _abort_uni_lavira("pose_mode_requested")
             zmq_frame_counter = 0
             print("Reset ZMQ frame counter")
             publish_initial_pose()
@@ -712,7 +733,9 @@ def main(config: InferenceConfig):
             print("Cleared cached action chunk")
             if cpp_mode == "PLANNER":
                 print("Switching to POSE mode")
-                if send_cpp_control_command(start=True, planner=False):
+                if send_cpp_control_command(
+                    start=True, planner=False, abort_bridge=False
+                ):
                     print("Switched to POSE mode (from PLANNER mode)")
                 else:
                     print("Warning: Failed to switch to POSE mode")
@@ -818,16 +841,12 @@ def main(config: InferenceConfig):
                         now=time.monotonic(),
                         planner_ready=planner_ready,
                     )
+                    if planner_output is not None and planner_ready:
+                        publish_planner_output(planner_output)
+                        uni_lavira_bridge.acknowledge_output_published()
                 except Exception as exc:
                     print(f"Warning: Uni-LaViRA planner bridge failed: {exc}")
-                    try:
-                        planner_output = uni_lavira_bridge.abort("internal_error")
-                    except Exception:
-                        planner_output = uni_lavira_bridge.executor.abort(
-                            "internal_error"
-                        )
-                if planner_output is not None and planner_ready:
-                    publish_planner_output(planner_output)
+                    _abort_uni_lavira("internal_error")
 
             # Consume result first so last_inference_time is fresh before trigger check
             try:

@@ -47,6 +47,8 @@ class BridgeTests(unittest.TestCase):
         self.assertEqual(socket.sent, [])
         finished = bridge.step(now=1.7, planner_ready=True)
         self.assertEqual(finished.phase, "stopped")
+        self.assertEqual(socket.sent, [])
+        bridge.acknowledge_output_published()
         self.assertEqual(socket.sent[-1]["status"], "completed")
         self.assertAlmostEqual(socket.sent[-1]["heading_rad"], 0.04)
 
@@ -58,6 +60,19 @@ class BridgeTests(unittest.TestCase):
         self.assertEqual(socket.sent[-1]["status"], "rejected")
         self.assertEqual(socket.sent[-1]["reason"], "invalid_commands")
 
+    def test_terminal_output_can_abort_before_publication_ack(self):
+        socket = FakeRepSocket([payload(rotate_for=0.0, walk_for=0.0)])
+        bridge = UniLaviraJsonBridge(socket, UniLaviraPlannerExecutor())
+        bridge.step(now=1.0, planner_ready=True)
+        stopped = bridge.step(now=1.5, planner_ready=True)
+        self.assertEqual(stopped.phase, "stopped")
+        self.assertEqual(socket.sent, [])
+
+        bridge.abort("planner_publish_failed")
+        self.assertEqual(
+            socket.sent[-1],
+            {"status": "aborted", "reason": "planner_publish_failed"},
+        )
     def test_losing_planner_mode_aborts_pending_request(self):
         socket = FakeRepSocket([payload()])
         bridge = UniLaviraJsonBridge(socket, UniLaviraPlannerExecutor())

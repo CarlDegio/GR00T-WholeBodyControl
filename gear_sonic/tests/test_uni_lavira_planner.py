@@ -81,7 +81,6 @@ class ExecutorTests(unittest.TestCase):
         paused = executor.tick(11.1)
         self.assertEqual(paused.phase, "transition_pause")
         self.assertEqual(paused.speed, 0.0)
-
         walking = executor.tick(11.6)
         self.assertEqual(walking.phase, "translating")
         self.assertAlmostEqual(walking.speed, 0.3)
@@ -92,6 +91,19 @@ class ExecutorTests(unittest.TestCase):
         self.assertEqual(stopped.speed, 0.0)
         self.assertTrue(executor.just_completed)
         self.assertFalse(executor.active)
+    def test_rejects_non_finite_or_non_positive_executor_limits(self):
+        invalid_options = [
+            {"transition_pause": float("nan")},
+            {"max_speed": float("nan")},
+            {"max_duration": float("inf")},
+            {"max_abs_yaw": 0.0},
+            {"max_speed": True},
+        ]
+        for options in invalid_options:
+            with self.subTest(options=options):
+                with self.assertRaises(ValueError):
+                    UniLaviraPlannerExecutor(**options)
+
 
     def test_accumulates_signed_relative_yaw(self):
         executor = UniLaviraPlannerExecutor()
@@ -150,6 +162,28 @@ class ExecutorTests(unittest.TestCase):
         self.assert_sequence_almost_equal(actual.facing, expected[2])
         self.assertAlmostEqual(actual.speed, expected[3])
         self.assertEqual(actual.height, expected[4])
+
+    def test_nonwalking_fields_match_keyboard_controller(self):
+        keyboard_class = self._load_keyboard_controller()
+        keyboard = keyboard_class(max_speed=0.3)
+        keyboard.facing_angle = 0.4
+        expected = keyboard.update_from_keys(set())
+
+        executor = UniLaviraPlannerExecutor(transition_pause=0.5)
+        executor.start(payload(), now=10.0)
+        outputs = (
+            executor.tick(10.2),
+            executor.tick(11.1),
+            executor.tick(13.5),
+        )
+        for actual in outputs:
+            with self.subTest(phase=actual.phase):
+                self.assertEqual(actual.mode, expected[0])
+                self.assert_sequence_almost_equal(actual.movement, expected[1])
+                self.assert_sequence_almost_equal(actual.facing, expected[2])
+                self.assertAlmostEqual(actual.speed, expected[3])
+                self.assertEqual(actual.height, expected[4])
+
 
     def assert_sequence_almost_equal(self, actual, expected):
         self.assertEqual(len(actual), len(expected))

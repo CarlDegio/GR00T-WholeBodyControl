@@ -78,8 +78,13 @@ def validate_object_nav_batch(
     commands = payload.get("commands")
     if not isinstance(commands, list) or len(commands) != 2:
         raise CommandValidationError("commands must contain exactly two entries")
-    if max_speed <= 0 or max_duration <= 0 or max_abs_yaw <= 0:
-        raise ValueError("planner safety limits must be positive")
+    limits = (max_speed, max_duration, max_abs_yaw)
+    if not all(
+        not isinstance(value, bool)
+        and isinstance(value, (int, float)) and math.isfinite(value) and value > 0
+        for value in limits
+    ):
+        raise ValueError("planner safety limits must be finite and positive")
 
     rotation = _velocity_command(commands[0], 0)
     translation = _velocity_command(commands[1], 1)
@@ -112,8 +117,19 @@ class UniLaviraPlannerExecutor:
         max_duration: float = 30.0,
         max_abs_yaw: float = math.pi,
     ):
-        if transition_pause < 0:
-            raise ValueError("transition_pause must be non-negative")
+        if (
+            not isinstance(transition_pause, (int, float))
+            or not math.isfinite(transition_pause)
+            or transition_pause < 0
+        ):
+            raise ValueError("transition_pause must be finite and non-negative")
+        limits = (max_speed, max_duration, max_abs_yaw)
+        if not all(
+            not isinstance(value, bool)
+            and isinstance(value, (int, float)) and math.isfinite(value) and value > 0
+            for value in limits
+        ):
+            raise ValueError("planner safety limits must be finite and positive")
         self.transition_pause = float(transition_pause)
         self.max_speed = float(max_speed)
         self.max_duration = float(max_duration)
@@ -250,6 +266,7 @@ class UniLaviraJsonBridge:
         self.socket = socket
         self.executor = executor
         self.pending_reply = False
+        self._completion_waiting = False
         self._has_output = False
 
     def step(self, *, now: float, planner_ready: bool) -> PlannerOutput | None:
@@ -258,13 +275,7 @@ class UniLaviraJsonBridge:
                 return self.abort("left_planner_mode")
             output = self.executor.tick(now)
             if self.executor.just_completed:
-                self.socket.send_json(
-                    {
-                        "status": "completed",
-                        "heading_rad": self.executor.heading_rad,
-                    }
-                )
-                self.pending_reply = False
+                self._completion_waiting = True
             return output
 
         if self.socket.poll(0):
@@ -288,7 +299,7 @@ class UniLaviraJsonBridge:
 
             try:
                 output = self.executor.start(request, now)
-            except CommandValidationError as exc:
+            except (CommandValidationError, ValueError) as exc:
                 self.socket.send_json(
                     {
                         "status": "rejected",
@@ -298,11 +309,27 @@ class UniLaviraJsonBridge:
                 )
                 return self._held_output(now, planner_ready)
 
+            self._completion_waiting = False
             self.pending_reply = True
             self._has_output = True
             return output
 
         return self._held_output(now, planner_ready)
+
+    def acknowledge_output_published(self) -> None:
+        """Reply completed only after the terminal stopped output was sent."""
+        if not self._completion_waiting:
+            return
+        if not self.pending_reply:
+            raise RuntimeError("terminal planner output has no pending REP reply")
+        self.socket.send_json(
+            {
+                "status": "completed",
+                "heading_rad": self.executor.heading_rad,
+            }
+        )
+        self.pending_reply = False
+        self._completion_waiting = False
 
     def abort(self, reason: str) -> PlannerOutput | None:
         if not self.pending_reply and not self._has_output:
@@ -311,6 +338,7 @@ class UniLaviraJsonBridge:
         if self.pending_reply:
             self.socket.send_json({"status": "aborted", "reason": str(reason)})
             self.pending_reply = False
+        self._completion_waiting = False
         return output
 
     def reset_control_session(self) -> None:
@@ -319,6 +347,7 @@ class UniLaviraJsonBridge:
         elif self.executor.active:
             self.executor.abort("control_session_reset")
         self.executor.reset_heading()
+        self._completion_waiting = False
         self._has_output = False
 
     def _held_output(
