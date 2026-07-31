@@ -259,6 +259,52 @@ class UniLaviraPlannerExecutor:
         )
 
 
+class PlannerModeTracker:
+    """Mirror the operator's k/i/o control state from keyboard messages."""
+
+    def __init__(self):
+        self._running = False
+        self._mode = "OFF"
+
+    @property
+    def running(self) -> bool:
+        return self._running
+
+    @property
+    def mode(self) -> str:
+        return self._mode
+
+    @property
+    def planner_ready(self) -> bool:
+        return self._running and self._mode == "PLANNER"
+
+    def apply(self, command: str) -> str | None:
+        normalized = str(command).strip().lower()
+        if normalized == "k":
+            if not self._running:
+                self._running = True
+                self._mode = "PLANNER"
+                return None
+            left_planner = self._mode == "PLANNER"
+            self._running = False
+            self._mode = "OFF"
+            return "control_stopped" if left_planner else None
+
+        if not self._running:
+            return None
+        if normalized == "i":
+            if self._mode == "PLANNER":
+                self._mode = "POSE"
+                return "pose_mode_requested"
+            self._mode = "POSE"
+            return None
+        if normalized == "o":
+            self._mode = "PLANNER"
+        return None
+
+
+
+
 class UniLaviraJsonBridge:
     """Coordinate one REP exchange with the non-blocking planner executor."""
 

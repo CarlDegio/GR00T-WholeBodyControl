@@ -5,6 +5,7 @@ import unittest
 
 from gear_sonic.tests.test_uni_lavira_planner import payload
 from gear_sonic.utils.inference.uni_lavira_planner import (
+    PlannerModeTracker,
     UniLaviraJsonBridge,
     UniLaviraPlannerExecutor,
 )
@@ -26,6 +27,37 @@ class FakeRepSocket:
 
     def send_json(self, value):
         self.sent.append(value)
+class PlannerModeTrackerTests(unittest.TestCase):
+    def test_tracks_operator_planner_lifecycle(self):
+        tracker = PlannerModeTracker()
+        self.assertFalse(tracker.running)
+        self.assertEqual(tracker.mode, "OFF")
+        self.assertFalse(tracker.planner_ready)
+
+        self.assertIsNone(tracker.apply("k"))
+        self.assertTrue(tracker.running)
+        self.assertEqual(tracker.mode, "PLANNER")
+        self.assertTrue(tracker.planner_ready)
+
+        self.assertEqual(tracker.apply("i"), "pose_mode_requested")
+        self.assertEqual(tracker.mode, "POSE")
+        self.assertFalse(tracker.planner_ready)
+
+        self.assertIsNone(tracker.apply("o"))
+        self.assertTrue(tracker.planner_ready)
+        self.assertEqual(tracker.apply(" K "), "control_stopped")
+        self.assertFalse(tracker.running)
+        self.assertEqual(tracker.mode, "OFF")
+
+    def test_ignores_unrelated_commands_and_planner_while_off(self):
+        tracker = PlannerModeTracker()
+        for command in ("", "p", "prompt:new task", "o", "i"):
+            with self.subTest(command=command):
+                self.assertIsNone(tracker.apply(command))
+                self.assertFalse(tracker.planner_ready)
+
+
+
 
 
 class BridgeTests(unittest.TestCase):
@@ -73,6 +105,7 @@ class BridgeTests(unittest.TestCase):
             socket.sent[-1],
             {"status": "aborted", "reason": "planner_publish_failed"},
         )
+
     def test_losing_planner_mode_aborts_pending_request(self):
         socket = FakeRepSocket([payload()])
         bridge = UniLaviraJsonBridge(socket, UniLaviraPlannerExecutor())
