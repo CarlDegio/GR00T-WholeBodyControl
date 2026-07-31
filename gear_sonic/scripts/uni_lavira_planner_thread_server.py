@@ -194,6 +194,26 @@ def step_bridge_once(
     return output
 
 
+def handle_deploy_disconnect(
+    tracker: PlannerModeTracker,
+    bridge: UniLaviraJsonBridge,
+    action_socket: Any,
+) -> None:
+    """End the old control session; a reconnected deploy requires a fresh k."""
+    was_planner = tracker.mode == "PLANNER"
+    action_socket.send(
+        build_command_message(
+            start=False, stop=True, planner=was_planner
+        )
+    )
+    if tracker.running:
+        tracker.apply("k")
+    stopped = _best_effort_abort(bridge, "deploy_disconnected")
+    if stopped is None:
+        stopped = bridge.executor.abort("deploy_disconnected")
+    publish_output(action_socket, stopped)
+
+
 def _sleep_remaining(started: float, period: float) -> None:
     remaining = period - (time.monotonic() - started)
     if remaining > 0:
@@ -251,6 +271,9 @@ def main(config: UniLaviraPlannerConfig) -> None:
                 print("[UniLaviraPlanner] Sonic command/planner subscribers ready")
             elif was_action_ready and not action_subscribers.ready:
                 print("[UniLaviraPlanner] Sonic subscriber disconnected")
+                handle_deploy_disconnect(
+                    tracker, bridge, action_pub
+                )
 
             keyboard_output = drain_keyboard_commands(
                 keyboard_sub, tracker, bridge, action_pub,

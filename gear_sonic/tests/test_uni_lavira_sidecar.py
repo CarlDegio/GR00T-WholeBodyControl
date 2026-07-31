@@ -92,6 +92,36 @@ class SidecarHelperTests(unittest.TestCase):
         self.assertFalse(tracker.running)
         self.assertEqual(publisher.sent, [])
 
+    def test_deploy_disconnect_aborts_and_requires_fresh_k(self):
+        rep = FakeRepSocket([payload()])
+        bridge = UniLaviraJsonBridge(rep, UniLaviraPlannerExecutor())
+        tracker = PlannerModeTracker()
+        tracker.apply("k")
+        bridge.step(now=1.0, planner_ready=True)
+        publisher = FakePublisher()
+
+        with mock.patch.object(
+            sidecar, "build_command_message", return_value=b"stop-command"
+        ) as command_builder, mock.patch.object(
+            sidecar, "build_planner_message", return_value=b"stopped-planner"
+        ):
+            sidecar.handle_deploy_disconnect(tracker, bridge, publisher)
+
+        command_builder.assert_called_once_with(
+            start=False, stop=True, planner=True
+        )
+        self.assertFalse(tracker.running)
+        self.assertEqual(tracker.mode, "OFF")
+        self.assertFalse(tracker.planner_ready)
+        self.assertEqual(
+            rep.sent[-1],
+            {"status": "aborted", "reason": "deploy_disconnected"},
+        )
+        self.assertEqual(
+            publisher.sent,
+            [b"stop-command", b"stopped-planner"],
+        )
+
     def test_config_targets_cpp_action_port_without_planner_relay(self):
         config = sidecar.UniLaviraPlannerConfig()
 
