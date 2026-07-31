@@ -135,6 +135,17 @@ class ExecutorTests(unittest.TestCase):
         self.assertEqual(executor.tick(2.1).phase, "transition_pause")
         self.assertEqual(executor.tick(2.5).phase, "translating")
 
+    def test_rejects_positive_phase_shorter_than_configured_period(self):
+        executor = UniLaviraPlannerExecutor(min_positive_duration=0.05)
+
+        with self.assertRaises(CommandValidationError):
+            executor.start(
+                payload(wz=0.0, rotate_for=0.0, walk_for=0.01), now=2.0
+            )
+
+        zero_duration = payload(wz=0.0, rotate_for=0.0, walk_for=0.0)
+        self.assertEqual(executor.start(zero_duration, now=2.0).speed, 0.0)
+
     def test_abort_and_reset_heading_are_stopped(self):
         executor = UniLaviraPlannerExecutor()
         executor.start(payload(), now=0.0)

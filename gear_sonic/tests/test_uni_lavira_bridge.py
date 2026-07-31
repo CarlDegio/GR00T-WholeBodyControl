@@ -106,6 +106,23 @@ class BridgeTests(unittest.TestCase):
             {"status": "aborted", "reason": "planner_publish_failed"},
         )
 
+    def test_abort_reply_failure_keeps_rep_exchange_pending(self):
+        class FailingSendRep(FakeRepSocket):
+            def send_json(self, value):
+                raise RuntimeError("send failed")
+
+        socket = FailingSendRep([payload()])
+        executor = UniLaviraPlannerExecutor()
+        bridge = UniLaviraJsonBridge(socket, executor)
+        bridge.step(now=1.0, planner_ready=True)
+
+        with self.assertRaisesRegex(RuntimeError, "send failed"):
+            bridge.abort("operator_stop")
+
+        self.assertTrue(bridge.pending_reply)
+        self.assertFalse(executor.active)
+        self.assertEqual(executor.tick(1.1).phase, "stopped")
+
     def test_losing_planner_mode_aborts_pending_request(self):
         socket = FakeRepSocket([payload()])
         bridge = UniLaviraJsonBridge(socket, UniLaviraPlannerExecutor())

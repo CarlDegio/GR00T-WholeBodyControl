@@ -71,6 +71,7 @@ def validate_object_nav_batch(
     max_speed: float = 0.5,
     max_duration: float = 30.0,
     max_abs_yaw: float = math.pi,
+    min_positive_duration: float = 0.0,
 ) -> ObjectNavBatch:
     """Return a validated fixed rotate-then-translate command batch."""
     if not isinstance(payload, Mapping):
@@ -85,6 +86,13 @@ def validate_object_nav_batch(
         for value in limits
     ):
         raise ValueError("planner safety limits must be finite and positive")
+    if (
+        isinstance(min_positive_duration, bool)
+        or not isinstance(min_positive_duration, (int, float))
+        or not math.isfinite(min_positive_duration)
+        or min_positive_duration < 0
+    ):
+        raise ValueError("min_positive_duration must be finite and non-negative")
 
     rotation = _velocity_command(commands[0], 0)
     translation = _velocity_command(commands[1], 1)
@@ -93,6 +101,10 @@ def validate_object_nav_batch(
             raise CommandValidationError(f"commands[{index}].duration must be non-negative")
         if command.duration > max_duration:
             raise CommandValidationError(f"commands[{index}].duration exceeds limit")
+        if 0 < command.duration < min_positive_duration:
+            raise CommandValidationError(
+                f"commands[{index}].duration is shorter than publish period"
+            )
 
     if math.hypot(rotation.vx, rotation.vy) > _ZERO_TOLERANCE:
         raise CommandValidationError("commands[0] must be pure rotation")
@@ -116,6 +128,7 @@ class UniLaviraPlannerExecutor:
         max_speed: float = 0.5,
         max_duration: float = 30.0,
         max_abs_yaw: float = math.pi,
+        min_positive_duration: float = 0.0,
     ):
         if (
             not isinstance(transition_pause, (int, float))
@@ -130,10 +143,18 @@ class UniLaviraPlannerExecutor:
             for value in limits
         ):
             raise ValueError("planner safety limits must be finite and positive")
+        if (
+            isinstance(min_positive_duration, bool)
+            or not isinstance(min_positive_duration, (int, float))
+            or not math.isfinite(min_positive_duration)
+            or min_positive_duration < 0
+        ):
+            raise ValueError("min_positive_duration must be finite and non-negative")
         self.transition_pause = float(transition_pause)
         self.max_speed = float(max_speed)
         self.max_duration = float(max_duration)
         self.max_abs_yaw = float(max_abs_yaw)
+        self.min_positive_duration = float(min_positive_duration)
         self._heading_rad = 0.0
         self._phase = "stopped"
         self._phase_deadline = 0.0
@@ -168,6 +189,7 @@ class UniLaviraPlannerExecutor:
             max_speed=self.max_speed,
             max_duration=self.max_duration,
             max_abs_yaw=self.max_abs_yaw,
+            min_positive_duration=self.min_positive_duration,
         )
         timestamp = float(now)
         if not math.isfinite(timestamp):
@@ -381,10 +403,10 @@ class UniLaviraJsonBridge:
         if not self.pending_reply and not self._has_output:
             return None
         output = self.executor.abort(reason)
-        self._completion_waiting = False
         if self.pending_reply:
-            self.pending_reply = False
             self.socket.send_json({"status": "aborted", "reason": str(reason)})
+            self.pending_reply = False
+        self._completion_waiting = False
         return output
 
     def reset_control_session(self) -> None:
