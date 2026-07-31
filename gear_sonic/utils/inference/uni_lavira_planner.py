@@ -381,10 +381,10 @@ class UniLaviraJsonBridge:
         if not self.pending_reply and not self._has_output:
             return None
         output = self.executor.abort(reason)
-        if self.pending_reply:
-            self.socket.send_json({"status": "aborted", "reason": str(reason)})
-            self.pending_reply = False
         self._completion_waiting = False
+        if self.pending_reply:
+            self.pending_reply = False
+            self.socket.send_json({"status": "aborted", "reason": str(reason)})
         return output
 
     def reset_control_session(self) -> None:
