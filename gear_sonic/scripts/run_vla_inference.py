@@ -86,6 +86,9 @@ class InferenceConfig:
     rate: float = 1 / 0.6
     """Rate at which we run the forward pass of the VLA policy (Hz)."""
 
+    assume_cpp_planner_running: bool = False
+    """Inherit a running C++ PLANNER session from ObjectNav handoff."""
+
     # Camera
     camera_host: str = "localhost"
     """Camera server host."""
@@ -136,6 +139,13 @@ class InferenceConfig:
 
 def print_green(x):
     print(f"\033[92m{x}\033[0m")
+
+
+def initial_cpp_control_state(assume_cpp_planner_running: bool) -> tuple[bool, str]:
+    """Return C++ state tracking for a fresh or ObjectNav-handoff VLA process."""
+    if assume_cpp_planner_running:
+        return True, "PLANNER"
+    return False, "OFF"
 
 
 JPEG_VIDEO_MARKER = "__opencv_jpeg_rgb__"
@@ -473,8 +483,11 @@ def main(config: InferenceConfig):
     loop_period = 1.0 / loop_rate
 
     # Track C++ control loop state
-    cpp_loop_running = False
-    cpp_mode = "OFF"  # "OFF", "PLANNER", or "POSE"
+    cpp_loop_running, cpp_mode = initial_cpp_control_state(
+        config.assume_cpp_planner_running
+    )
+    if config.assume_cpp_planner_running:
+        print_green("Inherited running C++ PLANNER state from ObjectNav handoff.")
 
     # Track initial pose hand states
     initial_pose_left_hand_closed = False
