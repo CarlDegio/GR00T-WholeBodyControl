@@ -274,6 +274,47 @@ def test_codex_client_builds_read_only_image_command_with_proxy_environment(
         assert environment["MARKER"] == "kept"
 
 
+def test_default_runner_materializes_strict_codex_schema_in_output_dir(
+    tmp_path: Path,
+) -> None:
+    captured_schema_path: Path | None = None
+
+    def fake_subprocess(
+        command: list[str], **_kwargs: object
+    ) -> subprocess.CompletedProcess[str]:
+        nonlocal captured_schema_path
+        if command[1:3] == ["login", "status"]:
+            return subprocess.CompletedProcess(
+                command, 0, stdout="Logged in using ChatGPT\n", stderr=""
+            )
+        schema_index = command.index("--output-schema") + 1
+        captured_schema_path = Path(command[schema_index])
+        assert captured_schema_path.is_file()
+        return subprocess.CompletedProcess(
+            command, 0, stdout=json.dumps(policy()), stderr=""
+        )
+
+    runner = ObjectNavRunner(
+        ObjectNavConfig("find chair", "chair", output_root=str(tmp_path)),
+        camera=FakeCamera([snapshot(index) for index in range(1, 6)]),
+    )
+    runner.codex.runner = fake_subprocess
+
+    result = runner.run_once()
+
+    assert result.outcome == "NAVIGATE"
+    assert result.policy["target"] == "red chair"
+    assert captured_schema_path == (
+        Path(result.output_dir) / "object_nav_policy.schema.json"
+    )
+    schema = json.loads(captured_schema_path.read_text(encoding="utf-8"))
+    assert schema["type"] == "object"
+    assert schema["additionalProperties"] is False
+    assert set(schema["required"]) == set(policy())
+    assert set(schema["properties"]) == set(policy())
+    assert schema["properties"]["action"] == {"enum": ["NAVIGATE", "STOP"]}
+
+
 def test_empty_proxy_overrides_remove_inherited_values(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
         os,

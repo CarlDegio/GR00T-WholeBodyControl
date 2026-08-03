@@ -29,12 +29,12 @@ from gear_sonic.utils.inference.object_nav_geometry import (
 )
 
 
-DEFAULT_SCHEMA_PATH = Path(__file__).with_name("object_nav_policy.schema.json")
+DEFAULT_SCHEMA_FILENAME = "object_nav_policy.schema.json"
 DEFAULT_HTTP_PROXY = "http://127.0.0.1:7897/"
 DEFAULT_ALL_PROXY = "socks://127.0.0.1:7897/"
 HTTP_PROXY_KEYS = ("http_proxy", "https_proxy", "HTTP_PROXY", "HTTPS_PROXY")
 ALL_PROXY_KEYS = ("all_proxy", "ALL_PROXY")
-REQUIRED_POLICY_KEYS = {
+POLICY_KEYS = (
     "visual_check",
     "action",
     "bbox_2d",
@@ -50,9 +50,65 @@ REQUIRED_POLICY_KEYS = {
     "confidence",
     "distance_confidence",
     "stop_reasoning",
-}
+)
+REQUIRED_POLICY_KEYS = set(POLICY_KEYS)
 TARGET_TYPES = {"global_target", "intermediate_landmark", "traversable_opening"}
 ROTATION_DIRECTIONS = {"LEFT", "RIGHT", "CENTERED"}
+DEFAULT_POLICY_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "visual_check": {"type": "string"},
+        "action": {"enum": ["NAVIGATE", "STOP"]},
+        "bbox_2d": {
+            "type": ["array", "null"],
+            "items": {"type": "number", "minimum": 0, "maximum": 1000},
+            "minItems": 4,
+            "maxItems": 4,
+        },
+        "target": {"type": "string"},
+        "target_type": {
+            "enum": [
+                "global_target",
+                "intermediate_landmark",
+                "traversable_opening",
+            ]
+        },
+        "estimated_distance_m": {
+            "type": ["number", "null"],
+            "exclusiveMinimum": 0,
+        },
+        "target_center_normalized": {
+            "type": ["array", "null"],
+            "items": {"type": "number", "minimum": 0, "maximum": 1000},
+            "minItems": 2,
+            "maxItems": 2,
+        },
+        "target_center_pixel": {
+            "type": ["array", "null"],
+            "items": {"type": "number", "minimum": 0},
+            "minItems": 2,
+            "maxItems": 2,
+        },
+        "horizontal_offset_pixel": {"type": ["number", "null"]},
+        "camera_bearing_deg": {"type": ["number", "null"]},
+        "rotation_direction": {
+            "enum": ["LEFT", "RIGHT", "CENTERED", None]
+        },
+        "rotation_angle_deg": {
+            "type": ["number", "null"],
+            "minimum": 0,
+        },
+        "confidence": {"type": "number", "minimum": 0, "maximum": 1},
+        "distance_confidence": {
+            "type": "number",
+            "minimum": 0,
+            "maximum": 1,
+        },
+        "stop_reasoning": {"type": "string"},
+    },
+    "required": list(POLICY_KEYS),
+    "additionalProperties": False,
+}
 
 
 @dataclass(frozen=True)
@@ -269,7 +325,7 @@ class CodexBBoxClient:
     def __init__(
         self,
         *,
-        schema_path: str | Path = DEFAULT_SCHEMA_PATH,
+        schema_path: str | Path | None = None,
         runner: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
         timeout_seconds: float = 180.0,
         codex_bin: str | None = None,
@@ -278,7 +334,9 @@ class CodexBBoxClient:
         http_proxy_url: str | None = None,
         all_proxy_url: str | None = None,
     ):
-        self.schema_path = Path(schema_path).resolve()
+        self.schema_path = (
+            None if schema_path is None else Path(schema_path).resolve()
+        )
         self.runner = runner
         self.timeout_seconds = float(timeout_seconds)
         self.codex_bin = codex_bin or os.environ.get("CODEX_BIN", "codex")
@@ -320,6 +378,17 @@ class CodexBBoxClient:
         login_text = f"{result.stdout or ''}\n{result.stderr or ''}".lower()
         if result.returncode != 0 or "chatgpt" not in login_text:
             raise RuntimeError("Codex CLI must be logged in with a ChatGPT subscription")
+
+    def _schema_path(self, cwd: str | Path) -> Path:
+        if self.schema_path is not None:
+            if not self.schema_path.is_file():
+                raise FileNotFoundError(
+                    f"ObjectNav output schema not found: {self.schema_path}"
+                )
+            return self.schema_path
+        schema_path = Path(cwd).resolve() / DEFAULT_SCHEMA_FILENAME
+        _write_json(schema_path, DEFAULT_POLICY_SCHEMA)
+        return schema_path
 
     @staticmethod
     def _is_finite_number(value: Any) -> bool:
@@ -433,10 +502,7 @@ class CodexBBoxClient:
         image_path = Path(image_path).resolve()
         if not image_path.is_file():
             raise FileNotFoundError(f"ObjectNav RGB image not found: {image_path}")
-        if not self.schema_path.is_file():
-            raise FileNotFoundError(
-                f"ObjectNav output schema not found: {self.schema_path}"
-            )
+        schema_path = self._schema_path(cwd)
         command = [
             self.codex_bin,
             "--ask-for-approval",
@@ -457,7 +523,7 @@ class CodexBBoxClient:
             "--image",
             str(image_path),
             "--output-schema",
-            str(self.schema_path),
+            str(schema_path),
             get_object_nav_policy_prompt(mission, global_target, snapshot),
         ]
         result = self.runner(
