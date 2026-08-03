@@ -60,6 +60,7 @@ class RealSenseSensor(Sensor, SensorServer):
 
         self.pipeline = rs.pipeline()
         self.config = rs.config()
+        self.mount_position = mount_position
         devices = sorted(devices, key=lambda x: x.get_info(rs.camera_info.serial_number))
         selected_serial = self._select_device_serial(devices=devices, device_id=device_id, id=id)
         self.config.enable_device(selected_serial)
@@ -80,13 +81,31 @@ class RealSenseSensor(Sensor, SensorServer):
                     rs.format.z16,
                     config.fps,
                 )
-            self.pipeline.start(self.config)
+            self._pipeline_profile = self.pipeline.start(self.config)
+            self._depth_aligner = None
+            self._camera_info = {}
+            if config.enable_depth:
+                self._depth_aligner = rs.align(rs.stream.color)
+                depth_scale_m = self._pipeline_profile.get_device().first_depth_sensor().get_depth_scale()
+                color_profile = self._pipeline_profile.get_stream(
+                    rs.stream.color
+                ).as_video_stream_profile()
+                intrinsics = color_profile.get_intrinsics()
+                self._camera_info = {
+                    "fx": float(intrinsics.fx),
+                    "fy": float(intrinsics.fy),
+                    "cx": float(intrinsics.ppx),
+                    "cy": float(intrinsics.ppy),
+                    "width": int(intrinsics.width),
+                    "height": int(intrinsics.height),
+                    "depth_scale_m": float(depth_scale_m),
+                    "depth_aligned_to": self.mount_position,
+                }
         except Exception as e:
             raise RuntimeError(f"Failed to start RealSense pipeline: {e}")
 
         self._realsense_config = config
         self._run_as_server = run_as_server
-        self.mount_position = mount_position
         if self._run_as_server:
             self.start_server(port)
         print(
@@ -120,6 +139,9 @@ class RealSenseSensor(Sensor, SensorServer):
         except Exception as e:
             print(f"ERROR! Failed to wait for frames: {e}")
             return None
+
+        if self._realsense_config.enable_depth:
+            frames = self._depth_aligner.process(frames)
 
         color_frame = frames.get_color_frame()
         depth_frame = frames.get_depth_frame() if self._realsense_config.enable_depth else None
@@ -160,10 +182,20 @@ class RealSenseSensor(Sensor, SensorServer):
             timestamps[f"{self.mount_position}_depth"] = current_time
             images[f"{self.mount_position}_depth"] = depth_image
 
-        return {"timestamps": timestamps, "images": images}
+        return {
+            "timestamps": timestamps,
+            "images": images,
+            "camera_info": {self.mount_position: self._camera_info}
+            if self._realsense_config.enable_depth
+            else {},
+        }
 
     def serialize(self, data: dict[str, Any]) -> dict[str, Any]:
-        serialized_msg = ImageMessageSchema(timestamps=data["timestamps"], images=data["images"])
+        serialized_msg = ImageMessageSchema(
+            timestamps=data["timestamps"],
+            images=data["images"],
+            camera_info=data.get("camera_info", {}),
+        )
         return serialized_msg.serialize()
 
     def observation_space(self):

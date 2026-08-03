@@ -1,4 +1,6 @@
+import importlib
 import sys
+import types
 from pathlib import Path
 
 import numpy as np
@@ -6,6 +8,101 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from gear_sonic.camera.sensor_server import ImageMessageSchema, ImageUtils
+
+
+class _FakeFrame:
+    def __init__(self, image):
+        self.image = image
+
+    def get_data(self):
+        return self.image
+
+
+class _FakeFrames:
+    def __init__(self, color, depth):
+        self.color = _FakeFrame(color)
+        self.depth = _FakeFrame(depth)
+
+    def get_color_frame(self):
+        return self.color
+
+    def get_depth_frame(self):
+        return self.depth
+
+
+def _fake_realsense_module():
+    raw_frames = _FakeFrames(
+        np.full((480, 640, 3), 10, dtype=np.uint8),
+        np.full((480, 640), 100, dtype=np.uint16),
+    )
+    aligned_frames = _FakeFrames(
+        np.full((480, 640, 3), 20, dtype=np.uint8),
+        np.full((480, 640), 200, dtype=np.uint16),
+    )
+
+    class FakeDevice:
+        def get_info(self, _info):
+            return "fake-device"
+
+        def first_depth_sensor(self):
+            return types.SimpleNamespace(get_depth_scale=lambda: 0.001)
+
+    class FakeProfile:
+        def get_device(self):
+            return FakeDevice()
+
+        def get_stream(self, stream):
+            assert stream == fake_rs.stream.color
+            intrinsics = types.SimpleNamespace(
+                fx=500.0, fy=501.0, ppx=320.0, ppy=240.0, width=640, height=480
+            )
+            return types.SimpleNamespace(
+                as_video_stream_profile=lambda: types.SimpleNamespace(
+                    get_intrinsics=lambda: intrinsics
+                )
+            )
+
+    class FakePipeline:
+        def start(self, _config):
+            return FakeProfile()
+
+        def wait_for_frames(self):
+            return raw_frames
+
+        def stop(self):
+            pass
+
+    class FakeConfig:
+        def enable_device(self, _device_id):
+            pass
+
+        def enable_stream(self, *_args):
+            pass
+
+    class FakeAlign:
+        instances = []
+
+        def __init__(self, stream):
+            self.stream = stream
+            self.processed_frames = []
+            self.__class__.instances.append(self)
+
+        def process(self, frames):
+            self.processed_frames.append(frames)
+            return aligned_frames
+
+    fake_rs = types.SimpleNamespace(
+        context=lambda: types.SimpleNamespace(query_devices=lambda: [FakeDevice()]),
+        pipeline=FakePipeline,
+        config=FakeConfig,
+        align=FakeAlign,
+        stream=types.SimpleNamespace(color="color", depth="depth"),
+        format=types.SimpleNamespace(rgb8="rgb8", z16="z16"),
+        camera_info=types.SimpleNamespace(
+            name="name", serial_number="serial_number", firmware_version="firmware_version"
+        ),
+    )
+    return fake_rs, raw_frames, FakeAlign
 
 
 def test_rgbd_schema_round_trip_preserves_uint16_and_camera_info():
@@ -49,3 +146,82 @@ def test_depth_encoder_rejects_wrong_dtype_and_shape():
 def test_legacy_rgb_message_without_camera_info_still_decodes():
     decoded = ImageMessageSchema.deserialize({"timestamps": {}, "images": {}})
     assert decoded.camera_info == {}
+
+
+def test_realsense_depth_uses_color_aligned_frames_and_publishes_calibration(monkeypatch):
+    """Catch raw-depth publication or calibration missing from an RGB-D frame."""
+    fake_rs, raw_frames, fake_align = _fake_realsense_module()
+    monkeypatch.setitem(sys.modules, "pyrealsense2", fake_rs)
+    monkeypatch.delitem(sys.modules, "gear_sonic.camera.drivers.realsense", raising=False)
+    realsense = importlib.import_module("gear_sonic.camera.drivers.realsense")
+
+    config = realsense.RealSenseConfig()
+    config.enable_depth = True
+    sensor = realsense.RealSenseSensor(
+        config=config, device_id="fake-device", mount_position="chest_view"
+    )
+
+    result = sensor.read()
+
+    assert result is not None
+    np.testing.assert_array_equal(
+        result["images"]["chest_view_depth"], np.full((480, 640), 200, dtype=np.uint16)
+    )
+    assert fake_align.instances[0].stream == fake_rs.stream.color
+    assert fake_align.instances[0].processed_frames == [raw_frames]
+    assert result["camera_info"]["chest_view"] == {
+        "fx": 500.0, "fy": 501.0, "cx": 320.0, "cy": 240.0,
+        "width": 640, "height": 480,
+        "depth_scale_m": 0.001,
+        "depth_aligned_to": "chest_view",
+    }
+
+
+def test_composed_camera_enables_depth_only_for_chest_and_merges_camera_info(monkeypatch):
+    """Catch depth enabled on non-chest cameras or metadata dropped by composition."""
+    from gear_sonic.camera.composed_camera import ComposedCameraConfig, ComposedCameraSensor
+
+    class FakeRealSenseConfig:
+        created = []
+
+        def __init__(self):
+            self.fps = 30
+            self.enable_depth = True
+            self.__class__.created.append(self)
+
+    class FakeRealSenseSensor:
+        def __init__(self, **kwargs):
+            self.config = kwargs["config"]
+
+    fake_driver = types.ModuleType("gear_sonic.camera.drivers.realsense")
+    fake_driver.RealSenseConfig = FakeRealSenseConfig
+    fake_driver.RealSenseSensor = FakeRealSenseSensor
+    monkeypatch.setitem(sys.modules, "gear_sonic.camera.drivers.realsense", fake_driver)
+
+    composed = object.__new__(ComposedCameraSensor)
+    composed.config = ComposedCameraConfig(realsense_enable_depth=True)
+    composed._instantiate_camera("ego_view", "realsense")
+    composed._instantiate_camera("chest_view", "realsense")
+
+    assert [config.enable_depth for config in FakeRealSenseConfig.created] == [False, True]
+
+    result = ImageMessageSchema.deserialize(
+        composed.serialize_message(
+            {
+                "ego_view": {
+                    "timestamps": {"ego_view": 1.0},
+                    "images": {"ego_view": np.zeros((1, 1, 3), dtype=np.uint8)},
+                    "camera_info": {},
+                },
+                "chest_view": {
+                    "timestamps": {"chest_view": 1.0, "chest_view_depth": 1.0},
+                    "images": {
+                        "chest_view": np.zeros((1, 1, 3), dtype=np.uint8),
+                        "chest_view_depth": np.ones((1, 1), dtype=np.uint16),
+                    },
+                    "camera_info": {"chest_view": {"fx": 500.0}},
+                },
+            }
+        )
+    ).asdict()
+    assert result["camera_info"] == {"chest_view": {"fx": 500.0}}

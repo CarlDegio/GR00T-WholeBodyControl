@@ -401,7 +401,10 @@ class ComposedCameraSensor(Sensor, SensorServer):
             )
             realsense_config = RealSenseConfig()
             realsense_config.fps = self.config.fps
-            realsense_config.enable_depth = self.config.realsense_enable_depth
+            realsense_config.enable_depth = (
+                self.config.realsense_enable_depth
+                and mount_position == CameraMountPosition.CHEST_VIEW.value
+            )
             return RealSenseSensor(
                 config=realsense_config,
                 mount_position=mount_position,
@@ -511,10 +514,16 @@ class ComposedCameraSensor(Sensor, SensorServer):
         """Merge per-camera data into a single ImageMessageSchema."""
         all_timestamps = {}
         all_images = {}
+        all_camera_info = {}
         for _mount, camera_data in message.items():
             all_timestamps.update(camera_data.get("timestamps", {}))
             all_images.update(camera_data.get("images", {}))
-        img_schema = ImageMessageSchema(timestamps=all_timestamps, images=all_images)
+            all_camera_info.update(camera_data.get("camera_info", {}))
+        img_schema = ImageMessageSchema(
+            timestamps=all_timestamps,
+            images=all_images,
+            camera_info=all_camera_info,
+        )
         return img_schema.serialize()
 
     def run_server(self):
