@@ -6,6 +6,7 @@ from dataclasses import FrozenInstanceError
 import json
 import math
 import queue
+import signal
 
 import pytest
 
@@ -18,6 +19,9 @@ from gear_sonic.scripts.lavira_planner import (
     PlannerBusyError,
     VelocityCommand,
     WorkerResult,
+    _PlannerTermination,
+    _TerminationControl,
+    _install_termination_handlers,
     build_reasan_velocity_message,
     run_inference_worker,
     run_planner_loop,
@@ -633,7 +637,88 @@ def test_keyboard_cancel_wins_when_current_worker_result_is_already_ready() -> N
     assert all(message["action"] == "stop" for message in decoded_messages(published))
 
 
-@pytest.mark.parametrize("exit_mode", ["key", "signal", "exception"])
+class SignalingResultQueue(queue.Queue[WorkerResult]):
+    def __init__(self, handler: object):
+        super().__init__(maxsize=1)
+        self.handler = handler
+
+    def get_nowait(self) -> WorkerResult:
+        item = super().get_nowait()
+        self.handler(signal.SIGTERM, None)  # type: ignore[operator]
+        return item
+
+
+def test_signal_after_result_dequeue_aborts_before_controller_acceptance() -> None:
+    published: list[str] = []
+    termination = _TerminationControl()
+    results = SignalingResultQueue(termination.request)
+    runtime = LaviraPlannerRuntime(
+        LaviraPlannerConfig(mission="find chair", global_target="chair"),
+        publish=published.append,
+        sleep=lambda _duration: None,
+        result_queue=results,
+    )
+    runtime.handle_key("n", now=1.0)
+    results.put_nowait(WorkerResult(1, result(), None))
+
+    run_planner_loop(
+        runtime,
+        read_key=lambda: None,
+        monotonic=lambda: 1.0,
+        sleep=lambda _duration: None,
+        running=termination.running,
+    )
+
+    assert results.empty()
+    assert all(message["action"] == "stop" for message in decoded_messages(published))
+
+
+def test_signal_inside_nonzero_publisher_aborts_before_recording_motion() -> None:
+    published: list[str] = []
+    termination = _TerminationControl()
+
+    def publish(message: str) -> None:
+        if json.loads(message)["action"] != "stop":
+            termination.request(signal.SIGTERM, None)
+        published.append(message)
+
+    runtime = LaviraPlannerRuntime(
+        LaviraPlannerConfig(mission="find chair", global_target="chair"),
+        publish=publish,
+        sleep=lambda _duration: None,
+    )
+    runtime.handle_key("n", now=1.0)
+    runtime.result_queue.put_nowait(WorkerResult(1, result(), None))
+
+    run_planner_loop(
+        runtime,
+        read_key=lambda: None,
+        monotonic=lambda: 1.0,
+        sleep=lambda _duration: None,
+        running=termination.running,
+    )
+
+    assert all(message["action"] == "stop" for message in decoded_messages(published))
+
+
+def test_signal_handlers_are_injectable_and_raise_private_termination() -> None:
+    registered: dict[int, object] = {}
+    termination = _TerminationControl()
+
+    _install_termination_handlers(
+        termination,
+        register=lambda signum, handler: registered.update({signum: handler}),
+    )
+
+    assert set(registered) == {signal.SIGINT, signal.SIGTERM}
+    with pytest.raises(_PlannerTermination):
+        registered[signal.SIGINT](signal.SIGINT, None)  # type: ignore[operator]
+    assert termination.running() is False
+
+
+@pytest.mark.parametrize(
+    "exit_mode", ["key", "signal", "exception", "keyboard_interrupt"]
+)
 def test_event_loop_repeats_stop_on_exit_signal_and_exception(exit_mode: str) -> None:
     published: list[str] = []
     runtime = LaviraPlannerRuntime(
@@ -648,9 +733,14 @@ def test_event_loop_repeats_stop_on_exit_signal_and_exception(exit_mode: str) ->
     elif exit_mode == "signal":
         read_key = lambda: None
         running = lambda: False
-    else:
+    elif exit_mode == "exception":
         def read_key() -> str:
             raise RuntimeError("terminal failed")
+
+        running = lambda: True
+    else:
+        def read_key() -> str:
+            raise KeyboardInterrupt
 
         running = lambda: True
 

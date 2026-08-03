@@ -40,6 +40,31 @@ class PlannerBusyError(RuntimeError):
     """Raised when a second command batch is started while one is active."""
 
 
+class _PlannerTermination(BaseException):
+    """Immediately unwind main-thread control flow into planner cleanup."""
+
+
+class _TerminationControl:
+    def __init__(self) -> None:
+        self.requested = False
+
+    def running(self) -> bool:
+        return not self.requested
+
+    def request(self, _signum: int, _frame: Any) -> None:
+        self.requested = True
+        raise _PlannerTermination
+
+
+def _install_termination_handlers(
+    termination: _TerminationControl,
+    *,
+    register: Callable[[int, Any], Any] = signal.signal,
+) -> None:
+    register(signal.SIGINT, termination.request)
+    register(signal.SIGTERM, termination.request)
+
+
 @dataclass
 class LaviraPlannerConfig:
     mission: str
@@ -569,25 +594,28 @@ def run_planner_loop(
 ) -> None:
     """Run the responsive main-thread event loop with guaranteed shutdown stops."""
     try:
-        while running():
-            now = monotonic()
-            key = read_key()
-            decision = (
-                runtime.handle_key(key, now=now, running=running)
-                if key is not None
-                else None
-            )
-            if not running():
-                break
-            if decision == "exit":
-                break
-            runtime.poll_worker_results(now=now)
-            if not running():
-                break
-            runtime.publish_due(now, running=running)
-            if not running():
-                break
-            sleep(min(0.01, 0.25 / runtime.config.planner_hz))
+        try:
+            while running():
+                now = monotonic()
+                key = read_key()
+                decision = (
+                    runtime.handle_key(key, now=now, running=running)
+                    if key is not None
+                    else None
+                )
+                if not running():
+                    break
+                if decision == "exit":
+                    break
+                runtime.poll_worker_results(now=now)
+                if not running():
+                    break
+                runtime.publish_due(now, running=running)
+                if not running():
+                    break
+                sleep(min(0.01, 0.25 / runtime.config.planner_hz))
+        except (_PlannerTermination, KeyboardInterrupt):
+            pass
     finally:
         runtime.shutdown("loop_exit")
 
@@ -643,23 +671,20 @@ def main(config: LaviraPlannerConfig) -> None:
         daemon=True,
     )
     worker.start()
-    keep_running = True
-
-    def stop(_signum: int, _frame: Any) -> None:
-        nonlocal keep_running
-        keep_running = False
-
-    signal.signal(signal.SIGINT, stop)
-    signal.signal(signal.SIGTERM, stop)
-    print(f"[LaViRA] PUB bound to {endpoint}; mission={config.mission!r}")
-    print("[LaViRA] N navigate | W/S/A/D/Q/E manual | Space stop | X exit")
+    termination = _TerminationControl()
     try:
-        with cbreak_terminal():
-            run_planner_loop(
-                runtime,
-                read_key=read_key_nonblocking,
-                running=lambda: keep_running,
-            )
+        try:
+            _install_termination_handlers(termination)
+            print(f"[LaViRA] PUB bound to {endpoint}; mission={config.mission!r}")
+            print("[LaViRA] N navigate | W/S/A/D/Q/E manual | Space stop | X exit")
+            with cbreak_terminal():
+                run_planner_loop(
+                    runtime,
+                    read_key=read_key_nonblocking,
+                    running=termination.running,
+                )
+        except (_PlannerTermination, KeyboardInterrupt):
+            pass
     finally:
         runtime.shutdown("main_exit")
         socket.close()
