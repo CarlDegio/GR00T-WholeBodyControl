@@ -201,6 +201,9 @@ uv.lock
 .venv_camera/
 .venv_inference/
 
+# Local Git worktrees
+.worktrees/
+
 # XRoboToolkit-PC-Service-Pybind
 xrobotoolkit_sdk.cpython-*-*-*.so
 teleop_vids/
