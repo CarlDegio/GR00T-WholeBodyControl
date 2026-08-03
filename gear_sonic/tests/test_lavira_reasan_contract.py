@@ -2,13 +2,27 @@
 
 from __future__ import annotations
 
+import sys
+
 import pytest
 
 from gear_sonic.scripts.lavira_planner import (
     VelocityCommand,
     build_reasan_velocity_message,
 )
-from gear_sonic.scripts.reasan_planner import decode_velocity_command
+from gear_sonic.scripts.reasan_planner import decode_velocity_command, parse_args
+
+
+def test_reasan_default_endpoints_preserve_lavira_input_and_planner_output(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """REASAN must receive LaViRA on 5558 and publish filtered output on 5563."""
+    monkeypatch.setattr(sys, "argv", ["reasan_planner.py"])
+
+    args = parse_args()
+
+    assert args.keyboard_endpoint == "tcp://127.0.0.1:5558"
+    assert args.output_endpoint == "tcp://*:5563"
 
 
 def test_lavira_messages_decode_for_turn_translation_and_stop() -> None:
