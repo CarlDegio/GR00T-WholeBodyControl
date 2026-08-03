@@ -176,6 +176,16 @@ def test_controller_obeys_rotation_pause_translation_deadlines() -> None:
     assert controller.failure_reason is None
 
 
+def test_delayed_rotation_transition_starts_full_pause_from_observation() -> None:
+    controller = LaviraPlannerController(transition_pause=0.5)
+    controller.start(result(), now=10.0)
+
+    assert controller.step(11.4).velocity == (0.0, 0.0, 0.0)
+    assert controller.phase == "transition_pause"
+    assert controller.step(11.899).velocity == (0.0, 0.0, 0.0)
+    assert controller.step(11.9).velocity == (0.3, 0.0, 0.0)
+
+
 def test_controller_publishes_three_final_stops_before_idle() -> None:
     controller = LaviraPlannerController(final_stop_count=3)
     controller.start(
@@ -269,6 +279,7 @@ def test_runtime_uses_one_slot_queues_and_rejects_repeated_n() -> None:
     runtime = LaviraPlannerRuntime(
         LaviraPlannerConfig(mission="find chair", global_target="chair"),
         publish=lambda _message: None,
+        sleep=lambda _duration: None,
     )
 
     assert runtime.request_queue.maxsize == 1
@@ -286,6 +297,7 @@ def test_cancel_increments_generation_publishes_stops_and_discards_late_result()
     runtime = LaviraPlannerRuntime(
         LaviraPlannerConfig(mission="find chair", global_target="chair"),
         publish=published.append,
+        sleep=lambda _duration: None,
     )
     assert runtime.handle_key("n", now=1.0) == "started"
 
@@ -303,7 +315,9 @@ def test_cancel_increments_generation_publishes_stops_and_discards_late_result()
 def test_manual_keys_cancel_first_and_reuse_keyboard_defaults(key: str) -> None:
     published: list[str] = []
     config = LaviraPlannerConfig(mission="find chair", global_target="chair")
-    runtime = LaviraPlannerRuntime(config, publish=published.append)
+    runtime = LaviraPlannerRuntime(
+        config, publish=published.append, sleep=lambda _duration: None
+    )
     runtime.handle_key("n", now=1.0)
 
     assert runtime.handle_key(key.upper(), now=1.1) == "manual"
@@ -323,11 +337,83 @@ def test_manual_keys_cancel_first_and_reuse_keyboard_defaults(key: str) -> None:
     assert manual["duration_s"] == 0.5
 
 
+def test_manual_override_spaces_stop_publications_before_nonzero() -> None:
+    events: list[tuple[str, object]] = []
+
+    def publish(message: str) -> None:
+        events.append(("publish", json.loads(message)["action"]))
+
+    runtime = LaviraPlannerRuntime(
+        LaviraPlannerConfig(mission="find chair", global_target="chair"),
+        publish=publish,
+        sleep=lambda duration: events.append(("sleep", duration)),
+    )
+
+    assert runtime.handle_key("w", now=1.0) == "manual"
+    assert events == [
+        ("publish", "stop"),
+        ("sleep", 0.05),
+        ("publish", "stop"),
+        ("sleep", 0.05),
+        ("publish", "stop"),
+        ("sleep", 0.05),
+        ("publish", "forward"),
+    ]
+
+
+def test_termination_during_manual_stop_interval_suppresses_nonzero() -> None:
+    published: list[str] = []
+    alive = True
+
+    def request_termination(_duration: float) -> None:
+        nonlocal alive
+        alive = False
+
+    runtime = LaviraPlannerRuntime(
+        LaviraPlannerConfig(mission="find chair", global_target="chair"),
+        publish=published.append,
+        sleep=request_termination,
+    )
+
+    run_planner_loop(
+        runtime,
+        read_key=iter(["w"]).__next__,
+        monotonic=lambda: 1.0,
+        sleep=lambda _duration: None,
+        running=lambda: alive,
+    )
+
+    assert all(message["action"] == "stop" for message in decoded_messages(published))
+
+
+def test_shutdown_spaces_all_repeated_stop_publications() -> None:
+    events: list[tuple[str, object]] = []
+    runtime = LaviraPlannerRuntime(
+        LaviraPlannerConfig(mission="find chair", global_target="chair"),
+        publish=lambda message: events.append(
+            ("publish", json.loads(message)["action"])
+        ),
+        sleep=lambda duration: events.append(("sleep", duration)),
+    )
+
+    runtime.shutdown()
+
+    assert events == [
+        ("publish", "stop"),
+        ("sleep", 0.05),
+        ("publish", "stop"),
+        ("sleep", 0.05),
+        ("publish", "stop"),
+        ("sleep", 0.05),
+    ]
+
+
 def test_exit_key_cancels_and_publishes_repeated_stop() -> None:
     published: list[str] = []
     runtime = LaviraPlannerRuntime(
         LaviraPlannerConfig(mission="find chair", global_target="chair"),
         publish=published.append,
+        sleep=lambda _duration: None,
     )
     runtime.handle_key("n", now=1.0)
 
@@ -341,6 +427,7 @@ def test_current_worker_result_starts_motion_and_stale_or_error_results_do_not()
     runtime = LaviraPlannerRuntime(
         LaviraPlannerConfig(mission="find chair", global_target="chair"),
         publish=published.append,
+        sleep=lambda _duration: None,
     )
     runtime.handle_key("n", now=10.0)
     assert runtime.request_queue.get_nowait() == 1
@@ -363,6 +450,7 @@ def test_poll_worker_results_drains_queue_and_disregards_stale_generation() -> N
     runtime = LaviraPlannerRuntime(
         LaviraPlannerConfig(mission="find chair", global_target="chair"),
         publish=lambda _message: None,
+        sleep=lambda _duration: None,
     )
     runtime.handle_key("n", now=1.0)
     runtime.result_queue.put_nowait(WorkerResult(0, result(), None))
@@ -431,6 +519,7 @@ def test_publish_due_uses_20_hz_cadence_and_command_action_names() -> None:
     runtime = LaviraPlannerRuntime(
         LaviraPlannerConfig(mission="find chair", global_target="chair"),
         publish=published.append,
+        sleep=lambda _duration: None,
     )
     runtime.handle_key("n", now=10.0)
     runtime.accept_worker_result(WorkerResult(1, result(), None), now=10.0)
@@ -449,6 +538,7 @@ def test_runtime_maps_negative_yaw_translation_and_stop_actions() -> None:
     runtime = LaviraPlannerRuntime(
         LaviraPlannerConfig(mission="find chair", global_target="chair"),
         publish=published.append,
+        sleep=lambda _duration: None,
     )
     runtime.handle_key("n", now=0.0)
     runtime.accept_worker_result(
@@ -479,12 +569,77 @@ def test_runtime_maps_negative_yaw_translation_and_stop_actions() -> None:
     assert runtime.phase == "idle"
 
 
+class RunningSequence:
+    def __init__(self, *values: bool):
+        self.values = iter(values)
+        self.last = values[-1]
+
+    def __call__(self) -> bool:
+        self.last = next(self.values, self.last)
+        return self.last
+
+
+@pytest.mark.parametrize(
+    ("running_values", "result_was_accepted"),
+    [
+        ((True, False), False),
+        ((True, True, False), True),
+        ((True, True, True, False), True),
+    ],
+)
+def test_termination_gate_prevents_nonzero_after_request(
+    running_values: tuple[bool, ...], result_was_accepted: bool
+) -> None:
+    published: list[str] = []
+    runtime = LaviraPlannerRuntime(
+        LaviraPlannerConfig(mission="find chair", global_target="chair"),
+        publish=published.append,
+        sleep=lambda _duration: None,
+    )
+    runtime.handle_key("n", now=1.0)
+    runtime.result_queue.put_nowait(WorkerResult(1, result(), None))
+
+    run_planner_loop(
+        runtime,
+        read_key=lambda: None,
+        monotonic=lambda: 1.0,
+        sleep=lambda _duration: None,
+        running=RunningSequence(*running_values),
+    )
+
+    assert all(message["action"] == "stop" for message in decoded_messages(published))
+    assert runtime.result_queue.empty() is result_was_accepted
+
+
+def test_keyboard_cancel_wins_when_current_worker_result_is_already_ready() -> None:
+    published: list[str] = []
+    runtime = LaviraPlannerRuntime(
+        LaviraPlannerConfig(mission="find chair", global_target="chair"),
+        publish=published.append,
+        sleep=lambda _duration: None,
+    )
+    runtime.handle_key("n", now=1.0)
+    runtime.result_queue.put_nowait(WorkerResult(1, result(), None))
+
+    run_planner_loop(
+        runtime,
+        read_key=iter([" "]).__next__,
+        monotonic=lambda: 1.0,
+        sleep=lambda _duration: None,
+        running=RunningSequence(True, True, True, False),
+    )
+
+    assert runtime.result_queue.empty()
+    assert all(message["action"] == "stop" for message in decoded_messages(published))
+
+
 @pytest.mark.parametrize("exit_mode", ["key", "signal", "exception"])
 def test_event_loop_repeats_stop_on_exit_signal_and_exception(exit_mode: str) -> None:
     published: list[str] = []
     runtime = LaviraPlannerRuntime(
         LaviraPlannerConfig(mission="find chair", global_target="chair"),
         publish=published.append,
+        sleep=lambda _duration: None,
     )
     if exit_mode == "key":
         keys = iter(["x"])

@@ -298,8 +298,8 @@ class LaviraPlannerController:
                 break
             if self.phase == "rotating":
                 self.phase = "transition_pause"
-                self._deadline += self.transition_pause
-                continue
+                self._deadline = timestamp + self.transition_pause
+                break
             if self.phase == "transition_pause":
                 assert self._batch is not None
                 if self._batch.translation.duration > 0.0:
@@ -352,12 +352,14 @@ class LaviraPlannerRuntime:
         config: LaviraPlannerConfig,
         *,
         publish: Callable[[str], None],
+        sleep: Callable[[float], None] = time.sleep,
         request_queue: queue.Queue[int | None] | None = None,
         result_queue: queue.Queue[WorkerResult] | None = None,
     ):
         self._validate_config(config)
         self.config = config
         self.publish = publish
+        self._sleep = sleep
         self.request_queue = request_queue or queue.Queue(maxsize=1)
         self.result_queue = result_queue or queue.Queue(maxsize=1)
         self.controller = LaviraPlannerController(
@@ -378,7 +380,13 @@ class LaviraPlannerRuntime:
             return "inferencing"
         return self.controller.phase
 
-    def handle_key(self, key: str, *, now: float) -> str:
+    def handle_key(
+        self,
+        key: str,
+        *,
+        now: float,
+        running: Callable[[], bool] = lambda: True,
+    ) -> str:
         normalized = str(key).lower()
         if normalized == "n":
             if self.phase != "idle":
@@ -399,10 +407,15 @@ class LaviraPlannerRuntime:
             return "cancelled"
         if normalized in _MANUAL_KEYS:
             self._cancel_and_publish_stops(f"manual_{normalized}", now)
+            if not running():
+                return "cancelled"
             manual_config, commands = self._manual_commands()
             action, velocity = commands[normalized]
             command = VelocityCommand(*velocity, manual_config.duration)
-            self.publish(build_reasan_velocity_message(command, action=action))
+            message = build_reasan_velocity_message(command, action=action)
+            if not running():
+                return "cancelled"
+            self.publish(message)
             return "manual"
         return "ignored"
 
@@ -430,7 +443,12 @@ class LaviraPlannerRuntime:
                 return accepted
             accepted += int(self.accept_worker_result(item, now=now))
 
-    def publish_due(self, now: float) -> VelocityCommand | None:
+    def publish_due(
+        self,
+        now: float,
+        *,
+        running: Callable[[], bool] = lambda: True,
+    ) -> VelocityCommand | None:
         timestamp = self.controller._timestamp(now)
         if not self.controller.active:
             self._next_publish_at = None
@@ -440,9 +458,12 @@ class LaviraPlannerRuntime:
         if timestamp + 1.0e-12 < self._next_publish_at:
             return None
         command = self.controller.step(timestamp)
-        self.publish(
-            build_reasan_velocity_message(command, action=self._action(command))
-        )
+        message = build_reasan_velocity_message(command, action=self._action(command))
+        if not running():
+            self.controller.cancel("termination_requested")
+            self._next_publish_at = None
+            return None
+        self.publish(message)
         self._next_publish_at = timestamp + 1.0 / self.config.planner_hz
         return command
 
@@ -460,6 +481,7 @@ class LaviraPlannerRuntime:
         for _ in range(self.config.final_stop_count):
             command = self.controller.step(now)
             self.publish(build_reasan_velocity_message(command, action="stop"))
+            self._sleep(1.0 / self.config.planner_hz)
         self._next_publish_at = None
 
     def _manual_commands(
@@ -550,10 +572,21 @@ def run_planner_loop(
         while running():
             now = monotonic()
             key = read_key()
-            if key is not None and runtime.handle_key(key, now=now) == "exit":
+            decision = (
+                runtime.handle_key(key, now=now, running=running)
+                if key is not None
+                else None
+            )
+            if not running():
+                break
+            if decision == "exit":
                 break
             runtime.poll_worker_results(now=now)
-            runtime.publish_due(now)
+            if not running():
+                break
+            runtime.publish_due(now, running=running)
+            if not running():
+                break
             sleep(min(0.01, 0.25 / runtime.config.planner_hz))
     finally:
         runtime.shutdown("loop_exit")
