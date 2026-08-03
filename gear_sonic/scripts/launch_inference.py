@@ -41,6 +41,7 @@ Usage (from repo root — no venv activation needed):
 from dataclasses import dataclass
 from pathlib import Path
 import os
+import shlex
 import shutil
 import signal
 import socket
@@ -49,6 +50,7 @@ import subprocess
 import sys
 import textwrap
 import time
+from typing import Literal
 
 
 def _bootstrap_venv():
@@ -157,6 +159,63 @@ class InferenceLaunchConfig:
     keyboard_planner_host: str = "localhost"
     """Keyboard planner sidecar host."""
 
+    planner_input: Literal["keyboard", "lavira"] = "keyboard"
+    """REASEN command source used in pane 3."""
+
+    lavira_mission: str = ""
+    """Mission sent to LaViRA when --planner-input lavira is selected."""
+
+    lavira_global_target: str = ""
+    """Global target used by LaViRA when --planner-input lavira is selected."""
+
+    lavira_debug: bool = False
+    """Enable LaViRA debug logging."""
+
+    lavira_host: str = "*"
+    """LaViRA REASAN publisher bind host."""
+
+    lavira_planner_hz: float = 20.0
+    """LaViRA velocity publication rate (Hz)."""
+
+    lavira_transition_pause: float = 0.5
+    """LaViRA stop duration between rotation and translation (s)."""
+
+    lavira_final_stop_count: int = 3
+    """Number of final zero-velocity messages published by LaViRA."""
+
+    lavira_max_speed: float = 0.5
+    """LaViRA maximum translation speed (m/s)."""
+
+    lavira_max_duration: float = 30.0
+    """LaViRA maximum command duration (s)."""
+
+    lavira_max_abs_yaw: float = 3.141592653589793
+    """LaViRA maximum relative yaw (rad)."""
+
+    lavira_camera_timeout_ms: int = 3000
+    """LaViRA RGB-D camera receive timeout (ms)."""
+
+    lavira_codex_timeout_seconds: float = 180.0
+    """LaViRA Codex policy timeout (s)."""
+
+    lavira_min_confidence: float = 0.6
+    """Minimum Codex target confidence accepted by LaViRA."""
+
+    lavira_rotation_speed: float = 0.4
+    """LaViRA automatic rotation speed (rad/s)."""
+
+    lavira_forward_speed: float = 0.3
+    """LaViRA automatic forward speed (m/s)."""
+
+    lavira_target_standoff_distance: float = 0.0
+    """LaViRA target standoff distance (m)."""
+
+    lavira_max_direct_travel: float = 8.0
+    """LaViRA maximum automatic direct travel distance (m)."""
+
+    lavira_output_root: str = "outputs/object_nav"
+    """Directory where LaViRA stores ObjectNav diagnostics."""
+
     reasan_ray_port: int = 5562
     """MID-360 ActorRay publisher port."""
 
@@ -192,6 +251,46 @@ class InferenceLaunchConfig:
 SESSION_NAME = "sonic_inference"
 
 
+def build_planner_input_command(config: InferenceLaunchConfig, repo_root: Path) -> str:
+    """Build the pane 3 command for the selected REASEN command source."""
+    if config.planner_input == "keyboard":
+        return (
+            f"cd {repo_root} && "
+            f"source .venv_teleop/bin/activate && "
+            f"python gear_sonic/scripts/keyboard_planner_thread_server.py "
+            f"--port {config.keyboard_planner_port} "
+            f"--hz {config.keyboard_planner_publish_rate} "
+            f"--host {config.keyboard_planner_host} "
+        )
+
+    debug = "--debug " if config.lavira_debug else ""
+    return (
+        f"cd {shlex.quote(str(repo_root))} && "
+        f"source .venv_inference/bin/activate && "
+        f"python gear_sonic/scripts/lavira_planner.py "
+        f"--mission {shlex.quote(config.lavira_mission)} "
+        f"--global-target {shlex.quote(config.lavira_global_target)} "
+        f"{debug}--host {shlex.quote(config.lavira_host)} "
+        f"--port {config.keyboard_planner_port} "
+        f"--planner-hz {config.lavira_planner_hz} "
+        f"--transition-pause {config.lavira_transition_pause} "
+        f"--final-stop-count {config.lavira_final_stop_count} "
+        f"--max-speed {config.lavira_max_speed} "
+        f"--max-duration {config.lavira_max_duration} "
+        f"--max-abs-yaw {config.lavira_max_abs_yaw} "
+        f"--camera-host {shlex.quote(config.camera_host)} "
+        f"--camera-port {config.camera_port} "
+        f"--camera-timeout-ms {config.lavira_camera_timeout_ms} "
+        f"--codex-timeout-seconds {config.lavira_codex_timeout_seconds} "
+        f"--min-confidence {config.lavira_min_confidence} "
+        f"--rotation-speed {config.lavira_rotation_speed} "
+        f"--forward-speed {config.lavira_forward_speed} "
+        f"--target-standoff-distance {config.lavira_target_standoff_distance} "
+        f"--max-direct-travel {config.lavira_max_direct_travel} "
+        f"--output-root {shlex.quote(config.lavira_output_root)}"
+    )
+
+
 def _check_prerequisites(config: InferenceLaunchConfig):
     """Verify that required tools and venvs exist."""
     errors = []
@@ -207,6 +306,14 @@ def _check_prerequisites(config: InferenceLaunchConfig):
         )
     if not (repo_root / ".venv_teleop" / "bin" / "activate").exists():
         errors.append(".venv_teleop not found. Run: bash install_scripts/install_pico.sh")
+
+    if config.planner_input == "lavira":
+        if not config.lavira_mission.strip():
+            errors.append("--lavira-mission is required when --planner-input lavira")
+        if not config.lavira_global_target.strip():
+            errors.append(
+                "--lavira-global-target is required when --planner-input lavira"
+            )
 
     if config.keyboard_planner and not Path(config.reasan_filter_onnx).is_file():
         errors.append(f"REASEN Filter ONNX not found: {config.reasan_filter_onnx}")
@@ -441,16 +548,9 @@ def main(config: InferenceLaunchConfig):
     print("Starting keyboard publisher (pane 2)...")
     _send_to_pane(1, keyboard_cmd, wait=2.0)
 
-    # --- Panes 3-5: REASEN keyboard, Filter planner, and MID-360 ---
+    # --- Panes 3-5: planner input, Filter planner, and MID-360 ---
     if config.keyboard_planner:
-        reasan_keyboard_cmd = (
-            f"cd {repo_root} && "
-            f"source .venv_teleop/bin/activate && "
-            f"python gear_sonic/scripts/keyboard_planner_thread_server.py "
-            f"--port {config.keyboard_planner_port} "
-            f"--hz {config.keyboard_planner_publish_rate} "
-            f"--host {config.keyboard_planner_host} "
-        )
+        reasan_keyboard_cmd = build_planner_input_command(config, repo_root)
         reasan_planner_cmd = (
             f"cd {repo_root} && "
             f"source .venv_teleop/bin/activate && "
@@ -470,7 +570,10 @@ def main(config: InferenceLaunchConfig):
             f"--ray-median-window 5 "
             f"--zmq-endpoint 'tcp://*:{config.reasan_ray_port}'"
         )
-        print("Starting REASEN keyboard (pane 3)...")
+        if config.planner_input == "lavira":
+            print("Starting LaViRA planner (pane 3)...")
+        else:
+            print("Starting REASEN keyboard (pane 3)...")
         _send_to_pane(3, reasan_keyboard_cmd, wait=1.0)
         print("Starting REASEN Filter planner (pane 4)...")
         _send_to_pane(4, reasan_planner_cmd, wait=1.0)
@@ -519,7 +622,10 @@ def main(config: InferenceLaunchConfig):
     print("    Pane 0: C++ Deploy")
     print("    Pane 1: SONIC Keyboard Publisher")
     print("    Pane 2: VLA Inference")
-    print("    Pane 3: REASEN Keyboard")
+    if config.planner_input == "lavira":
+        print("    Pane 3: LaViRA AgentNav Planner")
+    else:
+        print("    Pane 3: REASEN Keyboard")
     print("    Pane 4: REASEN Filter ONNX Planner")
     print("    Pane 5: MID-360 ActorRay/IMU")
     if config.data_exporter:
@@ -532,7 +638,10 @@ def main(config: InferenceLaunchConfig):
     print()
     print("  Planner workflow:")
     print("    1. In pane 1: k (start) -> o (PLANNER mode)")
-    print("    2. In pane 3: W/S/A/D/Q/E for filtered locomotion")
+    if config.planner_input == "lavira":
+        print("    2. In pane 3: N starts AgentNav; Space cancels and stops")
+    else:
+        print("    2. In pane 3: W/S/A/D/Q/E for filtered locomotion")
     print("    3. In pane 1: i (POSE mode)")
     print("  Keyboard controls (type in pane 1):")
     print("    p        - Pause / resume inference")

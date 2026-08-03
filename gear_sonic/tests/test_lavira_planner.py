@@ -5,10 +5,25 @@ from __future__ import annotations
 from dataclasses import FrozenInstanceError
 import json
 import math
+from pathlib import Path
 import queue
 import signal
+import sys
+import types
 
 import pytest
+
+
+# launch_inference bootstraps its production virtual environment when tyro is
+# unavailable. The command builder is pure, so a minimal tyro module keeps its
+# import side-effect free in this software-only test suite.
+sys.modules.setdefault("tyro", types.ModuleType("tyro"))
+
+from gear_sonic.scripts.launch_inference import (
+    InferenceLaunchConfig,
+    _check_prerequisites,
+    build_planner_input_command,
+)
 
 from gear_sonic.scripts.lavira_planner import (
     CommandValidationError,
@@ -28,6 +43,89 @@ from gear_sonic.scripts.lavira_planner import (
     validate_object_nav_batch,
 )
 from gear_sonic.utils.inference.object_nav import ObjectNavResult
+
+
+def test_launch_keyboard_input_preserves_existing_pane_command() -> None:
+    repo_root = Path("/workspace/sonic")
+
+    command = build_planner_input_command(InferenceLaunchConfig(), repo_root)
+
+    assert command == (
+        "cd /workspace/sonic && "
+        "source .venv_teleop/bin/activate && "
+        "python gear_sonic/scripts/keyboard_planner_thread_server.py "
+        "--port 5558 --hz 20 --host localhost "
+    )
+
+
+def test_launch_lavira_input_quotes_mission_and_passes_agentnav_values() -> None:
+    repo_root = Path("/workspace/sonic")
+    config = InferenceLaunchConfig(
+        planner_input="lavira",
+        lavira_mission="approach O'Reilly's chair",
+        lavira_global_target="red chair; echo unsafe",
+        lavira_debug=True,
+        lavira_host="*",
+        lavira_planner_hz=19.5,
+        lavira_transition_pause=0.75,
+        lavira_final_stop_count=4,
+        lavira_max_speed=0.45,
+        lavira_max_duration=29.0,
+        lavira_max_abs_yaw=3.0,
+        camera_host="camera host",
+        camera_port=5555,
+        lavira_camera_timeout_ms=2500,
+        lavira_codex_timeout_seconds=90.0,
+        lavira_min_confidence=0.7,
+        lavira_rotation_speed=0.35,
+        lavira_forward_speed=0.25,
+        lavira_target_standoff_distance=0.2,
+        lavira_max_direct_travel=7.0,
+        lavira_output_root="outputs/nav runs",
+    )
+
+    command = build_planner_input_command(config, repo_root)
+
+    assert command == (
+        "cd /workspace/sonic && "
+        "source .venv_inference/bin/activate && "
+        "python gear_sonic/scripts/lavira_planner.py "
+        "--mission 'approach O'\"'\"'Reilly'\"'\"'s chair' "
+        "--global-target 'red chair; echo unsafe' "
+        "--debug --host '*' --port 5558 "
+        "--planner-hz 19.5 --transition-pause 0.75 --final-stop-count 4 "
+        "--max-speed 0.45 --max-duration 29.0 --max-abs-yaw 3.0 "
+        "--camera-host 'camera host' --camera-port 5555 "
+        "--camera-timeout-ms 2500 --codex-timeout-seconds 90.0 "
+        "--min-confidence 0.7 --rotation-speed 0.35 --forward-speed 0.25 "
+        "--target-standoff-distance 0.2 --max-direct-travel 7.0 "
+        "--output-root 'outputs/nav runs'"
+    )
+
+
+def test_launch_requires_lavira_mission_and_target_only_when_selected(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setattr("gear_sonic.scripts.launch_inference.shutil.which", lambda _: "/tmux")
+    monkeypatch.setattr(
+        "gear_sonic.scripts.launch_inference.Path.exists", lambda _: True
+    )
+    monkeypatch.setattr(
+        "gear_sonic.scripts.launch_inference.Path.is_file", lambda _: True
+    )
+
+    _check_prerequisites(InferenceLaunchConfig(data_exporter=False))
+
+    with pytest.raises(SystemExit):
+        _check_prerequisites(
+            InferenceLaunchConfig(planner_input="lavira", data_exporter=False)
+        )
+
+    assert capsys.readouterr().out == (
+        "ERROR: Prerequisites not met:\n\n"
+        "  - --lavira-mission is required when --planner-input lavira\n"
+        "  - --lavira-global-target is required when --planner-input lavira\n\n"
+    )
 
 
 def commands(
