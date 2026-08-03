@@ -114,11 +114,19 @@ class ImageMessageSchema:
 
     timestamps: dict[str, float]
     images: dict[str, Any]
+    camera_info: dict[str, Any] = field(default_factory=dict)
 
     def serialize(self) -> dict[str, Any]:
-        serialized_msg: dict[str, Any] = {"timestamps": self.timestamps, "images": {}}
+        serialized_msg: dict[str, Any] = {
+            "schema_version": 2,
+            "timestamps": self.timestamps,
+            "images": {},
+            "camera_info": self.camera_info,
+        }
         for key, image in self.images.items():
-            if isinstance(image, bytes | bytearray):
+            if key.endswith("_depth"):
+                serialized_msg["images"][key] = ImageUtils.encode_depth_image(image)
+            elif isinstance(image, bytes | bytearray):
                 serialized_msg["images"][key] = image
             else:
                 serialized_msg["images"][key] = ImageUtils.encode_image(image)
@@ -133,7 +141,13 @@ class ImageMessageSchema:
                 images[key] = value
                 continue
 
-            if isinstance(value, bytes | bytearray):
+            if key.endswith("_depth") and isinstance(value, bytes | bytearray):
+                images[key] = cv2.imdecode(
+                    np.frombuffer(value, dtype=np.uint8), cv2.IMREAD_UNCHANGED
+                )
+            elif key.endswith("_depth") and isinstance(value, str):
+                images[key] = ImageUtils.decode_depth_image(value)
+            elif isinstance(value, bytes | bytearray):
                 mat = cv2.imdecode(np.frombuffer(value, dtype=np.uint8), cv2.IMREAD_COLOR)
                 images[key] = mat[..., ::-1]  # BGR -> RGB
             elif isinstance(value, str):
@@ -144,10 +158,18 @@ class ImageMessageSchema:
                 images[key] = m.decode(value)
             else:
                 images[key] = value
-        return ImageMessageSchema(timestamps=timestamps, images=images)
+        return ImageMessageSchema(
+            timestamps=timestamps,
+            images=images,
+            camera_info=data.get("camera_info", {}),
+        )
 
     def asdict(self) -> dict[str, Any]:
-        return {"timestamps": self.timestamps, "images": self.images}
+        return {
+            "timestamps": self.timestamps,
+            "images": self.images,
+            "camera_info": self.camera_info,
+        }
 
 
 # =============================================================================
@@ -232,6 +254,8 @@ class ImageUtils:
 
     @staticmethod
     def encode_depth_image(image: np.ndarray) -> str:
+        if not isinstance(image, np.ndarray) or image.ndim != 2 or image.dtype != np.uint16:
+            raise ValueError("depth image must be a 2D uint16 array")
         depth_compressed = cv2.imencode(".png", image)[1].tobytes()
         return base64.b64encode(depth_compressed).decode("utf-8")
 
