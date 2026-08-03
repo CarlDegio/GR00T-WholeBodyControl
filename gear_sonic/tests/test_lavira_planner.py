@@ -5,10 +5,13 @@ from __future__ import annotations
 from dataclasses import FrozenInstanceError
 import json
 import math
+import os
 from pathlib import Path
 import queue
 import signal
+import subprocess
 import sys
+import threading
 import types
 
 import pytest
@@ -190,6 +193,47 @@ def test_adapter_builds_existing_reasan_velocity_protocol() -> None:
     assert message["segments"] == [
         {"duration_s": 1.25, "vx": 0.0, "vy": 0.0, "wz": -0.4}
     ]
+
+
+def test_adapter_missing_tyro_fallback_is_hermetic_and_cleans_up() -> None:
+    repo_root = Path(__file__).resolve().parents[2]
+    script = """
+import builtins
+import json
+import sys
+
+from gear_sonic.scripts.lavira_planner import (
+    VelocityCommand,
+    build_reasan_velocity_message,
+)
+
+real_import = builtins.__import__
+
+def import_without_tyro(name, *args, **kwargs):
+    if name == "tyro" and "tyro" not in sys.modules:
+        raise ModuleNotFoundError("No module named 'tyro'", name="tyro")
+    return real_import(name, *args, **kwargs)
+
+builtins.__import__ = import_without_tyro
+message = json.loads(build_reasan_velocity_message(
+    VelocityCommand(0.0, 0.0, 0.0, 0.05), action="stop"
+))
+print(json.dumps({"action": message["action"], "tyro_present": "tyro" in sys.modules}))
+"""
+
+    completed = subprocess.run(
+        [sys.executable, "-c", script],
+        cwd=repo_root,
+        env={**os.environ, "PYTHONPATH": str(repo_root)},
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    assert json.loads(completed.stdout) == {
+        "action": "stop",
+        "tyro_present": False,
+    }
 
 
 def test_validation_accepts_exact_rotation_then_translation_boundaries() -> None:
@@ -510,6 +554,68 @@ def test_shutdown_spaces_all_repeated_stop_publications() -> None:
     ]
 
 
+def test_runtime_logs_each_state_transition_once() -> None:
+    logs: list[str] = []
+    runtime = LaviraPlannerRuntime(
+        LaviraPlannerConfig(mission="find chair", global_target="chair"),
+        publish=lambda _message: None,
+        sleep=lambda _duration: None,
+        logger=logs.append,
+    )
+
+    assert runtime.handle_key("n", now=0.0) == "started"
+    assert runtime.accept_worker_result(WorkerResult(1, result(), None), now=0.0)
+    for now in (0.0, 0.5, 1.0, 1.25, 1.5, 2.0, 3.5, 3.55, 3.60):
+        runtime.publish_due(now)
+
+    assert logs == [
+        "[LaViRA] STATE IDLE",
+        "[LaViRA] STATE INFERENCING",
+        "[LaViRA] STATE ROTATING",
+        "[LaViRA] STATE STOP_GAP",
+        "[LaViRA] STATE FORWARD",
+        "[LaViRA] STATE FINAL_STOP",
+        "[LaViRA] STATE IDLE",
+    ]
+
+
+def test_runtime_logs_busy_rejection_without_duplicate_state() -> None:
+    logs: list[str] = []
+    runtime = LaviraPlannerRuntime(
+        LaviraPlannerConfig(mission="find chair", global_target="chair"),
+        publish=lambda _message: None,
+        sleep=lambda _duration: None,
+        logger=logs.append,
+    )
+
+    assert runtime.handle_key("n", now=0.0) == "started"
+    assert runtime.handle_key("n", now=0.1) == "busy"
+
+    assert logs == [
+        "[LaViRA] STATE IDLE",
+        "[LaViRA] STATE INFERENCING",
+        "[LaViRA] BUSY navigation request rejected",
+    ]
+
+
+def test_runtime_logs_cancellation_and_worker_failure_reasons() -> None:
+    logs: list[str] = []
+    runtime = LaviraPlannerRuntime(
+        LaviraPlannerConfig(mission="find chair", global_target="chair"),
+        publish=lambda _message: None,
+        sleep=lambda _duration: None,
+        logger=logs.append,
+    )
+    runtime.handle_key("n", now=0.0)
+    assert runtime.accept_worker_result(
+        WorkerResult(1, None, "camera timeout"), now=0.1
+    )
+    runtime.handle_key(" ", now=0.2)
+
+    assert "[LaViRA] FAILURE camera timeout" in logs
+    assert "[LaViRA] CANCEL operator_stop" in logs
+
+
 def test_exit_key_cancels_and_publishes_repeated_stop() -> None:
     published: list[str] = []
     runtime = LaviraPlannerRuntime(
@@ -614,6 +720,42 @@ def test_worker_converts_inference_exception_to_generation_tagged_error() -> Non
 
     assert results.get_nowait() == WorkerResult(4, None, "camera unavailable")
     assert runner.closed is True
+
+
+def test_shutdown_replaces_full_request_and_worker_does_not_start_it() -> None:
+    stop_event = threading.Event()
+    requests: queue.Queue[int | None] = queue.Queue(maxsize=1)
+    results: queue.Queue[WorkerResult] = queue.Queue(maxsize=1)
+    factory_calls: list[str] = []
+    runtime = LaviraPlannerRuntime(
+        LaviraPlannerConfig(mission="find chair", global_target="chair"),
+        publish=lambda _message: None,
+        sleep=lambda _duration: None,
+        request_queue=requests,
+        worker_stop_event=stop_event,
+    )
+    assert runtime.handle_key("n", now=0.0) == "started"
+
+    runtime.shutdown("test_teardown")
+
+    assert stop_event.is_set()
+    assert requests.get_nowait() is None
+    requests.put_nowait(None)
+
+    def runner_factory() -> FakeRunner:
+        factory_calls.append("started")
+        return FakeRunner()
+
+    worker = threading.Thread(
+        target=run_inference_worker,
+        args=(runner_factory, requests, results, stop_event),
+    )
+    worker.start()
+    worker.join(timeout=1.0)
+
+    assert not worker.is_alive()
+    assert factory_calls == []
+    assert results.empty()
 
 
 def test_publish_due_uses_20_hz_cadence_and_command_action_names() -> None:
@@ -799,6 +941,51 @@ def test_signal_inside_nonzero_publisher_aborts_before_recording_motion() -> Non
     assert all(message["action"] == "stop" for message in decoded_messages(published))
 
 
+def test_sighup_during_active_motion_reaches_repeated_stop_cleanup() -> None:
+    published: list[str] = []
+    termination = _TerminationControl()
+
+    def publish(message: str) -> None:
+        if json.loads(message)["action"] != "stop":
+            termination.request(signal.SIGHUP, None)
+        published.append(message)
+
+    runtime = LaviraPlannerRuntime(
+        LaviraPlannerConfig(mission="find chair", global_target="chair"),
+        publish=publish,
+        sleep=lambda _duration: None,
+    )
+    runtime.handle_key("n", now=1.0)
+    runtime.result_queue.put_nowait(WorkerResult(1, result(), None))
+
+    run_planner_loop(
+        runtime,
+        read_key=lambda: None,
+        monotonic=lambda: 1.0,
+        sleep=lambda _duration: None,
+        running=termination.running,
+    )
+
+    assert_stop_messages(published)
+
+
+def test_repeated_sighup_during_cleanup_does_not_interrupt_stop_cadence() -> None:
+    published: list[str] = []
+    termination = _TerminationControl()
+    with pytest.raises(_PlannerTermination):
+        termination.request(signal.SIGHUP, None)
+
+    runtime = LaviraPlannerRuntime(
+        LaviraPlannerConfig(mission="find chair", global_target="chair"),
+        publish=published.append,
+        sleep=lambda _duration: termination.request(signal.SIGHUP, None),
+    )
+
+    runtime.shutdown("sighup")
+
+    assert_stop_messages(published)
+
+
 def test_signal_handlers_are_injectable_and_raise_private_termination() -> None:
     registered: dict[int, object] = {}
     termination = _TerminationControl()
@@ -808,7 +995,7 @@ def test_signal_handlers_are_injectable_and_raise_private_termination() -> None:
         register=lambda signum, handler: registered.update({signum: handler}),
     )
 
-    assert set(registered) == {signal.SIGINT, signal.SIGTERM}
+    assert set(registered) == {signal.SIGHUP, signal.SIGINT, signal.SIGTERM}
     with pytest.raises(_PlannerTermination):
         registered[signal.SIGINT](signal.SIGINT, None)  # type: ignore[operator]
     assert termination.running() is False

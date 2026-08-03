@@ -30,6 +30,14 @@ from gear_sonic.utils.inference.object_nav import (
 _ZERO_TOLERANCE = 1.0e-9
 _STOP_VELOCITY = (0.0, 0.0, 0.0)
 _MANUAL_KEYS = frozenset("wsadqe")
+_PHASE_LABELS = {
+    "idle": "IDLE",
+    "inferencing": "INFERENCING",
+    "rotating": "ROTATING",
+    "transition_pause": "STOP_GAP",
+    "translating": "FORWARD",
+    "final_stop": "FINAL_STOP",
+}
 
 
 class CommandValidationError(ValueError):
@@ -52,6 +60,8 @@ class _TerminationControl:
         return not self.requested
 
     def request(self, _signum: int, _frame: Any) -> None:
+        if self.requested:
+            return
         self.requested = True
         raise _PlannerTermination
 
@@ -61,6 +71,7 @@ def _install_termination_handlers(
     *,
     register: Callable[[int, Any], Any] = signal.signal,
 ) -> None:
+    register(signal.SIGHUP, termination.request)
     register(signal.SIGINT, termination.request)
     register(signal.SIGTERM, termination.request)
 
@@ -380,6 +391,8 @@ class LaviraPlannerRuntime:
         sleep: Callable[[float], None] = time.sleep,
         request_queue: queue.Queue[int | None] | None = None,
         result_queue: queue.Queue[WorkerResult] | None = None,
+        worker_stop_event: threading.Event | None = None,
+        logger: Callable[[str], None] = print,
     ):
         self._validate_config(config)
         self.config = config
@@ -387,6 +400,8 @@ class LaviraPlannerRuntime:
         self._sleep = sleep
         self.request_queue = request_queue or queue.Queue(maxsize=1)
         self.result_queue = result_queue or queue.Queue(maxsize=1)
+        self.worker_stop_event = worker_stop_event or threading.Event()
+        self._logger = logger
         self.controller = LaviraPlannerController(
             transition_pause=config.transition_pause,
             final_stop_count=config.final_stop_count,
@@ -398,6 +413,8 @@ class LaviraPlannerRuntime:
         self.generation = 0
         self._pending_generation: int | None = None
         self._next_publish_at: float | None = None
+        self._last_logged_phase: str | None = None
+        self._log_phase_transition()
 
     @property
     def phase(self) -> str:
@@ -414,15 +431,18 @@ class LaviraPlannerRuntime:
     ) -> str:
         normalized = str(key).lower()
         if normalized == "n":
-            if self.phase != "idle":
+            if self.phase != "idle" or self.worker_stop_event.is_set():
+                self._logger("[LaViRA] BUSY navigation request rejected")
                 return "busy"
             candidate = self.generation + 1
             try:
                 self.request_queue.put_nowait(candidate)
             except queue.Full:
+                self._logger("[LaViRA] BUSY navigation request rejected")
                 return "busy"
             self.generation = candidate
             self._pending_generation = candidate
+            self._log_phase_transition()
             return "started"
         if normalized == "x":
             self._cancel_and_publish_stops("exit", now)
@@ -453,10 +473,15 @@ class LaviraPlannerRuntime:
             return False
         self._pending_generation = None
         if item.error is not None or item.result is None:
-            self.controller.cancel(item.error or "inference returned no result")
+            reason = item.error or "inference returned no result"
+            self._logger(f"[LaViRA] FAILURE {reason}")
+            self.controller.cancel(reason)
         else:
             self.controller.start(item.result, now)
+            if self.controller.failure_reason is not None:
+                self._logger(f"[LaViRA] FAILURE {self.controller.failure_reason}")
         self._next_publish_at = self.controller._timestamp(now)
+        self._log_phase_transition()
         return True
 
     def poll_worker_results(self, *, now: float) -> int:
@@ -486,28 +511,52 @@ class LaviraPlannerRuntime:
         message = build_reasan_velocity_message(command, action=self._action(command))
         if not running():
             self.controller.cancel("termination_requested")
+            self._logger("[LaViRA] CANCEL termination_requested")
+            self._log_phase_transition()
             self._next_publish_at = None
             return None
         self.publish(message)
+        self._log_phase_transition()
         self._next_publish_at = timestamp + 1.0 / self.config.planner_hz
         return command
 
     def shutdown(self, reason: str = "shutdown") -> None:
+        self.worker_stop_event.set()
+        self._replace_requests_with_shutdown()
         self._cancel_and_publish_stops(reason, time.monotonic())
-        try:
-            self.request_queue.put_nowait(None)
-        except queue.Full:
-            pass
+
+    def _replace_requests_with_shutdown(self) -> None:
+        while True:
+            while True:
+                try:
+                    self.request_queue.get_nowait()
+                except queue.Empty:
+                    break
+            try:
+                self.request_queue.put_nowait(None)
+                return
+            except queue.Full:
+                continue
 
     def _cancel_and_publish_stops(self, reason: str, now: float) -> None:
         self.generation += 1
         self._pending_generation = None
         self.controller.cancel(reason)
+        self._logger(f"[LaViRA] CANCEL {reason}")
+        self._log_phase_transition()
         for _ in range(self.config.final_stop_count):
             command = self.controller.step(now)
             self.publish(build_reasan_velocity_message(command, action="stop"))
+            self._log_phase_transition()
             self._sleep(1.0 / self.config.planner_hz)
         self._next_publish_at = None
+
+    def _log_phase_transition(self) -> None:
+        phase = self.phase
+        if phase == self._last_logged_phase:
+            return
+        self._last_logged_phase = phase
+        self._logger(f"[LaViRA] STATE {_PHASE_LABELS[phase]}")
 
     def _manual_commands(
         self,
@@ -563,21 +612,27 @@ def run_inference_worker(
     runner_factory: Callable[[], ObjectNavRunner],
     requests: queue.Queue[int | None],
     results: queue.Queue[WorkerResult],
+    stop_event: threading.Event | None = None,
 ) -> None:
     """Run one AgentNav request at a time and tag every result by generation."""
+    stopping = stop_event or threading.Event()
     runner: ObjectNavRunner | None = None
     try:
-        while True:
+        while not stopping.is_set():
             generation = requests.get()
-            if generation is None:
+            if generation is None or stopping.is_set():
                 return
             try:
                 if runner is None:
                     runner = runner_factory()
+                if stopping.is_set():
+                    return
                 nav_result = runner.run_once()
                 item = WorkerResult(generation, nav_result, None)
             except Exception as exc:
                 item = WorkerResult(generation, None, str(exc))
+            if stopping.is_set():
+                return
             _offer_worker_result(results, item)
     finally:
         if runner is not None:
@@ -666,7 +721,12 @@ def main(config: LaviraPlannerConfig) -> None:
     runtime = LaviraPlannerRuntime(config, publish=socket.send_string)
     worker = threading.Thread(
         target=run_inference_worker,
-        args=(lambda: _runner_factory(config), runtime.request_queue, runtime.result_queue),
+        args=(
+            lambda: _runner_factory(config),
+            runtime.request_queue,
+            runtime.result_queue,
+            runtime.worker_stop_event,
+        ),
         name="lavira-object-nav",
         daemon=True,
     )

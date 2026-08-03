@@ -25,7 +25,7 @@ Output structure:
 from dataclasses import dataclass
 from pathlib import Path
 import time
-from typing import Optional
+from typing import Any, Mapping, Optional
 
 import cv2
 import numpy as np
@@ -57,6 +57,19 @@ class CameraViewerConfig:
     """Max width per camera tile in the display window."""
 
 
+def _is_rgb_image(image: Any) -> bool:
+    return (
+        isinstance(image, np.ndarray)
+        and image.ndim == 3
+        and image.shape[2] == 3
+    )
+
+
+def _rgb_camera_names(images: Mapping[str, Any]) -> list[str]:
+    """Return only three-channel streams suitable for this RGB viewer."""
+    return sorted(name for name, image in images.items() if _is_rgb_image(image))
+
+
 def main(config: CameraViewerConfig):
     client = ComposedCameraClientSensor(server_ip=config.camera_host, port=config.camera_port)
 
@@ -72,7 +85,7 @@ def main(config: CameraViewerConfig):
         print("ERROR: No camera frames received after 10s. Check the camera server.")
         return
 
-    camera_names = sorted(sample["images"].keys())
+    camera_names = _rgb_camera_names(sample["images"])
     print(f"Detected {len(camera_names)} camera stream(s): {camera_names}")
 
     output_dir = Path(config.output_path) if config.output_path else Path("camera_recordings")
@@ -105,13 +118,10 @@ def main(config: CameraViewerConfig):
             tiles = []
             for name in camera_names:
                 img = image_data["images"].get(name)
-                if img is None:
+                if not _is_rgb_image(img):
                     continue
 
-                if img.shape[2] == 3:
-                    img_bgr = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
-                else:
-                    img_bgr = img
+                img_bgr = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
 
                 if is_recording and name in video_writers:
                     video_writers[name].write(img_bgr)
@@ -169,7 +179,7 @@ def main(config: CameraViewerConfig):
                     video_writers = {}
                     for name in camera_names:
                         img = image_data["images"].get(name)
-                        if img is not None:
+                        if _is_rgb_image(img):
                             h, w = img.shape[:2]
                             path = recording_dir / f"{name}.mp4"
                             video_writers[name] = cv2.VideoWriter(
