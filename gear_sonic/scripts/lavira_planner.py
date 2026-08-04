@@ -16,7 +16,7 @@ import threading
 import time
 import tty
 import types
-from typing import Any, Callable, Iterator, Mapping, TextIO
+from typing import Any, Callable, Iterator, Literal, Mapping, TextIO
 
 import zmq
 
@@ -78,6 +78,9 @@ class LaviraPlannerConfig:
     mission: str
     global_target: str
     model: str = "gpt-5.6-luna"
+    vision_backend: Literal["codex", "qwenvl"] = "codex"
+    qwenvl_model: str = "qwen3-vl-32b-instruct"
+    qwenvl_base_url: str = "https://dashscope-intl.aliyuncs.com/compatible-mode/v1"
     warmup: bool = True
     debug: bool = False
     host: str = "*"
@@ -775,7 +778,10 @@ def _runner_factory(config: LaviraPlannerConfig) -> ObjectNavRunner:
         ObjectNavConfig(
             mission=config.mission,
             global_target=config.global_target,
+            vision_backend=config.vision_backend,
             model=config.model,
+            qwenvl_model=config.qwenvl_model,
+            qwenvl_base_url=config.qwenvl_base_url,
             camera_host=config.camera_host,
             camera_port=config.camera_port,
             camera_timeout_ms=config.camera_timeout_ms,

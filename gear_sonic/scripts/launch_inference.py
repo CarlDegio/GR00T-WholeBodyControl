@@ -171,6 +171,15 @@ class InferenceLaunchConfig:
     lavira_model: str = "gpt-5.6-luna"
     """Codex CLI vision model used by LaViRA."""
 
+    lavira_vision_backend: Literal["codex", "qwenvl"] = "codex"
+    """Vision provider used by LaViRA target recognition."""
+
+    lavira_qwenvl_model: str = "qwen3-vl-32b-instruct"
+    """DashScope Qwen-VL model used when the backend is qwenvl."""
+
+    lavira_qwenvl_base_url: str = "https://dashscope-intl.aliyuncs.com/compatible-mode/v1"
+    """DashScope OpenAI-compatible endpoint; key comes from DASHSCOPE_API_KEY."""
+
     lavira_warmup: bool = True
     """Run one discarded Luna request in the background at startup."""
 
@@ -271,10 +280,20 @@ def build_planner_input_command(config: InferenceLaunchConfig, repo_root: Path) 
 
     debug = "--debug " if config.lavira_debug else ""
     warmup = "" if config.lavira_warmup else "--no-warmup "
+    vision_backend = ""
+    local_env = ""
+    if config.lavira_vision_backend == "qwenvl":
+        local_env = "set -a; [ ! -f .env.local ] || . ./.env.local; set +a; "
+        vision_backend = (
+            "--vision-backend qwenvl "
+            f"--qwenvl-model {shlex.quote(config.lavira_qwenvl_model)} "
+            f"--qwenvl-base-url {shlex.quote(config.lavira_qwenvl_base_url)} "
+        )
     quoted_root = shlex.quote(str(repo_root))
     quoted_camera_host = shlex.quote(config.camera_host)
     return (
         f"cd {quoted_root} && "
+        f"{local_env}"
         f"ready_file=/tmp/sonic_lingbot_ready_$$; rm -f $ready_file; "
         f"PYTHONPATH={quoted_root} .venv_lingbot_depth/bin/python "
         f"gear_sonic/scripts/run_lingbot_depth_viewer.py "
@@ -289,7 +308,7 @@ def build_planner_input_command(config: InferenceLaunchConfig, repo_root: Path) 
         f"--mission {shlex.quote(config.lavira_mission)} "
         f"--global-target {shlex.quote(config.lavira_global_target)} "
         f"--model {shlex.quote(config.lavira_model)} "
-        f"{debug}{warmup}--host {shlex.quote(config.lavira_host)} "
+        f"{vision_backend}{debug}{warmup}--host {shlex.quote(config.lavira_host)} "
         f"--port {config.keyboard_planner_port} "
         f"--planner-hz {config.lavira_planner_hz} "
         f"--transition-pause {config.lavira_transition_pause} "

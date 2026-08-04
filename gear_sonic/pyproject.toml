@@ -80,6 +80,7 @@ camera = [
 # Inference: VLA inference client for running Isaac-GR00T policies
 # Usage: pip install -e "gear_sonic[inference]"
 inference = [
+    "openai>=1.0",
     "pyzmq",
     "msgpack",
     "msgpack-numpy",

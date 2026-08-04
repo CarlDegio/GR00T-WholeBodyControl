@@ -4,13 +4,14 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
+import base64
 import json
 import math
 import os
 import subprocess
 import tempfile
 import time
-from typing import Any, Callable, Mapping
+from typing import Any, Callable, Literal, Mapping
 
 import cv2
 import msgpack
@@ -30,6 +31,8 @@ from gear_sonic.utils.inference.object_nav_geometry import (
 
 
 DEFAULT_SCHEMA_FILENAME = "object_nav_policy.schema.json"
+DEFAULT_QWENVL_MODEL = "qwen3-vl-32b-instruct"
+DEFAULT_QWENVL_BASE_URL = "https://dashscope-intl.aliyuncs.com/compatible-mode/v1"
 HTTP_PROXY_KEYS = ("http_proxy", "https_proxy", "HTTP_PROXY", "HTTPS_PROXY")
 ALL_PROXY_KEYS = ("all_proxy", "ALL_PROXY")
 POLICY_KEYS = (
@@ -128,6 +131,9 @@ class ObjectNavConfig:
     mission: str
     global_target: str
     model: str = "gpt-5.6-luna"
+    vision_backend: Literal["codex", "qwenvl"] = "codex"
+    qwenvl_model: str = DEFAULT_QWENVL_MODEL
+    qwenvl_base_url: str = DEFAULT_QWENVL_BASE_URL
     camera_host: str = "localhost"
     camera_port: int = 5555
     camera_timeout_ms: int = 3000
@@ -561,6 +567,103 @@ class CodexBBoxClient:
             raise ValueError("Codex ObjectNav output is not valid JSON") from exc
 
 
+class QwenVLBBoxClient:
+    """Call Qwen-VL through DashScope's OpenAI-compatible chat API."""
+
+    def __init__(
+        self,
+        *,
+        model: str = DEFAULT_QWENVL_MODEL,
+        base_url: str = DEFAULT_QWENVL_BASE_URL,
+        timeout_seconds: float = 180.0,
+        api_key: str | None = None,
+        client: Any | None = None,
+        monotonic: Callable[[], float] = time.monotonic,
+    ):
+        self.model = model
+        self.base_url = base_url
+        self.timeout_seconds = float(timeout_seconds)
+        self._monotonic = monotonic
+        self.last_auth_check_seconds = 0.0
+        self.last_api_inference_seconds = 0.0
+
+        if client is not None:
+            self.client = client
+            return
+        key = api_key or os.environ.get("DASHSCOPE_API_KEY")
+        if not key:
+            raise RuntimeError(
+                "Qwen-VL requires the DASHSCOPE_API_KEY environment variable"
+            )
+        try:
+            from openai import OpenAI
+        except ImportError as exc:
+            raise RuntimeError(
+                "Qwen-VL requires the openai package; install the inference extra"
+            ) from exc
+        self.client = OpenAI(api_key=key, base_url=base_url)
+
+    @staticmethod
+    def _parse_json_content(content: Any) -> dict[str, Any]:
+        if not isinstance(content, str) or not content.strip():
+            raise ValueError("Qwen-VL ObjectNav output is empty")
+        text = content.strip()
+        if text.startswith("```") and text.endswith("```"):
+            lines = text.splitlines()
+            if len(lines) >= 3:
+                text = "\n".join(lines[1:-1]).strip()
+        try:
+            return CodexBBoxClient.validate_policy(json.loads(text))
+        except json.JSONDecodeError as exc:
+            raise ValueError("Qwen-VL ObjectNav output is not valid JSON") from exc
+
+    def locate(
+        self,
+        *,
+        image_path: str | Path,
+        mission: str,
+        global_target: str,
+        snapshot: RGBDSnapshot,
+        cwd: str | Path,
+    ) -> dict[str, Any]:
+        del cwd
+        image_path = Path(image_path).resolve()
+        if not image_path.is_file():
+            raise FileNotFoundError(f"ObjectNav RGB image not found: {image_path}")
+        image_data = base64.b64encode(image_path.read_bytes()).decode("ascii")
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": f"data:image/png;base64,{image_data}"},
+                    },
+                    {
+                        "type": "text",
+                        "text": get_object_nav_policy_prompt(
+                            mission, global_target, snapshot
+                        ),
+                    },
+                ],
+            }
+        ]
+        started = self._monotonic()
+        try:
+            completion = self.client.chat.completions.create(
+                model=self.model,
+                messages=messages,
+                timeout=self.timeout_seconds,
+            )
+        finally:
+            self.last_api_inference_seconds = self._monotonic() - started
+        try:
+            content = completion.choices[0].message.content
+        except (AttributeError, IndexError, TypeError) as exc:
+            raise ValueError("Qwen-VL ObjectNav response is malformed") from exc
+        return self._parse_json_content(content)
+
+
 def _draw_bbox(rgb_bgr: np.ndarray, bbox: Any) -> np.ndarray:
     image = rgb_bgr.copy()
     if not isinstance(bbox, list) or len(bbox) != 4:
@@ -620,7 +723,7 @@ class ObjectNavRunner:
         self,
         config: ObjectNavConfig,
         camera: Any | None = None,
-        codex: CodexBBoxClient | None = None,
+        codex: Any | None = None,
     ):
         if not config.mission.strip() or not config.global_target.strip():
             raise ValueError("mission and global_target are required")
@@ -629,11 +732,22 @@ class ObjectNavRunner:
         self.camera = camera or ComposedRGBDCamera(
             config.camera_host, config.camera_port, config.camera_timeout_ms
         )
-        self.codex = codex or CodexBBoxClient(
-            model=config.model,
-            reasoning_effort=None,
-            timeout_seconds=config.codex_timeout_seconds,
-        )
+        if codex is not None:
+            self.codex = codex
+        elif config.vision_backend == "codex":
+            self.codex = CodexBBoxClient(
+                model=config.model,
+                reasoning_effort=None,
+                timeout_seconds=config.codex_timeout_seconds,
+            )
+        elif config.vision_backend == "qwenvl":
+            self.codex = QwenVLBBoxClient(
+                model=config.qwenvl_model,
+                base_url=config.qwenvl_base_url,
+                timeout_seconds=config.codex_timeout_seconds,
+            )
+        else:
+            raise ValueError(f"unsupported vision_backend: {config.vision_backend}")
 
     def run_once(self, *, iteration: int = 1) -> ObjectNavResult:
         total_started = time.monotonic()

@@ -7,6 +7,7 @@ import json
 import os
 from pathlib import Path
 import subprocess
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -19,6 +20,7 @@ from gear_sonic.utils.inference.object_nav import (
     ObjectNavConfig,
     ObjectNavResult,
     ObjectNavRunner,
+    QwenVLBBoxClient,
     RGBDSnapshot,
     get_object_nav_policy_prompt,
 )
@@ -331,6 +333,52 @@ def test_default_runner_uses_luna_without_reasoning_override(tmp_path: Path) -> 
 
     assert runner.codex.model == "gpt-5.6-luna"
     assert runner.codex.reasoning_effort is None
+
+
+def test_qwenvl_client_sends_local_image_and_validates_policy(tmp_path: Path) -> None:
+    calls: list[dict[str, object]] = []
+
+    class FakeCompletions:
+        def create(self, **kwargs: object) -> object:
+            calls.append(kwargs)
+            return SimpleNamespace(
+                choices=[
+                    SimpleNamespace(
+                        message=SimpleNamespace(content=json.dumps(policy()))
+                    )
+                ]
+            )
+
+    client = SimpleNamespace(chat=SimpleNamespace(completions=FakeCompletions()))
+    image_path = tmp_path / "input.png"
+    image_path.write_bytes(b"png bytes")
+    ticks = iter([4.0, 5.25])
+    qwen = QwenVLBBoxClient(client=client, monotonic=lambda: next(ticks))
+
+    result = qwen.locate(
+        image_path=image_path,
+        mission="find chair",
+        global_target="chair",
+        snapshot=snapshot(),
+        cwd=tmp_path,
+    )
+
+    assert result == policy()
+    assert calls[0]["model"] == "qwen3-vl-32b-instruct"
+    assert calls[0]["timeout"] == 180.0
+    messages = calls[0]["messages"]
+    assert isinstance(messages, list)
+    image_url = messages[0]["content"][0]["image_url"]["url"]
+    assert image_url.startswith("data:image/png;base64,")
+    assert qwen.last_auth_check_seconds == 0.0
+    assert qwen.last_api_inference_seconds == pytest.approx(1.25)
+
+
+def test_qwenvl_client_requires_api_key(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("DASHSCOPE_API_KEY", raising=False)
+
+    with pytest.raises(RuntimeError, match="DASHSCOPE_API_KEY"):
+        QwenVLBBoxClient()
 
 
 def test_empty_proxy_overrides_remove_inherited_values(monkeypatch: pytest.MonkeyPatch) -> None:

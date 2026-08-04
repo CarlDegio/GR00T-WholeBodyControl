@@ -201,6 +201,11 @@ uv.lock
 .venv_camera/
 .venv_inference/
 
+# Local secrets (never commit)
+.env
+.env.local
+.env.*.local
+
 # Local Git worktrees
 .worktrees/
 

@@ -129,6 +129,26 @@ def test_launch_can_disable_lavira_warmup() -> None:
     assert "--no-warmup" in command
 
 
+def test_launch_lavira_can_select_qwenvl_backend() -> None:
+    command = build_planner_input_command(
+        InferenceLaunchConfig(
+            planner_input="lavira",
+            lavira_mission="find chair",
+            lavira_global_target="chair",
+            lavira_vision_backend="qwenvl",
+        ),
+        Path("/workspace/sonic"),
+    )
+
+    assert "--vision-backend qwenvl" in command
+    assert ". ./.env.local" in command
+    assert "--qwenvl-model qwen3-vl-32b-instruct" in command
+    assert (
+        "--qwenvl-base-url "
+        "https://dashscope-intl.aliyuncs.com/compatible-mode/v1"
+    ) in command
+
+
 def test_launch_lavira_starts_depth_viewer_in_same_pane_shell() -> None:
     command = build_planner_input_command(
         InferenceLaunchConfig(
