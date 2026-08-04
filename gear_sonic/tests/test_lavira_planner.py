@@ -172,6 +172,19 @@ def test_disabled_reasan_uses_standalone_lavira_sonic_relay() -> None:
     assert "--ray-endpoint" not in command
 
 
+def test_reasan_safety_subscribes_to_raw_chest_depth_camera() -> None:
+    config = InferenceLaunchConfig(
+        reasan_avoidance=True,
+        camera_host="192.168.123.164",
+        camera_port=5555,
+    )
+
+    command = build_reasan_planner_command(config, Path("/workspace/sonic"))
+
+    assert "--camera-host 192.168.123.164" in command
+    assert "--camera-port 5555" in command
+
+
 def test_launch_requires_lavira_mission_and_target_only_when_selected(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:

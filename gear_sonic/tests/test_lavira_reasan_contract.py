@@ -18,6 +18,7 @@ from gear_sonic.scripts.lavira_sonic_relay import (
 )
 from gear_sonic.scripts.reasan_planner import (
     apply_rule_based_safety,
+    raw_depth_requires_stop,
     decode_actor_ray,
     decode_velocity_command,
     parse_args,
@@ -38,6 +39,10 @@ def test_reasan_default_endpoints_preserve_lavira_input_and_planner_output(
 
     assert args.keyboard_endpoint == "tcp://127.0.0.1:5558"
     assert args.output_endpoint == "tcp://*:5563"
+    assert args.camera_host == "127.0.0.1"
+    assert args.camera_port == 5555
+    assert args.depth_stop_distance == pytest.approx(0.30)
+    assert args.depth_stop_min_area_pixels == 2000
 
 
 def test_lavira_messages_decode_for_turn_translation_and_stop() -> None:
@@ -135,6 +140,39 @@ def test_rule_guard_stops_forward_command_for_obstacle_in_front_90_degree_sector
     command = np.array([0.3, 0.1, 0.4], dtype=np.float32)
 
     safe = apply_rule_based_safety(command, ray)
+
+    assert safe.tolist() == pytest.approx([0.0, 0.0, 0.0])
+
+
+def test_raw_depth_stops_when_connected_near_area_exceeds_two_thousand_pixels() -> None:
+    depth_mm = np.full((50, 50), 1000, dtype=np.uint16)
+    depth_mm.flat[:2001] = 299
+
+    assert raw_depth_requires_stop(depth_mm, depth_scale_m=0.001)
+
+
+def test_raw_depth_does_not_stop_at_exactly_two_thousand_or_for_invalid_pixels() -> None:
+    depth_mm = np.full((50, 50), 1000, dtype=np.uint16)
+    depth_mm.flat[:2000] = 299
+
+    assert not raw_depth_requires_stop(depth_mm, depth_scale_m=0.001)
+
+    depth_mm.flat[:2100] = 0
+    assert not raw_depth_requires_stop(depth_mm, depth_scale_m=0.001)
+
+
+def test_raw_depth_does_not_combine_scattered_near_pixels_across_the_image() -> None:
+    depth_mm = np.full((100, 100), 1000, dtype=np.uint16)
+    depth_mm[::2, ::2] = 299
+
+    assert not raw_depth_requires_stop(depth_mm, depth_scale_m=0.001)
+
+
+def test_camera_stop_overrides_motion_independently_of_actor_ray() -> None:
+    ray = decode_actor_ray(actor_ray(angle_deg=90.0, distance_m=3.0))
+    command = np.array([0.0, 0.15, 0.4], dtype=np.float32)
+
+    safe = apply_rule_based_safety(command, ray, camera_stop=True)
 
     assert safe.tolist() == pytest.approx([0.0, 0.0, 0.0])
 

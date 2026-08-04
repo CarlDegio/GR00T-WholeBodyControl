@@ -330,7 +330,10 @@ def build_reasan_planner_command(
             f"--output 'tcp://*:{config.reasan_planner_port}' --hz 20"
         )
     return (
-        common + f"--ray-endpoint tcp://127.0.0.1:{config.reasan_ray_port}"
+        common
+        + f"--ray-endpoint tcp://127.0.0.1:{config.reasan_ray_port} "
+        + f"--camera-host {shlex.quote(config.camera_host)} "
+        + f"--camera-port {config.camera_port}"
     )
 
 
