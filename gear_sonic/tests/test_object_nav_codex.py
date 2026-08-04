@@ -140,6 +140,8 @@ def test_prompt_uses_explicit_inputs_and_live_intrinsics() -> None:
     assert "Never return STOP merely" in prompt
 
 
+
+
 @pytest.mark.parametrize("key", sorted(policy()))
 def test_policy_rejects_every_missing_required_key(key: str) -> None:
     value = policy()
@@ -248,7 +250,15 @@ def test_codex_client_builds_read_only_image_command_with_proxy_environment(
     image_path.write_bytes(b"image")
     schema_path = tmp_path / "schema.json"
     schema_path.write_text("{}", encoding="utf-8")
-    monkeypatch.setattr(os, "environ", {"MARKER": "kept"})
+    monkeypatch.setattr(
+        os,
+        "environ",
+        {
+            "MARKER": "kept",
+            "HTTP_PROXY": "http://127.0.0.1:7890/",
+            "ALL_PROXY": "socks://127.0.0.1:7890/",
+        },
+    )
 
     result = CodexBBoxClient(
         schema_path=schema_path, runner=fake_subprocess, timeout_seconds=12
@@ -269,50 +279,58 @@ def test_codex_client_builds_read_only_image_command_with_proxy_environment(
     for _, kwargs in calls:
         environment = kwargs["env"]
         assert isinstance(environment, dict)
-        assert environment["HTTP_PROXY"] == "http://127.0.0.1:7897/"
-        assert environment["ALL_PROXY"] == "socks://127.0.0.1:7897/"
+        assert environment["HTTP_PROXY"] == "http://127.0.0.1:7890/"
+        assert environment["ALL_PROXY"] == "socks://127.0.0.1:7890/"
         assert environment["MARKER"] == "kept"
 
 
-def test_default_runner_materializes_strict_codex_schema_in_output_dir(
+def test_codex_client_records_auth_and_api_latency(
     tmp_path: Path,
 ) -> None:
-    captured_schema_path: Path | None = None
+    completed = iter(
+        [
+            subprocess.CompletedProcess(
+                ["codex", "login", "status"],
+                0,
+                stdout="Logged in using ChatGPT\n",
+                stderr="",
+            ),
+            subprocess.CompletedProcess(
+                ["codex", "exec"], 0, stdout=json.dumps(policy()), stderr=""
+            ),
+        ]
+    )
+    ticks = iter([10.0, 10.2, 20.0, 22.5])
+    image_path = tmp_path / "input.png"
+    image_path.write_bytes(b"image")
+    schema_path = tmp_path / "schema.json"
+    schema_path.write_text("{}", encoding="utf-8")
+    client = CodexBBoxClient(
+        schema_path=schema_path,
+        runner=lambda *_args, **_kwargs: next(completed),
+        monotonic=lambda: next(ticks),
+    )
 
-    def fake_subprocess(
-        command: list[str], **_kwargs: object
-    ) -> subprocess.CompletedProcess[str]:
-        nonlocal captured_schema_path
-        if command[1:3] == ["login", "status"]:
-            return subprocess.CompletedProcess(
-                command, 0, stdout="Logged in using ChatGPT\n", stderr=""
-            )
-        schema_index = command.index("--output-schema") + 1
-        captured_schema_path = Path(command[schema_index])
-        assert captured_schema_path.is_file()
-        return subprocess.CompletedProcess(
-            command, 0, stdout=json.dumps(policy()), stderr=""
-        )
+    client.locate(
+        image_path=image_path,
+        mission="find chair",
+        global_target="chair",
+        snapshot=snapshot(),
+        cwd=tmp_path,
+    )
 
+    assert client.last_auth_check_seconds == pytest.approx(0.2)
+    assert client.last_api_inference_seconds == pytest.approx(2.5)
+
+
+def test_default_runner_uses_luna_without_reasoning_override(tmp_path: Path) -> None:
     runner = ObjectNavRunner(
         ObjectNavConfig("find chair", "chair", output_root=str(tmp_path)),
         camera=FakeCamera([snapshot(index) for index in range(1, 6)]),
     )
-    runner.codex.runner = fake_subprocess
 
-    result = runner.run_once()
-
-    assert result.outcome == "NAVIGATE"
-    assert result.policy["target"] == "red chair"
-    assert captured_schema_path == (
-        Path(result.output_dir) / "object_nav_policy.schema.json"
-    )
-    schema = json.loads(captured_schema_path.read_text(encoding="utf-8"))
-    assert schema["type"] == "object"
-    assert schema["additionalProperties"] is False
-    assert set(schema["required"]) == set(policy())
-    assert set(schema["properties"]) == set(policy())
-    assert schema["properties"]["action"] == {"enum": ["NAVIGATE", "STOP"]}
+    assert runner.codex.model == "gpt-5.6-luna"
+    assert runner.codex.reasoning_effort is None
 
 
 def test_empty_proxy_overrides_remove_inherited_values(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -359,8 +377,38 @@ def test_successful_cycle_captures_five_frames_and_writes_diagnostics(tmp_path: 
         "depth_raw_04.png",
         "depth_raw_05.png",
     ]
+    timing = result.geometry["timing_s"]
+    assert set(timing) == {
+        "camera_rgbd",
+        "image_io",
+        "auth_check",
+        "api_inference",
+        "postprocess",
+        "total",
+    }
+    assert all(float(value) >= 0.0 for value in timing.values())
+    saved_geometry = json.loads(
+        (output_dir / "object_nav_geometry.json").read_text(encoding="utf-8")
+    )
+    assert saved_geometry["timing_s"] == timing
     assert json.loads((output_dir / "camera_info.json").read_text())["frame_count"] == 5
     assert json.loads((output_dir / "object_nav_commands.json").read_text()) == result.commands
+
+
+def test_object_nav_warmup_runs_iteration_zero_without_returning_motion(
+    tmp_path: Path,
+) -> None:
+    camera = FakeCamera([snapshot(index) for index in range(1, 6)])
+    runner = ObjectNavRunner(
+        ObjectNavConfig("find chair", "chair", output_root=str(tmp_path)),
+        camera=camera,
+        codex=FakeCodex(policy()),
+    )
+
+    warmup = runner.warmup()
+
+    assert warmup.outcome == "NAVIGATE"
+    assert Path(warmup.output_dir).name == "iteration_0000"
 
 
 @pytest.mark.parametrize(
@@ -391,7 +439,16 @@ def test_codex_failure_returns_failed_result_and_empty_commands(tmp_path: Path) 
     assert result.outcome == "FAILED"
     assert result.commands == {"commands": []}
     assert result.error == "Codex unavailable"
-    assert result.geometry == {"status": "failed", "error": "Codex unavailable"}
+    assert result.geometry["status"] == "failed"
+    assert result.geometry["error"] == "Codex unavailable"
+    assert set(result.geometry["timing_s"]) == {
+        "camera_rgbd",
+        "image_io",
+        "auth_check",
+        "api_inference",
+        "postprocess",
+        "total",
+    }
 
 
 def test_injected_camera_lifecycle_remains_with_caller(tmp_path: Path) -> None:

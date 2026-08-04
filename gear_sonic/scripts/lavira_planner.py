@@ -30,13 +30,10 @@ from gear_sonic.utils.inference.object_nav import (
 _ZERO_TOLERANCE = 1.0e-9
 _STOP_VELOCITY = (0.0, 0.0, 0.0)
 _MANUAL_KEYS = frozenset("wsadqe")
+_MANUAL_HOLD_TIMEOUT = 0.55
 _PHASE_LABELS = {
-    "idle": "IDLE",
-    "inferencing": "INFERENCING",
-    "rotating": "ROTATING",
-    "transition_pause": "STOP_GAP",
-    "translating": "FORWARD",
-    "final_stop": "FINAL_STOP",
+    "listen_wasd": "LISTEN_WASD",
+    "nav": "NAV",
 }
 
 
@@ -80,6 +77,8 @@ def _install_termination_handlers(
 class LaviraPlannerConfig:
     mission: str
     global_target: str
+    model: str = "gpt-5.6-luna"
+    warmup: bool = True
     debug: bool = False
     host: str = "*"
     port: int = 5558
@@ -249,7 +248,6 @@ class LaviraPlannerController:
         self,
         *,
         transition_pause: float = 0.5,
-        final_stop_count: int = 3,
         max_speed: float = 0.5,
         max_duration: float = 30.0,
         max_abs_yaw: float = math.pi,
@@ -262,12 +260,6 @@ class LaviraPlannerController:
             or transition_pause < 0.0
         ):
             raise ValueError("transition_pause must be finite and non-negative")
-        if (
-            isinstance(final_stop_count, bool)
-            or not isinstance(final_stop_count, int)
-            or final_stop_count < 3
-        ):
-            raise ValueError("final_stop_count must be an integer of at least three")
         if not _valid_positive_limit(min_positive_duration):
             raise ValueError("min_positive_duration must be finite and positive")
         validate_object_nav_batch(
@@ -281,7 +273,6 @@ class LaviraPlannerController:
             min_positive_duration=min_positive_duration,
         )
         self.transition_pause = float(transition_pause)
-        self.final_stop_count = final_stop_count
         self.max_speed = float(max_speed)
         self.max_duration = float(max_duration)
         self.max_abs_yaw = float(max_abs_yaw)
@@ -290,7 +281,6 @@ class LaviraPlannerController:
         self.failure_reason: str | None = None
         self._batch: ObjectNavBatch | None = None
         self._deadline = 0.0
-        self._final_stops_remaining = 0
 
     @property
     def active(self) -> bool:
@@ -300,8 +290,10 @@ class LaviraPlannerController:
         if self.active:
             raise PlannerBusyError("a planner request is already active")
         timestamp = self._timestamp(now)
-        if getattr(result, "outcome", None) != "NAVIGATE":
-            self._enter_final_stop(f"object_nav_{getattr(result, 'outcome', 'invalid')}")
+        outcome = getattr(result, "outcome", None)
+        if outcome != "NAVIGATE":
+            reason = None if outcome == "STOP" else f"object_nav_{outcome or 'invalid'}"
+            self._finish_to_idle(reason)
             return
         try:
             batch = validate_object_nav_batch(
@@ -312,7 +304,7 @@ class LaviraPlannerController:
                 min_positive_duration=self.min_positive_duration,
             )
         except (CommandValidationError, TypeError, ValueError, AttributeError) as exc:
-            self._enter_final_stop(f"invalid_commands: {exc}")
+            self._finish_to_idle(f"invalid_commands: {exc}")
             return
 
         self._batch = batch
@@ -325,7 +317,13 @@ class LaviraPlannerController:
             self._deadline = timestamp + self.transition_pause
 
     def cancel(self, reason: str) -> None:
-        self._enter_final_stop(str(reason))
+        self._finish_to_idle(str(reason))
+
+    def abort_to_idle(self, reason: str) -> None:
+        """Abort automatic motion immediately for a manual-control takeover."""
+        self.phase = "idle"
+        self.failure_reason = str(reason)
+        self._batch = None
 
     def step(self, now: float) -> VelocityCommand:
         timestamp = self._timestamp(now)
@@ -342,9 +340,9 @@ class LaviraPlannerController:
                     self.phase = "translating"
                     self._deadline += self._batch.translation.duration
                     continue
-                self._enter_final_stop(None)
+                self._finish_to_idle(None)
                 break
-            self._enter_final_stop(None)
+            self._finish_to_idle(None)
             break
 
         if self.phase == "rotating":
@@ -353,13 +351,6 @@ class LaviraPlannerController:
         if self.phase == "translating":
             assert self._batch is not None
             return self._batch.translation
-        if self.phase == "final_stop":
-            command = self._stop_command()
-            self._final_stops_remaining -= 1
-            if self._final_stops_remaining == 0:
-                self.phase = "idle"
-                self._batch = None
-            return command
         return self._stop_command()
 
     @staticmethod
@@ -374,10 +365,10 @@ class LaviraPlannerController:
     def _stop_command(self) -> VelocityCommand:
         return VelocityCommand(*_STOP_VELOCITY, self.min_positive_duration)
 
-    def _enter_final_stop(self, reason: str | None) -> None:
-        self.phase = "final_stop"
+    def _finish_to_idle(self, reason: str | None) -> None:
+        self.phase = "idle"
         self.failure_reason = reason
-        self._final_stops_remaining = self.final_stop_count
+        self._batch = None
 
 
 class LaviraPlannerRuntime:
@@ -404,7 +395,6 @@ class LaviraPlannerRuntime:
         self._logger = logger
         self.controller = LaviraPlannerController(
             transition_pause=config.transition_pause,
-            final_stop_count=config.final_stop_count,
             max_speed=config.max_speed,
             max_duration=config.max_duration,
             max_abs_yaw=config.max_abs_yaw,
@@ -413,14 +403,17 @@ class LaviraPlannerRuntime:
         self.generation = 0
         self._pending_generation: int | None = None
         self._next_publish_at: float | None = None
+        self._manual_action = "stop"
+        self._manual_command = self._stop_command()
+        self._manual_deadline = 0.0
         self._last_logged_phase: str | None = None
         self._log_phase_transition()
 
     @property
     def phase(self) -> str:
-        if self._pending_generation is not None:
-            return "inferencing"
-        return self.controller.phase
+        if self._pending_generation is not None or self.controller.active:
+            return "nav"
+        return "listen_wasd"
 
     def handle_key(
         self,
@@ -430,10 +423,18 @@ class LaviraPlannerRuntime:
         running: Callable[[], bool] = lambda: True,
     ) -> str:
         normalized = str(key).lower()
+        if normalized == "x":
+            self._cancel_and_publish_stops("exit", now)
+            return "exit"
+        if key == " ":
+            self._return_to_listen("operator_stop", now)
+            return "cancelled"
         if normalized == "n":
-            if self.phase != "idle" or self.worker_stop_event.is_set():
+            if self.phase != "listen_wasd" or self.worker_stop_event.is_set():
                 self._logger("[LaViRA] BUSY navigation request rejected")
                 return "busy"
+            self._clear_manual_command()
+            self._publish_command(self._stop_command(), "stop")
             candidate = self.generation + 1
             try:
                 self.request_queue.put_nowait(candidate)
@@ -444,23 +445,17 @@ class LaviraPlannerRuntime:
             self._pending_generation = candidate
             self._log_phase_transition()
             return "started"
-        if normalized == "x":
-            self._cancel_and_publish_stops("exit", now)
-            return "exit"
-        if key == " ":
-            self._cancel_and_publish_stops("operator_stop", now)
-            return "cancelled"
         if normalized in _MANUAL_KEYS:
-            self._cancel_and_publish_stops(f"manual_{normalized}", now)
-            if not running():
-                return "cancelled"
+            if self.phase != "listen_wasd":
+                return "ignored"
             manual_config, commands = self._manual_commands()
             action, velocity = commands[normalized]
-            command = VelocityCommand(*velocity, manual_config.duration)
-            message = build_reasan_velocity_message(command, action=action)
-            if not running():
-                return "cancelled"
-            self.publish(message)
+            self._manual_action = action
+            self._manual_command = VelocityCommand(
+                *velocity, 1.0 / self.config.planner_hz
+            )
+            self._manual_deadline = self.controller._timestamp(now) + _MANUAL_HOLD_TIMEOUT
+            self._next_publish_at = self.controller._timestamp(now)
             return "manual"
         return "ignored"
 
@@ -477,12 +472,41 @@ class LaviraPlannerRuntime:
             self._logger(f"[LaViRA] FAILURE {reason}")
             self.controller.cancel(reason)
         else:
+            self._log_latency(item.result)
             self.controller.start(item.result, now)
             if self.controller.failure_reason is not None:
                 self._logger(f"[LaViRA] FAILURE {self.controller.failure_reason}")
         self._next_publish_at = self.controller._timestamp(now)
         self._log_phase_transition()
+        if not self.controller.active:
+            self._publish_stop_sequence()
+            self._next_publish_at = None
         return True
+
+    def _log_latency(self, result: ObjectNavResult) -> None:
+        timing = result.geometry.get("timing_s")
+        if not isinstance(timing, Mapping):
+            return
+        try:
+            values = {
+                name: float(timing[name])
+                for name in (
+                    "camera_rgbd",
+                    "image_io",
+                    "auth_check",
+                    "api_inference",
+                    "postprocess",
+                    "total",
+                )
+            }
+        except (KeyError, TypeError, ValueError):
+            return
+        self._logger(
+            "[LaViRA] latency "
+            f"total={values['total']:.3f}s api={values['api_inference']:.3f}s "
+            f"auth={values['auth_check']:.3f}s camera={values['camera_rgbd']:.3f}s "
+            f"io={values['image_io']:.3f}s post={values['postprocess']:.3f}s"
+        )
 
     def poll_worker_results(self, *, now: float) -> int:
         accepted = 0
@@ -500,6 +524,19 @@ class LaviraPlannerRuntime:
         running: Callable[[], bool] = lambda: True,
     ) -> VelocityCommand | None:
         timestamp = self.controller._timestamp(now)
+        if self.phase == "listen_wasd":
+            if self._next_publish_at is None:
+                self._next_publish_at = timestamp
+            if timestamp + 1.0e-12 < self._next_publish_at:
+                return None
+            if timestamp + 1.0e-12 >= self._manual_deadline:
+                self._clear_manual_command()
+            command = self._manual_command
+            if not running():
+                return None
+            self._publish_command(command, self._manual_action)
+            self._next_publish_at = timestamp + 1.0 / self.config.planner_hz
+            return command
         if not self.controller.active:
             self._next_publish_at = None
             return None
@@ -508,14 +545,13 @@ class LaviraPlannerRuntime:
         if timestamp + 1.0e-12 < self._next_publish_at:
             return None
         command = self.controller.step(timestamp)
-        message = build_reasan_velocity_message(command, action=self._action(command))
         if not running():
             self.controller.cancel("termination_requested")
             self._logger("[LaViRA] CANCEL termination_requested")
             self._log_phase_transition()
             self._next_publish_at = None
             return None
-        self.publish(message)
+        self._publish_command(command, self._action(command))
         self._log_phase_transition()
         self._next_publish_at = timestamp + 1.0 / self.config.planner_hz
         return command
@@ -544,12 +580,36 @@ class LaviraPlannerRuntime:
         self.controller.cancel(reason)
         self._logger(f"[LaViRA] CANCEL {reason}")
         self._log_phase_transition()
-        for _ in range(self.config.final_stop_count):
-            command = self.controller.step(now)
-            self.publish(build_reasan_velocity_message(command, action="stop"))
-            self._log_phase_transition()
-            self._sleep(1.0 / self.config.planner_hz)
+        self._publish_stop_sequence()
         self._next_publish_at = None
+
+    def _return_to_listen(self, reason: str, now: float) -> None:
+        if self.phase == "nav":
+            self.generation += 1
+            self._pending_generation = None
+            self.controller.cancel(reason)
+            self._logger(f"[LaViRA] CANCEL {reason}")
+        self._clear_manual_command()
+        self._publish_command(self._stop_command(), "stop")
+        self._next_publish_at = self.controller._timestamp(now) + 1.0 / self.config.planner_hz
+        self._log_phase_transition()
+
+    def _publish_stop_sequence(self) -> None:
+        stop = VelocityCommand(*_STOP_VELOCITY, 1.0 / self.config.planner_hz)
+        for _ in range(self.config.final_stop_count):
+            self.publish(build_reasan_velocity_message(stop, action="stop"))
+            self._sleep(1.0 / self.config.planner_hz)
+
+    def _clear_manual_command(self) -> None:
+        self._manual_action = "stop"
+        self._manual_command = self._stop_command()
+        self._manual_deadline = 0.0
+
+    def _stop_command(self) -> VelocityCommand:
+        return VelocityCommand(*_STOP_VELOCITY, 1.0 / self.config.planner_hz)
+
+    def _publish_command(self, command: VelocityCommand, action: str) -> None:
+        self.publish(build_reasan_velocity_message(command, action=action))
 
     def _log_phase_transition(self) -> None:
         phase = self.phase
@@ -613,11 +673,28 @@ def run_inference_worker(
     requests: queue.Queue[int | None],
     results: queue.Queue[WorkerResult],
     stop_event: threading.Event | None = None,
+    *,
+    warmup: bool = False,
+    logger: Callable[[str], None] = print,
 ) -> None:
     """Run one AgentNav request at a time and tag every result by generation."""
     stopping = stop_event or threading.Event()
     runner: ObjectNavRunner | None = None
     try:
+        if warmup and not stopping.is_set():
+            runner = runner_factory()
+            logger("[LaViRA] warmup started")
+            try:
+                warmup_result = runner.warmup()
+                total = warmup_result.geometry.get("timing_s", {}).get("total")
+                if warmup_result.error:
+                    logger(f"[LaViRA] warmup failed: {warmup_result.error}")
+                elif isinstance(total, (int, float)):
+                    logger(f"[LaViRA] warmup complete total={float(total):.3f}s")
+                else:
+                    logger("[LaViRA] warmup complete")
+            except Exception as exc:
+                logger(f"[LaViRA] warmup failed: {exc}")
         while not stopping.is_set():
             generation = requests.get()
             if generation is None or stopping.is_set():
@@ -698,6 +775,7 @@ def _runner_factory(config: LaviraPlannerConfig) -> ObjectNavRunner:
         ObjectNavConfig(
             mission=config.mission,
             global_target=config.global_target,
+            model=config.model,
             camera_host=config.camera_host,
             camera_port=config.camera_port,
             camera_timeout_ms=config.camera_timeout_ms,
@@ -727,6 +805,7 @@ def main(config: LaviraPlannerConfig) -> None:
             runtime.result_queue,
             runtime.worker_stop_event,
         ),
+        kwargs={"warmup": config.warmup, "logger": print},
         name="lavira-object-nav",
         daemon=True,
     )

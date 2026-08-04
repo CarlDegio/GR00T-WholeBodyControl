@@ -26,6 +26,7 @@ from gear_sonic.scripts.launch_inference import (
     InferenceLaunchConfig,
     _check_prerequisites,
     build_planner_input_command,
+    build_reasan_planner_command,
 )
 
 from gear_sonic.scripts.lavira_planner import (
@@ -67,6 +68,7 @@ def test_launch_lavira_input_quotes_mission_and_passes_agentnav_values() -> None
         planner_input="lavira",
         lavira_mission="approach O'Reilly's chair",
         lavira_global_target="red chair; echo unsafe",
+        lavira_model="gpt-5.6-luna",
         lavira_debug=True,
         lavira_host="*",
         lavira_planner_hz=19.5,
@@ -86,24 +88,88 @@ def test_launch_lavira_input_quotes_mission_and_passes_agentnav_values() -> None
         lavira_max_direct_travel=7.0,
         lavira_output_root="outputs/nav runs",
     )
-
     command = build_planner_input_command(config, repo_root)
 
     assert command == (
         "cd /workspace/sonic && "
-        "source .venv_inference/bin/activate && "
-        "python gear_sonic/scripts/lavira_planner.py "
+        "ready_file=/tmp/sonic_lingbot_ready_$$; rm -f $ready_file; "
+        "PYTHONPATH=/workspace/sonic .venv_lingbot_depth/bin/python "
+        "gear_sonic/scripts/run_lingbot_depth_viewer.py "
+        "--camera-host 'camera host' --camera-port 5555 --publish-port 5564 "
+        "--ready-file $ready_file & viewer_pid=$!; "
+        "trap 'kill $viewer_pid 2>/dev/null; rm -f $ready_file' EXIT; "
+        "while [ ! -f $ready_file ]; do kill -0 $viewer_pid 2>/dev/null || "
+        "{ wait $viewer_pid; exit 1; }; sleep 0.2; done; "
+        ".venv_inference/bin/python gear_sonic/scripts/lavira_planner.py "
         "--mission 'approach O'\"'\"'Reilly'\"'\"'s chair' "
         "--global-target 'red chair; echo unsafe' "
+        "--model gpt-5.6-luna "
         "--debug --host '*' --port 5558 "
         "--planner-hz 19.5 --transition-pause 0.75 --final-stop-count 4 "
         "--max-speed 0.45 --max-duration 29.0 --max-abs-yaw 3.0 "
-        "--camera-host 'camera host' --camera-port 5555 "
+        "--camera-host 127.0.0.1 --camera-port 5564 "
         "--camera-timeout-ms 2500 --codex-timeout-seconds 90.0 "
         "--min-confidence 0.7 --rotation-speed 0.35 --forward-speed 0.25 "
         "--target-standoff-distance 0.2 --max-direct-travel 7.0 "
         "--output-root 'outputs/nav runs'"
     )
+
+
+def test_launch_can_disable_lavira_warmup() -> None:
+    command = build_planner_input_command(
+        InferenceLaunchConfig(
+            planner_input="lavira",
+            lavira_mission="find chair",
+            lavira_global_target="chair",
+            lavira_warmup=False,
+        ),
+        Path("/workspace/sonic"),
+    )
+
+    assert "--no-warmup" in command
+
+
+def test_launch_lavira_starts_depth_viewer_in_same_pane_shell() -> None:
+    command = build_planner_input_command(
+        InferenceLaunchConfig(
+            planner_input="lavira",
+            lavira_mission="find basket",
+            lavira_global_target="basket",
+            camera_host="192.168.123.164",
+            camera_port=5555,
+        ),
+        Path("/workspace/sonic"),
+    )
+
+    assert ".venv_lingbot_depth/bin/python" in command
+    assert "PYTHONPATH=/workspace/sonic .venv_lingbot_depth/bin/python" in command
+    assert "gear_sonic/scripts/run_lingbot_depth_viewer.py" in command
+    assert "--camera-host 192.168.123.164 --camera-port 5555" in command
+    assert "--publish-port 5564" in command
+    assert "ready_file=/tmp/sonic_lingbot_ready_$$" in command
+    assert "--ready-file $ready_file" in command
+    assert "while [ ! -f $ready_file ]" in command
+    assert "kill -0 $viewer_pid" in command
+    assert "lavira_planner.py" in command
+    assert "--camera-host 127.0.0.1 --camera-port 5564" in command
+    assert "--camera-timeout-ms 15000" in command
+    assert "viewer_pid=$!" in command
+    assert "trap 'kill $viewer_pid 2>/dev/null; rm -f $ready_file' EXIT" in command
+
+
+def test_launch_uses_long_timeout_for_low_rate_lingbot_frames() -> None:
+    assert InferenceLaunchConfig().lavira_camera_timeout_ms == 15000
+
+
+def test_disabled_reasan_uses_standalone_lavira_sonic_relay() -> None:
+    config = InferenceLaunchConfig(reasan_avoidance=False)
+
+    command = build_reasan_planner_command(config, Path("/workspace/sonic"))
+
+    assert "python gear_sonic/scripts/lavira_sonic_relay.py" in command
+    assert "reasan_planner.py" not in command
+    assert "--filter" not in command
+    assert "--ray-endpoint" not in command
 
 
 def test_launch_requires_lavira_mission_and_target_only_when_selected(
@@ -127,7 +193,8 @@ def test_launch_requires_lavira_mission_and_target_only_when_selected(
     assert capsys.readouterr().out == (
         "ERROR: Prerequisites not met:\n\n"
         "  - --lavira-mission is required when --planner-input lavira\n"
-        "  - --lavira-global-target is required when --planner-input lavira\n\n"
+        "  - --lavira-global-target is required when --planner-input lavira\n"
+        "\n"
     )
 
 
@@ -318,7 +385,7 @@ def test_controller_obeys_rotation_pause_translation_deadlines() -> None:
     assert controller.phase == "translating"
     assert controller.step(13.499).velocity == (0.3, 0.0, 0.0)
     assert controller.step(13.5).velocity == (0.0, 0.0, 0.0)
-    assert controller.phase == "final_stop"
+    assert controller.phase == "idle"
     assert controller.failure_reason is None
 
 
@@ -332,8 +399,8 @@ def test_delayed_rotation_transition_starts_full_pause_from_observation() -> Non
     assert controller.step(11.9).velocity == (0.3, 0.0, 0.0)
 
 
-def test_controller_publishes_three_final_stops_before_idle() -> None:
-    controller = LaviraPlannerController(final_stop_count=3)
+def test_controller_finishes_directly_in_idle() -> None:
+    controller = LaviraPlannerController()
     controller.start(
         result(
             payload=commands(
@@ -344,11 +411,7 @@ def test_controller_publishes_three_final_stops_before_idle() -> None:
         now=2.0,
     )
 
-    assert [controller.step(2.5).velocity for _ in range(3)] == [
-        (0.0, 0.0, 0.0),
-        (0.0, 0.0, 0.0),
-        (0.0, 0.0, 0.0),
-    ]
+    assert controller.step(2.5).velocity == (0.0, 0.0, 0.0)
     assert controller.phase == "idle"
 
 
@@ -364,17 +427,20 @@ def test_controller_skips_zero_duration_motion_phases_but_keeps_pause() -> None:
 
 
 @pytest.mark.parametrize("outcome", ["STOP", "FAILED", "REJECTED", "UNKNOWN"])
-def test_non_navigation_results_fail_closed_into_final_stop(outcome: str) -> None:
+def test_non_navigation_results_fail_closed_directly_to_idle(outcome: str) -> None:
     controller = LaviraPlannerController()
     controller.start(result(outcome), now=1.0)
 
-    assert controller.phase == "final_stop"
-    assert [controller.step(1.0).velocity for _ in range(3)] == [
-        (0.0, 0.0, 0.0),
-        (0.0, 0.0, 0.0),
-        (0.0, 0.0, 0.0),
-    ]
     assert controller.phase == "idle"
+    assert controller.step(1.0).velocity == (0.0, 0.0, 0.0)
+
+
+def test_model_stop_is_successful_idle_not_a_failure() -> None:
+    controller = LaviraPlannerController()
+    controller.start(result("STOP"), now=1.0)
+
+    assert controller.phase == "idle"
+    assert controller.failure_reason is None
 
 
 def test_invalid_navigation_result_fails_closed_without_motion() -> None:
@@ -383,7 +449,7 @@ def test_invalid_navigation_result_fails_closed_without_motion() -> None:
         result(payload=commands(translation=(0.3, 0.0, 0.2, 1.0))), now=1.0
     )
 
-    assert controller.phase == "final_stop"
+    assert controller.phase == "idle"
     assert controller.failure_reason is not None
     assert controller.step(1.0).velocity == (0.0, 0.0, 0.0)
 
@@ -431,11 +497,67 @@ def test_runtime_uses_one_slot_queues_and_rejects_repeated_n() -> None:
     assert runtime.request_queue.maxsize == 1
     assert runtime.result_queue.maxsize == 1
     assert runtime.handle_key("n", now=1.0) == "started"
-    assert runtime.phase == "inferencing"
+    assert runtime.phase == "nav"
     assert runtime.generation == 1
     assert runtime.handle_key("N", now=1.1) == "busy"
     assert runtime.generation == 1
     assert runtime.request_queue.get_nowait() == 1
+
+
+def test_runtime_starts_in_listen_wasd_and_republishes_held_key_at_20_hz() -> None:
+    published: list[str] = []
+    runtime = LaviraPlannerRuntime(
+        LaviraPlannerConfig(mission="find chair", global_target="chair"),
+        publish=published.append,
+        sleep=lambda _duration: None,
+    )
+
+    assert runtime.phase == "listen_wasd"
+    assert runtime.handle_key("w", now=1.0) == "manual"
+    assert published == []
+    assert runtime.publish_due(1.0).velocity == (0.3, 0.0, 0.0)
+    assert runtime.publish_due(1.049) is None
+    assert runtime.publish_due(1.05).velocity == (0.3, 0.0, 0.0)
+
+
+def test_listen_wasd_releases_to_stop_after_keyboard_hold_window() -> None:
+    published: list[str] = []
+    runtime = LaviraPlannerRuntime(
+        LaviraPlannerConfig(mission="find chair", global_target="chair"),
+        publish=published.append,
+        sleep=lambda _duration: None,
+    )
+
+    runtime.handle_key("w", now=2.0)
+    assert runtime.publish_due(2.50).velocity == (0.3, 0.0, 0.0)
+    assert runtime.publish_due(2.55).velocity == (0.0, 0.0, 0.0)
+    assert runtime.phase == "listen_wasd"
+
+
+@pytest.mark.parametrize("key", ["w", "s", "a", "d", "q", "e", "n"])
+def test_nav_rejects_every_key_except_space_and_exit(key: str) -> None:
+    runtime = LaviraPlannerRuntime(
+        LaviraPlannerConfig(mission="find chair", global_target="chair"),
+        publish=lambda _message: None,
+        sleep=lambda _duration: None,
+    )
+    assert runtime.handle_key("n", now=1.0) == "started"
+
+    assert runtime.handle_key(key, now=1.1) in {"ignored", "busy"}
+    assert runtime.phase == "nav"
+    assert runtime.generation == 1
+
+
+def test_space_is_the_only_motion_key_that_returns_nav_to_listen_wasd() -> None:
+    runtime = LaviraPlannerRuntime(
+        LaviraPlannerConfig(mission="find chair", global_target="chair"),
+        publish=lambda _message: None,
+        sleep=lambda _duration: None,
+    )
+    runtime.handle_key("n", now=1.0)
+
+    assert runtime.handle_key(" ", now=1.1) == "cancelled"
+    assert runtime.phase == "listen_wasd"
 
 
 def test_cancel_increments_generation_publishes_stops_and_discards_late_result() -> None:
@@ -449,28 +571,32 @@ def test_cancel_increments_generation_publishes_stops_and_discards_late_result()
 
     assert runtime.handle_key(" ", now=1.1) == "cancelled"
     assert runtime.generation == 2
-    assert runtime.phase == "idle"
-    assert_stop_messages(published)
+    assert runtime.phase == "listen_wasd"
+    assert decoded_messages(published)[-1]["action"] == "stop"
 
     assert runtime.accept_worker_result(WorkerResult(1, result(), None), now=2.0) is False
-    assert runtime.phase == "idle"
-    assert runtime.publish_due(2.0) is None
+    assert runtime.phase == "listen_wasd"
+    assert runtime.publish_due(2.0).velocity == (0.0, 0.0, 0.0)
 
 
 @pytest.mark.parametrize("key", ["w", "s", "a", "d", "q", "e"])
-def test_manual_keys_cancel_first_and_reuse_keyboard_defaults(key: str) -> None:
+def test_listen_wasd_manual_keys_reuse_keyboard_defaults(key: str) -> None:
     published: list[str] = []
+    logs: list[str] = []
     config = LaviraPlannerConfig(mission="find chair", global_target="chair")
     runtime = LaviraPlannerRuntime(
-        config, publish=published.append, sleep=lambda _duration: None
+        config,
+        publish=published.append,
+        sleep=lambda _duration: None,
+        logger=logs.append,
     )
-    runtime.handle_key("n", now=1.0)
-
     assert runtime.handle_key(key.upper(), now=1.1) == "manual"
-    assert runtime.generation == 2
-    assert_stop_messages(published[:-1])
+    assert runtime.generation == 0
+    assert runtime.phase == "listen_wasd"
+    assert "[LaViRA] STATE FINAL_STOP" not in logs
+    runtime.publish_due(1.1)
     expected_action, expected_velocity = {
-        "w": ("forward", (0.5, 0.0, 0.0)),
+        "w": ("forward", (0.3, 0.0, 0.0)),
         "s": ("backward", (-0.3, 0.0, 0.0)),
         "a": ("move_left", (0.0, 0.15, 0.0)),
         "d": ("move_right", (0.0, -0.15, 0.0)),
@@ -480,10 +606,10 @@ def test_manual_keys_cancel_first_and_reuse_keyboard_defaults(key: str) -> None:
     manual = json.loads(published[-1])
     assert manual["action"] == expected_action
     assert manual["velocity"] == dict(zip(("vx", "vy", "wz"), expected_velocity))
-    assert manual["duration_s"] == 0.5
+    assert manual["duration_s"] == 0.05
 
 
-def test_manual_override_spaces_stop_publications_before_nonzero() -> None:
+def test_manual_key_is_published_by_nonblocking_20_hz_loop() -> None:
     events: list[tuple[str, object]] = []
 
     def publish(message: str) -> None:
@@ -496,38 +622,21 @@ def test_manual_override_spaces_stop_publications_before_nonzero() -> None:
     )
 
     assert runtime.handle_key("w", now=1.0) == "manual"
-    assert events == [
-        ("publish", "stop"),
-        ("sleep", 0.05),
-        ("publish", "stop"),
-        ("sleep", 0.05),
-        ("publish", "stop"),
-        ("sleep", 0.05),
-        ("publish", "forward"),
-    ]
+    assert events == []
+    runtime.publish_due(1.0)
+    assert events == [("publish", "forward")]
 
 
-def test_termination_during_manual_stop_interval_suppresses_nonzero() -> None:
+def test_termination_gate_suppresses_pending_manual_nonzero() -> None:
     published: list[str] = []
-    alive = True
-
-    def request_termination(_duration: float) -> None:
-        nonlocal alive
-        alive = False
-
     runtime = LaviraPlannerRuntime(
         LaviraPlannerConfig(mission="find chair", global_target="chair"),
         publish=published.append,
-        sleep=request_termination,
+        sleep=lambda _duration: None,
     )
 
-    run_planner_loop(
-        runtime,
-        read_key=iter(["w"]).__next__,
-        monotonic=lambda: 1.0,
-        sleep=lambda _duration: None,
-        running=lambda: alive,
-    )
+    runtime.handle_key("w", now=1.0)
+    assert runtime.publish_due(1.0, running=lambda: False) is None
 
     assert all(message["action"] == "stop" for message in decoded_messages(published))
 
@@ -569,13 +678,9 @@ def test_runtime_logs_each_state_transition_once() -> None:
         runtime.publish_due(now)
 
     assert logs == [
-        "[LaViRA] STATE IDLE",
-        "[LaViRA] STATE INFERENCING",
-        "[LaViRA] STATE ROTATING",
-        "[LaViRA] STATE STOP_GAP",
-        "[LaViRA] STATE FORWARD",
-        "[LaViRA] STATE FINAL_STOP",
-        "[LaViRA] STATE IDLE",
+        "[LaViRA] STATE LISTEN_WASD",
+        "[LaViRA] STATE NAV",
+        "[LaViRA] STATE LISTEN_WASD",
     ]
 
 
@@ -592,8 +697,8 @@ def test_runtime_logs_busy_rejection_without_duplicate_state() -> None:
     assert runtime.handle_key("n", now=0.1) == "busy"
 
     assert logs == [
-        "[LaViRA] STATE IDLE",
-        "[LaViRA] STATE INFERENCING",
+        "[LaViRA] STATE LISTEN_WASD",
+        "[LaViRA] STATE NAV",
         "[LaViRA] BUSY navigation request rejected",
     ]
 
@@ -613,7 +718,41 @@ def test_runtime_logs_cancellation_and_worker_failure_reasons() -> None:
     runtime.handle_key(" ", now=0.2)
 
     assert "[LaViRA] FAILURE camera timeout" in logs
-    assert "[LaViRA] CANCEL operator_stop" in logs
+    assert runtime.phase == "listen_wasd"
+
+
+def test_runtime_logs_segmented_object_nav_latency() -> None:
+    logs: list[str] = []
+    runtime = LaviraPlannerRuntime(
+        LaviraPlannerConfig(mission="find chair", global_target="chair"),
+        publish=lambda _message: None,
+        sleep=lambda _duration: None,
+        logger=logs.append,
+    )
+    runtime.handle_key("n", now=0.0)
+    nav_result = ObjectNavResult(
+        outcome="STOP",
+        policy={},
+        commands={"commands": []},
+        geometry={
+            "timing_s": {
+                "camera_rgbd": 0.25,
+                "image_io": 0.10,
+                "auth_check": 0.20,
+                "api_inference": 7.31,
+                "postprocess": 0.06,
+                "total": 7.92,
+            }
+        },
+        output_dir="/tmp/object-nav",
+    )
+
+    runtime.accept_worker_result(WorkerResult(1, nav_result, None), now=8.0)
+
+    assert (
+        "[LaViRA] latency total=7.920s api=7.310s auth=0.200s "
+        "camera=0.250s io=0.100s post=0.060s"
+    ) in logs
 
 
 def test_exit_key_cancels_and_publishes_repeated_stop() -> None:
@@ -641,17 +780,18 @@ def test_current_worker_result_starts_motion_and_stale_or_error_results_do_not()
     assert runtime.request_queue.get_nowait() == 1
 
     assert runtime.accept_worker_result(WorkerResult(0, result(), None), now=10.0) is False
-    assert runtime.phase == "inferencing"
+    assert runtime.phase == "nav"
     assert runtime.accept_worker_result(WorkerResult(1, result(), None), now=10.0) is True
-    assert runtime.phase == "rotating"
+    assert runtime.phase == "nav"
 
     runtime.handle_key(" ", now=10.1)
     runtime.handle_key("n", now=10.2)
     assert runtime.accept_worker_result(
         WorkerResult(3, None, "camera timeout"), now=10.3
     ) is True
-    assert runtime.phase == "final_stop"
+    assert runtime.phase == "listen_wasd"
     assert runtime.publish_due(10.3).velocity == (0.0, 0.0, 0.0)
+    assert_stop_messages(published)
 
 
 def test_poll_worker_results_drains_queue_and_disregards_stale_generation() -> None:
@@ -664,7 +804,7 @@ def test_poll_worker_results_drains_queue_and_disregards_stale_generation() -> N
     runtime.result_queue.put_nowait(WorkerResult(0, result(), None))
 
     assert runtime.poll_worker_results(now=2.0) == 0
-    assert runtime.phase == "inferencing"
+    assert runtime.phase == "nav"
     assert runtime.result_queue.empty()
 
 
@@ -688,6 +828,51 @@ class FakeRunner:
 
     def close(self) -> None:
         self.closed = True
+
+
+class WarmupRunner(FakeRunner):
+    def __init__(self, *, warmup_error: str | None = None):
+        super().__init__()
+        self.warmup_error = warmup_error
+        self.warmup_count = 0
+        self.run_count = 0
+
+    def warmup(self) -> ObjectNavResult:
+        self.warmup_count += 1
+        return ObjectNavResult(
+            outcome="FAILED" if self.warmup_error else "STOP",
+            policy={},
+            commands={"commands": []},
+            geometry={"timing_s": {"total": 4.25}},
+            output_dir="/tmp/warmup",
+            error=self.warmup_error,
+        )
+
+    def run_once(self) -> ObjectNavResult:
+        self.run_count += 1
+        return result()
+
+
+@pytest.mark.parametrize("warmup_error", [None, "temporary API failure"])
+def test_worker_warms_up_once_without_publishing_result_or_blocking_requests(
+    warmup_error: str | None,
+) -> None:
+    runner = WarmupRunner(warmup_error=warmup_error)
+    results: queue.Queue[WorkerResult] = queue.Queue(maxsize=1)
+    logs: list[str] = []
+
+    run_inference_worker(
+        lambda: runner,
+        RequestSequence(7, None),  # type: ignore[arg-type]
+        results,
+        warmup=True,
+        logger=logs.append,
+    )
+
+    assert runner.warmup_count == 1
+    assert runner.run_count == 1
+    assert results.get_nowait().generation == 7
+    assert any("warmup" in message.lower() for message in logs)
 
 
 def test_worker_tags_result_replaces_full_slot_and_closes_runner() -> None:
@@ -771,7 +956,7 @@ def test_publish_due_uses_20_hz_cadence_and_command_action_names() -> None:
     assert runtime.publish_due(10.0).velocity == (0.0, 0.0, 0.4)
     assert runtime.publish_due(10.049) is None
     assert runtime.publish_due(10.05).velocity == (0.0, 0.0, 0.4)
-    assert [message["action"] for message in decoded_messages(published)] == [
+    assert [message["action"] for message in decoded_messages(published)[-2:]] == [
         "turn_left",
         "turn_left",
     ]
@@ -802,15 +987,13 @@ def test_runtime_maps_negative_yaw_translation_and_stop_actions() -> None:
     for now in (0.0, 0.05, 0.55, 0.60, 0.65, 0.70):
         runtime.publish_due(now)
 
-    assert [message["action"] for message in decoded_messages(published)] == [
+    assert [message["action"] for message in decoded_messages(published)[1:5]] == [
         "turn_right",
         "stop",
         "move_forward",
         "stop",
-        "stop",
-        "stop",
     ]
-    assert runtime.phase == "idle"
+    assert runtime.phase == "listen_wasd"
 
 
 class RunningSequence:

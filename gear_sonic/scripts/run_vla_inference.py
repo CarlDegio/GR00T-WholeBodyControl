@@ -140,6 +140,8 @@ def print_green(x):
 
 JPEG_VIDEO_MARKER = "__opencv_jpeg_rgb__"
 JPEG_VIDEO_QUALITY = 95
+# Hold completed chunks so latency compensation selects points farther into the trajectory.
+SIMULATED_INFERENCE_DELAY_SECONDS = 0.2
 
 
 def encode_rgb_video_frame_as_jpeg(image: np.ndarray) -> dict:
@@ -367,6 +369,7 @@ def _inference_worker_loop(
     busy_event: threading.Event,
     prepare_obs_fn,
     inference_fn,
+    simulated_inference_delay_seconds: float = SIMULATED_INFERENCE_DELAY_SECONDS,
 ):
     """Persistent worker thread for async inference."""
     while not stop_event.is_set():
@@ -387,6 +390,8 @@ def _inference_worker_loop(
                 processed_action = inference_fn(observation)
 
                 if processed_action is not None:
+                    if stop_event.wait(simulated_inference_delay_seconds):
+                        continue
                     try:
                         result_queue.put_nowait((processed_action, inference_start_time))
                     except queue.Full:

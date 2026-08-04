@@ -8,7 +8,6 @@ from collections import deque
 from pathlib import Path
 import json
 import sys
-import threading
 import time
 from typing import Any
 
@@ -19,12 +18,6 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(SCRIPT_DIR))
 
 import view_mid360_open3d as mid360  # noqa: E402
-
-
-DEFAULT_ESTIMATOR = Path(
-    "/home/user/Project/REASAN/training/ray_predictor/ray_predictor/"
-    "runs/envelope_5x_history10_20260716/ray_predictor_g1_10f.onnx"
-)
 
 
 def rpy_matrix_deg(rpy_deg: tuple[float, float, float]) -> np.ndarray:
@@ -112,7 +105,7 @@ def pointcloud_to_spherical_grid(
     phi_bins = int(round((phi_range[1] - phi_range[0]) / phi_res_deg))
     theta_bins = int(round((theta_range[1] - theta_range[0]) / theta_res_deg))
     if phi_bins != 180 or theta_bins != 30:
-        raise ValueError(f"REASEN Estimator expects a [30,180] grid, got [{theta_bins},{phi_bins}]")
+        raise ValueError(f"REASEN ActorRay expects a [30,180] grid, got [{theta_bins},{phi_bins}]")
 
     grid = np.full((theta_bins, phi_bins), max_range, dtype=np.float32)
     if points_body.size == 0:
@@ -146,7 +139,7 @@ def pointcloud_to_spherical_grid(
 
 
 def direct_actor_profile(grid: np.ndarray, max_range: float) -> np.ndarray:
-    """Nearest observed point per azimuth; diagnostic, not Estimator ground truth."""
+    """Return the nearest observed point in each azimuth bin."""
     return np.clip(np.min(grid, axis=0) / max_range, 0.0, 1.0).astype(np.float32)
 
 
@@ -168,87 +161,6 @@ def make_radial_lines(points: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     return vertices, lines
 
 
-class ImuFeatureReceiver:
-    """Receive the two Estimator IMU features: projected gravity and body gyro."""
-
-    def __init__(self, topic: str) -> None:
-        mid360.import_unitree_sdk2()
-        self._lock = threading.Lock()
-        self._gravity = np.array([0.0, 0.0, -1.0], dtype=np.float32)
-        self._gyro = np.zeros(3, dtype=np.float32)
-        self._received_at: float | None = None
-        self._subscriber = mid360.ChannelSubscriber(topic, mid360.HGIMUState_)
-        self._subscriber.Init(self._on_imu, 1)
-
-    def _on_imu(self, msg: Any) -> None:
-        rpy = np.asarray(getattr(msg, "rpy", (0.0, 0.0, 0.0)), dtype=np.float64)
-        gyro = np.asarray(getattr(msg, "gyroscope", (0.0, 0.0, 0.0)), dtype=np.float32)
-        if rpy.shape[0] < 3 or gyro.shape[0] < 3 or not np.isfinite(rpy[:3]).all() or not np.isfinite(gyro[:3]).all():
-            return
-        rotation_w_from_b = mid360.rpy_to_rotation_matrix(*map(float, rpy[:3]))
-        gravity_b = rotation_w_from_b.T @ np.array([0.0, 0.0, -1.0], dtype=np.float64)
-        with self._lock:
-            self._gravity = gravity_b.astype(np.float32)
-            self._gyro = gyro[:3].copy()
-            self._received_at = time.monotonic()
-
-    def latest(self) -> np.ndarray:
-        with self._lock:
-            return np.concatenate((self._gravity, self._gyro)).astype(np.float32)
-
-    def snapshot(self) -> tuple[np.ndarray, bool, float | None]:
-        with self._lock:
-            features = np.concatenate((self._gravity, self._gyro)).astype(np.float32)
-            received_at = self._received_at
-        age = None if received_at is None else max(0.0, time.monotonic() - received_at)
-        return features, received_at is not None, age
-
-    def close(self) -> None:
-        self._subscriber.Close()
-
-
-class OnnxRayEstimator:
-    def __init__(self, model_path: Path) -> None:
-        try:
-            import onnxruntime as ort
-        except Exception as exc:
-            raise SystemExit("Estimator mode requires onnxruntime: python3 -m pip install onnxruntime-gpu") from exc
-
-        available = ort.get_available_providers()
-        preferred = [name for name in ("CUDAExecutionProvider", "CPUExecutionProvider") if name in available]
-        self.session = ort.InferenceSession(str(model_path), providers=preferred or available)
-        inputs = self.session.get_inputs()
-        grid_inputs = [item for item in inputs if len(item.shape) == 4]
-        imu_inputs = [item for item in inputs if len(item.shape) == 3]
-        if len(grid_inputs) != 1 or len(imu_inputs) != 1:
-            raise ValueError(f"Expected one rank-4 grid input and one rank-3 IMU input, got {[i.shape for i in inputs]}")
-        self.grid_name = grid_inputs[0].name
-        self.imu_name = imu_inputs[0].name
-        self.output_name = self.session.get_outputs()[0].name
-        self.history_frames = int(grid_inputs[0].shape[1])
-        if self.history_frames <= 0:
-            raise ValueError(f"Estimator ONNX has invalid history dimension: {grid_inputs[0].shape}")
-        self.grid_history: deque[np.ndarray] = deque(maxlen=self.history_frames)
-        self.imu_history: deque[np.ndarray] = deque(maxlen=self.history_frames)
-        print(
-            f"[estimator] {model_path} | H={self.history_frames} | "
-            f"{self.grid_name}{grid_inputs[0].shape}, {self.imu_name}{imu_inputs[0].shape} -> {self.output_name}"
-        )
-
-    def infer(self, grid_normalized: np.ndarray, imu: np.ndarray) -> np.ndarray:
-        if not self.grid_history:
-            for _ in range(self.history_frames):
-                self.grid_history.append(grid_normalized.copy())
-                self.imu_history.append(imu.copy())
-        else:
-            self.grid_history.append(grid_normalized.copy())
-            self.imu_history.append(imu.copy())
-        grid_batch = np.stack(self.grid_history, axis=0)[None].astype(np.float32)
-        imu_batch = np.stack(self.imu_history, axis=0)[None].astype(np.float32)
-        output = self.session.run([self.output_name], {self.grid_name: grid_batch, self.imu_name: imu_batch})[0]
-        return np.clip(np.asarray(output).reshape(-1), 0.0, 1.0).astype(np.float32)
-
-
 class RayMedianFilter:
     """Per-azimuth median over a short history of 180-D ray profiles."""
 
@@ -268,10 +180,6 @@ def build_actor_ray_message(
     *,
     sequence: int,
     max_range: float,
-    source: str,
-    imu_features: np.ndarray | None = None,
-    imu_valid: bool = False,
-    imu_age_s: float | None = None,
 ) -> dict[str, Any]:
     rays = np.clip(np.asarray(rays_normalized, dtype=np.float32).reshape(-1), 0.0, 1.0)
     if rays.size != 180:
@@ -282,7 +190,7 @@ def build_actor_ray_message(
         "timestamp_ns": time.time_ns(),
         "sequence": int(sequence),
         "frame_id": "torso_link",
-        "source": source,
+        "source": "direct_median",
         "count": 180,
         "angle_min_deg": -179.0,
         "angle_max_deg": 179.0,
@@ -290,16 +198,7 @@ def build_actor_ray_message(
         "range_max_m": float(max_range),
         "normalized": rays.tolist(),
         "ranges_m": (rays * max_range).tolist(),
-        "imu_valid": bool(imu_valid),
     }
-    if imu_features is not None:
-        imu = np.asarray(imu_features, dtype=np.float32).reshape(-1)
-        if imu.size != 6 or not np.isfinite(imu).all():
-            raise ValueError("IMU features must be [projected_gravity(3), angular_velocity(3)]")
-        message["projected_gravity"] = imu[:3].tolist()
-        message["angular_velocity"] = imu[3:].tolist()
-    if imu_age_s is not None:
-        message["imu_age_s"] = float(imu_age_s)
     return message
 
 
@@ -433,18 +332,12 @@ class ReasanOccupancyViewer:
         )
         return panel
 
-    def actor_panel(self, actor_rays: np.ndarray, direct_rays: np.ndarray | None) -> np.ndarray:
+    def actor_panel(self, actor_rays: np.ndarray) -> np.ndarray:
         cv2 = self.cv2
         rays = np.clip(np.asarray(actor_rays).reshape(-1), 0.0, 1.0)
         panel = self._base_panel("Normalized ActorRay received by Filter", f"normalized radius: 1.0 == {self.max_range:.1f} m")
         azimuth = np.deg2rad(-179.0 + 2.0 * np.arange(180, dtype=np.float32))
         directions = np.column_stack((np.cos(azimuth), np.sin(azimuth)))
-
-        if direct_rays is not None:
-            direct_endpoints = directions * np.asarray(direct_rays).reshape(-1, 1)
-            dx, dy = self._xy_to_pixels(direct_endpoints, 1.0)
-            for index in range(180):
-                cv2.circle(panel, (int(dx[index]), int(dy[index])), 1, (80, 190, 80), -1, cv2.LINE_AA)
 
         endpoints = directions * rays[:, None]
         px, py = self._xy_to_pixels(endpoints, 1.0)
@@ -463,7 +356,7 @@ class ReasanOccupancyViewer:
             1,
             cv2.LINE_AA,
         )
-        legend = "red: active ActorRay; green: raw direct profile" if direct_rays is not None else "red: occupied before max range; gray: no hit"
+        legend = "red: direct ActorRay; gray: no hit"
         cv2.putText(
             panel,
             legend,
@@ -476,11 +369,11 @@ class ReasanOccupancyViewer:
         )
         return panel
 
-    def compose(self, points_body: np.ndarray, actor_rays: np.ndarray, direct_rays: np.ndarray | None) -> np.ndarray:
-        return np.concatenate((self.physical_panel(points_body), self.actor_panel(actor_rays, direct_rays)), axis=1)
+    def compose(self, points_body: np.ndarray, actor_rays: np.ndarray) -> np.ndarray:
+        return np.concatenate((self.physical_panel(points_body), self.actor_panel(actor_rays)), axis=1)
 
-    def render(self, points_body: np.ndarray, actor_rays: np.ndarray, direct_rays: np.ndarray | None) -> bool:
-        frame = self.compose(points_body, actor_rays, direct_rays)
+    def render(self, points_body: np.ndarray, actor_rays: np.ndarray) -> bool:
+        frame = self.compose(points_body, actor_rays)
         if not self.window_created:
             return True
         self.cv2.imshow(self.WINDOW_NAME, frame)
@@ -492,13 +385,10 @@ class ReasanOccupancyViewer:
 
 
 def parser() -> argparse.ArgumentParser:
-    result = argparse.ArgumentParser(description="Visualize MID-360 point cloud and REASEN ActorRay/Estimator output.")
+    result = argparse.ArgumentParser(description="Visualize MID-360 point cloud and direct REASEN ActorRay output.")
     result.add_argument("--interface", "-i", help="NIC connected to G1, e.g. enp3s0")
     result.add_argument("--domain-id", type=int, default=0)
     result.add_argument("--topic", default=mid360.DEFAULT_TOPIC)
-    result.add_argument("--imu-topic", default=mid360.DEFAULT_IMU_TOPIC)
-    result.add_argument("--ray-source", choices=("direct", "estimator", "both"), default="both")
-    result.add_argument("--estimator", type=Path, default=DEFAULT_ESTIMATOR)
     result.add_argument("--min-range", type=float, default=0.3, help="Ignore points closer than this distance in meters")
     result.add_argument("--max-range", type=float, default=3.0)
     result.add_argument("--filter-ground", dest="filter_ground", action="store_true", default=True)
@@ -557,17 +447,11 @@ def run(args: argparse.Namespace) -> None:
     except Exception as exc:
         raise SystemExit("Install visualization dependencies: python3 -m pip install open3d") from exc
 
-    estimator = None
-    if args.ray_source in ("estimator", "both"):
-        if not args.estimator.is_file():
-            raise SystemExit(f"Estimator ONNX not found: {args.estimator}")
-        estimator = OnnxRayEstimator(args.estimator)
     ray_median_filter = RayMedianFilter(args.ray_median_window)
     ray_publisher = ActorRayZmqPublisher(args.zmq_endpoint) if args.zmq_endpoint else None
 
     mid360.init_dds(args.domain_id, args.interface)
     receiver = mid360.Mid360CloudReceiver(cloud_receiver_args(args))
-    imu_receiver = ImuFeatureReceiver(args.imu_topic) if estimator is not None or ray_publisher is not None else None
 
     vis = o3d.visualization.Visualizer()
     vis.create_window("G1 MID-360 raw 3-D point cloud", width=args.width, height=args.height, left=10, top=30, visible=True)
@@ -578,11 +462,9 @@ def run(args: argparse.Namespace) -> None:
 
     cloud = o3d.geometry.PointCloud()
     direct_lines = o3d.geometry.LineSet()
-    estimator_lines = o3d.geometry.LineSet()
     axis = o3d.geometry.TriangleMesh.create_coordinate_frame(size=0.5)
     vis.add_geometry(cloud)
     vis.add_geometry(direct_lines)
-    vis.add_geometry(estimator_lines)
     vis.add_geometry(axis)
     mid360.set_default_view(vis, 0.65)
     occupancy_viewer = (
@@ -591,7 +473,7 @@ def run(args: argparse.Namespace) -> None:
         else ReasanOccupancyViewer(args.max_range, window_left=args.width + 30)
     )
 
-    print("[colors] point cloud=white, direct profile=green, Estimator ActorRay=magenta")
+    print("[colors] point cloud=white, direct ActorRay=green")
     last_seq = 0
     next_update = 0.0
     update_period = 1.0 / max(args.update_hz, 1.0)
@@ -620,25 +502,12 @@ def run(args: argparse.Namespace) -> None:
                 )
                 direct_raw = direct_actor_profile(grid, args.max_range)
                 direct = ray_median_filter.update(direct_raw)
-                predicted = None
-                imu_features = None
-                imu_valid = False
-                imu_age_s = None
-                if imu_receiver is not None:
-                    imu_features, imu_valid, imu_age_s = imu_receiver.snapshot()
-                if estimator is not None and imu_receiver is not None:
-                    predicted = estimator.infer(grid / args.max_range, imu_features)
-                actor_for_filter = predicted if predicted is not None else direct
                 if ray_publisher is not None:
                     ray_publisher.publish(
                         build_actor_ray_message(
-                            actor_for_filter,
+                            direct,
                             sequence=frame.seq,
                             max_range=args.max_range,
-                            source="estimator" if predicted is not None else "direct_median",
-                            imu_features=imu_features,
-                            imu_valid=imu_valid,
-                            imu_age_s=imu_age_s,
                         )
                     )
 
@@ -646,23 +515,15 @@ def run(args: argparse.Namespace) -> None:
                 cloud.colors = o3d.utility.Vector3dVector(np.ones_like(points_body, dtype=np.float64))
                 vis.update_geometry(cloud)
 
-                if args.show_rays_3d and args.ray_source in ("direct", "both"):
+                if args.show_rays_3d:
                     vertices, lines = make_radial_lines(rays_to_points(direct, args.max_range, z=0.02))
                     direct_lines.points = o3d.utility.Vector3dVector(vertices)
                     direct_lines.lines = o3d.utility.Vector2iVector(lines)
                     direct_lines.colors = o3d.utility.Vector3dVector(np.tile([0.1, 1.0, 0.1], (180, 1)))
                     vis.update_geometry(direct_lines)
 
-                if args.show_rays_3d and predicted is not None:
-                    vertices, lines = make_radial_lines(rays_to_points(predicted, args.max_range, z=0.06))
-                    estimator_lines.points = o3d.utility.Vector3dVector(vertices)
-                    estimator_lines.lines = o3d.utility.Vector2iVector(lines)
-                    estimator_lines.colors = o3d.utility.Vector3dVector(np.tile([1.0, 0.1, 0.8], (180, 1)))
-                    vis.update_geometry(estimator_lines)
-
                 if occupancy_viewer is not None:
-                    comparison = direct_raw if predicted is None or args.ray_source == "both" else None
-                    if not occupancy_viewer.render(points_body, actor_for_filter, comparison):
+                    if not occupancy_viewer.render(points_body, direct):
                         break
 
                 occupied = int(np.count_nonzero(grid < args.max_range))
@@ -682,8 +543,6 @@ def run(args: argparse.Namespace) -> None:
         vis.destroy_window()
         if occupancy_viewer is not None:
             occupancy_viewer.close()
-        if imu_receiver is not None:
-            imu_receiver.close()
         if ray_publisher is not None:
             ray_publisher.close()
         receiver.close()
@@ -728,23 +587,16 @@ def self_test() -> None:
     impulse[20] = 0.1
     assert np.isclose(median_filter.update(impulse)[20], 0.55)
     assert np.isclose(median_filter.update(baseline)[20], 1.0)
-    imu = np.array([0.0, 0.0, -1.0, 0.1, 0.2, 0.3], dtype=np.float32)
     message = build_actor_ray_message(
         baseline,
         sequence=7,
         max_range=3.0,
-        source="direct_median",
-        imu_features=imu,
-        imu_valid=True,
-        imu_age_s=0.01,
     )
     assert message["count"] == 180
     assert len(message["normalized"]) == 180
     assert len(message["ranges_m"]) == 180
     assert message["ranges_m"][0] == 3.0
-    assert message["imu_valid"] is True
-    assert np.allclose(message["projected_gravity"], [0.0, 0.0, -1.0])
-    assert np.allclose(message["angular_velocity"], [0.1, 0.2, 0.3])
+    assert message["source"] == "direct_median"
     json.dumps(message)
     print("self-test passed: grid=[30,180], ActorRay=[180]")
 

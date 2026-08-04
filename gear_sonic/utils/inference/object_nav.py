@@ -30,8 +30,6 @@ from gear_sonic.utils.inference.object_nav_geometry import (
 
 
 DEFAULT_SCHEMA_FILENAME = "object_nav_policy.schema.json"
-DEFAULT_HTTP_PROXY = "http://127.0.0.1:7897/"
-DEFAULT_ALL_PROXY = "socks://127.0.0.1:7897/"
 HTTP_PROXY_KEYS = ("http_proxy", "https_proxy", "HTTP_PROXY", "HTTPS_PROXY")
 ALL_PROXY_KEYS = ("all_proxy", "ALL_PROXY")
 POLICY_KEYS = (
@@ -129,6 +127,7 @@ class RGBDSnapshot:
 class ObjectNavConfig:
     mission: str
     global_target: str
+    model: str = "gpt-5.6-luna"
     camera_host: str = "localhost"
     camera_port: int = 5555
     camera_timeout_ms: int = 3000
@@ -330,9 +329,10 @@ class CodexBBoxClient:
         timeout_seconds: float = 180.0,
         codex_bin: str | None = None,
         model: str = "gpt-5.6-sol",
-        reasoning_effort: str = "high",
+        reasoning_effort: str | None = "high",
         http_proxy_url: str | None = None,
         all_proxy_url: str | None = None,
+        monotonic: Callable[[], float] = time.monotonic,
     ):
         self.schema_path = (
             None if schema_path is None else Path(schema_path).resolve()
@@ -342,13 +342,16 @@ class CodexBBoxClient:
         self.codex_bin = codex_bin or os.environ.get("CODEX_BIN", "codex")
         self.model = model
         self.reasoning_effort = reasoning_effort
+        self._monotonic = monotonic
+        self.last_auth_check_seconds = 0.0
+        self.last_api_inference_seconds = 0.0
         self.http_proxy_url = (
-            os.environ.get("OBJECT_NAV_CODEX_HTTP_PROXY", DEFAULT_HTTP_PROXY)
+            os.environ.get("OBJECT_NAV_CODEX_HTTP_PROXY")
             if http_proxy_url is None
             else http_proxy_url
         )
         self.all_proxy_url = (
-            os.environ.get("OBJECT_NAV_CODEX_ALL_PROXY", DEFAULT_ALL_PROXY)
+            os.environ.get("OBJECT_NAV_CODEX_ALL_PROXY")
             if all_proxy_url is None
             else all_proxy_url
         )
@@ -359,6 +362,8 @@ class CodexBBoxClient:
             (HTTP_PROXY_KEYS, self.http_proxy_url),
             (ALL_PROXY_KEYS, self.all_proxy_url),
         ):
+            if value is None:
+                continue
             for key in keys:
                 if value:
                     child_env[key] = value
@@ -498,7 +503,11 @@ class CodexBBoxClient:
         snapshot: RGBDSnapshot,
         cwd: str | Path,
     ) -> dict[str, Any]:
-        self._check_chatgpt_login()
+        auth_started = self._monotonic()
+        try:
+            self._check_chatgpt_login()
+        finally:
+            self.last_auth_check_seconds = self._monotonic() - auth_started
         image_path = Path(image_path).resolve()
         if not image_path.is_file():
             raise FileNotFoundError(f"ObjectNav RGB image not found: {image_path}")
@@ -518,23 +527,31 @@ class CodexBBoxClient:
             "never",
             "--model",
             self.model,
-            "--config",
-            f'model_reasoning_effort="{self.reasoning_effort}"',
             "--image",
             str(image_path),
             "--output-schema",
             str(schema_path),
             get_object_nav_policy_prompt(mission, global_target, snapshot),
         ]
-        result = self.runner(
-            command,
-            capture_output=True,
-            text=True,
-            timeout=self.timeout_seconds,
-            check=False,
-            cwd=str(cwd),
-            env=self._subprocess_env(),
-        )
+        if self.reasoning_effort is not None:
+            model_index = command.index("--image")
+            command[model_index:model_index] = [
+                "--config",
+                f'model_reasoning_effort="{self.reasoning_effort}"',
+            ]
+        api_started = self._monotonic()
+        try:
+            result = self.runner(
+                command,
+                capture_output=True,
+                text=True,
+                timeout=self.timeout_seconds,
+                check=False,
+                cwd=str(cwd),
+                env=self._subprocess_env(),
+            )
+        finally:
+            self.last_api_inference_seconds = self._monotonic() - api_started
         if result.returncode != 0:
             message = (result.stderr or result.stdout or "unknown error").strip()
             raise RuntimeError(f"Codex ObjectNav policy failed: {message}")
@@ -613,10 +630,22 @@ class ObjectNavRunner:
             config.camera_host, config.camera_port, config.camera_timeout_ms
         )
         self.codex = codex or CodexBBoxClient(
-            timeout_seconds=config.codex_timeout_seconds
+            model=config.model,
+            reasoning_effort=None,
+            timeout_seconds=config.codex_timeout_seconds,
         )
 
     def run_once(self, *, iteration: int = 1) -> ObjectNavResult:
+        total_started = time.monotonic()
+        timing = {
+            "camera_rgbd": 0.0,
+            "image_io": 0.0,
+            "auth_check": 0.0,
+            "api_inference": 0.0,
+            "postprocess": 0.0,
+            "total": 0.0,
+        }
+        postprocess_started: float | None = None
         timestamp = time.strftime("%Y%m%d_%H%M%S")
         output_dir = (
             Path(self.config.output_root)
@@ -630,21 +659,40 @@ class ObjectNavRunner:
         error: str | None = None
         outcome = "FAILED"
         try:
+            camera_started = time.monotonic()
             snapshots = [
                 self.camera.capture_aligned_rgbd() for _ in range(FRAME_COUNT)
             ]
+            timing["camera_rgbd"] = time.monotonic() - camera_started
+            image_io_started = time.monotonic()
             _save_raw_depth_outputs(snapshots, output_dir)
             snapshot = snapshots[POLICY_FRAME_INDEX]
             input_path = output_dir / "object_nav_input.png"
             if not cv2.imwrite(str(input_path), snapshot.rgb_bgr):
                 raise RuntimeError("failed to save ObjectNav RGB input")
-            policy = self.codex.locate(
-                image_path=input_path,
-                mission=self.config.mission,
-                global_target=self.config.global_target,
-                snapshot=snapshot,
-                cwd=output_dir,
-            )
+            timing["image_io"] = time.monotonic() - image_io_started
+            policy_call_started = time.monotonic()
+            try:
+                policy = self.codex.locate(
+                    image_path=input_path,
+                    mission=self.config.mission,
+                    global_target=self.config.global_target,
+                    snapshot=snapshot,
+                    cwd=output_dir,
+                )
+            finally:
+                policy_call_seconds = time.monotonic() - policy_call_started
+                timing["auth_check"] = float(
+                    getattr(self.codex, "last_auth_check_seconds", 0.0)
+                )
+                timing["api_inference"] = float(
+                    getattr(
+                        self.codex,
+                        "last_api_inference_seconds",
+                        max(0.0, policy_call_seconds - timing["auth_check"]),
+                    )
+                )
+            postprocess_started = time.monotonic()
             _write_json(output_dir / "object_nav_policy.json", policy)
             if not cv2.imwrite(
                 str(output_dir / "object_nav_bbox_vis.png"),
@@ -692,6 +740,10 @@ class ObjectNavRunner:
             geometry = {"status": "failed", "error": error}
             print(f"[ObjectNav] {error}", file=os.sys.stderr, flush=True)
         finally:
+            if postprocess_started is not None:
+                timing["postprocess"] = time.monotonic() - postprocess_started
+            timing["total"] = time.monotonic() - total_started
+            geometry["timing_s"] = timing
             if not (output_dir / "object_nav_policy.json").exists():
                 _write_json(output_dir / "object_nav_policy.json", policy)
             _write_json(output_dir / "object_nav_geometry.json", geometry)
@@ -719,6 +771,10 @@ class ObjectNavRunner:
             output_dir=str(output_dir),
             error=error,
         )
+
+    def warmup(self) -> ObjectNavResult:
+        """Execute one real policy request whose motion result is never consumed."""
+        return self.run_once(iteration=0)
 
     def close(self) -> None:
         if self._owns_camera:

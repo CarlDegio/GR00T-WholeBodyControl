@@ -148,7 +148,7 @@ class InferenceLaunchConfig:
     """Camera server port."""
 
     keyboard_planner: bool = True
-    """Start the REASEN keyboard, Filter planner, and MID-360 sidecars."""
+    """Start planner input, rule-based safety, and MID-360 sidecars."""
 
     keyboard_planner_port: int = 5558
     """Keyboard planner sidecar port."""
@@ -167,6 +167,12 @@ class InferenceLaunchConfig:
 
     lavira_global_target: str = ""
     """Global target used by LaViRA when --planner-input lavira is selected."""
+
+    lavira_model: str = "gpt-5.6-luna"
+    """Codex CLI vision model used by LaViRA."""
+
+    lavira_warmup: bool = True
+    """Run one discarded Luna request in the background at startup."""
 
     lavira_debug: bool = False
     """Enable LaViRA debug logging."""
@@ -192,8 +198,11 @@ class InferenceLaunchConfig:
     lavira_max_abs_yaw: float = 3.141592653589793
     """LaViRA maximum relative yaw (rad)."""
 
-    lavira_camera_timeout_ms: int = 3000
-    """LaViRA RGB-D camera receive timeout (ms)."""
+    lavira_camera_timeout_ms: int = 15000
+    """LaViRA pure LingBot RGB-D receive timeout (ms)."""
+
+    lavira_depth_port: int = 5564
+    """Local pure LingBot completed RGB-D stream consumed by LaViRA."""
 
     lavira_codex_timeout_seconds: float = 180.0
     """LaViRA Codex policy timeout (s)."""
@@ -219,17 +228,14 @@ class InferenceLaunchConfig:
     reasan_ray_port: int = 5562
     """MID-360 ActorRay publisher port."""
 
+    reasan_avoidance: bool = True
+    """Run the MID-360 rule-based forward protective stop."""
+
     reasan_planner_port: int = 5563
     """Filtered SONIC planner publisher port consumed by VLA inference."""
 
     reasan_radar_interface: str = "enx6c1ff7bed314"
     """Network interface connected to the G1 MID-360."""
-
-    reasan_filter_onnx: str = (
-        "/home/user/Project/REASAN/training/logs/rsl_rl/g1_filter/"
-        "g1_filter_bigger_z_speed/exported/filter_g1_model_19998.onnx"
-    )
-    """G1 REASEN Filter ONNX path."""
 
     # Data exporter (optional recording during inference)
     data_exporter: bool = True
@@ -264,13 +270,26 @@ def build_planner_input_command(config: InferenceLaunchConfig, repo_root: Path) 
         )
 
     debug = "--debug " if config.lavira_debug else ""
+    warmup = "" if config.lavira_warmup else "--no-warmup "
+    quoted_root = shlex.quote(str(repo_root))
+    quoted_camera_host = shlex.quote(config.camera_host)
     return (
-        f"cd {shlex.quote(str(repo_root))} && "
-        f"source .venv_inference/bin/activate && "
-        f"python gear_sonic/scripts/lavira_planner.py "
+        f"cd {quoted_root} && "
+        f"ready_file=/tmp/sonic_lingbot_ready_$$; rm -f $ready_file; "
+        f"PYTHONPATH={quoted_root} .venv_lingbot_depth/bin/python "
+        f"gear_sonic/scripts/run_lingbot_depth_viewer.py "
+        f"--camera-host {quoted_camera_host} --camera-port {config.camera_port} "
+        f"--publish-port {config.lavira_depth_port} --ready-file $ready_file & "
+        f"viewer_pid=$!; "
+        f"trap 'kill $viewer_pid 2>/dev/null; rm -f $ready_file' EXIT; "
+        f"while [ ! -f $ready_file ]; do "
+        f"kill -0 $viewer_pid 2>/dev/null || {{ wait $viewer_pid; exit 1; }}; "
+        f"sleep 0.2; done; "
+        f".venv_inference/bin/python gear_sonic/scripts/lavira_planner.py "
         f"--mission {shlex.quote(config.lavira_mission)} "
         f"--global-target {shlex.quote(config.lavira_global_target)} "
-        f"{debug}--host {shlex.quote(config.lavira_host)} "
+        f"--model {shlex.quote(config.lavira_model)} "
+        f"{debug}{warmup}--host {shlex.quote(config.lavira_host)} "
         f"--port {config.keyboard_planner_port} "
         f"--planner-hz {config.lavira_planner_hz} "
         f"--transition-pause {config.lavira_transition_pause} "
@@ -278,8 +297,8 @@ def build_planner_input_command(config: InferenceLaunchConfig, repo_root: Path) 
         f"--max-speed {config.lavira_max_speed} "
         f"--max-duration {config.lavira_max_duration} "
         f"--max-abs-yaw {config.lavira_max_abs_yaw} "
-        f"--camera-host {shlex.quote(config.camera_host)} "
-        f"--camera-port {config.camera_port} "
+        f"--camera-host 127.0.0.1 "
+        f"--camera-port {config.lavira_depth_port} "
         f"--camera-timeout-ms {config.lavira_camera_timeout_ms} "
         f"--codex-timeout-seconds {config.lavira_codex_timeout_seconds} "
         f"--min-confidence {config.lavira_min_confidence} "
@@ -288,6 +307,30 @@ def build_planner_input_command(config: InferenceLaunchConfig, repo_root: Path) 
         f"--target-standoff-distance {config.lavira_target_standoff_distance} "
         f"--max-direct-travel {config.lavira_max_direct_travel} "
         f"--output-root {shlex.quote(config.lavira_output_root)}"
+    )
+
+
+def build_reasan_planner_command(
+    config: InferenceLaunchConfig, repo_root: Path
+) -> str:
+    """Build the rule-based safety command or direct LaViRA-to-SONIC bypass."""
+    common = (
+        f"cd {repo_root} && "
+        f"source .venv_teleop/bin/activate && "
+        f"python gear_sonic/scripts/reasan_planner.py "
+        f"--keyboard-endpoint tcp://127.0.0.1:{config.keyboard_planner_port} "
+        f"--output-endpoint 'tcp://*:{config.reasan_planner_port}' "
+    )
+    if not config.reasan_avoidance:
+        return (
+            f"cd {repo_root} && "
+            f"source .venv_teleop/bin/activate && "
+            f"python gear_sonic/scripts/lavira_sonic_relay.py "
+            f"--source tcp://127.0.0.1:{config.keyboard_planner_port} "
+            f"--output 'tcp://*:{config.reasan_planner_port}' --hz 20"
+        )
+    return (
+        common + f"--ray-endpoint tcp://127.0.0.1:{config.reasan_ray_port}"
     )
 
 
@@ -314,9 +357,6 @@ def _check_prerequisites(config: InferenceLaunchConfig):
             errors.append(
                 "--lavira-global-target is required when --planner-input lavira"
             )
-
-    if config.keyboard_planner and not Path(config.reasan_filter_onnx).is_file():
-        errors.append(f"REASEN Filter ONNX not found: {config.reasan_filter_onnx}")
 
     deploy_dir = repo_root / "gear_sonic_deploy"
     if not (deploy_dir / "deploy.sh").exists():
@@ -352,7 +392,18 @@ def _kill_existing_session():
     )
 
 
-def _create_tmux_session():
+def _parse_pane_ids(output: str) -> list[str]:
+    indexed = {}
+    for line in output.splitlines():
+        fields = line.split()
+        if len(fields) == 2:
+            indexed[int(fields[0])] = fields[1]
+    if len(indexed) != 6 or sorted(indexed) != list(range(6)):
+        raise RuntimeError(f"expected 6 tmux panes, found {len(indexed)}")
+    return [indexed[index] for index in range(6)]
+
+
+def _create_tmux_session() -> list[str]:
     bash = shutil.which("bash") or "/bin/bash"
     subprocess.run(
         [
@@ -363,6 +414,13 @@ def _create_tmux_session():
     )
     subprocess.run(
         ["tmux", "set-option", "-t", SESSION_NAME, "-g", "mouse", "on"],
+    )
+    subprocess.run(
+        [
+            "tmux", "set-option", "-t", f"{SESSION_NAME}:0", "-w",
+            "remain-on-exit", "on",
+        ],
+        check=True,
     )
     subprocess.run(
         ["tmux", "bind-key", "-T", "root", "C-\\", "kill-session"],
@@ -399,21 +457,31 @@ def _create_tmux_session():
             )
     subprocess.run(["tmux", "select-layout", "-t", f"{SESSION_NAME}:0", "tiled"], check=True)
 
+    pane_output = subprocess.run(
+        [
+            "tmux", "list-panes", "-t", f"{SESSION_NAME}:0",
+            "-F", "#{pane_index} #{pane_id}",
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout
+    pane_ids = _parse_pane_ids(pane_output)
     time.sleep(5)
+    return pane_ids
 
 
-def _send_to_pane(pane_index: int, cmd: str, wait: float = 1.0):
-    target = f"{SESSION_NAME}:0.{pane_index}"
+def _send_to_pane(pane_id: str, cmd: str, wait: float = 1.0):
     subprocess.run(
-        ["tmux", "send-keys", "-t", target, cmd, "C-m"],
+        ["tmux", "send-keys", "-t", pane_id, cmd, "C-m"],
+        check=True,
     )
     time.sleep(wait)
 
 
-def _check_pane_alive(pane_index: int) -> bool:
-    target = f"{SESSION_NAME}:0.{pane_index}"
+def _check_pane_alive(pane_id: str) -> bool:
     result = subprocess.run(
-        ["tmux", "list-panes", "-t", target, "-F", "#{pane_dead}"],
+        ["tmux", "list-panes", "-t", pane_id, "-F", "#{pane_dead}"],
         capture_output=True,
         text=True,
     )
@@ -446,7 +514,7 @@ def main(config: InferenceLaunchConfig):
     print(f"  PC IP:           {_get_local_ip()}")
     print("=" * 60)
 
-    _create_tmux_session()
+    pane_ids = _create_tmux_session()
     print(f"Created tmux session: {SESSION_NAME}")
 
     # --- Window 1 (sim only): MuJoCo Simulator ---
@@ -496,9 +564,9 @@ def main(config: InferenceLaunchConfig):
     deploy_cmd += deploy_mode
 
     print("Starting C++ deploy (pane 0)...")
-    _send_to_pane(0, deploy_cmd, wait=3.0)
+    _send_to_pane(pane_ids[0], deploy_cmd, wait=3.0)
 
-    if not _check_pane_alive(0):
+    if not _check_pane_alive(pane_ids[0]):
         print("WARNING: C++ deploy pane may have failed to start.")
 
     # --- Pane 1 (top-right): VLA Inference ---
@@ -519,7 +587,7 @@ def main(config: InferenceLaunchConfig):
     )
 
     print("Starting VLA inference (pane 1)...")
-    _send_to_pane(2, inference_cmd, wait=1.0)
+    _send_to_pane(pane_ids[2], inference_cmd, wait=1.0)
 
     # --- Pane 2 (bottom-left): Keyboard Publisher ---
     keyboard_script = textwrap.dedent("""\
@@ -546,27 +614,18 @@ def main(config: InferenceLaunchConfig):
     )
 
     print("Starting keyboard publisher (pane 2)...")
-    _send_to_pane(1, keyboard_cmd, wait=2.0)
+    _send_to_pane(pane_ids[1], keyboard_cmd, wait=2.0)
 
-    # --- Panes 3-5: planner input, Filter planner, and MID-360 ---
+    # --- Panes 3-5: planner input, rule-based safety, and MID-360 ---
     if config.keyboard_planner:
         reasan_keyboard_cmd = build_planner_input_command(config, repo_root)
-        reasan_planner_cmd = (
-            f"cd {repo_root} && "
-            f"source .venv_teleop/bin/activate && "
-            f"python gear_sonic/scripts/reasan_planner.py "
-            f"--filter {config.reasan_filter_onnx} "
-            f"--ray-endpoint tcp://127.0.0.1:{config.reasan_ray_port} "
-            f"--keyboard-endpoint tcp://127.0.0.1:{config.keyboard_planner_port} "
-            f"--output-endpoint 'tcp://*:{config.reasan_planner_port}' "
-            f"--suppress-output-on-zero-input"
-        )
+        reasan_planner_cmd = build_reasan_planner_command(config, repo_root)
         radar_cmd = (
             f"cd {repo_root} && "
             f"source .venv_teleop/bin/activate && "
             f"python tools/mid360_reasan_open3d.py "
             f"--interface {config.reasan_radar_interface} "
-            f"--ray-source direct --min-range 0.3 --filter-ground "
+            f"--min-range 0.3 --filter-ground "
             f"--ray-median-window 5 "
             f"--zmq-endpoint 'tcp://*:{config.reasan_ray_port}'"
         )
@@ -574,11 +633,17 @@ def main(config: InferenceLaunchConfig):
             print("Starting LaViRA planner (pane 3)...")
         else:
             print("Starting REASEN keyboard (pane 3)...")
-        _send_to_pane(3, reasan_keyboard_cmd, wait=1.0)
-        print("Starting REASEN Filter planner (pane 4)...")
-        _send_to_pane(4, reasan_planner_cmd, wait=1.0)
-        print("Starting MID-360 ActorRay publisher (pane 5)...")
-        _send_to_pane(5, radar_cmd, wait=2.0)
+        _send_to_pane(pane_ids[3], reasan_keyboard_cmd, wait=1.0)
+        if config.reasan_avoidance:
+            print("Starting REASEN rule-based safety planner (pane 4)...")
+        else:
+            print("Starting direct LaViRA-to-SONIC relay (pane 4)...")
+        _send_to_pane(pane_ids[4], reasan_planner_cmd, wait=1.0)
+        if config.reasan_avoidance:
+            print("Starting MID-360 ActorRay publisher (pane 5)...")
+            _send_to_pane(pane_ids[5], radar_cmd, wait=2.0)
+        else:
+            print("REASEN avoidance disabled; MID-360 pane left idle.")
 
 
     if config.data_exporter:
@@ -626,8 +691,12 @@ def main(config: InferenceLaunchConfig):
         print("    Pane 3: LaViRA AgentNav Planner")
     else:
         print("    Pane 3: REASEN Keyboard")
-    print("    Pane 4: REASEN Filter ONNX Planner")
-    print("    Pane 5: MID-360 ActorRay/IMU")
+    if config.reasan_avoidance:
+        print("    Pane 4: REASEN Rule-Based Safety Planner")
+        print("    Pane 5: MID-360 ActorRay/IMU")
+    else:
+        print("    Pane 4: Direct LaViRA-to-SONIC Relay")
+        print("    Pane 5: Idle (REASEN/MID-360 disabled)")
     if config.data_exporter:
         print("    Window 'data_exporter':")
         print("      Data Exporter (.venv_data_collection)")
@@ -641,7 +710,7 @@ def main(config: InferenceLaunchConfig):
     if config.planner_input == "lavira":
         print("    2. In pane 3: N starts AgentNav; Space cancels and stops")
     else:
-        print("    2. In pane 3: W/S/A/D/Q/E for filtered locomotion")
+        print("    2. In pane 3: W/S/A/D/Q/E for safety-guarded locomotion")
     print("    3. In pane 1: i (POSE mode)")
     print("  Keyboard controls (type in pane 1):")
     print("    p        - Pause / resume inference")

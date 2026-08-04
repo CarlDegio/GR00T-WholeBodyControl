@@ -28,7 +28,7 @@ class KeyboardPlannerConfig:
     hz: float = 20.0
     """Compatibility option retained for launch_inference; commands remain key-triggered."""
     duration: float = 0.5
-    forward_speed: float = 0.5
+    forward_speed: float = 0.3
     backward_speed: float = 0.3
     lateral_speed: float = 0.15
     yaw_speed: float = 0.5

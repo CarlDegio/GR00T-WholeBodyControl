@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run the G1 REASEN Filter ONNX and publish SONIC planner messages."""
+"""Apply a rule-based forward protective stop and publish SONIC commands."""
 
 from __future__ import annotations
 
@@ -7,20 +7,15 @@ import argparse
 from dataclasses import dataclass
 import json
 import math
-from pathlib import Path
 import signal
-import sys
 import time
 from typing import Any
 
 import numpy as np
-import onnxruntime as ort
 import zmq
 
 
-ROOT = Path(__file__).resolve().parents[2]
-sys.path.insert(0, str(ROOT))
-from gear_sonic.utils.teleop.zmq.zmq_planner_sender import (  # noqa: E402
+from gear_sonic.utils.teleop.zmq.zmq_planner_sender import (
     build_command_message,
     build_planner_message,
 )
@@ -28,12 +23,10 @@ from gear_sonic.utils.teleop.zmq.zmq_planner_sender import (  # noqa: E402
 
 RAY_MESSAGE_TYPE = "reasan_actor_ray"
 COMMAND_MESSAGE_TYPE = "navila_reasan_velocity_command"
-DEFAULT_FILTER = Path(
-    "/home/user/Project/REASAN/training/logs/rsl_rl/g1_filter/"
-    "g1_filter_bigger_z_speed/exported/filter_g1_model_19998.onnx"
-)
 COMMAND_LOWER = np.array([-0.5, -0.15, -1.0], dtype=np.float32)
 COMMAND_UPPER = np.array([1.0, 0.15, 1.0], dtype=np.float32)
+FORWARD_STOP_DISTANCE_M = 0.5
+FORWARD_HALF_ANGLE_DEG = 45.0
 
 
 @dataclass
@@ -57,26 +50,27 @@ def decode_actor_ray(raw: bytes | str) -> dict[str, Any]:
     if not isinstance(message, dict) or message.get("type") != RAY_MESSAGE_TYPE or message.get("version") != 1:
         raise ValueError("unsupported ActorRay message")
     rays = np.asarray(message.get("normalized"), dtype=np.float32)
-    gravity = np.asarray(message.get("projected_gravity"), dtype=np.float32)
-    angular_velocity = np.asarray(message.get("angular_velocity"), dtype=np.float32)
     if rays.shape != (180,) or not np.isfinite(rays).all() or np.any((rays < 0.0) | (rays > 1.0)):
         raise ValueError("ActorRay must contain 180 finite normalized values in [0,1]")
-    if gravity.shape != (3,) or angular_velocity.shape != (3,):
-        raise ValueError("ActorRay message is missing projected_gravity/angular_velocity")
-    if not np.isfinite(gravity).all() or not np.isfinite(angular_velocity).all():
-        raise ValueError("IMU features must be finite")
-    if not bool(message.get("imu_valid", False)):
-        raise ValueError("IMU has not received a valid sample")
-    imu_age = float(message.get("imu_age_s", math.inf))
-    if not math.isfinite(imu_age) or imu_age < 0.0:
-        raise ValueError("invalid IMU age")
+    try:
+        angle_min = float(message["angle_min_deg"])
+        angle_increment = float(message["angle_increment_deg"])
+        range_max = float(message["range_max_m"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError("ActorRay angular/range metadata is missing") from exc
+    if (
+        not all(math.isfinite(value) for value in (angle_min, angle_increment, range_max))
+        or angle_increment <= 0.0
+        or range_max <= 0.0
+    ):
+        raise ValueError("ActorRay angular/range metadata is invalid")
+    angles = angle_min + angle_increment * np.arange(rays.size, dtype=np.float32)
     return {
         "sequence": int(message["sequence"]),
         "source": str(message.get("source", "unknown")),
         "rays": rays,
-        "gravity": gravity,
-        "angular_velocity": angular_velocity,
-        "imu_age": imu_age,
+        "angles_deg": angles,
+        "distances": rays * range_max,
     }
 
 
@@ -107,45 +101,25 @@ def decode_velocity_command(raw: bytes | str) -> dict[str, Any]:
     }
 
 
-class ReasanFilterOnnx:
-    def __init__(self, model_path: Path, action_ema_alpha: float) -> None:
-        providers = [p for p in ("CUDAExecutionProvider", "CPUExecutionProvider") if p in ort.get_available_providers()]
-        self.session = ort.InferenceSession(str(model_path), providers=providers)
-        expected_inputs = {"proprio_obs", "ray_obs", "h_in", "c_in"}
-        expected_outputs = {"actions", "h_out", "c_out"}
-        if {item.name for item in self.session.get_inputs()} != expected_inputs:
-            raise ValueError(f"unexpected Filter inputs: {[item.name for item in self.session.get_inputs()]}")
-        if {item.name for item in self.session.get_outputs()} != expected_outputs:
-            raise ValueError(f"unexpected Filter outputs: {[item.name for item in self.session.get_outputs()]}")
-        self.action_ema_alpha = action_ema_alpha
-        self.hidden = np.zeros((1, 1, 256), dtype=np.float32)
-        self.cell = np.zeros((1, 1, 256), dtype=np.float32)
-        self.previous_action = np.zeros(3, dtype=np.float32)
-        print(f"[REASEN Filter] {model_path} | providers={self.session.get_providers()}")
-
-    def reset(self) -> None:
-        self.hidden.fill(0.0)
-        self.cell.fill(0.0)
-        self.previous_action.fill(0.0)
-
-    def infer(self, command: np.ndarray, ray: dict[str, Any], suppress_zero: bool) -> np.ndarray:
-        command = np.clip(np.asarray(command, dtype=np.float32), COMMAND_LOWER, COMMAND_UPPER)
-        proprio = np.concatenate(
-            (ray["angular_velocity"] * 0.25, ray["gravity"], command, self.previous_action)
-        )[None].astype(np.float32)
-        actions, self.hidden, self.cell = self.session.run(
-            ["actions", "h_out", "c_out"],
-            {"proprio_obs": proprio, "ray_obs": ray["rays"][None], "h_in": self.hidden, "c_in": self.cell},
-        )
-        action = np.clip(np.asarray(actions, dtype=np.float32).reshape(3), COMMAND_LOWER, COMMAND_UPPER)
-        if suppress_zero and np.all(np.abs(command) <= 1.0e-6):
-            action.fill(0.0)
-            self.previous_action.fill(0.0)
-            return action
-        if self.action_ema_alpha > 0.0:
-            action = self.action_ema_alpha * self.previous_action + (1.0 - self.action_ema_alpha) * action
-        self.previous_action = action.copy()
-        return action
+def apply_rule_based_safety(
+    command: np.ndarray,
+    ray: dict[str, Any],
+    *,
+    stop_distance_m: float = FORWARD_STOP_DISTANCE_M,
+    half_angle_deg: float = FORWARD_HALF_ANGLE_DEG,
+) -> np.ndarray:
+    """Stop only positive-X motion when an obstacle enters the front sector."""
+    velocity = np.clip(
+        np.asarray(command, dtype=np.float32).reshape(3), COMMAND_LOWER, COMMAND_UPPER
+    )
+    if float(velocity[0]) <= 1.0e-6:
+        return velocity.copy()
+    angles = np.asarray(ray["angles_deg"], dtype=np.float32)
+    distances = np.asarray(ray["distances"], dtype=np.float32)
+    in_front = np.abs(angles) <= float(half_angle_deg)
+    if np.any(in_front & (distances <= float(stop_distance_m))):
+        return np.zeros(3, dtype=np.float32)
+    return velocity.copy()
 
 
 @dataclass
@@ -166,17 +140,14 @@ class PlannerState:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--filter", type=Path, default=DEFAULT_FILTER)
     parser.add_argument("--ray-endpoint", default="tcp://127.0.0.1:5562")
     parser.add_argument("--keyboard-endpoint", default="tcp://127.0.0.1:5558")
     parser.add_argument("--output-endpoint", default="tcp://*:5563")
-    parser.add_argument("--filter-hz", type=float, default=50.0)
     parser.add_argument("--output-hz", type=float, default=20.0)
     parser.add_argument("--ray-timeout", type=float, default=0.35)
-    parser.add_argument("--imu-timeout", type=float, default=0.15)
     parser.add_argument("--keyboard-timeout", type=float, default=0.7)
-    parser.add_argument("--action-ema-alpha", type=float, default=0.0)
-    parser.add_argument("--suppress-output-on-zero-input", action="store_true")
+    parser.add_argument("--forward-stop-distance", type=float, default=FORWARD_STOP_DISTANCE_M)
+    parser.add_argument("--forward-half-angle", type=float, default=FORWARD_HALF_ANGLE_DEG)
     parser.add_argument("--status-hz", type=float, default=2.0)
     return parser.parse_args()
 
@@ -192,12 +163,16 @@ def make_latest_subscriber(context: zmq.Context, endpoint: str) -> zmq.Socket:
 
 def main() -> None:
     args = parse_args()
-    positive = (args.filter_hz, args.output_hz, args.ray_timeout, args.imu_timeout, args.keyboard_timeout, args.status_hz)
-    if min(positive) <= 0.0 or not 0.0 <= args.action_ema_alpha < 1.0:
-        raise ValueError("frequencies/timeouts must be positive and EMA alpha must be in [0,1)")
-    if not args.filter.is_file():
-        raise FileNotFoundError(f"Filter ONNX not found: {args.filter}")
-    filter_model = ReasanFilterOnnx(args.filter, args.action_ema_alpha)
+    positive = (
+        args.output_hz,
+        args.ray_timeout,
+        args.keyboard_timeout,
+        args.forward_stop_distance,
+        args.forward_half_angle,
+        args.status_hz,
+    )
+    if min(positive) <= 0.0 or args.forward_half_angle > 180.0:
+        raise ValueError("frequencies, timeouts and safety-sector values must be valid")
     context = zmq.Context.instance()
     ray_socket = make_latest_subscriber(context, args.ray_endpoint)
     keyboard_socket = make_latest_subscriber(context, args.keyboard_endpoint)
@@ -210,7 +185,7 @@ def main() -> None:
     latest_ray, latest_command = LatestValue(), LatestValue()
     planner = PlannerState()
     safe_velocity = np.zeros(3, dtype=np.float32)
-    running, healthy_last, turn_bypass_last = True, False, False
+    running = True
 
     def stop(_signum=None, _frame=None) -> None:
         nonlocal running
@@ -218,11 +193,14 @@ def main() -> None:
 
     signal.signal(signal.SIGINT, stop)
     signal.signal(signal.SIGTERM, stop)
-    filter_period, output_period = 1.0 / args.filter_hz, 1.0 / args.output_hz
-    next_filter = next_output = next_status = time.monotonic()
+    output_period = 1.0 / args.output_hz
+    next_output = next_status = time.monotonic()
     print(f"[REASEN Planner] rays={args.ray_endpoint} keyboard={args.keyboard_endpoint}")
-    print(f"[REASEN Planner] SONIC PUB={args.output_endpoint}, Filter={args.filter_hz:g} Hz, output={args.output_hz:g} Hz")
-    print(f"[REASEN Planner] EMA={args.action_ema_alpha:g}, suppress-zero={args.suppress_output_on_zero_input}")
+    print(f"[REASEN Planner] SONIC PUB={args.output_endpoint}, output={args.output_hz:g} Hz")
+    print(
+        f"[REASEN Planner] rule=front-stop distance={args.forward_stop_distance:g} m "
+        f"sector=+/-{args.forward_half_angle:g} deg"
+    )
     try:
         while running:
             events = dict(poller.poll(1))
@@ -239,40 +217,28 @@ def main() -> None:
                     print(f"[REASEN Planner] Ignored keyboard command: {exc}")
 
             ray_ok = latest_ray.age(now) <= args.ray_timeout
-            imu_ok = ray_ok and latest_ray.value["imu_age"] + latest_ray.age(now) <= args.imu_timeout
             command_age = latest_command.age(now)
             command_ok = latest_command.value is not None and command_age <= min(
                 args.keyboard_timeout, latest_command.value["duration"]
             )
-            healthy = bool(ray_ok and imu_ok and latest_command.value is not None)
+            healthy = bool(ray_ok and latest_command.value is not None)
             command = latest_command.value["velocity"] if command_ok else np.zeros(3, dtype=np.float32)
-            turn_bypass = bool(
-                command_ok
-                and abs(float(command[0])) <= 1.0e-6
-                and abs(float(command[1])) <= 1.0e-6
-                and abs(float(command[2])) > 1.0e-6
-            )
-            if now >= next_filter:
-                if turn_bypass:
-                    if not turn_bypass_last:
-                        filter_model.reset()
-                    safe_velocity = command.copy()
-                elif healthy:
-                    if turn_bypass_last:
-                        filter_model.reset()
-                    safe_velocity = filter_model.infer(command, latest_ray.value, args.suppress_output_on_zero_input)
-                else:
-                    safe_velocity.fill(0.0)
-                    if healthy_last or turn_bypass_last:
-                        filter_model.reset()
-                healthy_last = healthy
-                turn_bypass_last = turn_bypass
-                next_filter = now + filter_period
             if now >= next_output:
+                safe_velocity = (
+                    apply_rule_based_safety(
+                        command,
+                        latest_ray.value,
+                        stop_distance_m=args.forward_stop_distance,
+                        half_angle_deg=args.forward_half_angle,
+                    )
+                    if healthy
+                    else np.zeros(3, dtype=np.float32)
+                )
                 output.send(planner.message(safe_velocity, output_period))
                 next_output = now + output_period
             if now >= next_status:
-                status = "TURN-BYPASS" if turn_bypass else ("OK" if healthy else "SAFE-STOP")
+                protective_stop = healthy and float(command[0]) > 1.0e-6 and not np.any(safe_velocity)
+                status = "PROTECTIVE-STOP" if protective_stop else ("PASS" if healthy else "SENSOR-STOP")
                 print(
                     f"[REASEN Planner] {status} ray_age={latest_ray.age(now):.3f}s "
                     f"cmd_age={command_age:.3f}s in={command.tolist()} out={safe_velocity.tolist()}"
