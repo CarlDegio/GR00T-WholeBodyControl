@@ -25,6 +25,8 @@ from gear_sonic.scripts.run_depth_camera_viewer import colorize_depth
 class LingBotDepthViewerConfig:
     camera_host: str = "localhost"
     camera_port: int = 5555
+    stream_name: str = "chest_view"
+    """RGB stream to enhance; its aligned depth key is ``<stream_name>_depth``."""
     publish_port: int = 5564
     ready_file: str = ""
     model: str = "robbyant/lingbot-depth-pretrain-vitl-14-v0.5"
@@ -110,12 +112,11 @@ def completed_depth_payload(
     *,
     timestamp: float,
     max_depth_m: float,
+    stream_name: str = "chest_view",
 ) -> ImageMessageSchema:
     """Build a composed-camera message containing pure LingBot depth."""
     completed = np.asarray(completed_depth_m, dtype=np.float32)
-    valid = (
-        np.isfinite(completed) & (completed > 0.0) & (completed <= max_depth_m)
-    )
+    valid = np.isfinite(completed) & (completed > 0.0) & (completed <= max_depth_m)
     depth_mm = np.zeros(completed.shape, dtype=np.uint16)
     depth_mm[valid] = np.rint(completed[valid] * 1000.0).astype(np.uint16)
     info = dict(camera_info)
@@ -124,14 +125,15 @@ def completed_depth_payload(
             "width": int(rgb.shape[1]),
             "height": int(rgb.shape[0]),
             "depth_scale_m": 0.001,
-            "depth_aligned_to": "chest_view",
+            "depth_aligned_to": stream_name,
             "depth_source": "lingbot-depth",
         }
     )
+    depth_key = f"{stream_name}_depth"
     return ImageMessageSchema(
-        timestamps={"chest_view": timestamp, "chest_view_depth": timestamp},
-        images={"chest_view": rgb, "chest_view_depth": depth_mm},
-        camera_info={"chest_view": info},
+        timestamps={stream_name: timestamp, depth_key: timestamp},
+        images={stream_name: rgb, depth_key: depth_mm},
+        camera_info={stream_name: info},
     )
 
 
@@ -178,11 +180,14 @@ class LingBotDepthCompleter:
     ) -> tuple[np.ndarray, float]:
         torch = self.torch
         started = time.monotonic()
-        rgb_tensor = torch.from_numpy(
-            np.ascontiguousarray(rgb.astype(np.float32) / 255.0)
-        ).permute(2, 0, 1).unsqueeze(0).to(self.device)
-        depth_tensor = torch.from_numpy(np.ascontiguousarray(depth_m)).unsqueeze(0).to(
-            self.device
+        rgb_tensor = (
+            torch.from_numpy(np.ascontiguousarray(rgb.astype(np.float32) / 255.0))
+            .permute(2, 0, 1)
+            .unsqueeze(0)
+            .to(self.device)
+        )
+        depth_tensor = (
+            torch.from_numpy(np.ascontiguousarray(depth_m)).unsqueeze(0).to(self.device)
         )
         intrinsics_tensor = torch.from_numpy(intrinsics).unsqueeze(0).to(self.device)
         output = self.model.infer(
@@ -200,8 +205,14 @@ class LingBotDepthCompleter:
 def _label(image: np.ndarray, text: str) -> np.ndarray:
     output = image.copy()
     cv2.putText(
-        output, text, (10, 26), cv2.FONT_HERSHEY_SIMPLEX, 0.65,
-        (255, 255, 255), 2, cv2.LINE_AA,
+        output,
+        text,
+        (10, 26),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.65,
+        (255, 255, 255),
+        2,
+        cv2.LINE_AA,
     )
     return output
 
@@ -225,15 +236,19 @@ def main(config: LingBotDepthViewerConfig) -> None:
     last_submit = 0.0
     period = 1.0 / max(config.display_hz, 1.0)
     inference_period = 1.0 / max(config.inference_hz, 0.01)
-    window = "LingBot Chest Depth: raw | completed | conservative"
+    stream_name = config.stream_name.strip()
+    if not stream_name:
+        raise ValueError("stream_name must be non-empty")
+    depth_key = f"{stream_name}_depth"
+    window = f"LingBot {stream_name} Depth: raw | completed | conservative"
 
     try:
         while True:
             loop_start = time.monotonic()
             packet = client.read(blocking=False)
             images = packet.get("images", {}) if packet else {}
-            rgb = images.get("chest_view")
-            raw_depth = images.get("chest_view_depth")
+            rgb = images.get(stream_name)
+            raw_depth = images.get(depth_key)
 
             if pending is not None and pending.done():
                 try:
@@ -247,6 +262,7 @@ def main(config: LingBotDepthViewerConfig) -> None:
                                 frame_info,
                                 timestamp=frame_timestamp,
                                 max_depth_m=config.max_depth_m,
+                                stream_name=stream_name,
                             ).serialize()
                         )
                         published_frames += 1
@@ -263,7 +279,13 @@ def main(config: LingBotDepthViewerConfig) -> None:
                 pending_frame = None
 
             if rgb is not None and raw_depth is not None:
-                info = packet.get("camera_info", {}).get("chest_view", {})
+                info = packet.get("camera_info", {}).get(stream_name, {})
+                if info.get("depth_aligned_to") != stream_name:
+                    print(
+                        f"[LingBotDepth] ignored unaligned {depth_key}: "
+                        f"depth_aligned_to={info.get('depth_aligned_to')!r}"
+                    )
+                    continue
                 scale = float(info.get("depth_scale_m", 0.001))
                 raw_m = prepare_depth_meters(
                     raw_depth,
@@ -288,7 +310,11 @@ def main(config: LingBotDepthViewerConfig) -> None:
                         pending_frame = (
                             rgb.copy(),
                             dict(info),
-                            float(packet.get("timestamps", {}).get("chest_view", time.time())),
+                            float(
+                                packet.get("timestamps", {}).get(
+                                    stream_name, time.time()
+                                )
+                            ),
                         )
                         last_submit = now
 
@@ -310,7 +336,9 @@ def main(config: LingBotDepthViewerConfig) -> None:
                     )
                     tiles.extend(
                         [
-                            _label(completed_color, f"LINGBOT {inference_seconds:.2f}s"),
+                            _label(
+                                completed_color, f"LINGBOT {inference_seconds:.2f}s"
+                            ),
                             _label(fused_color, "CONSERVATIVE"),
                         ]
                     )

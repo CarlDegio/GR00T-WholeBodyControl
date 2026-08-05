@@ -88,6 +88,9 @@ class ComposedCameraConfig:
     realsense_enable_depth: bool = False
     """Whether RealSense cameras should publish depth alongside color."""
 
+    realsense_depth_mount: str = CameraMountPosition.CHEST_VIEW.value
+    """RealSense mount that publishes aligned depth when depth is enabled."""
+
     run_as_server: bool = True
     """Run as ZMQ PUB server (set False for in-process usage)."""
 
@@ -114,6 +117,17 @@ class ComposedCameraConfig:
 
     def __post_init__(self):
         self.run_as_server = self.server
+        valid_depth_mounts = {
+            CameraMountPosition.EGO_VIEW.value,
+            CameraMountPosition.HEAD.value,
+            CameraMountPosition.CHEST_VIEW.value,
+        }
+        if self.realsense_depth_mount not in valid_depth_mounts:
+            choices = ", ".join(sorted(valid_depth_mounts))
+            raise ValueError(
+                f"realsense_depth_mount must be one of {choices}, "
+                f"got {self.realsense_depth_mount!r}"
+            )
 
 
 class ComposedCameraSensor(Sensor, SensorServer):
@@ -160,7 +174,9 @@ class ComposedCameraSensor(Sensor, SensorServer):
             init_start = time.time()
             while time.time() - init_start < init_timeout:
                 if mount_position in self._observation_spaces:
-                    print(f"[{mount_position}] Camera ready, waiting 3s before next camera...")
+                    print(
+                        f"[{mount_position}] Camera ready, waiting 3s before next camera..."
+                    )
                     time.sleep(3.0)
                     break
                 time.sleep(0.5)
@@ -274,13 +290,17 @@ class ComposedCameraSensor(Sensor, SensorServer):
                                 f"[{mount_position}] Initializing camera "
                                 f"(attempt {attempt + 1}/{max_init_retries})..."
                             )
-                        camera = self._instantiate_camera(mount_position, camera_type, device_id)
+                        camera = self._instantiate_camera(
+                            mount_position, camera_type, device_id
+                        )
                         print(f"[{mount_position}] Camera initialized successfully")
                         break
                     except Exception as e:
                         print(f"[{mount_position}] Camera init failed: {e}")
                         if attempt < max_init_retries - 1:
-                            print(f"[{mount_position}] Retrying in {init_retry_delay:.1f}s...")
+                            print(
+                                f"[{mount_position}] Retrying in {init_retry_delay:.1f}s..."
+                            )
                             time.sleep(init_retry_delay)
                             init_retry_delay = min(init_retry_delay * 1.5, 10.0)
                         else:
@@ -347,7 +367,9 @@ class ComposedCameraSensor(Sensor, SensorServer):
 
                 if not shutdown_event.is_set():
                     reconnect_count += 1
-                    print(f"[{mount_position}] Waiting 5 seconds before reconnect attempt...")
+                    print(
+                        f"[{mount_position}] Waiting 5 seconds before reconnect attempt..."
+                    )
                     time.sleep(5.0)
 
             except Exception as e:
@@ -390,10 +412,15 @@ class ComposedCameraSensor(Sensor, SensorServer):
             if camera_type == "oak_mono":
                 oak_config.enable_mono_cameras = True
             print(f"Initializing OAK sensor for camera type: {camera_type}")
-            return OAKSensor(config=oak_config, mount_position=mount_position, device_id=device_id)
+            return OAKSensor(
+                config=oak_config, mount_position=mount_position, device_id=device_id
+            )
 
         elif camera_type == "realsense":
-            from gear_sonic.camera.drivers.realsense import RealSenseConfig, RealSenseSensor
+            from gear_sonic.camera.drivers.realsense import (
+                RealSenseConfig,
+                RealSenseSensor,
+            )
 
             print(
                 f"Initializing RealSense sensor for camera type: {camera_type}, "
@@ -403,7 +430,7 @@ class ComposedCameraSensor(Sensor, SensorServer):
             realsense_config.fps = self.config.fps
             realsense_config.enable_depth = (
                 self.config.realsense_enable_depth
-                and mount_position == CameraMountPosition.CHEST_VIEW.value
+                and mount_position == self.config.realsense_depth_mount
             )
             return RealSenseSensor(
                 config=realsense_config,
@@ -418,13 +445,20 @@ class ComposedCameraSensor(Sensor, SensorServer):
             return ReplayDummySensor(video_path=camera_type)
 
         elif camera_type == "usb":
-            from gear_sonic.camera.drivers.usb_camera import USBCameraConfig, USBCameraSensor
+            from gear_sonic.camera.drivers.usb_camera import (
+                USBCameraConfig,
+                USBCameraSensor,
+            )
 
             usb_config = USBCameraConfig()
             device_idx = int(device_id) if device_id else 0
-            print(f"Initializing USB camera for type: {camera_type}, device: {device_idx}")
+            print(
+                f"Initializing USB camera for type: {camera_type}, device: {device_idx}"
+            )
             return USBCameraSensor(
-                config=usb_config, mount_position=mount_position, device_index=device_idx
+                config=usb_config,
+                mount_position=mount_position,
+                device_index=device_idx,
             )
 
         else:
@@ -434,7 +468,8 @@ class ComposedCameraSensor(Sensor, SensorServer):
         for mount_position, error_event in self.error_events.items():
             if error_event.is_set():
                 error_msg = self.error_messages.get(
-                    mount_position, f"Camera {mount_position} encountered an unknown error"
+                    mount_position,
+                    f"Camera {mount_position} encountered an unknown error",
                 )
                 raise RuntimeError(error_msg)
 
@@ -485,7 +520,9 @@ class ComposedCameraSensor(Sensor, SensorServer):
             stale_count = 0
         self._stale_frame_counts[mount_position] = stale_count
 
-    def _get_latest_from_queue(self, camera_queue: queue.Queue) -> dict[str, Any] | None:
+    def _get_latest_from_queue(
+        self, camera_queue: queue.Queue
+    ) -> dict[str, Any] | None:
         # Peek instead of draining so each camera always exposes its latest frame
         # until the producer overwrites it with a newer one.
         with camera_queue.mutex:
@@ -546,7 +583,9 @@ class ComposedCameraSensor(Sensor, SensorServer):
                 idx += 1
 
                 if idx % 10 == 0:
-                    print(f"Image sending FPS: {10 / (time.monotonic() - fps_print_time):.2f}")
+                    print(
+                        f"Image sending FPS: {10 / (time.monotonic() - fps_print_time):.2f}"
+                    )
                     fps_print_time = time.monotonic()
 
             current_time = time.monotonic()
@@ -761,7 +800,9 @@ if __name__ == "__main__":
         print("Running composed camera server...")
         composed_camera.run_server()
     else:
-        composed_client = ComposedCameraClientSensor(server_ip="localhost", port=config.port)
+        composed_client = ComposedCameraClientSensor(
+            server_ip="localhost", port=config.port
+        )
         try:
             while True:
                 data = composed_client.read()

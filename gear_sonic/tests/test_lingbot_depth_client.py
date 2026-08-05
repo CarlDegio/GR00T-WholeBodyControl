@@ -95,9 +95,7 @@ def test_mark_ready_replaces_stale_marker(tmp_path: Path) -> None:
 
 def test_completed_depth_payload_contains_only_lingbot_depth() -> None:
     rgb = np.zeros((2, 3, 3), dtype=np.uint8)
-    completed_m = np.array(
-        [[0.0, 1.25, 11.0], [2.5, np.inf, 0.1]], dtype=np.float32
-    )
+    completed_m = np.array([[0.0, 1.25, 11.0], [2.5, np.inf, 0.1]], dtype=np.float32)
     info = {
         "fx": 500.0,
         "fy": 500.0,
@@ -125,3 +123,20 @@ def test_completed_depth_payload_contains_only_lingbot_depth() -> None:
         decoded.depth_mm,
         [[0.0, 1250.0, 0.0], [2500.0, 0.0, 100.0]],
     )
+
+
+def test_completed_depth_payload_can_publish_aligned_ego_view() -> None:
+    rgb = np.zeros((2, 3, 3), dtype=np.uint8)
+    payload = completed_depth_payload(
+        rgb,
+        np.ones((2, 3), dtype=np.float32),
+        {"fx": 500.0, "fy": 500.0, "cx": 1.0, "cy": 1.0},
+        timestamp=3.0,
+        max_depth_m=10.0,
+        stream_name="ego_view",
+    )
+
+    assert set(payload.images) == {"ego_view", "ego_view_depth"}
+    assert payload.images["ego_view_depth"].dtype == np.uint16
+    assert payload.camera_info["ego_view"]["depth_aligned_to"] == "ego_view"
+    assert payload.camera_info["ego_view"]["depth_source"] == "lingbot-depth"

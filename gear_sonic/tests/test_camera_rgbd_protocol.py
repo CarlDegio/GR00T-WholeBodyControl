@@ -99,7 +99,9 @@ def _fake_realsense_module():
         stream=types.SimpleNamespace(color="color", depth="depth"),
         format=types.SimpleNamespace(rgb8="rgb8", z16="z16"),
         camera_info=types.SimpleNamespace(
-            name="name", serial_number="serial_number", firmware_version="firmware_version"
+            name="name",
+            serial_number="serial_number",
+            firmware_version="firmware_version",
         ),
     )
     return fake_rs, raw_frames, FakeAlign
@@ -148,11 +150,15 @@ def test_legacy_rgb_message_without_camera_info_still_decodes():
     assert decoded.camera_info == {}
 
 
-def test_realsense_depth_uses_color_aligned_frames_and_publishes_calibration(monkeypatch):
+def test_realsense_depth_uses_color_aligned_frames_and_publishes_calibration(
+    monkeypatch,
+):
     """Catch raw-depth publication or calibration missing from an RGB-D frame."""
     fake_rs, raw_frames, fake_align = _fake_realsense_module()
     monkeypatch.setitem(sys.modules, "pyrealsense2", fake_rs)
-    monkeypatch.delitem(sys.modules, "gear_sonic.camera.drivers.realsense", raising=False)
+    monkeypatch.delitem(
+        sys.modules, "gear_sonic.camera.drivers.realsense", raising=False
+    )
     realsense = importlib.import_module("gear_sonic.camera.drivers.realsense")
 
     config = realsense.RealSenseConfig()
@@ -170,16 +176,52 @@ def test_realsense_depth_uses_color_aligned_frames_and_publishes_calibration(mon
     assert fake_align.instances[0].stream == fake_rs.stream.color
     assert fake_align.instances[0].processed_frames == [raw_frames]
     assert result["camera_info"]["chest_view"] == {
-        "fx": 500.0, "fy": 501.0, "cx": 320.0, "cy": 240.0,
-        "width": 640, "height": 480,
+        "fx": 500.0,
+        "fy": 501.0,
+        "cx": 320.0,
+        "cy": 240.0,
+        "width": 640,
+        "height": 480,
         "depth_scale_m": 0.001,
         "depth_aligned_to": "chest_view",
     }
 
 
-def test_composed_camera_enables_depth_only_for_chest_and_merges_camera_info(monkeypatch):
+def test_realsense_rgb_only_still_publishes_live_color_intrinsics(monkeypatch):
+    fake_rs, _raw_frames, _fake_align = _fake_realsense_module()
+    monkeypatch.setitem(sys.modules, "pyrealsense2", fake_rs)
+    monkeypatch.delitem(
+        sys.modules, "gear_sonic.camera.drivers.realsense", raising=False
+    )
+    realsense = importlib.import_module("gear_sonic.camera.drivers.realsense")
+
+    config = realsense.RealSenseConfig()
+    config.enable_depth = False
+    sensor = realsense.RealSenseSensor(
+        config=config, device_id="fake-device", mount_position="ego_view"
+    )
+
+    result = sensor.read()
+
+    assert "ego_view_depth" not in result["images"]
+    assert result["camera_info"]["ego_view"] == {
+        "fx": 500.0,
+        "fy": 501.0,
+        "cx": 320.0,
+        "cy": 240.0,
+        "width": 640,
+        "height": 480,
+    }
+
+
+def test_composed_camera_enables_depth_only_for_chest_and_merges_camera_info(
+    monkeypatch,
+):
     """Catch depth enabled on non-chest cameras or metadata dropped by composition."""
-    from gear_sonic.camera.composed_camera import ComposedCameraConfig, ComposedCameraSensor
+    from gear_sonic.camera.composed_camera import (
+        ComposedCameraConfig,
+        ComposedCameraSensor,
+    )
 
     class FakeRealSenseConfig:
         created = []
@@ -203,7 +245,10 @@ def test_composed_camera_enables_depth_only_for_chest_and_merges_camera_info(mon
     composed._instantiate_camera("ego_view", "realsense")
     composed._instantiate_camera("chest_view", "realsense")
 
-    assert [config.enable_depth for config in FakeRealSenseConfig.created] == [False, True]
+    assert [config.enable_depth for config in FakeRealSenseConfig.created] == [
+        False,
+        True,
+    ]
 
     result = ImageMessageSchema.deserialize(
         composed.serialize_message(
@@ -225,3 +270,40 @@ def test_composed_camera_enables_depth_only_for_chest_and_merges_camera_info(mon
         )
     ).asdict()
     assert result["camera_info"] == {"chest_view": {"fx": 500.0}}
+
+
+def test_composed_camera_can_move_aligned_depth_to_ego_view(monkeypatch):
+    from gear_sonic.camera.composed_camera import (
+        ComposedCameraConfig,
+        ComposedCameraSensor,
+    )
+
+    class FakeRealSenseConfig:
+        created = []
+
+        def __init__(self):
+            self.fps = 30
+            self.enable_depth = False
+            self.__class__.created.append(self)
+
+    class FakeRealSenseSensor:
+        def __init__(self, **kwargs):
+            self.config = kwargs["config"]
+
+    fake_driver = types.ModuleType("gear_sonic.camera.drivers.realsense")
+    fake_driver.RealSenseConfig = FakeRealSenseConfig
+    fake_driver.RealSenseSensor = FakeRealSenseSensor
+    monkeypatch.setitem(sys.modules, "gear_sonic.camera.drivers.realsense", fake_driver)
+
+    composed = object.__new__(ComposedCameraSensor)
+    composed.config = ComposedCameraConfig(
+        realsense_enable_depth=True,
+        realsense_depth_mount="ego_view",
+    )
+    composed._instantiate_camera("ego_view", "realsense")
+    composed._instantiate_camera("chest_view", "realsense")
+
+    assert [config.enable_depth for config in FakeRealSenseConfig.created] == [
+        True,
+        False,
+    ]

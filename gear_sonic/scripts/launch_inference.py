@@ -57,6 +57,7 @@ def _bootstrap_venv():
     """Re-exec with the inference Python if tyro is not available."""
     try:
         import tyro  # noqa: F401
+
         return
     except ImportError:
         pass
@@ -159,8 +160,74 @@ class InferenceLaunchConfig:
     keyboard_planner_host: str = "localhost"
     """Keyboard planner sidecar host."""
 
-    planner_input: Literal["keyboard", "lavira"] = "keyboard"
-    """REASEN command source used in pane 3."""
+    planner_input: Literal["keyboard", "lavira", "base_pose"] = "keyboard"
+    """SONIC planner command source used in pane 3."""
+
+    base_pose_mode: Literal["rgb", "rgbd", "rgb_depth_query"] = "rgb"
+    """Head-vision input experiment used by the base-pose planner."""
+
+    base_pose_task: str = ""
+    """Manipulation task for base-pose adjustment; defaults to ``prompt``."""
+
+    base_pose_model: str = "gpt-5.6"
+    """Codex CLI vision model used by base-pose adjustment."""
+
+    base_pose_reasoning_effort: str = "high"
+    """Reasoning effort passed to the base-pose model."""
+
+    base_pose_camera_stream: str = "ego_view"
+    """Head RGB stream; aligned depth is read from ``<stream>_depth``."""
+
+    base_pose_camera_height_m: float = 1.2
+    """Head camera optical-center height above the ground (m)."""
+
+    base_pose_camera_pitch_deg: float = -47.6
+    """Head camera optical-axis pitch under the positive-upward convention."""
+
+    base_pose_vertical_fov_deg: float = 55.2
+    """Full head-camera vertical field of view."""
+
+    base_pose_camera_forward_offset_m: float = 0.0
+    """Configured camera optical-center forward offset from the base."""
+
+    base_pose_camera_lateral_offset_m: float = 0.0
+    """Configured camera optical-center left/right offset from the base."""
+
+    base_pose_depth_port: int = 5564
+    """Local pure LingBot RGB-D stream used by the two depth modes."""
+
+    base_pose_camera_timeout_ms: int = 15000
+    """Timeout for a fresh base-pose camera snapshot."""
+
+    base_pose_codex_timeout_seconds: float = 180.0
+    """Timeout for each base-pose Codex inference call."""
+
+    base_pose_rotation_speed: float = 0.4
+    """Fixed SONIC yaw speed used to execute model rotations (rad/s)."""
+
+    base_pose_translation_speed: float = 0.3
+    """Fixed SONIC forward/backward speed used for model translations (m/s)."""
+
+    base_pose_transition_pause: float = 0.5
+    """Planner IDLE duration between model-authored motion steps (s)."""
+
+    base_pose_final_stop_count: int = 3
+    """Number of zero-motion publications after completion or cancellation."""
+
+    base_pose_depth_visual_max_m: float = 3.0
+    """Maximum range in the attached fixed-scale color depth image."""
+
+    base_pose_output_root: str = "outputs/base_pose_adjustment"
+    """Root for RGB/depth/prompts/results and execution diagnostics."""
+
+    base_pose_lingbot_model: str = "robbyant/lingbot-depth-pretrain-vitl-14-v0.5"
+    """LingBot-Depth checkpoint used by base-pose depth modes."""
+
+    base_pose_lingbot_root: str = "/home/user/Project/lingbot-depth"
+    """LingBot-Depth checkout on the deployment machine."""
+
+    base_pose_hold_ready_timeout_seconds: float = 5.0
+    """Maximum wait after ``k`` for a valid current upper-body/hand latch."""
 
     lavira_mission: str = ""
     """Mission sent to LaViRA when --planner-input lavira is selected."""
@@ -177,7 +244,9 @@ class InferenceLaunchConfig:
     lavira_qwenvl_model: str = "qwen3-vl-32b-instruct"
     """DashScope Qwen-VL model used when the backend is qwenvl."""
 
-    lavira_qwenvl_base_url: str = "https://dashscope-intl.aliyuncs.com/compatible-mode/v1"
+    lavira_qwenvl_base_url: str = (
+        "https://dashscope-intl.aliyuncs.com/compatible-mode/v1"
+    )
     """DashScope OpenAI-compatible endpoint; key comes from DASHSCOPE_API_KEY."""
 
     lavira_warmup: bool = True
@@ -266,6 +335,74 @@ class InferenceLaunchConfig:
 SESSION_NAME = "sonic_inference"
 
 
+def base_pose_hold_ready_file(config: InferenceLaunchConfig) -> str:
+    """Return the deterministic latch marker shared by relay and VLA keyboard."""
+    return f"/tmp/sonic_base_pose_hold_{config.reasan_planner_port}.ready"
+
+
+def uses_reasan_avoidance(config: InferenceLaunchConfig) -> bool:
+    """Base-pose adjustment intentionally bypasses MID-360/REASAN."""
+    return config.reasan_avoidance and config.planner_input != "base_pose"
+
+
+def _base_pose_planner_command(config: InferenceLaunchConfig, repo_root: Path) -> str:
+    task = config.base_pose_task.strip() or config.prompt.strip()
+    quoted_root = shlex.quote(str(repo_root))
+    planner = (
+        ".venv_inference/bin/python gear_sonic/scripts/base_pose_planner.py "
+        f"--task {shlex.quote(task)} "
+        f"--mode {shlex.quote(config.base_pose_mode)} "
+        f"--model {shlex.quote(config.base_pose_model)} "
+        f"--reasoning-effort {shlex.quote(config.base_pose_reasoning_effort)} "
+        f"--host {shlex.quote(config.keyboard_planner_host)} "
+        f"--port {config.keyboard_planner_port} "
+        f"--planner-hz {config.keyboard_planner_publish_rate} "
+        f"--transition-pause {config.base_pose_transition_pause} "
+        f"--final-stop-count {config.base_pose_final_stop_count} "
+        f"--rotation-speed {config.base_pose_rotation_speed} "
+        f"--translation-speed {config.base_pose_translation_speed} "
+        f"--camera-timeout-ms {config.base_pose_camera_timeout_ms} "
+        f"--camera-stream {shlex.quote(config.base_pose_camera_stream)} "
+        f"--camera-height-m {config.base_pose_camera_height_m} "
+        f"--camera-pitch-deg {config.base_pose_camera_pitch_deg} "
+        f"--vertical-fov-deg {config.base_pose_vertical_fov_deg} "
+        f"--camera-forward-offset-m {config.base_pose_camera_forward_offset_m} "
+        f"--camera-lateral-offset-m {config.base_pose_camera_lateral_offset_m} "
+        f"--depth-visual-max-m {config.base_pose_depth_visual_max_m} "
+        f"--codex-timeout-seconds {config.base_pose_codex_timeout_seconds} "
+        f"--output-root {shlex.quote(config.base_pose_output_root)} "
+        f"--planner-ready-file "
+        f"{shlex.quote(base_pose_hold_ready_file(config))}"
+    )
+    if config.base_pose_mode == "rgb":
+        return (
+            f"cd {quoted_root} && "
+            f"{planner} --camera-host {shlex.quote(config.camera_host)} "
+            f"--camera-port {config.camera_port}"
+        )
+
+    return (
+        f"cd {quoted_root} && "
+        f"ready_file=/tmp/sonic_base_pose_lingbot_ready_$$; rm -f $ready_file; "
+        f"PYTHONPATH={quoted_root} .venv_lingbot_depth/bin/python "
+        f"gear_sonic/scripts/run_lingbot_depth_viewer.py "
+        f"--camera-host {shlex.quote(config.camera_host)} "
+        f"--camera-port {config.camera_port} "
+        f"--stream-name {shlex.quote(config.base_pose_camera_stream)} "
+        f"--publish-port {config.base_pose_depth_port} "
+        f"--ready-file $ready_file "
+        f"--model {shlex.quote(config.base_pose_lingbot_model)} "
+        f"--lingbot-root {shlex.quote(config.base_pose_lingbot_root)} & "
+        f"viewer_pid=$!; "
+        f"trap 'kill $viewer_pid 2>/dev/null; rm -f $ready_file' EXIT; "
+        f"while [ ! -f $ready_file ]; do "
+        f"kill -0 $viewer_pid 2>/dev/null || {{ wait $viewer_pid; exit 1; }}; "
+        f"sleep 0.2; done; "
+        f"{planner} --camera-host 127.0.0.1 "
+        f"--camera-port {config.base_pose_depth_port}"
+    )
+
+
 def build_planner_input_command(config: InferenceLaunchConfig, repo_root: Path) -> str:
     """Build the pane 3 command for the selected REASEN command source."""
     if config.planner_input == "keyboard":
@@ -277,6 +414,8 @@ def build_planner_input_command(config: InferenceLaunchConfig, repo_root: Path) 
             f"--hz {config.keyboard_planner_publish_rate} "
             f"--host {config.keyboard_planner_host} "
         )
+    if config.planner_input == "base_pose":
+        return _base_pose_planner_command(config, repo_root)
 
     debug = "--debug " if config.lavira_debug else ""
     warmup = "" if config.lavira_warmup else "--no-warmup "
@@ -329,10 +468,19 @@ def build_planner_input_command(config: InferenceLaunchConfig, repo_root: Path) 
     )
 
 
-def build_reasan_planner_command(
-    config: InferenceLaunchConfig, repo_root: Path
-) -> str:
-    """Build the rule-based safety command or direct LaViRA-to-SONIC bypass."""
+def build_reasan_planner_command(config: InferenceLaunchConfig, repo_root: Path) -> str:
+    """Build rule-based safety or a direct planner-input-to-SONIC relay."""
+    if config.planner_input == "base_pose":
+        return (
+            f"cd {shlex.quote(str(repo_root))} && "
+            f"source .venv_teleop/bin/activate && "
+            f"python gear_sonic/scripts/lavira_sonic_relay.py "
+            f"--source tcp://127.0.0.1:{config.keyboard_planner_port} "
+            f"--output 'tcp://*:{config.reasan_planner_port}' --hz 20 "
+            f"--freeze-current-upper-body --state-host localhost "
+            f"--state-port 5557 "
+            f"--hold-ready-file {shlex.quote(base_pose_hold_ready_file(config))}"
+        )
     common = (
         f"cd {repo_root} && "
         f"source .venv_teleop/bin/activate && "
@@ -370,7 +518,9 @@ def _check_prerequisites(config: InferenceLaunchConfig):
             ".venv_inference not found. Run: bash install_scripts/install_inference.sh"
         )
     if not (repo_root / ".venv_teleop" / "bin" / "activate").exists():
-        errors.append(".venv_teleop not found. Run: bash install_scripts/install_pico.sh")
+        errors.append(
+            ".venv_teleop not found. Run: bash install_scripts/install_pico.sh"
+        )
 
     if config.planner_input == "lavira":
         if not config.lavira_mission.strip():
@@ -378,6 +528,23 @@ def _check_prerequisites(config: InferenceLaunchConfig):
         if not config.lavira_global_target.strip():
             errors.append(
                 "--lavira-global-target is required when --planner-input lavira"
+            )
+    if config.planner_input == "base_pose":
+        if not config.keyboard_planner:
+            errors.append(
+                "--keyboard-planner is required for --planner-input base_pose"
+            )
+        if not (config.base_pose_task.strip() or config.prompt.strip()):
+            errors.append(
+                "--base-pose-task or --prompt is required when --planner-input base_pose"
+            )
+        if (
+            config.base_pose_mode != "rgb"
+            and not (repo_root / ".venv_lingbot_depth" / "bin" / "python").exists()
+        ):
+            errors.append(
+                ".venv_lingbot_depth not found; it is required by base-pose "
+                "rgbd and rgb_depth_query modes"
             )
 
     deploy_dir = repo_root / "gear_sonic_deploy"
@@ -395,9 +562,7 @@ def _check_prerequisites(config: InferenceLaunchConfig):
             )
 
     if config.sim and not (repo_root / ".venv_sim" / "bin" / "activate").exists():
-        errors.append(
-            ".venv_sim not found. Set up the simulation venv first."
-        )
+        errors.append(".venv_sim not found. Set up the simulation venv first.")
 
     if errors:
         print("ERROR: Prerequisites not met:\n")
@@ -429,8 +594,18 @@ def _create_tmux_session() -> list[str]:
     bash = shutil.which("bash") or "/bin/bash"
     subprocess.run(
         [
-            "tmux", "new-session", "-d", "-x", "240", "-y", "60",
-            "-s", SESSION_NAME, bash, "--noprofile", "--norc",
+            "tmux",
+            "new-session",
+            "-d",
+            "-x",
+            "240",
+            "-y",
+            "60",
+            "-s",
+            SESSION_NAME,
+            bash,
+            "--noprofile",
+            "--norc",
         ],
         check=True,
     )
@@ -439,8 +614,13 @@ def _create_tmux_session() -> list[str]:
     )
     subprocess.run(
         [
-            "tmux", "set-option", "-t", f"{SESSION_NAME}:0", "-w",
-            "remain-on-exit", "on",
+            "tmux",
+            "set-option",
+            "-t",
+            f"{SESSION_NAME}:0",
+            "-w",
+            "remain-on-exit",
+            "on",
         ],
         check=True,
     )
@@ -461,8 +641,17 @@ def _create_tmux_session() -> list[str]:
     ).stdout.strip()
     bottom_pane = subprocess.run(
         [
-            "tmux", "split-window", "-v", "-t", top_pane, "-P", "-F", "#{pane_id}",
-            bash, "--noprofile", "--norc",
+            "tmux",
+            "split-window",
+            "-v",
+            "-t",
+            top_pane,
+            "-P",
+            "-F",
+            "#{pane_id}",
+            bash,
+            "--noprofile",
+            "--norc",
         ],
         check=True,
         capture_output=True,
@@ -472,17 +661,29 @@ def _create_tmux_session() -> list[str]:
         for _ in range(2):
             subprocess.run(
                 [
-                    "tmux", "split-window", "-h", "-t", row_pane,
-                    bash, "--noprofile", "--norc",
+                    "tmux",
+                    "split-window",
+                    "-h",
+                    "-t",
+                    row_pane,
+                    bash,
+                    "--noprofile",
+                    "--norc",
                 ],
                 check=True,
             )
-    subprocess.run(["tmux", "select-layout", "-t", f"{SESSION_NAME}:0", "tiled"], check=True)
+    subprocess.run(
+        ["tmux", "select-layout", "-t", f"{SESSION_NAME}:0", "tiled"], check=True
+    )
 
     pane_output = subprocess.run(
         [
-            "tmux", "list-panes", "-t", f"{SESSION_NAME}:0",
-            "-F", "#{pane_index} #{pane_id}",
+            "tmux",
+            "list-panes",
+            "-t",
+            f"{SESSION_NAME}:0",
+            "-F",
+            "#{pane_index} #{pane_id}",
         ],
         check=True,
         capture_output=True,
@@ -607,12 +808,20 @@ def main(config: InferenceLaunchConfig):
         f"--planner-relay-zmq-host localhost "
         f"--planner-relay-zmq-port {config.reasan_planner_port}"
     )
+    if config.planner_input == "base_pose":
+        inference_cmd += (
+            f" --planner-hold-ready-file "
+            f"{shlex.quote(base_pose_hold_ready_file(config))} "
+            f"--planner-hold-ready-timeout-seconds "
+            f"{config.base_pose_hold_ready_timeout_seconds}"
+        )
 
     print("Starting VLA inference (pane 1)...")
     _send_to_pane(pane_ids[2], inference_cmd, wait=1.0)
 
     # --- Pane 2 (bottom-left): Keyboard Publisher ---
-    keyboard_script = textwrap.dedent("""\
+    keyboard_script = textwrap.dedent(
+        """\
         import zmq, time
         ctx = zmq.Context()
         pub = ctx.socket(zmq.PUB)
@@ -627,7 +836,8 @@ def main(config: InferenceLaunchConfig):
             else:
                 pub.send_string(key)
                 print('Sent: ' + key)
-    """)
+    """
+    )
     encoded = base64.b64encode(keyboard_script.encode()).decode()
     keyboard_cmd = (
         f"cd {repo_root} && "
@@ -653,20 +863,25 @@ def main(config: InferenceLaunchConfig):
         )
         if config.planner_input == "lavira":
             print("Starting LaViRA planner (pane 3)...")
+        elif config.planner_input == "base_pose":
+            print("Starting GPT base-pose adjustment planner (pane 3)...")
         else:
             print("Starting REASEN keyboard (pane 3)...")
         _send_to_pane(pane_ids[3], reasan_keyboard_cmd, wait=1.0)
-        if config.reasan_avoidance:
+        if uses_reasan_avoidance(config):
             print("Starting REASEN rule-based safety planner (pane 4)...")
+        elif config.planner_input == "base_pose":
+            print("Starting direct base-pose-to-SONIC hold relay (pane 4)...")
         else:
             print("Starting direct LaViRA-to-SONIC relay (pane 4)...")
         _send_to_pane(pane_ids[4], reasan_planner_cmd, wait=1.0)
-        if config.reasan_avoidance:
+        if uses_reasan_avoidance(config):
             print("Starting MID-360 ActorRay publisher (pane 5)...")
             _send_to_pane(pane_ids[5], radar_cmd, wait=2.0)
+        elif config.planner_input == "base_pose":
+            print("Base-pose direct relay selected; MID-360 pane left idle.")
         else:
             print("REASEN avoidance disabled; MID-360 pane left idle.")
-
 
     if config.data_exporter:
         subprocess.run(
@@ -686,14 +901,20 @@ def main(config: InferenceLaunchConfig):
         if config.record_chest_camera:
             exporter_cmd += " --record-chest-camera"
         subprocess.run(
-            ["tmux", "send-keys", "-t", f"{SESSION_NAME}:data_exporter", exporter_cmd, "C-m"],
+            [
+                "tmux",
+                "send-keys",
+                "-t",
+                f"{SESSION_NAME}:data_exporter",
+                exporter_cmd,
+                "C-m",
+            ],
         )
         print("Starting data exporter (window: data_exporter)...")
         time.sleep(2.0)
         subprocess.run(
             ["tmux", "select-window", "-t", f"{SESSION_NAME}:inference"],
         )
-
 
     print()
     print("=" * 60)
@@ -711,11 +932,16 @@ def main(config: InferenceLaunchConfig):
     print("    Pane 2: VLA Inference")
     if config.planner_input == "lavira":
         print("    Pane 3: LaViRA AgentNav Planner")
+    elif config.planner_input == "base_pose":
+        print(f"    Pane 3: GPT Base Pose Planner ({config.base_pose_mode})")
     else:
         print("    Pane 3: REASEN Keyboard")
-    if config.reasan_avoidance:
+    if uses_reasan_avoidance(config):
         print("    Pane 4: REASEN Rule-Based Safety Planner")
         print("    Pane 5: MID-360 ActorRay/IMU")
+    elif config.planner_input == "base_pose":
+        print("    Pane 4: Direct Base-Pose-to-SONIC Hold Relay")
+        print("    Pane 5: Idle (base_pose does not use MID-360/REASAN)")
     else:
         print("    Pane 4: Direct LaViRA-to-SONIC Relay")
         print("    Pane 5: Idle (REASEN/MID-360 disabled)")
@@ -728,16 +954,25 @@ def main(config: InferenceLaunchConfig):
     print("     click on pane 0 and press Enter to proceed **")
     print()
     print("  Planner workflow:")
-    print("    1. In pane 1: k (start) -> o (PLANNER mode)")
-    if config.planner_input == "lavira":
+    if config.planner_input == "base_pose":
+        print("    1. In pane 1: k starts PLANNER and latches current upper body/hands")
+        print("    2. In pane 3: N plans; Space cancels+holds; X exits source")
+        print("    3. Press N again only after IDLE and only from a fresh observation")
+    elif config.planner_input == "lavira":
+        print("    1. In pane 1: k (start) -> o (PLANNER mode)")
         print("    2. In pane 3: N starts AgentNav; Space cancels and stops")
+        print("    3. In pane 1: i (POSE mode)")
     else:
+        print("    1. In pane 1: k (start) -> o (PLANNER mode)")
         print("    2. In pane 3: W/S/A/D/Q/E for safety-guarded locomotion")
-    print("    3. In pane 1: i (POSE mode)")
+        print("    3. In pane 1: i (POSE mode)")
     print("  Keyboard controls (type in pane 1):")
     print("    p        - Pause / resume inference")
     print("    k        - Start / stop C++ control loop")
-    print("    i        - Send initial pose")
+    if config.planner_input == "base_pose":
+        print("    i        - Disabled (base_pose holds measured current pose)")
+    else:
+        print("    i        - Send initial pose")
     print("    [        - Toggle left hand open/closed (initial pose)")
     print("    ]        - Toggle right hand open/closed (initial pose)")
     print("    t <text> - Change inference prompt")

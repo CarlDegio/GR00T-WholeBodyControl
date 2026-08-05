@@ -56,13 +56,19 @@ class RealSenseSensor(Sensor, SensorServer):
         for device in devices:
             print(f"Device: {device.get_info(rs.camera_info.name)}")
             print(f"    Serial number: {device.get_info(rs.camera_info.serial_number)}")
-            print(f"    Firmware version: {device.get_info(rs.camera_info.firmware_version)}")
+            print(
+                f"    Firmware version: {device.get_info(rs.camera_info.firmware_version)}"
+            )
 
         self.pipeline = rs.pipeline()
         self.config = rs.config()
         self.mount_position = mount_position
-        devices = sorted(devices, key=lambda x: x.get_info(rs.camera_info.serial_number))
-        selected_serial = self._select_device_serial(devices=devices, device_id=device_id, id=id)
+        devices = sorted(
+            devices, key=lambda x: x.get_info(rs.camera_info.serial_number)
+        )
+        selected_serial = self._select_device_serial(
+            devices=devices, device_id=device_id, id=id
+        )
         self.config.enable_device(selected_serial)
 
         try:
@@ -83,24 +89,31 @@ class RealSenseSensor(Sensor, SensorServer):
                 )
             self._pipeline_profile = self.pipeline.start(self.config)
             self._depth_aligner = None
-            self._camera_info = {}
+            color_profile = self._pipeline_profile.get_stream(
+                rs.stream.color
+            ).as_video_stream_profile()
+            intrinsics = color_profile.get_intrinsics()
+            self._camera_info = {
+                "fx": float(intrinsics.fx),
+                "fy": float(intrinsics.fy),
+                "cx": float(intrinsics.ppx),
+                "cy": float(intrinsics.ppy),
+                "width": int(intrinsics.width),
+                "height": int(intrinsics.height),
+            }
             if config.enable_depth:
                 self._depth_aligner = rs.align(rs.stream.color)
-                depth_scale_m = self._pipeline_profile.get_device().first_depth_sensor().get_depth_scale()
-                color_profile = self._pipeline_profile.get_stream(
-                    rs.stream.color
-                ).as_video_stream_profile()
-                intrinsics = color_profile.get_intrinsics()
-                self._camera_info = {
-                    "fx": float(intrinsics.fx),
-                    "fy": float(intrinsics.fy),
-                    "cx": float(intrinsics.ppx),
-                    "cy": float(intrinsics.ppy),
-                    "width": int(intrinsics.width),
-                    "height": int(intrinsics.height),
-                    "depth_scale_m": float(depth_scale_m),
-                    "depth_aligned_to": self.mount_position,
-                }
+                depth_scale_m = (
+                    self._pipeline_profile.get_device()
+                    .first_depth_sensor()
+                    .get_depth_scale()
+                )
+                self._camera_info.update(
+                    {
+                        "depth_scale_m": float(depth_scale_m),
+                        "depth_aligned_to": self.mount_position,
+                    }
+                )
         except Exception as e:
             raise RuntimeError(f"Failed to start RealSense pipeline: {e}")
 
@@ -113,7 +126,9 @@ class RealSenseSensor(Sensor, SensorServer):
         )
 
     @staticmethod
-    def _select_device_serial(devices: list[Any], device_id: str | None, id: int) -> str:
+    def _select_device_serial(
+        devices: list[Any], device_id: str | None, id: int
+    ) -> str:
         available_serials = [
             device.get_info(rs.camera_info.serial_number) for device in devices
         ]
@@ -144,7 +159,9 @@ class RealSenseSensor(Sensor, SensorServer):
             frames = self._depth_aligner.process(frames)
 
         color_frame = frames.get_color_frame()
-        depth_frame = frames.get_depth_frame() if self._realsense_config.enable_depth else None
+        depth_frame = (
+            frames.get_depth_frame() if self._realsense_config.enable_depth else None
+        )
 
         if not color_frame:
             print("WARNING! No color frame")
@@ -185,9 +202,7 @@ class RealSenseSensor(Sensor, SensorServer):
         return {
             "timestamps": timestamps,
             "images": images,
-            "camera_info": {self.mount_position: self._camera_info}
-            if self._realsense_config.enable_depth
-            else {},
+            "camera_info": {self.mount_position: self._camera_info},
         }
 
     def serialize(self, data: dict[str, Any]) -> dict[str, Any]:

@@ -2,11 +2,16 @@ import queue
 import threading
 import time
 import unittest
+from pathlib import Path
+from tempfile import TemporaryDirectory
 
 from gear_sonic.scripts.run_vla_inference import (
     SIMULATED_INFERENCE_DELAY_SECONDS,
     _inference_worker_loop,
+    _planner_message_has_frozen_targets,
+    wait_for_planner_hold_ready,
 )
+from gear_sonic.utils.teleop.zmq.zmq_planner_sender import build_planner_message
 from gear_sonic.utils.inference.vla_utils import calculate_latency_compensated_index
 
 
@@ -85,6 +90,56 @@ class InferenceWorkerDelayTest(unittest.TestCase):
             0.1 + SIMULATED_INFERENCE_DELAY_SECONDS, 50, 70
         )
         self.assertEqual(with_delay - without_delay, 10)
+
+    def test_planner_k_requests_a_fresh_hold_before_accepting_ready(self):
+        with TemporaryDirectory() as directory:
+            marker = Path(directory) / "hold.ready"
+
+            def acknowledge(_seconds):
+                self.assertTrue(Path(f"{marker}.request").is_file())
+                marker.write_text("ready\n")
+
+            self.assertTrue(
+                wait_for_planner_hold_ready(
+                    str(marker),
+                    5.0,
+                    monotonic=lambda: 0.0,
+                    sleep=acknowledge,
+                )
+            )
+
+    def test_planner_k_timeout_removes_unhandled_latch_request(self):
+        with TemporaryDirectory() as directory:
+            marker = Path(directory) / "hold.ready"
+            now = [0.0]
+
+            def monotonic():
+                return now[0]
+
+            def advance(seconds):
+                now[0] += seconds
+
+            self.assertFalse(
+                wait_for_planner_hold_ready(
+                    str(marker), 0.1, monotonic=monotonic, sleep=advance
+                )
+            )
+            self.assertFalse(Path(f"{marker}.request").exists())
+
+    def test_planner_k_accepts_only_a_relay_frame_with_body_and_both_hands(self):
+        idle = build_planner_message(0, [0.0] * 3, [1.0, 0.0, 0.0])
+        frozen = build_planner_message(
+            0,
+            [0.0] * 3,
+            [1.0, 0.0, 0.0],
+            upper_body_position=[0.0] * 17,
+            upper_body_velocity=[0.0] * 17,
+            left_hand_position=[0.0] * 7,
+            right_hand_position=[0.0] * 7,
+        )
+
+        self.assertFalse(_planner_message_has_frozen_targets(idle))
+        self.assertTrue(_planner_message_has_frozen_targets(frozen))
 
 
 if __name__ == "__main__":

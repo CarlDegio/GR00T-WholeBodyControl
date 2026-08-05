@@ -25,8 +25,10 @@ sys.modules.setdefault("tyro", types.ModuleType("tyro"))
 from gear_sonic.scripts.launch_inference import (
     InferenceLaunchConfig,
     _check_prerequisites,
+    base_pose_hold_ready_file,
     build_planner_input_command,
     build_reasan_planner_command,
+    uses_reasan_avoidance,
 )
 
 from gear_sonic.scripts.lavira_planner import (
@@ -144,8 +146,7 @@ def test_launch_lavira_can_select_qwenvl_backend() -> None:
     assert ". ./.env.local" in command
     assert "--qwenvl-model qwen3-vl-32b-instruct" in command
     assert (
-        "--qwenvl-base-url "
-        "https://dashscope-intl.aliyuncs.com/compatible-mode/v1"
+        "--qwenvl-base-url " "https://dashscope-intl.aliyuncs.com/compatible-mode/v1"
     ) in command
 
 
@@ -181,6 +182,60 @@ def test_launch_uses_long_timeout_for_low_rate_lingbot_frames() -> None:
     assert InferenceLaunchConfig().lavira_camera_timeout_ms == 15000
 
 
+def test_base_pose_rgb_uses_ego_camera_without_starting_lingbot() -> None:
+    config = InferenceLaunchConfig(
+        planner_input="base_pose",
+        prompt="put the cup in the tray",
+        camera_host="g1-camera",
+        camera_port=5555,
+    )
+
+    command = build_planner_input_command(config, Path("/workspace/sonic"))
+
+    assert "base_pose_planner.py" in command
+    assert "--task 'put the cup in the tray'" in command
+    assert "--mode rgb" in command
+    assert "--model gpt-5.6" in command
+    assert "--reasoning-effort high" in command
+    assert "--camera-stream ego_view" in command
+    assert "--camera-height-m 1.2" in command
+    assert "--camera-host g1-camera --camera-port 5555" in command
+    assert ".venv_lingbot_depth" not in command
+    assert "run_lingbot_depth_viewer.py" not in command
+
+
+@pytest.mark.parametrize("mode", ["rgbd", "rgb_depth_query"])
+def test_base_pose_depth_modes_start_parameterized_ego_lingbot(mode: str) -> None:
+    config = InferenceLaunchConfig(
+        planner_input="base_pose",
+        base_pose_mode=mode,  # type: ignore[arg-type]
+        base_pose_task="press the red button",
+    )
+
+    command = build_planner_input_command(config, Path("/workspace/sonic"))
+
+    assert ".venv_lingbot_depth/bin/python" in command
+    assert "run_lingbot_depth_viewer.py" in command
+    assert "--stream-name ego_view" in command
+    assert "--publish-port 5564" in command
+    assert "base_pose_planner.py" in command
+    assert f"--mode {mode}" in command
+    assert "--camera-host 127.0.0.1 --camera-port 5564" in command
+
+
+def test_base_pose_always_uses_direct_frozen_pose_relay_without_reasan() -> None:
+    config = InferenceLaunchConfig(planner_input="base_pose", reasan_avoidance=True)
+
+    command = build_reasan_planner_command(config, Path("/workspace/sonic"))
+
+    assert "lavira_sonic_relay.py" in command
+    assert "--freeze-current-upper-body" in command
+    assert "--state-port 5557" in command
+    assert f"--hold-ready-file {base_pose_hold_ready_file(config)}" in command
+    assert "reasan_planner.py" not in command
+    assert not uses_reasan_avoidance(config)
+
+
 def test_disabled_reasan_uses_standalone_lavira_sonic_relay() -> None:
     config = InferenceLaunchConfig(reasan_avoidance=False)
 
@@ -208,7 +263,9 @@ def test_reasan_safety_subscribes_to_raw_chest_depth_camera() -> None:
 def test_launch_requires_lavira_mission_and_target_only_when_selected(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    monkeypatch.setattr("gear_sonic.scripts.launch_inference.shutil.which", lambda _: "/tmux")
+    monkeypatch.setattr(
+        "gear_sonic.scripts.launch_inference.shutil.which", lambda _: "/tmux"
+    )
     monkeypatch.setattr(
         "gear_sonic.scripts.launch_inference.Path.exists", lambda _: True
     )
@@ -377,10 +434,12 @@ def test_validation_rejects_malformed_or_unsafe_batches(
         commands(rotation=(0.0, 0.0, 0.4, -0.1)),
         commands(translation=(0.3, 0.0, 0.0, -0.1)),
         commands(rotation=(0.0, 0.0, 0.4, True)),
-        {"commands": [
-            {"vx": 0.0, "vy": 0.0, "wz": 0.4},
-            {"vx": 0.3, "vy": 0.0, "wz": 0.0, "duration": 1.0},
-        ]},
+        {
+            "commands": [
+                {"vx": 0.0, "vy": 0.0, "wz": 0.4},
+                {"vx": 0.3, "vy": 0.0, "wz": 0.0, "duration": 1.0},
+            ]
+        },
     ],
 )
 def test_validation_rejects_invalid_command_fields(payload: object) -> None:
@@ -450,9 +509,7 @@ def test_controller_finishes_directly_in_idle() -> None:
 
 def test_controller_skips_zero_duration_motion_phases_but_keeps_pause() -> None:
     controller = LaviraPlannerController(transition_pause=0.5)
-    controller.start(
-        result(payload=commands(rotation=(0.0, 0.0, 0.0, 0.0))), now=4.0
-    )
+    controller.start(result(payload=commands(rotation=(0.0, 0.0, 0.0, 0.0))), now=4.0)
 
     assert controller.phase == "transition_pause"
     assert controller.step(4.0).velocity == (0.0, 0.0, 0.0)
@@ -593,7 +650,9 @@ def test_space_is_the_only_motion_key_that_returns_nav_to_listen_wasd() -> None:
     assert runtime.phase == "listen_wasd"
 
 
-def test_cancel_increments_generation_publishes_stops_and_discards_late_result() -> None:
+def test_cancel_increments_generation_publishes_stops_and_discards_late_result() -> (
+    None
+):
     published: list[str] = []
     runtime = LaviraPlannerRuntime(
         LaviraPlannerConfig(mission="find chair", global_target="chair"),
@@ -607,7 +666,9 @@ def test_cancel_increments_generation_publishes_stops_and_discards_late_result()
     assert runtime.phase == "listen_wasd"
     assert decoded_messages(published)[-1]["action"] == "stop"
 
-    assert runtime.accept_worker_result(WorkerResult(1, result(), None), now=2.0) is False
+    assert (
+        runtime.accept_worker_result(WorkerResult(1, result(), None), now=2.0) is False
+    )
     assert runtime.phase == "listen_wasd"
     assert runtime.publish_due(2.0).velocity == (0.0, 0.0, 0.0)
 
@@ -802,7 +863,9 @@ def test_exit_key_cancels_and_publishes_repeated_stop() -> None:
     assert_stop_messages(published)
 
 
-def test_current_worker_result_starts_motion_and_stale_or_error_results_do_not() -> None:
+def test_current_worker_result_starts_motion_and_stale_or_error_results_do_not() -> (
+    None
+):
     published: list[str] = []
     runtime = LaviraPlannerRuntime(
         LaviraPlannerConfig(mission="find chair", global_target="chair"),
@@ -812,16 +875,21 @@ def test_current_worker_result_starts_motion_and_stale_or_error_results_do_not()
     runtime.handle_key("n", now=10.0)
     assert runtime.request_queue.get_nowait() == 1
 
-    assert runtime.accept_worker_result(WorkerResult(0, result(), None), now=10.0) is False
+    assert (
+        runtime.accept_worker_result(WorkerResult(0, result(), None), now=10.0) is False
+    )
     assert runtime.phase == "nav"
-    assert runtime.accept_worker_result(WorkerResult(1, result(), None), now=10.0) is True
+    assert (
+        runtime.accept_worker_result(WorkerResult(1, result(), None), now=10.0) is True
+    )
     assert runtime.phase == "nav"
 
     runtime.handle_key(" ", now=10.1)
     runtime.handle_key("n", now=10.2)
-    assert runtime.accept_worker_result(
-        WorkerResult(3, None, "camera timeout"), now=10.3
-    ) is True
+    assert (
+        runtime.accept_worker_result(WorkerResult(3, None, "camera timeout"), now=10.3)
+        is True
+    )
     assert runtime.phase == "listen_wasd"
     assert runtime.publish_due(10.3).velocity == (0.0, 0.0, 0.0)
     assert_stop_messages(published)
@@ -1235,11 +1303,13 @@ def test_event_loop_repeats_stop_on_exit_signal_and_exception(exit_mode: str) ->
         read_key = lambda: None
         running = lambda: False
     elif exit_mode == "exception":
+
         def read_key() -> str:
             raise RuntimeError("terminal failed")
 
         running = lambda: True
     else:
+
         def read_key() -> str:
             raise KeyboardInterrupt
 
