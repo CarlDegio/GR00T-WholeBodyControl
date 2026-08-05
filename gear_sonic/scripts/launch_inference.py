@@ -226,9 +226,6 @@ class InferenceLaunchConfig:
     base_pose_lingbot_root: str = "/home/user/Project/lingbot-depth"
     """LingBot-Depth checkout on the deployment machine."""
 
-    base_pose_hold_ready_timeout_seconds: float = 5.0
-    """Maximum wait after ``k`` for a valid current upper-body/hand latch."""
-
     lavira_mission: str = ""
     """Mission sent to LaViRA when --planner-input lavira is selected."""
 
@@ -335,11 +332,6 @@ class InferenceLaunchConfig:
 SESSION_NAME = "sonic_inference"
 
 
-def base_pose_hold_ready_file(config: InferenceLaunchConfig) -> str:
-    """Return the deterministic latch marker shared by relay and VLA keyboard."""
-    return f"/tmp/sonic_base_pose_hold_{config.reasan_planner_port}.ready"
-
-
 def uses_reasan_avoidance(config: InferenceLaunchConfig) -> bool:
     """Base-pose adjustment intentionally bypasses MID-360/REASAN."""
     return config.reasan_avoidance and config.planner_input != "base_pose"
@@ -370,9 +362,7 @@ def _base_pose_planner_command(config: InferenceLaunchConfig, repo_root: Path) -
         f"--camera-lateral-offset-m {config.base_pose_camera_lateral_offset_m} "
         f"--depth-visual-max-m {config.base_pose_depth_visual_max_m} "
         f"--codex-timeout-seconds {config.base_pose_codex_timeout_seconds} "
-        f"--output-root {shlex.quote(config.base_pose_output_root)} "
-        f"--planner-ready-file "
-        f"{shlex.quote(base_pose_hold_ready_file(config))}"
+        f"--output-root {shlex.quote(config.base_pose_output_root)}"
     )
     if config.base_pose_mode == "rgb":
         return (
@@ -476,10 +466,7 @@ def build_reasan_planner_command(config: InferenceLaunchConfig, repo_root: Path)
             f"source .venv_teleop/bin/activate && "
             f"python gear_sonic/scripts/lavira_sonic_relay.py "
             f"--source tcp://127.0.0.1:{config.keyboard_planner_port} "
-            f"--output 'tcp://*:{config.reasan_planner_port}' --hz 20 "
-            f"--freeze-current-upper-body --state-host localhost "
-            f"--state-port 5557 "
-            f"--hold-ready-file {shlex.quote(base_pose_hold_ready_file(config))}"
+            f"--output 'tcp://*:{config.reasan_planner_port}' --hz 20"
         )
     common = (
         f"cd {repo_root} && "
@@ -808,14 +795,6 @@ def main(config: InferenceLaunchConfig):
         f"--planner-relay-zmq-host localhost "
         f"--planner-relay-zmq-port {config.reasan_planner_port}"
     )
-    if config.planner_input == "base_pose":
-        inference_cmd += (
-            f" --planner-hold-ready-file "
-            f"{shlex.quote(base_pose_hold_ready_file(config))} "
-            f"--planner-hold-ready-timeout-seconds "
-            f"{config.base_pose_hold_ready_timeout_seconds}"
-        )
-
     print("Starting VLA inference (pane 1)...")
     _send_to_pane(pane_ids[2], inference_cmd, wait=1.0)
 
@@ -871,7 +850,7 @@ def main(config: InferenceLaunchConfig):
         if uses_reasan_avoidance(config):
             print("Starting REASEN rule-based safety planner (pane 4)...")
         elif config.planner_input == "base_pose":
-            print("Starting direct base-pose-to-SONIC hold relay (pane 4)...")
+            print("Starting stateless base-pose-to-SONIC relay (pane 4)...")
         else:
             print("Starting direct LaViRA-to-SONIC relay (pane 4)...")
         _send_to_pane(pane_ids[4], reasan_planner_cmd, wait=1.0)
@@ -940,7 +919,7 @@ def main(config: InferenceLaunchConfig):
         print("    Pane 4: REASEN Rule-Based Safety Planner")
         print("    Pane 5: MID-360 ActorRay/IMU")
     elif config.planner_input == "base_pose":
-        print("    Pane 4: Direct Base-Pose-to-SONIC Hold Relay")
+        print("    Pane 4: Stateless Base-Pose-to-SONIC Relay")
         print("    Pane 5: Idle (base_pose does not use MID-360/REASAN)")
     else:
         print("    Pane 4: Direct LaViRA-to-SONIC Relay")
@@ -955,8 +934,8 @@ def main(config: InferenceLaunchConfig):
     print()
     print("  Planner workflow:")
     if config.planner_input == "base_pose":
-        print("    1. In pane 1: k starts PLANNER and latches current upper body/hands")
-        print("    2. In pane 3: N plans; Space cancels+holds; X exits source")
+        print("    1. In pane 1: k starts the C++ loop in PLANNER mode")
+        print("    2. In pane 3: N plans; Space cancels+stops; X exits source")
         print("    3. Press N again only after IDLE and only from a fresh observation")
     elif config.planner_input == "lavira":
         print("    1. In pane 1: k (start) -> o (PLANNER mode)")
@@ -969,10 +948,7 @@ def main(config: InferenceLaunchConfig):
     print("  Keyboard controls (type in pane 1):")
     print("    p        - Pause / resume inference")
     print("    k        - Start / stop C++ control loop")
-    if config.planner_input == "base_pose":
-        print("    i        - Disabled (base_pose holds measured current pose)")
-    else:
-        print("    i        - Send initial pose")
+    print("    i        - Send initial pose")
     print("    [        - Toggle left hand open/closed (initial pose)")
     print("    ]        - Toggle right hand open/closed (initial pose)")
     print("    t <text> - Change inference prompt")

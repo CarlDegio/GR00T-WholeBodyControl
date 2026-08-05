@@ -25,7 +25,6 @@ sys.modules.setdefault("tyro", types.ModuleType("tyro"))
 from gear_sonic.scripts.launch_inference import (
     InferenceLaunchConfig,
     _check_prerequisites,
-    base_pose_hold_ready_file,
     build_planner_input_command,
     build_reasan_planner_command,
     uses_reasan_avoidance,
@@ -202,6 +201,7 @@ def test_base_pose_rgb_uses_ego_camera_without_starting_lingbot() -> None:
     assert "--camera-host g1-camera --camera-port 5555" in command
     assert ".venv_lingbot_depth" not in command
     assert "run_lingbot_depth_viewer.py" not in command
+    assert "--planner-ready-file" not in command
 
 
 @pytest.mark.parametrize("mode", ["rgbd", "rgb_depth_query"])
@@ -223,15 +223,16 @@ def test_base_pose_depth_modes_start_parameterized_ego_lingbot(mode: str) -> Non
     assert "--camera-host 127.0.0.1 --camera-port 5564" in command
 
 
-def test_base_pose_always_uses_direct_frozen_pose_relay_without_reasan() -> None:
+def test_base_pose_uses_stateless_direct_relay_without_reasan() -> None:
     config = InferenceLaunchConfig(planner_input="base_pose", reasan_avoidance=True)
 
     command = build_reasan_planner_command(config, Path("/workspace/sonic"))
 
     assert "lavira_sonic_relay.py" in command
-    assert "--freeze-current-upper-body" in command
-    assert "--state-port 5557" in command
-    assert f"--hold-ready-file {base_pose_hold_ready_file(config)}" in command
+    assert "--freeze-current-upper-body" not in command
+    assert "--state-host" not in command
+    assert "--state-port" not in command
+    assert "--hold-ready-file" not in command
     assert "reasan_planner.py" not in command
     assert not uses_reasan_avoidance(config)
 
