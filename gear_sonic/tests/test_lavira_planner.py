@@ -194,8 +194,9 @@ def test_base_pose_rgb_uses_ego_camera_without_starting_lingbot() -> None:
     assert "base_pose_planner.py" in command
     assert "--task 'put the cup in the tray'" in command
     assert "--mode rgb" in command
-    assert "--model gpt-5.6" in command
-    assert "--reasoning-effort high" in command
+    assert "--model gpt-5.6-sol" in command
+    assert "--reasoning-effort max" in command
+    assert "--codex-timeout-seconds 600.0" in command
     assert "--camera-stream ego_view" in command
     assert "--camera-height-m 1.2" in command
     assert "--camera-host g1-camera --camera-port 5555" in command

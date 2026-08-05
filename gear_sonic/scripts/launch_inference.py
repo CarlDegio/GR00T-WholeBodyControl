@@ -169,10 +169,10 @@ class InferenceLaunchConfig:
     base_pose_task: str = ""
     """Manipulation task for base-pose adjustment; defaults to ``prompt``."""
 
-    base_pose_model: str = "gpt-5.6"
+    base_pose_model: str = "gpt-5.6-sol"
     """Codex CLI vision model used by base-pose adjustment."""
 
-    base_pose_reasoning_effort: str = "high"
+    base_pose_reasoning_effort: str = "max"
     """Reasoning effort passed to the base-pose model."""
 
     base_pose_camera_stream: str = "ego_view"
@@ -199,7 +199,7 @@ class InferenceLaunchConfig:
     base_pose_camera_timeout_ms: int = 15000
     """Timeout for a fresh base-pose camera snapshot."""
 
-    base_pose_codex_timeout_seconds: float = 180.0
+    base_pose_codex_timeout_seconds: float = 600.0
     """Timeout for each base-pose Codex inference call."""
 
     base_pose_rotation_speed: float = 0.4

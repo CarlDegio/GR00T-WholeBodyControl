@@ -36,8 +36,8 @@ STOP_VELOCITY = (0.0, 0.0, 0.0)
 class BasePosePlannerConfig:
     task: str
     mode: str = "rgb"
-    model: str = "gpt-5.6"
-    reasoning_effort: str = "high"
+    model: str = "gpt-5.6-sol"
+    reasoning_effort: str = "max"
     host: str = "*"
     port: int = 5558
     planner_hz: float = 20.0
@@ -55,7 +55,7 @@ class BasePosePlannerConfig:
     camera_forward_offset_m: float = 0.0
     camera_lateral_offset_m: float = 0.0
     depth_visual_max_m: float = 3.0
-    codex_timeout_seconds: float = 180.0
+    codex_timeout_seconds: float = 600.0
     output_root: str = "outputs/base_pose_adjustment"
 
 

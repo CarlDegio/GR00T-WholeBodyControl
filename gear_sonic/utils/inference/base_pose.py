@@ -243,8 +243,8 @@ class AlignedRGBDSnapshot:
 class BasePoseConfig:
     task: str
     mode: BasePoseMode = "rgb"
-    model: str = "gpt-5.6"
-    reasoning_effort: str = "high"
+    model: str = "gpt-5.6-sol"
+    reasoning_effort: str = "max"
     camera_host: str = "localhost"
     camera_port: int = 5555
     camera_timeout_ms: int = 15000
@@ -255,7 +255,7 @@ class BasePoseConfig:
     camera_forward_offset_m: float = 0.0
     camera_lateral_offset_m: float = 0.0
     depth_visual_max_m: float = 3.0
-    codex_timeout_seconds: float = 180.0
+    codex_timeout_seconds: float = 600.0
     output_root: str = "outputs/base_pose_adjustment"
 
 
@@ -972,9 +972,9 @@ class CodexStructuredVisionClient:
     def __init__(
         self,
         *,
-        model: str = "gpt-5.6",
-        reasoning_effort: str = "high",
-        timeout_seconds: float = 180.0,
+        model: str = "gpt-5.6-sol",
+        reasoning_effort: str = "max",
+        timeout_seconds: float = 600.0,
         codex_bin: str | None = None,
         runner: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
     ):

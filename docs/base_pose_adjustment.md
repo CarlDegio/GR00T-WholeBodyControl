@@ -80,9 +80,9 @@ LingBot RGB-D or two-stage ROI depth lookup:
 ```
 
 If `--base-pose-task` is empty, the launcher uses `--prompt`. Defaults are
-`gpt-5.6`, high reasoning effort, camera height `1.2 m`, pitch `-47.6°`, and
-vertical FOV `55.2°`. Camera intrinsics and horizontal FOV come from the live
-frame.
+`gpt-5.6-sol`, max reasoning effort, a `600 s` Codex timeout, camera height
+`1.2 m`, pitch `-47.6°`, and vertical FOV `55.2°`. Camera intrinsics and
+horizontal FOV come from the live frame.
 
 ## Operator state machine
 
