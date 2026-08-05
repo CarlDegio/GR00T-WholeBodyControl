@@ -226,12 +226,12 @@ class SensorClient:
 
     def receive_message(self):
         packed = self.socket.recv()
-        return msgpack.unpackb(packed, object_hook=m.decode)
+        return msgpack.unpackb(packed, raw=False, object_hook=m.decode)
 
     def receive_message_nonblocking(self, timeout_ms: int = 0):
         if self.socket.poll(timeout_ms):
             packed = self.socket.recv()
-            return msgpack.unpackb(packed, object_hook=m.decode)
+            return msgpack.unpackb(packed, raw=False, object_hook=m.decode)
         return None
 
 

@@ -39,6 +39,21 @@ An explicit output path can be supplied as the second argument:
 ./start_camera_and_save_first_ego_frame.zsh base_pose /tmp/ego_first.png
 ```
 
+When the camera server runs on the robot and this repository runs on the
+deployment machine, start the subscriber on the deployment machine first:
+
+```bash
+./start_camera_and_save_first_ego_frame.zsh remote 192.168.123.164
+```
+
+Then start `start_base_pose_camera_server.zsh` or `start_camera_server.zsh` on
+the robot. The remote mode never launches a local camera process; it receives
+from the robot's TCP port `5555`, saves the first received frame on the
+deployment machine, and exits. If the robot camera is already publishing, it
+saves the first frame received after the deployment-side subscriber connects.
+The output path and a non-default port can be supplied as the third and fourth
+arguments, respectively.
+
 ## Launch examples
 
 RGB-only:

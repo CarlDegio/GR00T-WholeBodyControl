@@ -3,11 +3,12 @@ import sys
 import types
 from pathlib import Path
 
+import msgpack
 import numpy as np
 import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-from gear_sonic.camera.sensor_server import ImageMessageSchema, ImageUtils
+from gear_sonic.camera.sensor_server import ImageMessageSchema, ImageUtils, SensorClient
 
 
 class _FakeFrame:
@@ -148,6 +149,33 @@ def test_depth_encoder_rejects_wrong_dtype_and_shape():
 def test_legacy_rgb_message_without_camera_info_still_decodes():
     decoded = ImageMessageSchema.deserialize({"timestamps": {}, "images": {}})
     assert decoded.camera_info == {}
+
+
+def test_sensor_client_decodes_msgpack_map_keys_as_strings():
+    """Old msgpack releases otherwise return bytes keys and hide ego_view."""
+    wire_message = ImageMessageSchema(
+        timestamps={"ego_view": 1.0},
+        images={"ego_view": np.zeros((2, 3, 3), dtype=np.uint8)},
+    ).serialize()
+    packed = msgpack.packb(wire_message, use_bin_type=True)
+
+    class FakeSocket:
+        @staticmethod
+        def poll(_timeout_ms):
+            return True
+
+        @staticmethod
+        def recv():
+            return packed
+
+    client = SensorClient.__new__(SensorClient)
+    client.socket = FakeSocket()
+
+    unpacked = client.receive_message_nonblocking()
+    decoded = ImageMessageSchema.deserialize(unpacked)
+
+    assert list(unpacked["images"]) == ["ego_view"]
+    assert decoded.images["ego_view"].shape == (2, 3, 3)
 
 
 def test_realsense_depth_uses_color_aligned_frames_and_publishes_calibration(
