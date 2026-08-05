@@ -29,12 +29,7 @@ Keyboard commands (received via ZMQ from the standalone keyboard publisher):
   f  -> stop recording failure (handled by data exporter)
 """
 
-from collections.abc import Callable
 from dataclasses import dataclass
-from pathlib import Path
-from typing import Literal
-import json
-import math
 import queue
 import threading
 import time
@@ -68,7 +63,6 @@ from gear_sonic.utils.teleop.solver.hand.g1_gripper_ik_solver import (
     G1GripperInverseKinematicsSolver,
 )
 from gear_sonic.utils.teleop.zmq.zmq_planner_sender import (
-    HEADER_SIZE,
     build_command_message,
     build_planner_message,
     pack_pose_message,
@@ -131,12 +125,6 @@ class InferenceConfig:
     planner_relay_zmq_port: int = 5558
     """Port for the planner relay SUB socket."""
 
-    planner_hold_ready_file: str = ""
-    """Optional marker proving current planner upper-body/hand targets are latched."""
-
-    planner_hold_ready_timeout_seconds: float = 5.0
-    """Maximum wait on first ``k`` for the planner hold marker."""
-
     # Embodiment
     embodiment_tag: str = "unitree_g1_sonic"
     """Embodiment tag for policy inference."""
@@ -152,78 +140,6 @@ class InferenceConfig:
 
 def print_green(x):
     print(f"\033[92m{x}\033[0m")
-
-
-def _clear_planner_hold(path: str) -> None:
-    if not path:
-        return
-    marker = Path(path).expanduser()
-    marker.unlink(missing_ok=True)
-    Path(f"{marker}.request").unlink(missing_ok=True)
-
-
-def _request_planner_hold(path: str) -> bool:
-    if not path:
-        return True
-    marker = Path(path).expanduser()
-    request = Path(f"{marker}.request")
-    try:
-        _clear_planner_hold(path)
-        request.parent.mkdir(parents=True, exist_ok=True)
-        request.write_text(f"{time.time_ns()}\n", encoding="utf-8")
-    except OSError:
-        return False
-    return True
-
-
-def _execute_cpp_control_toggle(
-    *,
-    cpp_loop_running: bool,
-    cpp_mode: str,
-    planner_hold_ready_file: str,
-    send_control_command: Callable[[bool, bool], bool],
-) -> Literal["started", "stopped", "failed"]:
-    if cpp_loop_running:
-        if not send_control_command(False, cpp_mode == "PLANNER"):
-            return "failed"
-        _clear_planner_hold(planner_hold_ready_file)
-        return "stopped"
-
-    if not send_control_command(True, True):
-        return "failed"
-    if planner_hold_ready_file and not _request_planner_hold(
-        planner_hold_ready_file
-    ):
-        print("Warning: failed to request post-start planner hold state")
-    return "started"
-
-
-def wait_for_planner_hold_ready(
-    path: str,
-    timeout_seconds: float,
-    *,
-    monotonic=time.monotonic,
-    sleep=time.sleep,
-) -> bool:
-    """Request a fresh pose latch and wait for its ready marker."""
-    if not path:
-        return True
-    if timeout_seconds < 0.0:
-        raise ValueError("planner hold-ready timeout must be non-negative")
-    marker = Path(path).expanduser()
-    request = Path(f"{marker}.request")
-    if not _request_planner_hold(path):
-        return False
-    deadline = monotonic() + timeout_seconds
-    while True:
-        if marker.is_file():
-            request.unlink(missing_ok=True)
-            return True
-        remaining = deadline - monotonic()
-        if remaining <= 0.0:
-            request.unlink(missing_ok=True)
-            return False
-        sleep(min(0.05, remaining))
 
 
 JPEG_VIDEO_MARKER = "__opencv_jpeg_rgb__"
@@ -748,12 +664,6 @@ def main(config: InferenceConfig):
         elif key == "f":
             print("Keyboard: 'f' (stop recording failure -- handled by data exporter)")
         elif key == "i":
-            if config.planner_hold_ready_file:
-                print(
-                    "Warning: 'i' is disabled for base_pose; the measured current "
-                    "upper body and hands remain latched in PLANNER mode"
-                )
-                return
             print("Switch to pose mode")
             zmq_frame_counter = 0
             print("Reset ZMQ frame counter")
@@ -807,23 +717,17 @@ def main(config: InferenceConfig):
 
         elif key == "k":
             if cpp_loop_running:
+                current_planner = cpp_mode == "PLANNER"
                 print(f"Stopping C++ control loop (from {cpp_mode} mode)...")
+                if send_cpp_control_command(start=False, planner=current_planner):
+                    print("Stopped C++ control loop")
             else:
                 print("Starting C++ control loop in PLANNER mode...")
-            result = _execute_cpp_control_toggle(
-                cpp_loop_running=cpp_loop_running,
-                cpp_mode=cpp_mode,
-                planner_hold_ready_file=config.planner_hold_ready_file,
-                send_control_command=send_cpp_control_command,
-            )
-            if result == "stopped":
-                print("Stopped C++ control loop")
-            elif result == "started":
-                print("Started C++ control loop in PLANNER mode")
-                if not config.planner_hold_ready_file:
+                if send_cpp_control_command(start=True, planner=True):
+                    print("Started C++ control loop in PLANNER mode")
                     print("Press 'i' to send initial pose and switch to POSE mode")
-                if pause_loop:
-                    print("Note: Policy loop is paused - press 'p' to resume")
+                    if pause_loop:
+                        print("Note: Policy loop is paused - press 'p' to resume")
         elif key == "[":
             initial_pose_left_hand_closed = not initial_pose_left_hand_closed
             print(
@@ -1001,10 +905,6 @@ def main(config: InferenceConfig):
     finally:
         inference_stop_event.set()
         inference_worker_thread.join(timeout=1.0)
-        if config.planner_hold_ready_file:
-            marker = Path(config.planner_hold_ready_file).expanduser()
-            marker.unlink(missing_ok=True)
-            Path(f"{marker}.request").unlink(missing_ok=True)
         planner_relay_sub.close()
         zmq_socket.close()
         zmq_context.term()
@@ -1023,45 +923,6 @@ def _relay_planner_messages(
         action_pub.send(message)
         relayed += 1
     return relayed
-
-
-def _planner_message_has_frozen_targets(message: bytes) -> bool:
-    topic = b"planner"
-    if not message.startswith(topic) or len(message) < len(topic) + HEADER_SIZE:
-        return False
-    try:
-        header = json.loads(
-            message[len(topic) : len(topic) + HEADER_SIZE].rstrip(b"\x00")
-        )
-        names = {field["name"] for field in header["fields"]}
-    except (json.JSONDecodeError, KeyError, TypeError):
-        return False
-    return {
-        "upper_body_position",
-        "upper_body_velocity",
-        "left_hand_joints",
-        "right_hand_joints",
-    }.issubset(names)
-
-
-def _forward_frozen_planner_hold(
-    planner_relay_sub: zmq.Socket,
-    action_pub: zmq.Socket,
-    *,
-    timeout_seconds: float,
-) -> bool:
-    """Forward one verified hold frame before allowing C++ Planner startup."""
-    deadline = time.monotonic() + max(0.0, timeout_seconds)
-    while True:
-        remaining_ms = max(0, int(math.ceil((deadline - time.monotonic()) * 1000)))
-        if not planner_relay_sub.poll(remaining_ms):
-            return False
-        message = planner_relay_sub.recv()
-        if _planner_message_has_frozen_targets(message):
-            action_pub.send(message)
-            return True
-        if time.monotonic() >= deadline:
-            return False
 
 
 def _sleep_remaining(t_start: float, loop_period: float):

@@ -1,18 +1,14 @@
+from dataclasses import fields
 import queue
 import threading
 import time
 import unittest
-from pathlib import Path
-from tempfile import TemporaryDirectory
 
+from gear_sonic.scripts import run_vla_inference as inference_module
 from gear_sonic.scripts.run_vla_inference import (
     SIMULATED_INFERENCE_DELAY_SECONDS,
-    _execute_cpp_control_toggle,
     _inference_worker_loop,
-    _planner_message_has_frozen_targets,
-    wait_for_planner_hold_ready,
 )
-from gear_sonic.utils.teleop.zmq.zmq_planner_sender import build_planner_message
 from gear_sonic.utils.inference.vla_utils import calculate_latency_compensated_index
 
 
@@ -92,91 +88,23 @@ class InferenceWorkerDelayTest(unittest.TestCase):
         )
         self.assertEqual(with_delay - without_delay, 10)
 
-    def test_base_pose_k_starts_before_request_and_second_k_stops(self):
-        with TemporaryDirectory() as directory:
-            marker = Path(directory) / "hold.ready"
-            request = Path(f"{marker}.request")
-            events = []
-
-            def send_control(start, planner):
-                events.append((start, planner, request.exists()))
-                return True
-
-            self.assertEqual(
-                _execute_cpp_control_toggle(
-                    cpp_loop_running=False,
-                    cpp_mode="OFF",
-                    planner_hold_ready_file=str(marker),
-                    send_control_command=send_control,
-                ),
-                "started",
-            )
-            self.assertEqual(events, [(True, True, False)])
-            self.assertTrue(request.is_file())
-
-            marker.write_text("ready\n", encoding="utf-8")
-            self.assertEqual(
-                _execute_cpp_control_toggle(
-                    cpp_loop_running=True,
-                    cpp_mode="PLANNER",
-                    planner_hold_ready_file=str(marker),
-                    send_control_command=send_control,
-                ),
-                "stopped",
-            )
-            self.assertEqual(events[-1], (False, True, True))
-            self.assertFalse(marker.exists())
-            self.assertFalse(request.exists())
-
-    def test_planner_k_requests_a_fresh_hold_before_accepting_ready(self):
-        with TemporaryDirectory() as directory:
-            marker = Path(directory) / "hold.ready"
-
-            def acknowledge(_seconds):
-                self.assertTrue(Path(f"{marker}.request").is_file())
-                marker.write_text("ready\n")
-
-            self.assertTrue(
-                wait_for_planner_hold_ready(
-                    str(marker),
-                    5.0,
-                    monotonic=lambda: 0.0,
-                    sleep=acknowledge,
-                )
-            )
-
-    def test_planner_k_timeout_removes_unhandled_latch_request(self):
-        with TemporaryDirectory() as directory:
-            marker = Path(directory) / "hold.ready"
-            now = [0.0]
-
-            def monotonic():
-                return now[0]
-
-            def advance(seconds):
-                now[0] += seconds
-
+    def test_base_pose_control_exposes_no_hold_ready_state(self):
+        config_fields = {
+            field.name for field in fields(inference_module.InferenceConfig)
+        }
+        self.assertNotIn("planner_hold_ready_file", config_fields)
+        self.assertNotIn("planner_hold_ready_timeout_seconds", config_fields)
+        for removed_helper in (
+            "_clear_planner_hold",
+            "_request_planner_hold",
+            "_execute_cpp_control_toggle",
+            "wait_for_planner_hold_ready",
+            "_planner_message_has_frozen_targets",
+            "_forward_frozen_planner_hold",
+        ):
             self.assertFalse(
-                wait_for_planner_hold_ready(
-                    str(marker), 0.1, monotonic=monotonic, sleep=advance
-                )
+                hasattr(inference_module, removed_helper), removed_helper
             )
-            self.assertFalse(Path(f"{marker}.request").exists())
-
-    def test_planner_k_accepts_only_a_relay_frame_with_body_and_both_hands(self):
-        idle = build_planner_message(0, [0.0] * 3, [1.0, 0.0, 0.0])
-        frozen = build_planner_message(
-            0,
-            [0.0] * 3,
-            [1.0, 0.0, 0.0],
-            upper_body_position=[0.0] * 17,
-            upper_body_velocity=[0.0] * 17,
-            left_hand_position=[0.0] * 7,
-            right_hand_position=[0.0] * 7,
-        )
-
-        self.assertFalse(_planner_message_has_frozen_targets(idle))
-        self.assertTrue(_planner_message_has_frozen_targets(frozen))
 
 
 if __name__ == "__main__":
