@@ -1,4 +1,4 @@
-#!/usr/bin/env zsh
+#!/usr/bin/env bash
 
 # Save the first received ego_view RGB frame. Local modes also start one of the
 # existing camera servers; remote mode only subscribes to a server on the robot
@@ -6,7 +6,7 @@
 
 set -eu
 
-script_dir="${0:A:h}"
+script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 mode="${1:-base_pose}"
 camera_host="127.0.0.1"
 camera_port="5555"
@@ -25,8 +25,8 @@ case "$mode" in
         ;;
     remote)
         if [[ -z "${2:-}" ]]; then
-            print -u2 "ERROR: remote mode requires the robot camera-server hostname or IP"
-            print -u2 "Usage: $0 remote ROBOT_IP [OUTPUT_PNG] [CAMERA_PORT]"
+            printf '%s\n' "ERROR: remote mode requires the robot camera-server hostname or IP" >&2
+            printf '%s\n' "Usage: $0 remote ROBOT_IP [OUTPUT_PNG] [CAMERA_PORT]" >&2
             exit 2
         fi
         launch_local_camera=false
@@ -35,18 +35,19 @@ case "$mode" in
         camera_port="${4:-5555}"
         ;;
     -h|--help)
-        print "Usage:"
-        print "  $0 [base_pose|original] [OUTPUT_PNG]"
-        print "  $0 remote ROBOT_IP [OUTPUT_PNG] [CAMERA_PORT]"
-        print ""
-        print "Examples:"
-        print "  $0 base_pose"
-        print "  $0 original outputs/camera_startup/agentnav_ego.png"
-        print "  $0 remote 192.168.123.164"
+        printf '%s\n' "Usage:"
+        printf '%s\n' "  $0 [base_pose|original] [OUTPUT_PNG]"
+        printf '%s\n' "  $0 remote ROBOT_IP [OUTPUT_PNG] [CAMERA_PORT]"
+        printf '\n'
+        printf '%s\n' "Examples:"
+        printf '%s\n' "  $0 base_pose"
+        printf '%s\n' "  $0 original outputs/camera_startup/agentnav_ego.png"
+        printf '%s\n' "  $0 remote 192.168.123.164"
         exit 0
         ;;
     *)
-        print -u2 "ERROR: camera mode must be 'base_pose', 'original', or 'remote', got '$mode'"
+        printf '%s\n' \
+            "ERROR: camera mode must be 'base_pose', 'original', or 'remote', got '$mode'" >&2
         exit 2
         ;;
 esac
@@ -54,8 +55,9 @@ esac
 timestamp="$(date +%Y%m%d_%H%M%S)"
 output_path="${output_argument:-$script_dir/outputs/camera_startup/${timestamp}_ego_view_rgb.png}"
 
-if [[ "$camera_port" != <-> ]] || (( camera_port < 1 || camera_port > 65535 )); then
-    print -u2 "ERROR: invalid camera port: $camera_port"
+if [[ ! "$camera_port" =~ ^[0-9]+$ ]] \
+    || (( camera_port < 1 || camera_port > 65535 )); then
+    printf '%s\n' "ERROR: invalid camera port: $camera_port" >&2
     exit 2
 fi
 
@@ -77,12 +79,13 @@ else
 fi
 
 if [[ -z "$python_bin" || ! -x "$python_bin" ]]; then
-    print -u2 "ERROR: no compatible Python environment was found"
-    print -u2 "Set FIRST_EGO_FRAME_PYTHON to an environment containing OpenCV, NumPy, and pyzmq."
+    printf '%s\n' "ERROR: no compatible Python environment was found" >&2
+    printf '%s\n' \
+        "Set FIRST_EGO_FRAME_PYTHON to an environment containing OpenCV, NumPy, and pyzmq." >&2
     exit 1
 fi
 if $launch_local_camera && [[ ! -x "$camera_script" ]]; then
-    print -u2 "ERROR: camera startup script is not executable: $camera_script"
+    printf '%s\n' "ERROR: camera startup script is not executable: $camera_script" >&2
     exit 1
 fi
 
@@ -108,7 +111,7 @@ trap cleanup EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
 
-print "Preparing ego_view first-frame subscriber..."
+printf '%s\n' "Preparing ego_view first-frame subscriber..."
 (
     cd "$script_dir"
     exec "$python_bin" -m gear_sonic.scripts.save_first_ego_frame \
@@ -124,29 +127,29 @@ attempt=0
 while [[ ! -f "$ready_file" ]]; do
     if ! kill -0 "$capture_pid" 2>/dev/null; then
         wait "$capture_pid" || true
-        print -u2 "ERROR: first-frame subscriber exited before it became ready"
+        printf '%s\n' "ERROR: first-frame subscriber exited before it became ready" >&2
         exit 1
     fi
     attempt=$((attempt + 1))
     if (( attempt >= 50 )); then
-        print -u2 "ERROR: first-frame subscriber was not ready within 5 seconds"
+        printf '%s\n' "ERROR: first-frame subscriber was not ready within 5 seconds" >&2
         exit 1
     fi
     sleep 0.1
 done
 
 if ! $launch_local_camera; then
-    print "Waiting for the first ego_view RGB frame from $camera_host:$camera_port ..."
-    print "The image will be stored on this deployment machine at:"
-    print "  $output_path"
+    printf '%s\n' "Waiting for the first ego_view RGB frame from $camera_host:$camera_port ..."
+    printf '%s\n' "The image will be stored on this deployment machine at:"
+    printf '%s\n' "  $output_path"
     capture_status=0
     wait "$capture_pid" || capture_status=$?
     capture_pid=""
     exit "$capture_status"
 fi
 
-print "Starting '$mode' camera server; first ego_view RGB will be saved to:"
-print "  $output_path"
+printf '%s\n' "Starting '$mode' camera server; first ego_view RGB will be saved to:"
+printf '%s\n' "  $output_path"
 "$camera_script" &
 camera_pid=$!
 
