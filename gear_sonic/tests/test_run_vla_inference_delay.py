@@ -7,6 +7,7 @@ from tempfile import TemporaryDirectory
 
 from gear_sonic.scripts.run_vla_inference import (
     SIMULATED_INFERENCE_DELAY_SECONDS,
+    _execute_cpp_control_toggle,
     _inference_worker_loop,
     _planner_message_has_frozen_targets,
     wait_for_planner_hold_ready,
@@ -90,6 +91,42 @@ class InferenceWorkerDelayTest(unittest.TestCase):
             0.1 + SIMULATED_INFERENCE_DELAY_SECONDS, 50, 70
         )
         self.assertEqual(with_delay - without_delay, 10)
+
+    def test_base_pose_k_starts_before_request_and_second_k_stops(self):
+        with TemporaryDirectory() as directory:
+            marker = Path(directory) / "hold.ready"
+            request = Path(f"{marker}.request")
+            events = []
+
+            def send_control(start, planner):
+                events.append((start, planner, request.exists()))
+                return True
+
+            self.assertEqual(
+                _execute_cpp_control_toggle(
+                    cpp_loop_running=False,
+                    cpp_mode="OFF",
+                    planner_hold_ready_file=str(marker),
+                    send_control_command=send_control,
+                ),
+                "started",
+            )
+            self.assertEqual(events, [(True, True, False)])
+            self.assertTrue(request.is_file())
+
+            marker.write_text("ready\n", encoding="utf-8")
+            self.assertEqual(
+                _execute_cpp_control_toggle(
+                    cpp_loop_running=True,
+                    cpp_mode="PLANNER",
+                    planner_hold_ready_file=str(marker),
+                    send_control_command=send_control,
+                ),
+                "stopped",
+            )
+            self.assertEqual(events[-1], (False, True, True))
+            self.assertFalse(marker.exists())
+            self.assertFalse(request.exists())
 
     def test_planner_k_requests_a_fresh_hold_before_accepting_ready(self):
         with TemporaryDirectory() as directory:

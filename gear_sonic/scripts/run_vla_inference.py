@@ -29,8 +29,10 @@ Keyboard commands (received via ZMQ from the standalone keyboard publisher):
   f  -> stop recording failure (handled by data exporter)
 """
 
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Literal
 import json
 import math
 import queue
@@ -152,6 +154,50 @@ def print_green(x):
     print(f"\033[92m{x}\033[0m")
 
 
+def _clear_planner_hold(path: str) -> None:
+    if not path:
+        return
+    marker = Path(path).expanduser()
+    marker.unlink(missing_ok=True)
+    Path(f"{marker}.request").unlink(missing_ok=True)
+
+
+def _request_planner_hold(path: str) -> bool:
+    if not path:
+        return True
+    marker = Path(path).expanduser()
+    request = Path(f"{marker}.request")
+    try:
+        _clear_planner_hold(path)
+        request.parent.mkdir(parents=True, exist_ok=True)
+        request.write_text(f"{time.time_ns()}\n", encoding="utf-8")
+    except OSError:
+        return False
+    return True
+
+
+def _execute_cpp_control_toggle(
+    *,
+    cpp_loop_running: bool,
+    cpp_mode: str,
+    planner_hold_ready_file: str,
+    send_control_command: Callable[[bool, bool], bool],
+) -> Literal["started", "stopped", "failed"]:
+    if cpp_loop_running:
+        if not send_control_command(False, cpp_mode == "PLANNER"):
+            return "failed"
+        _clear_planner_hold(planner_hold_ready_file)
+        return "stopped"
+
+    if not send_control_command(True, True):
+        return "failed"
+    if planner_hold_ready_file and not _request_planner_hold(
+        planner_hold_ready_file
+    ):
+        print("Warning: failed to request post-start planner hold state")
+    return "started"
+
+
 def wait_for_planner_hold_ready(
     path: str,
     timeout_seconds: float,
@@ -166,11 +212,7 @@ def wait_for_planner_hold_ready(
         raise ValueError("planner hold-ready timeout must be non-negative")
     marker = Path(path).expanduser()
     request = Path(f"{marker}.request")
-    try:
-        marker.unlink(missing_ok=True)
-        request.parent.mkdir(parents=True, exist_ok=True)
-        request.write_text(f"{time.time_ns()}\n", encoding="utf-8")
-    except OSError:
+    if not _request_planner_hold(path):
         return False
     deadline = monotonic() + timeout_seconds
     while True:
@@ -765,49 +807,23 @@ def main(config: InferenceConfig):
 
         elif key == "k":
             if cpp_loop_running:
-                current_planner = cpp_mode == "PLANNER"
                 print(f"Stopping C++ control loop (from {cpp_mode} mode)...")
-                if send_cpp_control_command(start=False, planner=current_planner):
-                    if config.planner_hold_ready_file:
-                        Path(config.planner_hold_ready_file).expanduser().unlink(
-                            missing_ok=True
-                        )
-                    print("Stopped C++ control loop")
             else:
-                if config.planner_hold_ready_file:
-                    while planner_relay_sub.poll(0):
-                        planner_relay_sub.recv(zmq.NOBLOCK)
-                    print(
-                        "Waiting for a valid current upper-body/hand planner hold "
-                        f"({config.planner_hold_ready_timeout_seconds:g}s timeout)..."
-                    )
-                    if not wait_for_planner_hold_ready(
-                        config.planner_hold_ready_file,
-                        config.planner_hold_ready_timeout_seconds,
-                    ):
-                        print(
-                            "Warning: planner hold state is not ready; C++ control "
-                            "loop was not started"
-                        )
-                        return
-                    if not _forward_frozen_planner_hold(
-                        planner_relay_sub, zmq_socket, timeout_seconds=0.5
-                    ):
-                        Path(config.planner_hold_ready_file).expanduser().unlink(
-                            missing_ok=True
-                        )
-                        print(
-                            "Warning: latched Planner IDLE message did not arrive; "
-                            "C++ control loop was not started"
-                        )
-                        return
                 print("Starting C++ control loop in PLANNER mode...")
-                if send_cpp_control_command(start=True, planner=True):
-                    print("Started C++ control loop in PLANNER mode")
-                    if not config.planner_hold_ready_file:
-                        print("Press 'i' to send initial pose and switch to POSE mode")
-                    if pause_loop:
-                        print("Note: Policy loop is paused - press 'p' to resume")
+            result = _execute_cpp_control_toggle(
+                cpp_loop_running=cpp_loop_running,
+                cpp_mode=cpp_mode,
+                planner_hold_ready_file=config.planner_hold_ready_file,
+                send_control_command=send_cpp_control_command,
+            )
+            if result == "stopped":
+                print("Stopped C++ control loop")
+            elif result == "started":
+                print("Started C++ control loop in PLANNER mode")
+                if not config.planner_hold_ready_file:
+                    print("Press 'i' to send initial pose and switch to POSE mode")
+                if pause_loop:
+                    print("Note: Policy loop is paused - press 'p' to resume")
         elif key == "[":
             initial_pose_left_hand_closed = not initial_pose_left_hand_closed
             print(
