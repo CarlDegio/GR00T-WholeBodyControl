@@ -57,7 +57,6 @@ class BasePosePlannerConfig:
     depth_visual_max_m: float = 3.0
     codex_timeout_seconds: float = 180.0
     output_root: str = "outputs/base_pose_adjustment"
-    planner_ready_file: str = ""
 
 
 @dataclass(frozen=True)
@@ -269,7 +268,6 @@ class BasePosePlannerRuntime:
         self.pending_generation: int | None = None
         self.next_publish_at: float | None = None
         self.current_output_dir: str | None = None
-        self.planner_ready_token: str | None = None
         self._shutdown = False
 
     @property
@@ -282,7 +280,7 @@ class BasePosePlannerRuntime:
 
     def _publish_stop(self) -> None:
         self.publish(
-            build_velocity_message(self.controller.stop_command(), action="hold")
+            build_velocity_message(self.controller.stop_command(), action="stop")
         )
 
     def _publish_stop_sequence(self) -> None:
@@ -295,18 +293,6 @@ class BasePosePlannerRuntime:
                 self.request_queue.get_nowait()
             except queue.Empty:
                 return
-
-    def _read_planner_ready_token(self) -> str | None:
-        if not self.config.planner_ready_file:
-            return ""
-        try:
-            return (
-                Path(self.config.planner_ready_file)
-                .expanduser()
-                .read_text(encoding="utf-8")
-            )
-        except OSError:
-            return None
 
     def _record_event(self, event: str, **fields: Any) -> None:
         directory = (
@@ -329,34 +315,30 @@ class BasePosePlannerRuntime:
         except OSError as exc:
             self.logger(f"[BasePose] diagnostic write failed: {exc}")
 
-    def cancel_and_hold(self, reason: str, now: float) -> None:
+    def cancel_and_stop(self, reason: str, now: float) -> None:
         self.controller._timestamp(now)
         previous_phase = self.phase
-        self._record_event("cancel_and_hold", reason=reason, phase=previous_phase)
+        self._record_event("cancel_and_stop", reason=reason, phase=previous_phase)
         self.generation += 1
         self.pending_generation = None
         self._discard_queued_requests()
         self.controller.cancel()
         self._publish_stop_sequence()
         self.next_publish_at = float(now) + 1.0 / self.config.planner_hz
-        self.logger(f"[BasePose] HOLD {reason}")
+        self.logger(f"[BasePose] STOP {reason}")
 
     def handle_key(self, key: str, *, now: float) -> str:
         normalized = str(key).lower()
         if normalized == "x":
-            self.cancel_and_hold("exit", now)
+            self.cancel_and_stop("exit", now)
             return "exit"
         if key == " ":
-            self.cancel_and_hold("operator_space", now)
+            self.cancel_and_stop("operator_space", now)
             return "cancelled"
         if normalized == "n":
             if self.phase != "idle" or self.stop_event.is_set():
                 self.logger("[BasePose] BUSY request rejected")
                 return "busy"
-            ready_token = self._read_planner_ready_token()
-            if ready_token is None:
-                self.logger("[BasePose] Planner hold is not ready; press k before N")
-                return "not_ready"
             candidate = self.generation + 1
             try:
                 self.request_queue.put_nowait(candidate)
@@ -364,7 +346,6 @@ class BasePosePlannerRuntime:
                 self.logger("[BasePose] BUSY request rejected")
                 return "busy"
             self.current_output_dir = None
-            self.planner_ready_token = ready_token
             self.generation = candidate
             self.pending_generation = candidate
             self._publish_stop()
@@ -448,13 +429,6 @@ class BasePosePlannerRuntime:
 
     def publish_due(self, now: float) -> VelocityCommand | None:
         timestamp = self.controller._timestamp(now)
-        if (
-            self.phase != "idle"
-            and self.config.planner_ready_file
-            and self._read_planner_ready_token() != self.planner_ready_token
-        ):
-            self.cancel_and_hold("cpp_planner_not_ready", timestamp)
-            return self.controller.stop_command()
         if self.next_publish_at is None:
             self.next_publish_at = timestamp
         if timestamp + 1.0e-12 < self.next_publish_at:
@@ -476,7 +450,7 @@ class BasePosePlannerRuntime:
             return
         self._shutdown = True
         self.stop_event.set()
-        self.cancel_and_hold("shutdown", time.monotonic())
+        self.cancel_and_stop("shutdown", time.monotonic())
         try:
             self.request_queue.put_nowait(None)
         except queue.Full:
@@ -618,7 +592,7 @@ def main(config: BasePosePlannerConfig) -> None:
         print(
             f"[BasePose] PUB bound to {endpoint}; mode={config.mode}; task={config.task!r}"
         )
-        print("[BasePose] N plan | Space cancel-and-hold | X exit")
+        print("[BasePose] N plan | Space cancel-and-stop | X stop-and-exit")
         with cbreak_terminal():
             run_planner_loop(
                 runtime, read_key=read_key_nonblocking, running=lambda: running

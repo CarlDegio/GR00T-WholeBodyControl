@@ -302,37 +302,36 @@ def test_space_discards_not_yet_started_request_so_fresh_n_can_queue(
     assert runtime.handle_key("n", now=1.2) == "started"
 
 
-def test_cpp_k_stop_marker_removal_discards_remaining_motion(tmp_path: Path) -> None:
-    marker = tmp_path / "hold.ready"
-    marker.write_text("ready\n")
+def test_runtime_exposes_no_planner_ready_state() -> None:
+    assert "planner_ready_file" not in BasePosePlannerConfig.__dataclass_fields__
+
+
+def test_space_publishes_exact_zero_stop_sequence(tmp_path: Path) -> None:
+    messages: list[str] = []
+    logs: list[str] = []
+    config = BasePosePlannerConfig(
+        task="adjust",
+        output_root=str(tmp_path),
+        final_stop_count=4,
+    )
     runtime = BasePosePlannerRuntime(
-        BasePosePlannerConfig(
-            task="adjust",
-            output_root=str(tmp_path),
-            planner_ready_file=str(marker),
-        ),
-        publish=lambda _message: None,
-        logger=lambda _message: None,
+        config,
+        publish=messages.append,
+        logger=logs.append,
     )
     assert runtime.handle_key("n", now=1.0) == "started"
-    generation = runtime.pending_generation
-    assert runtime.accept_worker_result(
-        WorkerResult(
-            generation=generation,  # type: ignore[arg-type]
-            result=result(
-                plan([command(1, "MOVE_FORWARD", 0.5)]),
-                output_dir=str(tmp_path / "motion"),
-            ),
-            error=None,
-        ),
-        now=1.0,
+    count_before_space = len(messages)
+
+    assert runtime.handle_key(" ", now=1.1) == "cancelled"
+
+    stops = [json.loads(message) for message in messages[count_before_space:]]
+    assert len(stops) == config.final_stop_count
+    assert all(
+        stop["velocity"] == {"vx": 0.0, "vy": 0.0, "wz": 0.0}
+        for stop in stops
     )
-    marker.unlink()
-
-    command_after_k = runtime.publish_due(1.1)
-
-    assert runtime.phase == "idle"
-    assert command_after_k.velocity == (0.0, 0.0, 0.0)
+    assert all(stop["action"] == "stop" for stop in stops)
+    assert logs[-1] == "[BasePose] STOP operator_space"
 
 
 def snapshot(*, depth: bool = True) -> AlignedRGBDSnapshot:
