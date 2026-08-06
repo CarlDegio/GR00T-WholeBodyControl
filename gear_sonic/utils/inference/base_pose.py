@@ -590,12 +590,20 @@ def build_base_pose_prompt(
     config: BasePoseConfig, snapshot: AlignedRGBDSnapshot
 ) -> str:
     params = json.dumps(
-        camera_parameters(config, snapshot), ensure_ascii=False, indent=2
+        {
+            "camera_height_m": config.camera_height_m,
+            "camera_pitch_deg": config.camera_pitch_deg,
+            "vertical_fov_deg": config.vertical_fov_deg,
+            "pitch_reference": "robot_body_horizontal",
+            "pitch_convention": "positive_upward",
+        },
+        ensure_ascii=False,
+        indent=2,
     )
-    task = json.dumps(config.task, ensure_ascii=False)
+    task = json.dumps([config.task], ensure_ascii=False)
     return f"""You are a base-pose adjustment planner for a G1 humanoid robot standing near a table and preparing to perform a manipulation task.
 
-Your goal is to generate a complete and coherent sequence of robot base movements that places the robot in a suitable pose for completing the full manipulation task.
+Your goal is to generate a complete and coherent sequence of base movements that places the robot in a suitable pose for manipulation.
 
 ## Inputs
 
@@ -605,203 +613,115 @@ Task description:
 
 RGB image:
 
-[ATTACHED_IMAGE_1]
+[ATTACHED IMAGE]
 
-Camera parameters:
 
 {params}
 
-## Camera-parameter interpretation
-
-* `camera_height_m` is the height of the camera optical center above the ground, measured in meters.
-* `camera_pitch_deg` is the pitch angle of the camera optical axis relative to the robot-body horizontal plane.
-* Under the `positive_upward` convention, positive pitch points upward and negative pitch points downward.
-* Therefore, a negative `camera_pitch_deg` means that the camera optical axis points downward relative to the robot-body horizontal plane.
-* `vertical_fov_deg` and `horizontal_fov_deg` are full fields of view.
-* Use the camera height, camera pitch, fields of view, live intrinsics, image perspective, object scale, support-surface geometry, and visible spatial relationships when estimating the required base adjustment.
-* Assume that the camera forward direction in the horizontal plane is aligned with the robot's forward body direction.
-* The configured camera forward/lateral offsets are relative to the robot base; zero means that translation extrinsics are not yet calibrated.
-* Do not assume access to any information other than the task description, attached inputs, and camera parameters listed above.
-* All numerical movement values are approximate visual estimates.
 
 ## Planning objectives
 
-Use the task description, RGB image, and camera parameters to:
+Use the task description and RGB image to:
 
-1. Interpret the complete manipulation task, including the required order of object interactions.
-2. Identify the primary manipulation target or targets.
-3. Distinguish among manipulation targets, destination containers, support surfaces, nearby objects, environmental obstacles, and irrelevant background objects.
-4. Select the task-relevant manipulation anchor for each interaction, such as a handle, button, opening, graspable region, contact surface, insertion point, small-object center, or container opening.
-5. Determine which manipulation anchor or combined manipulation workspace should guide the final base pose.
-6. Determine the most suitable final horizontal alignment between the task-relevant manipulation workspace and the robot's ego-view.
-7. Estimate whether the robot should move closer to or farther from the manipulation workspace.
-8. Estimate whether the robot should rotate left, rotate right, or remain aligned.
-9. Generate a continuous multi-step base-motion sequence that adjusts both robot position and orientation.
-10. Prefer one final base pose that supports the complete sequence of manipulations without requiring another base adjustment between individual arm actions.
-11. For tasks involving both hands, keep right-hand objects in the right workspace, left-hand objects in the left workspace, and shared containers near the central workspace when practical.
-12. After the planned movement, the robot should face the workspace with a practical table standoff and body orientation.
+1. Identify the primary manipulation target.
+2. Distinguish the primary target from secondary objects, containers, support surfaces, and obstacles.
+3. Select the task-relevant manipulation anchor, such as:
 
-The objective is not always to align the geometric center of an entire object with the center of the image. Align the task-relevant anchor, opening, interaction axis, or combined workspace best suited to the complete task.
+   * a handle;
+   * a button;
+   * an opening;
+   * a graspable region;
+   * a contact surface;
+   * an insertion point;
+   * an object center, only when it is appropriate for the task.
+4. Determine the most suitable final horizontal alignment between the manipulation anchor and the robot’s ego-view.
+5. Estimate whether the robot should move closer to or farther from the target.
+6. Generate a continuous multi-step motion sequence that adjusts both the robot’s position and orientation.
 
-## Visual reasoning guidelines
-
-* Classify horizontal workspace position as FAR_LEFT, LEFT, CENTERED, RIGHT, or FAR_RIGHT.
-* Classify current standoff as TOO_CLOSE, SUITABLE, TOO_FAR, or UNKNOWN.
-* Do not infer distance from vertical image position alone; account for the downward pitch and support-surface geometry.
-* Prioritize the complete manipulation workspace for multi-object tasks.
-* Balance reachability, visibility, collision clearance, both-arm access, and destination access.
-* Prefer small purposeful corrections when the current pose is close to suitable.
+The objective is not always to align the geometric center of the entire object with the image center. Align the task-relevant manipulation anchor or interaction axis that is most suitable for completing the task.
 
 ## Allowed motion commands
 
-* `ROTATE_LEFT`: counterclockwise rotation in degrees.
-* `ROTATE_RIGHT`: clockwise rotation in degrees.
-* `MOVE_FORWARD`: forward motion along the current heading in meters.
-* `MOVE_BACKWARD`: backward motion along the current heading in meters.
+* ROTATE_LEFT: rotate counterclockwise by a specified number of degrees.
+* ROTATE_RIGHT: rotate clockwise by a specified number of degrees.
+* MOVE_FORWARD: move forward along the robot’s current heading by a specified number of meters.
+* MOVE_BACKWARD: move backward along the robot’s current heading by a specified number of meters.
 
-Direct lateral translation is unavailable.
+Direct lateral translation is not available.
 
 ## Motion-planning rules
 
-* Output every movement required to reach the final manipulation pose in exact execution order.
-* Every command is relative to the pose resulting from all previous commands.
+* Output a coherent sequence containing all movements needed to reach the estimated manipulation pose.
+* The commands must be ordered exactly as they should be executed.
+* Each command is defined relative to the robot pose resulting from all previous commands.
+* You may output multiple rotations and translations.
+* Do not limit the plan to small incremental movements.
+* Every MOVE_FORWARD or MOVE_BACKWARD command must specify a distance greater than or equal to 0.3 meters.
+* If the desired positional correction is less than 0.3 meters, do not output a translation below 0.3 meters. When geometrically appropriate and safe, prefer an indirect adjustment using backward movement, rotation, forward movement, and a final corrective rotation toward the manipulation target.
 * Do not require a new observation between commands.
-* For lateral repositioning, use a geometrically coherent backward/rotation/forward/corrective-rotation sequence.
-* Restore a suitable final orientation toward the manipulation workspace.
-* Avoid redundant commands and unnecessary direction changes.
-* Do not output arm, hand, gripper, head, gaze, perception, or manipulation commands.
-* Keep reasonable clearance from the table and visible obstacles.
-* Do not move forward when already extremely close to the table.
-* If backing away is required before rotating, move backward first.
-* Rotation values must be in degrees and translations in meters.
-* Each rotation must be between 2 and 90 degrees.
-* Each translation must be between 0.10 and 1.50 meters.
-* Use at most 8 commands, at most 180 cumulative rotation degrees, and at most 3.0 cumulative translation meters.
-* Numerical values must be plausible estimates rather than false precision.
-
-## Status-selection rules
-
-Return `READY` when the complete manipulation workspace is suitably aligned and reachable without base movement.
-Return `ADJUST` when a coherent correction can be inferred and one or more commands are required.
-Return `UNSURE` when targets, anchors, necessary direction, or important workspace areas cannot be reliably determined.
-Return `UNSAFE` when a coherent collision-free base sequence cannot be inferred from the visible scene.
+* Use combinations of backward movement, rotation, forward movement, and corrective rotation when lateral repositioning is needed.
+* When producing an indirect lateral adjustment, restore an appropriate final body orientation toward the manipulation target.
+* Avoid unnecessary movements and redundant direction changes.
+* Prefer a smooth and geometrically consistent trajectory.
+* Do not output direct lateral movement.
+* Do not output arm or hand commands.
+* Do not include target-recognition or observation commands in the motion sequence.
+* Because no depth image or camera calibration is provided, distance and angle values are approximate visual estimates.
+* Do not claim that the estimated motion values are geometrically exact.
+* If the target cannot be identified or the required movement cannot be reasonably inferred, return UNSURE instead of inventing a motion sequence.
+* If the scene appears unsafe for the proposed motion, return UNSAFE.
+* When the robot already appears suitably positioned, return READY with an empty command sequence.
 
 ## Output requirements
 
-Output only one valid JSON object.
+Output only one valid JSON object. Do not include Markdown or additional text.
 
-Do not include Markdown, comments, explanations, hidden reasoning, or any text outside the JSON object.
-
-Use exactly this structure:
+Use this format:
 
 {{
-  "status": "READY | ADJUST | UNSURE | UNSAFE",
-  "task_interpretation": {{
-    "primary_target": "",
-    "secondary_targets": [],
-    "manipulation_anchor": "",
-    "interaction_direction": "",
-    "selection_reason": ""
-  }},
-  "current_alignment": {{
-    "horizontal_position": "FAR_LEFT | LEFT | CENTERED | RIGHT | FAR_RIGHT | UNKNOWN",
-    "distance_estimate": "TOO_CLOSE | SUITABLE | TOO_FAR | UNKNOWN",
-    "orientation_estimate": "TURNED_LEFT | ALIGNED | TURNED_RIGHT | UNKNOWN"
-  }},
-  "desired_final_pose": {{
-    "target_alignment": "",
-    "target_distance": "",
-    "target_orientation": ""
-  }},
-  "command_sequence": [
-    {{
-      "step": 1,
-      "action": "ROTATE_LEFT | ROTATE_RIGHT | MOVE_FORWARD | MOVE_BACKWARD",
-      "value": 2.0,
-      "unit": "degrees | meters",
-      "purpose": ""
-    }}
-  ],
-  "expected_result": "",
-  "confidence": 0.0,
-  "limitations": ""
+"status": "READY | ADJUST | UNSURE | UNSAFE",
+"task_interpretation": {{
+"primary_target": "",
+"secondary_targets": [],
+"manipulation_anchor": "",
+"interaction_direction": "",
+"selection_reason": ""
+}},
+"current_alignment": {{
+"horizontal_position": "FAR_LEFT | LEFT | CENTERED | RIGHT | FAR_RIGHT | UNKNOWN",
+"distance_estimate": "TOO_CLOSE | SUITABLE | TOO_FAR | UNKNOWN",
+"orientation_estimate": "TURNED_LEFT | ALIGNED | TURNED_RIGHT | UNKNOWN"
+}},
+"desired_final_pose": {{
+"target_alignment": "",
+"target_distance": "",
+"target_orientation": ""
+}},
+"command_sequence": [
+{{
+"step": 1,
+"action": "ROTATE_LEFT | ROTATE_RIGHT | MOVE_FORWARD | MOVE_BACKWARD",
+"value": 0.3,
+"unit": "degrees | meters",
+"purpose": ""
 }}
-
-## Field-definition requirements
-
-### `task_interpretation.primary_target`
-
-Describe the object or objects that must be directly manipulated. For a multi-object task, include all primary manipulation objects in one concise string.
-
-### `task_interpretation.secondary_targets`
-
-List destination containers, support surfaces, and task-relevant environmental objects. Do not include irrelevant background objects unless they affect safety or movement.
-
-### `task_interpretation.manipulation_anchor`
-
-Describe the task-relevant grasping, contact, insertion, or placement regions. For a multi-stage task, include both pickup anchors and destination anchors when necessary.
-
-### `task_interpretation.interaction_direction`
-
-Describe the preferred direction from which the robot should face or approach the combined manipulation workspace.
-
-### `task_interpretation.selection_reason`
-
-Explain why the selected workspace and anchor are appropriate for the complete task.
-
-### `current_alignment.horizontal_position`
-
-Classify the task-relevant manipulation workspace relative to the current ego-view. Base this classification on the anchor or combined workspace, not necessarily on the geometric center of the largest object.
-
-### `current_alignment.distance_estimate`
-
-Classify the current table or workspace standoff using visible scene geometry and the supplied camera parameters.
-
-### `current_alignment.orientation_estimate`
-
-Use `TURNED_LEFT` when the robot appears oriented too far toward the left side of the desired workspace; `TURNED_RIGHT` when it appears oriented too far toward the right; `ALIGNED` when the current body-facing direction is suitable; and `UNKNOWN` when orientation cannot be inferred.
-
-### `desired_final_pose.target_alignment`
-
-Describe where the manipulation workspace should appear horizontally after all commands are executed.
-
-### `desired_final_pose.target_distance`
-
-Describe the intended final table or workspace standoff.
-
-### `desired_final_pose.target_orientation`
-
-Describe the intended final body-facing direction.
-
-### `command_sequence`
-
-Include only base-motion commands. Each command must contain a consecutive step number, one allowed action, a positive numerical value, the correct unit, and a concise purpose.
-
-### `expected_result`
-
-Describe the estimated final relationship after the complete sequence. Mention final horizontal alignment, table or workspace standoff, body orientation, and expected accessibility of the targets and container.
-
-### `confidence`
-
-Use a number from `0.0` to `1.0`. Use lower confidence when target boundaries are unclear, the table edge is partially visible, dimensions are uncertain, the exact camera-to-base relationship is uncertain, or motion relies heavily on approximate visual interpretation.
-
-### `limitations`
-
-Briefly state the main causes of uncertainty. Do not use this field to contradict the selected status or command sequence.
+],
+"expected_result": "",
+"confidence": 0.0,
+"limitations": ""
+}}
 
 ## Consistency constraints
 
-* `READY`, `UNSURE`, and `UNSAFE` require an empty `command_sequence`.
-* `ADJUST` requires at least one command.
-* Step numbers must be consecutive and start from `1`.
-* Rotation commands must use `"unit": "degrees"`.
-* Translation commands must use `"unit": "meters"`.
-* Every command value must be greater than `0` and within the limits above.
-* Do not emit zero-value commands or unsupported actions.
-* `expected_result` must describe the estimated final pose after every command has executed.
-* The sequence must be geometrically consistent with the desired final pose.
-* The final corrective rotation must face the robot toward the selected workspace.
-* Output must be syntactically valid JSON.
+* READY must have an empty command_sequence.
+* UNSURE must have an empty command_sequence.
+* UNSAFE must have an empty command_sequence.
+* ADJUST must contain at least one command.
+* Rotation commands must use degrees.
+* Translation commands must use meters.
+* Every MOVE_FORWARD or MOVE_BACKWARD value must be greater than or equal to 0.3 meters.
+* Every step number must be consecutive, starting from 1.
+* The expected_result must describe the estimated final robot-to-target alignment after the complete sequence has been executed.
 """
 
 

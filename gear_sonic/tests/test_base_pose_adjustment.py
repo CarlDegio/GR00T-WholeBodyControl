@@ -30,6 +30,7 @@ from gear_sonic.utils.inference.base_pose import (
     BasePoseResult,
     BasePoseRunner,
     BasePoseValidationError,
+    build_base_pose_prompt,
     query_depth_regions,
     validate_base_pose_plan,
 )
@@ -92,6 +93,38 @@ def result(value: dict[str, object] | None = None, output_dir: str = "/tmp/base"
         output_dir=output_dir,
         timing_s={},
     )
+
+
+def test_prompt_requires_point_three_meter_minimum_and_indirect_small_correction() -> None:
+    snapshot = AlignedRGBDSnapshot(
+        rgb=np.zeros((2, 2, 3), dtype=np.uint8),
+        depth_raw=None,
+        fx=1.0,
+        fy=1.0,
+        cx=0.5,
+        cy=0.5,
+        depth_scale_m=None,
+        depth_aligned_to=None,
+        depth_source=None,
+        timestamp=1.0,
+    )
+
+    prompt = build_base_pose_prompt(BasePoseConfig(task="adjust pose"), snapshot)
+
+    assert (
+        "Every MOVE_FORWARD or MOVE_BACKWARD command must specify a distance "
+        "greater than or equal to 0.3 meters."
+    ) in prompt
+    assert (
+        "If the desired positional correction is less than 0.3 meters, do not "
+        "output a translation below 0.3 meters."
+    ) in prompt
+    assert (
+        "Every MOVE_FORWARD or MOVE_BACKWARD value must be greater than or "
+        "equal to 0.3 meters."
+    ) in prompt
+    assert '"value": 0.3' in prompt
+    assert '"value": 0.0' not in prompt
 
 
 def test_validator_accepts_exact_two_degree_and_point_one_meter_minima() -> None:
