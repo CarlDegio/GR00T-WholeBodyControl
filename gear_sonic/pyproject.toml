@@ -33,6 +33,7 @@ license = {text = "Apache-2.0"}
 # pico_manager_thread_server.py + visualization (pyzmq, pyvista, pinocchio FK)
 # Usage: pip install -e "gear_sonic[teleop]"
 teleop = [
+    "casadi==3.7.0",
     "pyzmq",
     "msgpack",
     "pin",

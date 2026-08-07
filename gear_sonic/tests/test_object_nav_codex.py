@@ -7,6 +7,7 @@ import json
 import os
 from pathlib import Path
 import subprocess
+import sys
 from types import SimpleNamespace
 
 import numpy as np
@@ -59,6 +60,17 @@ def policy(*, action: str = "NAVIGATE", confidence: float = 0.9) -> dict[str, ob
         "rotation_angle_deg": 0.0 if boxable else None,
         "confidence": confidence,
         "distance_confidence": 0.7,
+        "stop_reasoning": "target reached" if action == "STOP" else "",
+    }
+
+
+def qwen_policy(*, action: str = "NAVIGATE") -> dict[str, object]:
+    return {
+        "action": action,
+        "bbox_2d": [450, 450, 550, 550] if action == "NAVIGATE" else None,
+        "target": "red chair",
+        "target_type": "global_target",
+        "confidence": 0.9,
         "stop_reasoning": "target reached" if action == "STOP" else "",
     }
 
@@ -344,7 +356,7 @@ def test_qwenvl_client_sends_local_image_and_validates_policy(tmp_path: Path) ->
             return SimpleNamespace(
                 choices=[
                     SimpleNamespace(
-                        message=SimpleNamespace(content=json.dumps(policy()))
+                        message=SimpleNamespace(content=json.dumps(qwen_policy()))
                     )
                 ]
             )
@@ -363,15 +375,57 @@ def test_qwenvl_client_sends_local_image_and_validates_policy(tmp_path: Path) ->
         cwd=tmp_path,
     )
 
-    assert result == policy()
+    assert result["action"] == "NAVIGATE"
+    assert result["bbox_2d"] == [450, 450, 550, 550]
+    assert result["estimated_distance_m"] is None
+    assert result["target_center_normalized"] == [500.0, 500.0]
+    assert result["target_center_pixel"] == [2.0, 2.0]
+    assert result["horizontal_offset_pixel"] == 0.0
+    assert result["camera_bearing_deg"] == 0.0
+    assert result["rotation_direction"] == "CENTERED"
+    assert result["rotation_angle_deg"] == 0.0
     assert calls[0]["model"] == "qwen3-vl-32b-instruct"
     assert calls[0]["timeout"] == 180.0
+    assert calls[0]["response_format"] == {"type": "json_object"}
+    assert calls[0]["extra_body"] == {"enable_thinking": False}
     messages = calls[0]["messages"]
     assert isinstance(messages, list)
     image_url = messages[0]["content"][0]["image_url"]["url"]
     assert image_url.startswith("data:image/png;base64,")
+    prompt = messages[0]["content"][1]["text"]
+    assert '"bbox_2d": [x1, y1, x2, y2] or null' in prompt
+    assert "Do not output target_center" in prompt
     assert qwen.last_auth_check_seconds == 0.0
     assert qwen.last_api_inference_seconds == pytest.approx(1.25)
+
+
+def test_qwenvl_derives_right_turn_from_bbox_and_camera_intrinsics(tmp_path: Path) -> None:
+    value = qwen_policy()
+    value["bbox_2d"] = [700, 400, 800, 600]
+
+    class FakeCompletions:
+        def create(self, **_kwargs: object) -> object:
+            return SimpleNamespace(
+                choices=[SimpleNamespace(message=SimpleNamespace(content=json.dumps(value)))]
+            )
+
+    image_path = tmp_path / "input.png"
+    image_path.write_bytes(b"png bytes")
+    client = SimpleNamespace(chat=SimpleNamespace(completions=FakeCompletions()))
+
+    result = QwenVLBBoxClient(client=client).locate(
+        image_path=image_path,
+        mission="find chair",
+        global_target="chair",
+        snapshot=replace(snapshot(), fx=2.0),
+        cwd=tmp_path,
+    )
+
+    assert result["target_center_pixel"] == [3.0, 2.0]
+    assert result["horizontal_offset_pixel"] == 1.0
+    assert result["camera_bearing_deg"] == pytest.approx(26.565, abs=0.001)
+    assert result["rotation_direction"] == "RIGHT"
+    assert result["rotation_angle_deg"] == pytest.approx(26.565, abs=0.001)
 
 
 def test_qwenvl_client_requires_api_key(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -379,6 +433,35 @@ def test_qwenvl_client_requires_api_key(monkeypatch: pytest.MonkeyPatch) -> None
 
     with pytest.raises(RuntimeError, match="DASHSCOPE_API_KEY"):
         QwenVLBBoxClient()
+
+
+def test_qwenvl_client_uses_isolated_http_proxy_and_ignores_environment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, object] = {}
+
+    class FakeHttpClient:
+        def __init__(self, **kwargs: object):
+            captured["httpx"] = kwargs
+
+    class FakeOpenAI:
+        def __init__(self, **kwargs: object):
+            captured["openai"] = kwargs
+
+    monkeypatch.setenv("ALL_PROXY", "socks://127.0.0.1:7890/")
+    monkeypatch.setitem(sys.modules, "httpx", SimpleNamespace(Client=FakeHttpClient))
+    monkeypatch.setitem(sys.modules, "openai", SimpleNamespace(OpenAI=FakeOpenAI))
+
+    QwenVLBBoxClient(
+        api_key="test-key",
+        proxy_url="http://127.0.0.1:7890",
+    )
+
+    assert captured["httpx"] == {
+        "proxy": "http://127.0.0.1:7890",
+        "trust_env": False,
+    }
+    assert captured["openai"]["http_client"].__class__ is FakeHttpClient
 
 
 def test_empty_proxy_overrides_remove_inherited_values(monkeypatch: pytest.MonkeyPatch) -> None:

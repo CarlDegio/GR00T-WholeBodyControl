@@ -1,76 +1,35 @@
 #!/usr/bin/env python3
-"""Publish one-shot LaViRA ObjectNav commands through the REASAN input."""
+"""LaViRA semantic target selector and LISTEN_WASD/NAV keyboard state machine."""
 
 from __future__ import annotations
 
 from contextlib import contextmanager
 from dataclasses import dataclass
-import importlib
+import json
 import math
 import queue
 import select
-import signal
 import sys
 import termios
 import threading
 import time
 import tty
-import types
 from typing import Any, Callable, Iterator, Literal, Mapping, TextIO
 
 import zmq
 
-from gear_sonic.utils.inference.object_nav import (
-    ObjectNavConfig,
-    ObjectNavResult,
-    ObjectNavRunner,
-)
+from gear_sonic.scripts.navdp_planner import build_navigation_message
+from gear_sonic.utils.inference.object_nav import ObjectNavConfig, ObjectNavResult, ObjectNavRunner
 
 
-_ZERO_TOLERANCE = 1.0e-9
-_STOP_VELOCITY = (0.0, 0.0, 0.0)
-_MANUAL_KEYS = frozenset("wsadqe")
-_MANUAL_HOLD_TIMEOUT = 0.55
-_PHASE_LABELS = {
-    "listen_wasd": "LISTEN_WASD",
-    "nav": "NAV",
+MANUAL = {
+    "w": ("forward", (0.3, 0.0, 0.0)),
+    "s": ("backward", (-0.3, 0.0, 0.0)),
+    "a": ("move_left", (0.0, 0.15, 0.0)),
+    "d": ("move_right", (0.0, -0.15, 0.0)),
+    "q": ("turn_left", (0.0, 0.0, 0.5)),
+    "e": ("turn_right", (0.0, 0.0, -0.5)),
 }
-
-
-class CommandValidationError(ValueError):
-    """Raised before motion when an ObjectNav command batch is unsafe."""
-
-
-class PlannerBusyError(RuntimeError):
-    """Raised when a second command batch is started while one is active."""
-
-
-class _PlannerTermination(BaseException):
-    """Immediately unwind main-thread control flow into planner cleanup."""
-
-
-class _TerminationControl:
-    def __init__(self) -> None:
-        self.requested = False
-
-    def running(self) -> bool:
-        return not self.requested
-
-    def request(self, _signum: int, _frame: Any) -> None:
-        if self.requested:
-            return
-        self.requested = True
-        raise _PlannerTermination
-
-
-def _install_termination_handlers(
-    termination: _TerminationControl,
-    *,
-    register: Callable[[int, Any], Any] = signal.signal,
-) -> None:
-    register(signal.SIGHUP, termination.request)
-    register(signal.SIGINT, termination.request)
-    register(signal.SIGTERM, termination.request)
 
 
 @dataclass
@@ -85,40 +44,15 @@ class LaviraPlannerConfig:
     debug: bool = False
     host: str = "*"
     port: int = 5558
+    status_host: str = "127.0.0.1"
+    status_port: int = 5559
     planner_hz: float = 20.0
-    transition_pause: float = 0.5
-    final_stop_count: int = 3
-    max_speed: float = 0.5
-    max_duration: float = 30.0
-    max_abs_yaw: float = math.pi
     camera_host: str = "localhost"
     camera_port: int = 5555
-    camera_timeout_ms: int = 3000
+    camera_timeout_ms: int = 15000
     codex_timeout_seconds: float = 180.0
     min_confidence: float = 0.6
-    rotation_speed: float = 0.4
-    forward_speed: float = 0.3
-    target_standoff_distance: float = 0.0
-    max_direct_travel: float = 8.0
     output_root: str = "outputs/object_nav"
-
-
-@dataclass(frozen=True)
-class VelocityCommand:
-    vx: float
-    vy: float
-    wz: float
-    duration: float
-
-    @property
-    def velocity(self) -> tuple[float, float, float]:
-        return (self.vx, self.vy, self.wz)
-
-
-@dataclass(frozen=True)
-class ObjectNavBatch:
-    rotation: VelocityCommand
-    translation: VelocityCommand
 
 
 @dataclass(frozen=True)
@@ -128,631 +62,163 @@ class WorkerResult:
     error: str | None
 
 
-def _keyboard_module() -> Any:
-    """Load the unchanged keyboard helpers when the CLI-only tyro is absent."""
-    module_name = "gear_sonic.scripts.keyboard_planner_thread_server"
-    try:
-        return importlib.import_module(module_name)
-    except ModuleNotFoundError as exc:
-        if exc.name != "tyro":
-            raise
-        placeholder = types.ModuleType("tyro")
-        placeholder.cli = None  # type: ignore[attr-defined]
-        sys.modules["tyro"] = placeholder
-        try:
-            return importlib.import_module(module_name)
-        finally:
-            if sys.modules.get("tyro") is placeholder:
-                del sys.modules["tyro"]
-
-
-def build_reasan_velocity_message(
-    command: VelocityCommand, *, action: str
-) -> str:
-    """Adapt a velocity command through the existing keyboard JSON builder."""
-    return _keyboard_module().build_navila_message(
-        action,
-        command.velocity,
-        command.duration,
-        raw_text="lavira object nav",
-    )
-
-
-def _finite_number(command: Mapping[str, Any], field: str, index: int) -> float:
-    if field not in command:
-        raise CommandValidationError(f"commands[{index}] missing {field}")
-    value = command[field]
-    if isinstance(value, bool) or not isinstance(value, (int, float)):
-        raise CommandValidationError(f"commands[{index}].{field} must be numeric")
-    result = float(value)
-    if not math.isfinite(result):
-        raise CommandValidationError(f"commands[{index}].{field} must be finite")
-    return result
-
-
-def _velocity_command(value: Any, index: int) -> VelocityCommand:
-    if not isinstance(value, Mapping):
-        raise CommandValidationError(f"commands[{index}] must be an object")
-    return VelocityCommand(
-        vx=_finite_number(value, "vx", index),
-        vy=_finite_number(value, "vy", index),
-        wz=_finite_number(value, "wz", index),
-        duration=_finite_number(value, "duration", index),
-    )
-
-
-def _valid_positive_limit(value: Any) -> bool:
-    return (
-        not isinstance(value, bool)
-        and isinstance(value, (int, float))
-        and math.isfinite(value)
-        and value > 0.0
-    )
-
-
-def validate_object_nav_batch(
-    payload: Any,
-    *,
-    max_speed: float = 0.5,
-    max_duration: float = 30.0,
-    max_abs_yaw: float = math.pi,
-    min_positive_duration: float = 0.05,
-) -> ObjectNavBatch:
-    """Return one validated pure-rotation then pure-translation batch."""
-    if not isinstance(payload, Mapping):
-        raise CommandValidationError("request must be a JSON object")
-    commands = payload.get("commands")
-    if not isinstance(commands, list) or len(commands) != 2:
-        raise CommandValidationError("commands must contain exactly two entries")
-    if not all(
-        _valid_positive_limit(value)
-        for value in (max_speed, max_duration, max_abs_yaw)
-    ):
-        raise ValueError("planner safety limits must be finite and positive")
-    if (
-        isinstance(min_positive_duration, bool)
-        or not isinstance(min_positive_duration, (int, float))
-        or not math.isfinite(min_positive_duration)
-        or min_positive_duration < 0.0
-    ):
-        raise ValueError("min_positive_duration must be finite and non-negative")
-
-    rotation = _velocity_command(commands[0], 0)
-    translation = _velocity_command(commands[1], 1)
-    for index, command in enumerate((rotation, translation)):
-        if command.duration < 0.0:
-            raise CommandValidationError(
-                f"commands[{index}].duration must be non-negative"
-            )
-        if command.duration > max_duration:
-            raise CommandValidationError(
-                f"commands[{index}].duration exceeds limit"
-            )
-        if 0.0 < command.duration < min_positive_duration:
-            raise CommandValidationError(
-                f"commands[{index}].duration is shorter than publish period"
-            )
-
-    if math.hypot(rotation.vx, rotation.vy) > _ZERO_TOLERANCE:
-        raise CommandValidationError("commands[0] must be pure rotation")
-    if abs(translation.wz) > _ZERO_TOLERANCE:
-        raise CommandValidationError("commands[1] must be pure translation")
-    if math.hypot(translation.vx, translation.vy) > max_speed:
-        raise CommandValidationError("commands[1] speed exceeds limit")
-    if abs(rotation.wz * rotation.duration) > max_abs_yaw:
-        raise CommandValidationError("commands[0] yaw exceeds limit")
-    return ObjectNavBatch(rotation=rotation, translation=translation)
-
-
-class LaviraPlannerController:
-    """Advance one validated ObjectNav result without blocking the main thread."""
-
-    def __init__(
-        self,
-        *,
-        transition_pause: float = 0.5,
-        max_speed: float = 0.5,
-        max_duration: float = 30.0,
-        max_abs_yaw: float = math.pi,
-        min_positive_duration: float = 0.05,
-    ):
-        if (
-            isinstance(transition_pause, bool)
-            or not isinstance(transition_pause, (int, float))
-            or not math.isfinite(transition_pause)
-            or transition_pause < 0.0
-        ):
-            raise ValueError("transition_pause must be finite and non-negative")
-        if not _valid_positive_limit(min_positive_duration):
-            raise ValueError("min_positive_duration must be finite and positive")
-        validate_object_nav_batch(
-            {"commands": [
-                {"vx": 0.0, "vy": 0.0, "wz": 0.0, "duration": 0.0},
-                {"vx": 0.0, "vy": 0.0, "wz": 0.0, "duration": 0.0},
-            ]},
-            max_speed=max_speed,
-            max_duration=max_duration,
-            max_abs_yaw=max_abs_yaw,
-            min_positive_duration=min_positive_duration,
-        )
-        self.transition_pause = float(transition_pause)
-        self.max_speed = float(max_speed)
-        self.max_duration = float(max_duration)
-        self.max_abs_yaw = float(max_abs_yaw)
-        self.min_positive_duration = float(min_positive_duration)
-        self.phase = "idle"
-        self.failure_reason: str | None = None
-        self._batch: ObjectNavBatch | None = None
-        self._deadline = 0.0
-
-    @property
-    def active(self) -> bool:
-        return self.phase != "idle"
-
-    def start(self, result: ObjectNavResult, now: float) -> None:
-        if self.active:
-            raise PlannerBusyError("a planner request is already active")
-        timestamp = self._timestamp(now)
-        outcome = getattr(result, "outcome", None)
-        if outcome != "NAVIGATE":
-            reason = None if outcome == "STOP" else f"object_nav_{outcome or 'invalid'}"
-            self._finish_to_idle(reason)
-            return
-        try:
-            batch = validate_object_nav_batch(
-                result.commands,
-                max_speed=self.max_speed,
-                max_duration=self.max_duration,
-                max_abs_yaw=self.max_abs_yaw,
-                min_positive_duration=self.min_positive_duration,
-            )
-        except (CommandValidationError, TypeError, ValueError, AttributeError) as exc:
-            self._finish_to_idle(f"invalid_commands: {exc}")
-            return
-
-        self._batch = batch
-        self.failure_reason = None
-        if batch.rotation.duration > 0.0:
-            self.phase = "rotating"
-            self._deadline = timestamp + batch.rotation.duration
-        else:
-            self.phase = "transition_pause"
-            self._deadline = timestamp + self.transition_pause
-
-    def cancel(self, reason: str) -> None:
-        self._finish_to_idle(str(reason))
-
-    def abort_to_idle(self, reason: str) -> None:
-        """Abort automatic motion immediately for a manual-control takeover."""
-        self.phase = "idle"
-        self.failure_reason = str(reason)
-        self._batch = None
-
-    def step(self, now: float) -> VelocityCommand:
-        timestamp = self._timestamp(now)
-        while self.phase in {"rotating", "transition_pause", "translating"}:
-            if timestamp + 1.0e-12 < self._deadline:
-                break
-            if self.phase == "rotating":
-                self.phase = "transition_pause"
-                self._deadline = timestamp + self.transition_pause
-                break
-            if self.phase == "transition_pause":
-                assert self._batch is not None
-                if self._batch.translation.duration > 0.0:
-                    self.phase = "translating"
-                    self._deadline += self._batch.translation.duration
-                    continue
-                self._finish_to_idle(None)
-                break
-            self._finish_to_idle(None)
-            break
-
-        if self.phase == "rotating":
-            assert self._batch is not None
-            return self._batch.rotation
-        if self.phase == "translating":
-            assert self._batch is not None
-            return self._batch.translation
-        return self._stop_command()
-
-    @staticmethod
-    def _timestamp(now: float) -> float:
-        if isinstance(now, bool) or not isinstance(now, (int, float)):
-            raise ValueError("now must be finite")
-        timestamp = float(now)
-        if not math.isfinite(timestamp):
-            raise ValueError("now must be finite")
-        return timestamp
-
-    def _stop_command(self) -> VelocityCommand:
-        return VelocityCommand(*_STOP_VELOCITY, self.min_positive_duration)
-
-    def _finish_to_idle(self, reason: str | None) -> None:
-        self.phase = "idle"
-        self.failure_reason = reason
-        self._batch = None
+def result_to_goal(result: ObjectNavResult) -> tuple[float, float]:
+    """Use depth-derived range/bearing; x is forward and y is left."""
+    distance = float(result.geometry["mean_range"])
+    angle = math.radians(float(result.geometry["angle_deg"]))
+    return distance * math.cos(angle), distance * math.sin(angle)
 
 
 class LaviraPlannerRuntime:
-    """Coordinate keyboard, generation-tagged inference, and publication."""
-
     def __init__(
         self,
         config: LaviraPlannerConfig,
         *,
         publish: Callable[[str], None],
-        sleep: Callable[[float], None] = time.sleep,
-        request_queue: queue.Queue[int | None] | None = None,
-        result_queue: queue.Queue[WorkerResult] | None = None,
-        worker_stop_event: threading.Event | None = None,
         logger: Callable[[str], None] = print,
-    ):
-        self._validate_config(config)
+    ) -> None:
         self.config = config
         self.publish = publish
-        self._sleep = sleep
-        self.request_queue = request_queue or queue.Queue(maxsize=1)
-        self.result_queue = result_queue or queue.Queue(maxsize=1)
-        self.worker_stop_event = worker_stop_event or threading.Event()
-        self._logger = logger
-        self.controller = LaviraPlannerController(
-            transition_pause=config.transition_pause,
-            max_speed=config.max_speed,
-            max_duration=config.max_duration,
-            max_abs_yaw=config.max_abs_yaw,
-            min_positive_duration=1.0 / config.planner_hz,
-        )
+        self.logger = logger
         self.generation = 0
-        self._pending_generation: int | None = None
-        self._next_publish_at: float | None = None
-        self._manual_action = "stop"
-        self._manual_command = self._stop_command()
-        self._manual_deadline = 0.0
-        self._last_logged_phase: str | None = None
-        self._log_phase_transition()
+        self.state = "listen_wasd"
+        self.pending_generation: int | None = None
+        self.requests: queue.Queue[int | None] = queue.Queue(maxsize=1)
+        self.results: queue.Queue[WorkerResult] = queue.Queue(maxsize=1)
+        self.stop_event = threading.Event()
+        self.manual_velocity = (0.0, 0.0, 0.0)
+        self.manual_deadline = 0.0
 
     @property
     def phase(self) -> str:
-        if self._pending_generation is not None or self.controller.active:
-            return "nav"
-        return "listen_wasd"
+        return self.state
 
-    def handle_key(
-        self,
-        key: str,
-        *,
-        now: float,
-        running: Callable[[], bool] = lambda: True,
-    ) -> str:
-        normalized = str(key).lower()
+    def _send(self, mode: str, **kwargs: Any) -> None:
+        self.publish(build_navigation_message(mode=mode, generation=self.generation, **kwargs))
+
+    def stop(self, reason: str) -> None:
+        self.generation += 1
+        self.pending_generation = None
+        self.state = "listen_wasd"
+        self.manual_velocity = (0.0, 0.0, 0.0)
+        self._send("stop")
+        self.logger(f"[LaViRA] LISTEN_WASD ({reason})")
+
+    def handle_key(self, key: str, *, now: float) -> str:
+        normalized = key.lower()
         if normalized == "x":
-            self._cancel_and_publish_stops("exit", now)
+            self.stop("exit")
             return "exit"
         if key == " ":
-            self._return_to_listen("operator_stop", now)
+            self.stop("operator_stop")
             return "cancelled"
         if normalized == "n":
-            if self.phase != "listen_wasd" or self.worker_stop_event.is_set():
-                self._logger("[LaViRA] BUSY navigation request rejected")
+            if self.state != "listen_wasd" or self.pending_generation is not None:
                 return "busy"
-            self._clear_manual_command()
-            self._publish_command(self._stop_command(), "stop")
-            candidate = self.generation + 1
-            try:
-                self.request_queue.put_nowait(candidate)
-            except queue.Full:
-                self._logger("[LaViRA] BUSY navigation request rejected")
-                return "busy"
-            self.generation = candidate
-            self._pending_generation = candidate
-            self._log_phase_transition()
+            self.generation += 1
+            self.pending_generation = self.generation
+            self.state = "nav"
+            self._send("stop")
+            self.requests.put_nowait(self.generation)
+            self.logger(f"[LaViRA] NAV generation={self.generation}")
             return "started"
-        if normalized in _MANUAL_KEYS:
-            if self.phase != "listen_wasd":
+        if normalized in MANUAL:
+            if self.state != "listen_wasd":
                 return "ignored"
-            manual_config, commands = self._manual_commands()
-            action, velocity = commands[normalized]
-            self._manual_action = action
-            self._manual_command = VelocityCommand(
-                *velocity, 1.0 / self.config.planner_hz
-            )
-            self._manual_deadline = self.controller._timestamp(now) + _MANUAL_HOLD_TIMEOUT
-            self._next_publish_at = self.controller._timestamp(now)
+            _, self.manual_velocity = MANUAL[normalized]
+            self.manual_deadline = now + 0.55
+            self._send("manual_velocity", velocity=self.manual_velocity)
             return "manual"
         return "ignored"
 
-    def accept_worker_result(self, item: WorkerResult, *, now: float) -> bool:
-        if (
-            self._pending_generation is None
-            or item.generation != self._pending_generation
-            or item.generation != self.generation
-        ):
+    def tick(self, now: float) -> None:
+        while True:
+            try:
+                item = self.results.get_nowait()
+            except queue.Empty:
+                break
+            if item.generation != self.generation or item.generation != self.pending_generation:
+                continue
+            self.pending_generation = None
+            if item.error or item.result is None or item.result.outcome != "NAVIGATE":
+                self.stop(item.error or f"lavira_{getattr(item.result, 'outcome', 'failed')}")
+                continue
+            try:
+                goal = result_to_goal(item.result)
+                policy = item.result.policy
+                self._send(
+                    "nav_goal",
+                    goal_base=goal,
+                    target=str(policy.get("target", self.config.global_target)),
+                    target_type=str(policy.get("target_type", "global_target")),
+                    confidence=float(policy.get("confidence", 0.0)),
+                )
+            except Exception as exc:
+                self.stop(f"invalid_goal: {exc}")
+        if self.state == "listen_wasd" and now >= self.manual_deadline and any(self.manual_velocity):
+            self.manual_velocity = (0.0, 0.0, 0.0)
+            self._send("manual_velocity", velocity=self.manual_velocity)
+
+    def accept_status(self, message: str | bytes | Mapping[str, Any]) -> bool:
+        payload = json.loads(message) if isinstance(message, (str, bytes)) else dict(message)
+        if payload.get("type") != "sonic_navigation_status" or int(payload.get("generation", -1)) != self.generation:
             return False
-        self._pending_generation = None
-        if item.error is not None or item.result is None:
-            reason = item.error or "inference returned no result"
-            self._logger(f"[LaViRA] FAILURE {reason}")
-            self.controller.cancel(reason)
-        else:
-            self._log_latency(item.result)
-            self.controller.start(item.result, now)
-            if self.controller.failure_reason is not None:
-                self._logger(f"[LaViRA] FAILURE {self.controller.failure_reason}")
-        self._next_publish_at = self.controller._timestamp(now)
-        self._log_phase_transition()
-        if not self.controller.active:
-            self._publish_stop_sequence()
-            self._next_publish_at = None
+        if payload.get("state") in {"reached", "failed", "stopped"}:
+            self.stop(f"navdp_{payload.get('state')}: {payload.get('reason', '')}")
         return True
 
-    def _log_latency(self, result: ObjectNavResult) -> None:
-        timing = result.geometry.get("timing_s")
-        if not isinstance(timing, Mapping):
-            return
+    def shutdown(self) -> None:
+        self.stop_event.set()
+        self.stop("shutdown")
         try:
-            values = {
-                name: float(timing[name])
-                for name in (
-                    "camera_rgbd",
-                    "image_io",
-                    "auth_check",
-                    "api_inference",
-                    "postprocess",
-                    "total",
-                )
-            }
-        except (KeyError, TypeError, ValueError):
-            return
-        self._logger(
-            "[LaViRA] latency "
-            f"total={values['total']:.3f}s api={values['api_inference']:.3f}s "
-            f"auth={values['auth_check']:.3f}s camera={values['camera_rgbd']:.3f}s "
-            f"io={values['image_io']:.3f}s post={values['postprocess']:.3f}s"
-        )
-
-    def poll_worker_results(self, *, now: float) -> int:
-        accepted = 0
-        while True:
-            try:
-                item = self.result_queue.get_nowait()
-            except queue.Empty:
-                return accepted
-            accepted += int(self.accept_worker_result(item, now=now))
-
-    def publish_due(
-        self,
-        now: float,
-        *,
-        running: Callable[[], bool] = lambda: True,
-    ) -> VelocityCommand | None:
-        timestamp = self.controller._timestamp(now)
-        if self.phase == "listen_wasd":
-            if self._next_publish_at is None:
-                self._next_publish_at = timestamp
-            if timestamp + 1.0e-12 < self._next_publish_at:
-                return None
-            if timestamp + 1.0e-12 >= self._manual_deadline:
-                self._clear_manual_command()
-            command = self._manual_command
-            if not running():
-                return None
-            self._publish_command(command, self._manual_action)
-            self._next_publish_at = timestamp + 1.0 / self.config.planner_hz
-            return command
-        if not self.controller.active:
-            self._next_publish_at = None
-            return None
-        if self._next_publish_at is None:
-            self._next_publish_at = timestamp
-        if timestamp + 1.0e-12 < self._next_publish_at:
-            return None
-        command = self.controller.step(timestamp)
-        if not running():
-            self.controller.cancel("termination_requested")
-            self._logger("[LaViRA] CANCEL termination_requested")
-            self._log_phase_transition()
-            self._next_publish_at = None
-            return None
-        self._publish_command(command, self._action(command))
-        self._log_phase_transition()
-        self._next_publish_at = timestamp + 1.0 / self.config.planner_hz
-        return command
-
-    def shutdown(self, reason: str = "shutdown") -> None:
-        self.worker_stop_event.set()
-        self._replace_requests_with_shutdown()
-        self._cancel_and_publish_stops(reason, time.monotonic())
-
-    def _replace_requests_with_shutdown(self) -> None:
-        while True:
-            while True:
-                try:
-                    self.request_queue.get_nowait()
-                except queue.Empty:
-                    break
-            try:
-                self.request_queue.put_nowait(None)
-                return
-            except queue.Full:
-                continue
-
-    def _cancel_and_publish_stops(self, reason: str, now: float) -> None:
-        self.generation += 1
-        self._pending_generation = None
-        self.controller.cancel(reason)
-        self._logger(f"[LaViRA] CANCEL {reason}")
-        self._log_phase_transition()
-        self._publish_stop_sequence()
-        self._next_publish_at = None
-
-    def _return_to_listen(self, reason: str, now: float) -> None:
-        if self.phase == "nav":
-            self.generation += 1
-            self._pending_generation = None
-            self.controller.cancel(reason)
-            self._logger(f"[LaViRA] CANCEL {reason}")
-        self._clear_manual_command()
-        self._publish_command(self._stop_command(), "stop")
-        self._next_publish_at = self.controller._timestamp(now) + 1.0 / self.config.planner_hz
-        self._log_phase_transition()
-
-    def _publish_stop_sequence(self) -> None:
-        stop = VelocityCommand(*_STOP_VELOCITY, 1.0 / self.config.planner_hz)
-        for _ in range(self.config.final_stop_count):
-            self.publish(build_reasan_velocity_message(stop, action="stop"))
-            self._sleep(1.0 / self.config.planner_hz)
-
-    def _clear_manual_command(self) -> None:
-        self._manual_action = "stop"
-        self._manual_command = self._stop_command()
-        self._manual_deadline = 0.0
-
-    def _stop_command(self) -> VelocityCommand:
-        return VelocityCommand(*_STOP_VELOCITY, 1.0 / self.config.planner_hz)
-
-    def _publish_command(self, command: VelocityCommand, action: str) -> None:
-        self.publish(build_reasan_velocity_message(command, action=action))
-
-    def _log_phase_transition(self) -> None:
-        phase = self.phase
-        if phase == self._last_logged_phase:
-            return
-        self._last_logged_phase = phase
-        self._logger(f"[LaViRA] STATE {_PHASE_LABELS[phase]}")
-
-    def _manual_commands(
-        self,
-    ) -> tuple[Any, dict[str, tuple[str, tuple[float, float, float]]]]:
-        keyboard = _keyboard_module()
-        manual_config = keyboard.KeyboardPlannerConfig()
-        return manual_config, keyboard.key_commands(manual_config)
-
-    @staticmethod
-    def _action(command: VelocityCommand) -> str:
-        if all(abs(value) <= _ZERO_TOLERANCE for value in command.velocity):
-            return "stop"
-        if command.wz > _ZERO_TOLERANCE:
-            return "turn_left"
-        if command.wz < -_ZERO_TOLERANCE:
-            return "turn_right"
-        return "move_forward"
-
-    @staticmethod
-    def _validate_config(config: LaviraPlannerConfig) -> None:
-        if not config.mission.strip() or not config.global_target.strip():
-            raise ValueError("mission and global_target are required")
-        for name in (
-            "planner_hz",
-            "max_speed",
-            "max_duration",
-            "max_abs_yaw",
-        ):
-            if not _valid_positive_limit(getattr(config, name)):
-                raise ValueError(f"{name} must be finite and positive")
-        if isinstance(config.final_stop_count, bool) or not isinstance(
-            config.final_stop_count, int
-        ) or config.final_stop_count < 3:
-            raise ValueError("final_stop_count must be an integer of at least three")
-
-
-def _offer_worker_result(
-    results: queue.Queue[WorkerResult], item: WorkerResult
-) -> None:
-    try:
-        results.put_nowait(item)
-        return
-    except queue.Full:
-        pass
-    try:
-        results.get_nowait()
-    except queue.Empty:
-        pass
-    results.put_nowait(item)
+            self.requests.put_nowait(None)
+        except queue.Full:
+            pass
 
 
 def run_inference_worker(
-    runner_factory: Callable[[], ObjectNavRunner],
-    requests: queue.Queue[int | None],
-    results: queue.Queue[WorkerResult],
-    stop_event: threading.Event | None = None,
-    *,
-    warmup: bool = False,
-    logger: Callable[[str], None] = print,
+    factory: Callable[[], ObjectNavRunner], runtime: LaviraPlannerRuntime
 ) -> None:
-    """Run one AgentNav request at a time and tag every result by generation."""
-    stopping = stop_event or threading.Event()
     runner: ObjectNavRunner | None = None
     try:
-        if warmup and not stopping.is_set():
-            runner = runner_factory()
-            logger("[LaViRA] warmup started")
+        if runtime.config.warmup and not runtime.stop_event.is_set():
+            runner = factory()
+            runtime.logger("[LaViRA] warmup started")
+            runner.warmup()
+            runtime.logger("[LaViRA] warmup complete")
+        while not runtime.stop_event.is_set():
+            generation = runtime.requests.get()
+            if generation is None:
+                break
             try:
-                warmup_result = runner.warmup()
-                total = warmup_result.geometry.get("timing_s", {}).get("total")
-                if warmup_result.error:
-                    logger(f"[LaViRA] warmup failed: {warmup_result.error}")
-                elif isinstance(total, (int, float)):
-                    logger(f"[LaViRA] warmup complete total={float(total):.3f}s")
-                else:
-                    logger("[LaViRA] warmup complete")
-            except Exception as exc:
-                logger(f"[LaViRA] warmup failed: {exc}")
-        while not stopping.is_set():
-            generation = requests.get()
-            if generation is None or stopping.is_set():
-                return
-            try:
-                if runner is None:
-                    runner = runner_factory()
-                if stopping.is_set():
-                    return
-                nav_result = runner.run_once()
-                item = WorkerResult(generation, nav_result, None)
+                runner = runner or factory()
+                item = WorkerResult(generation, runner.run_once(), None)
             except Exception as exc:
                 item = WorkerResult(generation, None, str(exc))
-            if stopping.is_set():
-                return
-            _offer_worker_result(results, item)
+            try:
+                runtime.results.put_nowait(item)
+            except queue.Full:
+                pass
     finally:
         if runner is not None:
             runner.close()
 
 
-def run_planner_loop(
-    runtime: LaviraPlannerRuntime,
-    *,
-    read_key: Callable[[], str | None],
-    monotonic: Callable[[], float] = time.monotonic,
-    sleep: Callable[[float], None] = time.sleep,
-    running: Callable[[], bool] = lambda: True,
-) -> None:
-    """Run the responsive main-thread event loop with guaranteed shutdown stops."""
-    try:
-        try:
-            while running():
-                now = monotonic()
-                key = read_key()
-                decision = (
-                    runtime.handle_key(key, now=now, running=running)
-                    if key is not None
-                    else None
-                )
-                if not running():
-                    break
-                if decision == "exit":
-                    break
-                runtime.poll_worker_results(now=now)
-                if not running():
-                    break
-                runtime.publish_due(now, running=running)
-                if not running():
-                    break
-                sleep(min(0.01, 0.25 / runtime.config.planner_hz))
-        except (_PlannerTermination, KeyboardInterrupt):
-            pass
-    finally:
-        runtime.shutdown("loop_exit")
+def _runner(config: LaviraPlannerConfig) -> ObjectNavRunner:
+    return ObjectNavRunner(ObjectNavConfig(
+        mission=config.mission,
+        global_target=config.global_target,
+        vision_backend=config.vision_backend,
+        model=config.model,
+        qwenvl_model=config.qwenvl_model,
+        qwenvl_base_url=config.qwenvl_base_url,
+        camera_host=config.camera_host,
+        camera_port=config.camera_port,
+        camera_timeout_ms=config.camera_timeout_ms,
+        codex_timeout_seconds=config.codex_timeout_seconds,
+        min_confidence=config.min_confidence,
+        output_root=config.output_root,
+    ))
 
 
 def read_key_nonblocking(stream: TextIO = sys.stdin) -> str | None:
@@ -773,67 +239,33 @@ def cbreak_terminal(stream: TextIO = sys.stdin) -> Iterator[None]:
         termios.tcsetattr(descriptor, termios.TCSADRAIN, original)
 
 
-def _runner_factory(config: LaviraPlannerConfig) -> ObjectNavRunner:
-    return ObjectNavRunner(
-        ObjectNavConfig(
-            mission=config.mission,
-            global_target=config.global_target,
-            vision_backend=config.vision_backend,
-            model=config.model,
-            qwenvl_model=config.qwenvl_model,
-            qwenvl_base_url=config.qwenvl_base_url,
-            camera_host=config.camera_host,
-            camera_port=config.camera_port,
-            camera_timeout_ms=config.camera_timeout_ms,
-            codex_timeout_seconds=config.codex_timeout_seconds,
-            min_confidence=config.min_confidence,
-            rotation_speed=config.rotation_speed,
-            forward_speed=config.forward_speed,
-            target_standoff_distance=config.target_standoff_distance,
-            max_direct_travel=config.max_direct_travel,
-            output_root=config.output_root,
-        )
-    )
-
-
 def main(config: LaviraPlannerConfig) -> None:
     context = zmq.Context.instance()
-    socket = context.socket(zmq.PUB)
-    socket.setsockopt(zmq.LINGER, 0)
-    endpoint = f"tcp://{config.host}:{config.port}"
-    socket.bind(endpoint)
-    runtime = LaviraPlannerRuntime(config, publish=socket.send_string)
-    worker = threading.Thread(
-        target=run_inference_worker,
-        args=(
-            lambda: _runner_factory(config),
-            runtime.request_queue,
-            runtime.result_queue,
-            runtime.worker_stop_event,
-        ),
-        kwargs={"warmup": config.warmup, "logger": print},
-        name="lavira-object-nav",
-        daemon=True,
-    )
+    publisher = context.socket(zmq.PUB)
+    publisher.bind(f"tcp://{config.host}:{config.port}")
+    status = context.socket(zmq.SUB)
+    status.connect(f"tcp://{config.status_host}:{config.status_port}")
+    status.setsockopt_string(zmq.SUBSCRIBE, "")
+    runtime = LaviraPlannerRuntime(config, publish=publisher.send_string)
+    worker = threading.Thread(target=run_inference_worker, args=(lambda: _runner(config), runtime), daemon=True)
     worker.start()
-    termination = _TerminationControl()
+    print("[LaViRA] LISTEN_WASD: W/S/A/D/Q/E | N: NAV | Space: stop | X: exit")
     try:
-        try:
-            _install_termination_handlers(termination)
-            print(f"[LaViRA] PUB bound to {endpoint}; mission={config.mission!r}")
-            print("[LaViRA] N navigate | W/S/A/D/Q/E manual | Space stop | X exit")
-            with cbreak_terminal():
-                run_planner_loop(
-                    runtime,
-                    read_key=read_key_nonblocking,
-                    running=termination.running,
-                )
-        except (_PlannerTermination, KeyboardInterrupt):
-            pass
+        with cbreak_terminal():
+            while True:
+                key = read_key_nonblocking()
+                if key is not None and runtime.handle_key(key, now=time.monotonic()) == "exit":
+                    break
+                while status.poll(0):
+                    runtime.accept_status(status.recv())
+                runtime.tick(time.monotonic())
+                time.sleep(0.01)
+    except KeyboardInterrupt:
+        pass
     finally:
-        runtime.shutdown("main_exit")
-        socket.close()
-        print("[LaViRA] Stopped")
+        runtime.shutdown()
+        publisher.close(0)
+        status.close(0)
 
 
 if __name__ == "__main__":

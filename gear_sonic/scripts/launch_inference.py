@@ -159,8 +159,8 @@ class InferenceLaunchConfig:
     keyboard_planner_host: str = "localhost"
     """Keyboard planner sidecar host."""
 
-    planner_input: Literal["keyboard", "lavira"] = "keyboard"
-    """REASEN command source used in pane 3."""
+    planner_input: Literal["keyboard", "lavira"] = "lavira"
+    """Navigation keyboard and semantic target source used in pane 3."""
 
     lavira_mission: str = ""
     """Mission sent to LaViRA when --planner-input lavira is selected."""
@@ -192,21 +192,6 @@ class InferenceLaunchConfig:
     lavira_planner_hz: float = 20.0
     """LaViRA velocity publication rate (Hz)."""
 
-    lavira_transition_pause: float = 0.5
-    """LaViRA stop duration between rotation and translation (s)."""
-
-    lavira_final_stop_count: int = 3
-    """Number of final zero-velocity messages published by LaViRA."""
-
-    lavira_max_speed: float = 0.5
-    """LaViRA maximum translation speed (m/s)."""
-
-    lavira_max_duration: float = 30.0
-    """LaViRA maximum command duration (s)."""
-
-    lavira_max_abs_yaw: float = 3.141592653589793
-    """LaViRA maximum relative yaw (rad)."""
-
     lavira_camera_timeout_ms: int = 15000
     """LaViRA pure LingBot RGB-D receive timeout (ms)."""
 
@@ -219,32 +204,20 @@ class InferenceLaunchConfig:
     lavira_min_confidence: float = 0.6
     """Minimum Codex target confidence accepted by LaViRA."""
 
-    lavira_rotation_speed: float = 0.4
-    """LaViRA automatic rotation speed (rad/s)."""
-
-    lavira_forward_speed: float = 0.3
-    """LaViRA automatic forward speed (m/s)."""
-
-    lavira_target_standoff_distance: float = 0.0
-    """LaViRA target standoff distance (m)."""
-
-    lavira_max_direct_travel: float = 8.0
-    """LaViRA maximum automatic direct travel distance (m)."""
-
     lavira_output_root: str = "outputs/object_nav"
     """Directory where LaViRA stores ObjectNav diagnostics."""
 
-    reasan_ray_port: int = 5562
-    """MID-360 ActorRay publisher port."""
+    navdp_output_port: int = 5563
+    """NavDP planner publisher port consumed by VLA inference."""
 
-    reasan_avoidance: bool = True
-    """Run the MID-360 rule-based forward protective stop."""
-
-    reasan_planner_port: int = 5563
-    """Filtered SONIC planner publisher port consumed by VLA inference."""
-
-    reasan_radar_interface: str = "enx6c1ff7bed314"
-    """Network interface connected to the G1 MID-360."""
+    navdp_root: str = "/home/user/Project/NavDP/baselines/navdp"
+    navdp_checkpoint: str = "/home/user/Downloads/navdp-cross-modal.ckpt"
+    navdp_port: int = 19999
+    fastlio_workspace: str = "/home/user/Project/fastlio_humanoid_ws"
+    livox_sdk_lib: str = "/home/user/Project/livox_sdk2_install/lib"
+    fastlio_config: str = "mid360.yaml"
+    lidar_ready_timeout: float = 30.0
+    navigation_ready_timeout: float = 60.0
 
     # Data exporter (optional recording during inference)
     data_exporter: bool = True
@@ -311,49 +284,74 @@ def build_planner_input_command(config: InferenceLaunchConfig, repo_root: Path) 
         f"{vision_backend}{debug}{warmup}--host {shlex.quote(config.lavira_host)} "
         f"--port {config.keyboard_planner_port} "
         f"--planner-hz {config.lavira_planner_hz} "
-        f"--transition-pause {config.lavira_transition_pause} "
-        f"--final-stop-count {config.lavira_final_stop_count} "
-        f"--max-speed {config.lavira_max_speed} "
-        f"--max-duration {config.lavira_max_duration} "
-        f"--max-abs-yaw {config.lavira_max_abs_yaw} "
         f"--camera-host 127.0.0.1 "
         f"--camera-port {config.lavira_depth_port} "
         f"--camera-timeout-ms {config.lavira_camera_timeout_ms} "
         f"--codex-timeout-seconds {config.lavira_codex_timeout_seconds} "
         f"--min-confidence {config.lavira_min_confidence} "
-        f"--rotation-speed {config.lavira_rotation_speed} "
-        f"--forward-speed {config.lavira_forward_speed} "
-        f"--target-standoff-distance {config.lavira_target_standoff_distance} "
-        f"--max-direct-travel {config.lavira_max_direct_travel} "
         f"--output-root {shlex.quote(config.lavira_output_root)}"
     )
 
 
-def build_reasan_planner_command(
-    config: InferenceLaunchConfig, repo_root: Path
-) -> str:
-    """Build the rule-based safety command or direct LaViRA-to-SONIC bypass."""
-    common = (
-        f"cd {repo_root} && "
-        f"source .venv_teleop/bin/activate && "
-        f"python gear_sonic/scripts/reasan_planner.py "
-        f"--keyboard-endpoint tcp://127.0.0.1:{config.keyboard_planner_port} "
-        f"--output-endpoint 'tcp://*:{config.reasan_planner_port}' "
-    )
-    if not config.reasan_avoidance:
-        return (
-            f"cd {repo_root} && "
-            f"source .venv_teleop/bin/activate && "
-            f"python gear_sonic/scripts/lavira_sonic_relay.py "
-            f"--source tcp://127.0.0.1:{config.keyboard_planner_port} "
-            f"--output 'tcp://*:{config.reasan_planner_port}' --hz 20"
-        )
+def build_navdp_planner_command(config: InferenceLaunchConfig, repo_root: Path) -> str:
     return (
-        common
-        + f"--ray-endpoint tcp://127.0.0.1:{config.reasan_ray_port} "
-        + f"--camera-host {shlex.quote(config.camera_host)} "
-        + f"--camera-port {config.camera_port}"
+        "unset COLCON_CURRENT_PREFIX AMENT_PREFIX_PATH CMAKE_PREFIX_PATH; "
+        "source /opt/ros/humble/setup.bash && "
+        f"source {shlex.quote(config.fastlio_workspace)}/install/setup.bash && "
+        f"cd {shlex.quote(str(repo_root))} && source .venv_teleop/bin/activate && "
+        "python gear_sonic/scripts/navdp_planner.py "
+        f"--camera-host {shlex.quote(config.camera_host)} --camera-port {config.camera_port} "
+        f"--navdp-server http://127.0.0.1:{config.navdp_port}"
     )
+
+
+def build_navdp_server_command(config: InferenceLaunchConfig) -> str:
+    return (
+        f"cd {shlex.quote(config.navdp_root)} && "
+        "conda run --no-capture-output -n navdp python navdp_server.py "
+        f"--port {config.navdp_port} --checkpoint {shlex.quote(config.navdp_checkpoint)}"
+    )
+
+
+def build_livox_command(config: InferenceLaunchConfig) -> str:
+    return (
+        "unset COLCON_CURRENT_PREFIX AMENT_PREFIX_PATH CMAKE_PREFIX_PATH; "
+        "source /opt/ros/humble/setup.bash && "
+        f"export LD_LIBRARY_PATH={shlex.quote(config.livox_sdk_lib)}:$LD_LIBRARY_PATH && "
+        f"source {shlex.quote(config.fastlio_workspace)}/install/setup.bash && "
+        "ros2 launch livox_ros_driver2 msg_MID360_launch.py"
+    )
+
+
+def build_fastlio_command(config: InferenceLaunchConfig) -> str:
+    return (
+        "unset COLCON_CURRENT_PREFIX AMENT_PREFIX_PATH CMAKE_PREFIX_PATH; "
+        "source /opt/ros/humble/setup.bash && "
+        f"export LD_LIBRARY_PATH={shlex.quote(config.livox_sdk_lib)}:$LD_LIBRARY_PATH && "
+        f"source {shlex.quote(config.fastlio_workspace)}/install/setup.bash && "
+        f"ros2 launch fast_lio mapping.launch.py config_file:={shlex.quote(config.fastlio_config)} rviz:=false"
+    )
+
+
+def run_readiness_gate(
+    config: InferenceLaunchConfig, repo_root: Path, stage: Literal["lidar", "navigation"]
+) -> bool:
+    timeout = (
+        config.lidar_ready_timeout if stage == "lidar" else config.navigation_ready_timeout
+    )
+    command = (
+        "unset COLCON_CURRENT_PREFIX AMENT_PREFIX_PATH CMAKE_PREFIX_PATH; "
+        "source /opt/ros/humble/setup.bash && "
+        f"source {shlex.quote(config.fastlio_workspace)}/install/setup.bash && "
+        f"cd {shlex.quote(str(repo_root))} && source .venv_teleop/bin/activate && "
+        f"python gear_sonic/scripts/navdp_readiness_gate.py --stage {stage} "
+        f"--timeout {timeout} "
+        f"--camera-host {shlex.quote(config.camera_host)} --camera-port {config.camera_port} "
+        f"--navdp-host 127.0.0.1 --navdp-port {config.navdp_port}"
+    )
+    return subprocess.run(
+        ["/usr/bin/bash", "--noprofile", "--norc", "-c", command]
+    ).returncode == 0
 
 
 def _check_prerequisites(config: InferenceLaunchConfig):
@@ -378,6 +376,21 @@ def _check_prerequisites(config: InferenceLaunchConfig):
         if not config.lavira_global_target.strip():
             errors.append(
                 "--lavira-global-target is required when --planner-input lavira"
+            )
+        for path, label in (
+            (Path(config.navdp_root) / "navdp_server.py", "NavDP server"),
+            (Path(config.navdp_checkpoint), "NavDP checkpoint"),
+            (Path(config.fastlio_workspace) / "install" / "setup.bash", "FAST-LIO workspace"),
+            (Path("/opt/ros/humble/setup.bash"), "ROS2 Humble"),
+        ):
+            if not path.exists():
+                errors.append(f"{label} not found: {path}")
+        try:
+            with socket.create_connection((config.camera_host, config.camera_port), timeout=1.0):
+                pass
+        except OSError:
+            errors.append(
+                f"robot camera is not reachable at {config.camera_host}:{config.camera_port}"
             )
 
     deploy_dir = repo_root / "gear_sonic_deploy"
@@ -420,9 +433,9 @@ def _parse_pane_ids(output: str) -> list[str]:
         fields = line.split()
         if len(fields) == 2:
             indexed[int(fields[0])] = fields[1]
-    if len(indexed) != 6 or sorted(indexed) != list(range(6)):
-        raise RuntimeError(f"expected 6 tmux panes, found {len(indexed)}")
-    return [indexed[index] for index in range(6)]
+    if len(indexed) != 9 or sorted(indexed) != list(range(9)):
+        raise RuntimeError(f"expected 9 tmux panes, found {len(indexed)}")
+    return [indexed[index] for index in range(9)]
 
 
 def _create_tmux_session() -> list[str]:
@@ -451,7 +464,7 @@ def _create_tmux_session() -> list[str]:
         ["tmux", "rename-window", "-t", f"{SESSION_NAME}:0", "inference"],
     )
 
-    # Build two rows first, then split each row into three columns. This also
+    # Build three rows first, then split each row into three columns. This also
     # works when the detached tmux server initially reports a short terminal.
     top_pane = subprocess.run(
         ["tmux", "display-message", "-p", "-t", f"{SESSION_NAME}:0.0", "#{pane_id}"],
@@ -468,7 +481,16 @@ def _create_tmux_session() -> list[str]:
         capture_output=True,
         text=True,
     ).stdout.strip()
-    for row_pane in (top_pane, bottom_pane):
+    middle_pane = subprocess.run(
+        [
+            "tmux", "split-window", "-v", "-t", top_pane, "-P", "-F", "#{pane_id}",
+            bash, "--noprofile", "--norc",
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    for row_pane in (top_pane, middle_pane, bottom_pane):
         for _ in range(2):
             subprocess.run(
                 [
@@ -605,7 +627,7 @@ def main(config: InferenceLaunchConfig):
         f"--camera-host {config.camera_host} "
         f"--camera-port {config.camera_port} "
         f"--planner-relay-zmq-host localhost "
-        f"--planner-relay-zmq-port {config.reasan_planner_port}"
+        f"--planner-relay-zmq-port {config.navdp_output_port}"
     )
 
     print("Starting VLA inference (pane 1)...")
@@ -638,34 +660,50 @@ def main(config: InferenceLaunchConfig):
     print("Starting keyboard publisher (pane 2)...")
     _send_to_pane(pane_ids[1], keyboard_cmd, wait=2.0)
 
-    # --- Panes 3-5: planner input, rule-based safety, and MID-360 ---
+    # --- Panes 3-8: semantic target, NavDP, NavDP server, Livox, FAST-LIO, health ---
     if config.keyboard_planner:
-        reasan_keyboard_cmd = build_planner_input_command(config, repo_root)
-        reasan_planner_cmd = build_reasan_planner_command(config, repo_root)
-        radar_cmd = (
-            f"cd {repo_root} && "
-            f"source .venv_teleop/bin/activate && "
-            f"python tools/mid360_reasan_open3d.py "
-            f"--interface {config.reasan_radar_interface} "
-            f"--min-range 0.3 --filter-ground "
-            f"--ray-median-window 5 "
-            f"--zmq-endpoint 'tcp://*:{config.reasan_ray_port}'"
-        )
-        if config.planner_input == "lavira":
-            print("Starting LaViRA planner (pane 3)...")
-        else:
-            print("Starting REASEN keyboard (pane 3)...")
-        _send_to_pane(pane_ids[3], reasan_keyboard_cmd, wait=1.0)
-        if config.reasan_avoidance:
-            print("Starting REASEN rule-based safety planner (pane 4)...")
-        else:
-            print("Starting direct LaViRA-to-SONIC relay (pane 4)...")
-        _send_to_pane(pane_ids[4], reasan_planner_cmd, wait=1.0)
-        if config.reasan_avoidance:
-            print("Starting MID-360 ActorRay publisher (pane 5)...")
-            _send_to_pane(pane_ids[5], radar_cmd, wait=2.0)
-        else:
-            print("REASEN avoidance disabled; MID-360 pane left idle.")
+        planner_input_cmd = build_planner_input_command(config, repo_root)
+        commands = [
+            (3, "LaViRA semantic planner", planner_input_cmd),
+            (4, "NavDP planner", build_navdp_planner_command(config, repo_root)),
+            (5, "NavDP server", build_navdp_server_command(config)),
+            (6, "Livox ROS2 driver", build_livox_command(config)),
+            (7, "FAST-LIO2", build_fastlio_command(config)),
+            (
+                8,
+                "navigation health monitor",
+                "unset COLCON_CURRENT_PREFIX AMENT_PREFIX_PATH CMAKE_PREFIX_PATH; "
+                "source /opt/ros/humble/setup.bash && "
+                f"source {shlex.quote(config.fastlio_workspace)}/install/setup.bash && "
+                f"cd {repo_root} && source .venv_teleop/bin/activate && "
+                f"python gear_sonic/scripts/navdp_health_monitor.py "
+                f"--camera-host {shlex.quote(config.camera_host)} --camera-port {config.camera_port} "
+                f"--navdp-port {config.navdp_port}",
+            ),
+        ]
+        # Strictly serialized startup: the launcher does not dispatch a later
+        # stage until real data has passed the previous readiness gate.
+        for pane, label, command in (commands[2], commands[3]):
+            print(f"Starting {label} (pane {pane})...")
+            _send_to_pane(pane_ids[pane], command, wait=1.0)
+        print("Waiting for real MID-360 LiDAR and IMU samples...")
+        if not run_readiness_gate(config, repo_root, "lidar"):
+            raise RuntimeError(
+                "MID-360 did not become ready; FAST-LIO and navigation were not started"
+            )
+
+        pane, label, command = commands[4]
+        print(f"Starting {label} (pane {pane})...")
+        _send_to_pane(pane_ids[pane], command, wait=1.0)
+        print("Waiting for FAST-LIO odometry, registered cloud, camera, and NavDP server...")
+        if not run_readiness_gate(config, repo_root, "navigation"):
+            raise RuntimeError(
+                "navigation prerequisites did not become ready; LaViRA and NavDP planner were not started"
+            )
+
+        for pane, label, command in (commands[0], commands[1], commands[5]):
+            print(f"Starting {label} (pane {pane})...")
+            _send_to_pane(pane_ids[pane], command, wait=1.0)
 
 
     if config.data_exporter:
@@ -709,16 +747,12 @@ def main(config: InferenceLaunchConfig):
     print("    Pane 0: C++ Deploy")
     print("    Pane 1: SONIC Keyboard Publisher")
     print("    Pane 2: VLA Inference")
-    if config.planner_input == "lavira":
-        print("    Pane 3: LaViRA AgentNav Planner")
-    else:
-        print("    Pane 3: REASEN Keyboard")
-    if config.reasan_avoidance:
-        print("    Pane 4: REASEN Rule-Based Safety Planner")
-        print("    Pane 5: MID-360 ActorRay/IMU")
-    else:
-        print("    Pane 4: Direct LaViRA-to-SONIC Relay")
-        print("    Pane 5: Idle (REASEN/MID-360 disabled)")
+    print("    Pane 3: LaViRA Semantic + LISTEN_WASD")
+    print("    Pane 4: NavDP Continuous Planner + Safety")
+    print("    Pane 5: NavDP Server")
+    print("    Pane 6: Livox ROS2 Driver")
+    print("    Pane 7: FAST-LIO2")
+    print("    Pane 8: Navigation Health Monitor")
     if config.data_exporter:
         print("    Window 'data_exporter':")
         print("      Data Exporter (.venv_data_collection)")

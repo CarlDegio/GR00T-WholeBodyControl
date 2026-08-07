@@ -33,6 +33,7 @@ from gear_sonic.utils.inference.object_nav_geometry import (
 DEFAULT_SCHEMA_FILENAME = "object_nav_policy.schema.json"
 DEFAULT_QWENVL_MODEL = "qwen3-vl-32b-instruct"
 DEFAULT_QWENVL_BASE_URL = "https://dashscope-intl.aliyuncs.com/compatible-mode/v1"
+DEFAULT_QWENVL_PROXY_URL = "http://127.0.0.1:7890"
 HTTP_PROXY_KEYS = ("http_proxy", "https_proxy", "HTTP_PROXY", "HTTPS_PROXY")
 ALL_PROXY_KEYS = ("all_proxy", "ALL_PROXY")
 POLICY_KEYS = (
@@ -55,6 +56,14 @@ POLICY_KEYS = (
 REQUIRED_POLICY_KEYS = set(POLICY_KEYS)
 TARGET_TYPES = {"global_target", "intermediate_landmark", "traversable_opening"}
 ROTATION_DIRECTIONS = {"LEFT", "RIGHT", "CENTERED"}
+QWENVL_POLICY_KEYS = {
+    "action",
+    "bbox_2d",
+    "target",
+    "target_type",
+    "confidence",
+    "stop_reasoning",
+}
 DEFAULT_POLICY_SCHEMA: dict[str, Any] = {
     "type": "object",
     "properties": {
@@ -324,6 +333,41 @@ Return exactly one JSON object matching the supplied schema, without Markdown or
 text before or after it. Do not output hidden reasoning."""
 
 
+def get_qwenvl_policy_prompt(
+    mission: str, global_target: str, snapshot: RGBDSnapshot
+) -> str:
+    """Build Qwen-VL's explicit minimal JSON contract."""
+    height, width = snapshot.rgb_bgr.shape[:2]
+    return f"""You are the visual navigation policy for a Unitree G1 humanoid robot.
+Analyse only the supplied current chest-camera image. Robot body parts, reflections,
+and shadows are never navigation targets.
+
+MISSION: \"{_escape_prompt_value(mission)}\"
+GLOBAL TARGET: \"{_escape_prompt_value(global_target)}\"
+IMAGE SIZE: width={width}, height={height}
+
+Select exactly one target. Prefer the visible global target; otherwise select a useful
+intermediate landmark or traversable opening. Return NAVIGATE unless the global target
+is clearly reached and no further forward motion is needed. Never return STOP merely
+because the target is absent or uncertain.
+
+Return one JSON object with exactly these fields:
+{{
+  \"action\": \"NAVIGATE\" or \"STOP\",
+  \"bbox_2d\": [x1, y1, x2, y2] or null,
+  \"target\": string,
+  \"target_type\": \"global_target\", \"intermediate_landmark\", or \"traversable_opening\",
+  \"confidence\": number from 0 to 1,
+  \"stop_reasoning\": string
+}}
+
+For NAVIGATE, bbox_2d is required, ordered [left, top, right, bottom], and every
+coordinate is normalized to [0,1000]. For STOP, bbox_2d must be null, target_type must
+be global_target, and stop_reasoning must be non-empty. Do not output target_center,
+pixel offsets, distance, bearing, rotation direction, rotation angle, Markdown, or
+hidden reasoning."""
+
+
 class CodexBBoxClient:
     """Run a read-only Codex CLI image request and validate its policy JSON."""
 
@@ -483,7 +527,6 @@ class CodexBBoxClient:
         if bbox is not None and any(
             policy[key] is None
             for key in (
-                "estimated_distance_m",
                 "target_center_normalized",
                 "target_center_pixel",
                 "horizontal_offset_pixel",
@@ -577,6 +620,7 @@ class QwenVLBBoxClient:
         base_url: str = DEFAULT_QWENVL_BASE_URL,
         timeout_seconds: float = 180.0,
         api_key: str | None = None,
+        proxy_url: str | None = DEFAULT_QWENVL_PROXY_URL,
         client: Any | None = None,
         monotonic: Callable[[], float] = time.monotonic,
     ):
@@ -597,11 +641,17 @@ class QwenVLBBoxClient:
             )
         try:
             from openai import OpenAI
+            import httpx
         except ImportError as exc:
             raise RuntimeError(
-                "Qwen-VL requires the openai package; install the inference extra"
+                "Qwen-VL requires the openai and httpx packages; install the inference extra"
             ) from exc
-        self.client = OpenAI(api_key=key, base_url=base_url)
+        http_client = httpx.Client(proxy=proxy_url, trust_env=False)
+        self.client = OpenAI(
+            api_key=key,
+            base_url=base_url,
+            http_client=http_client,
+        )
 
     @staticmethod
     def _parse_json_content(content: Any) -> dict[str, Any]:
@@ -613,9 +663,85 @@ class QwenVLBBoxClient:
             if len(lines) >= 3:
                 text = "\n".join(lines[1:-1]).strip()
         try:
-            return CodexBBoxClient.validate_policy(json.loads(text))
+            payload = json.loads(text)
         except json.JSONDecodeError as exc:
             raise ValueError("Qwen-VL ObjectNav output is not valid JSON") from exc
+        if not isinstance(payload, dict):
+            raise ValueError("Qwen-VL ObjectNav output must be a JSON object")
+        return payload
+
+    @classmethod
+    def _normalize_policy(
+        cls, payload: dict[str, Any], snapshot: RGBDSnapshot
+    ) -> dict[str, Any]:
+        if set(payload) != QWENVL_POLICY_KEYS:
+            raise ValueError("Qwen-VL policy has an invalid object schema")
+        action = payload["action"]
+        if action not in {"NAVIGATE", "STOP"}:
+            raise ValueError("Qwen-VL policy has an invalid action")
+        if payload["target_type"] not in TARGET_TYPES:
+            raise ValueError("Qwen-VL policy has an invalid target_type")
+        if not isinstance(payload["target"], str) or not isinstance(
+            payload["stop_reasoning"], str
+        ):
+            raise ValueError("Qwen-VL policy text fields must be strings")
+        confidence = payload["confidence"]
+        if not CodexBBoxClient._is_finite_number(confidence) or not 0.0 <= float(
+            confidence
+        ) <= 1.0:
+            raise ValueError("Qwen-VL policy confidence is invalid")
+
+        bbox = payload["bbox_2d"]
+        if action == "NAVIGATE" and not CodexBBoxClient._valid_bbox(bbox):
+            raise ValueError("Qwen-VL NAVIGATE requires a valid bbox_2d")
+        if action == "STOP":
+            if bbox is not None:
+                raise ValueError("Qwen-VL STOP requires bbox_2d=null")
+            if payload["target_type"] != "global_target":
+                raise ValueError("Qwen-VL STOP is only valid for the global target")
+            if not payload["stop_reasoning"].strip():
+                raise ValueError("Qwen-VL STOP requires stop_reasoning")
+
+        derived: dict[str, Any] = {
+            "estimated_distance_m": None,
+            "target_center_normalized": None,
+            "target_center_pixel": None,
+            "horizontal_offset_pixel": None,
+            "camera_bearing_deg": None,
+            "rotation_direction": None,
+            "rotation_angle_deg": None,
+        }
+        if bbox is not None:
+            x1, y1, x2, y2 = map(float, bbox)
+            center_x = (x1 + x2) / 2.0
+            center_y = (y1 + y2) / 2.0
+            height, width = snapshot.rgb_bgr.shape[:2]
+            pixel_x = center_x * (width - 1) / 1000.0
+            pixel_y = center_y * (height - 1) / 1000.0
+            offset = pixel_x - float(snapshot.cx)
+            bearing = math.degrees(math.atan2(offset, float(snapshot.fx)))
+            if abs(bearing) <= 2.0:
+                direction = "CENTERED"
+            else:
+                direction = "RIGHT" if bearing > 0.0 else "LEFT"
+            derived.update(
+                {
+                    "target_center_normalized": [center_x, center_y],
+                    "target_center_pixel": [round(pixel_x, 3), round(pixel_y, 3)],
+                    "horizontal_offset_pixel": round(offset, 3),
+                    "camera_bearing_deg": round(bearing, 3),
+                    "rotation_direction": direction,
+                    "rotation_angle_deg": round(abs(bearing), 3),
+                }
+            )
+
+        canonical = {
+            "visual_check": f"Qwen-VL selected {payload['target']}",
+            **payload,
+            **derived,
+            "distance_confidence": 0.0,
+        }
+        return CodexBBoxClient.validate_policy(canonical)
 
     def locate(
         self,
@@ -641,7 +767,7 @@ class QwenVLBBoxClient:
                     },
                     {
                         "type": "text",
-                        "text": get_object_nav_policy_prompt(
+                        "text": get_qwenvl_policy_prompt(
                             mission, global_target, snapshot
                         ),
                     },
@@ -654,6 +780,8 @@ class QwenVLBBoxClient:
                 model=self.model,
                 messages=messages,
                 timeout=self.timeout_seconds,
+                response_format={"type": "json_object"},
+                extra_body={"enable_thinking": False},
             )
         finally:
             self.last_api_inference_seconds = self._monotonic() - started
@@ -661,7 +789,7 @@ class QwenVLBBoxClient:
             content = completion.choices[0].message.content
         except (AttributeError, IndexError, TypeError) as exc:
             raise ValueError("Qwen-VL ObjectNav response is malformed") from exc
-        return self._parse_json_content(content)
+        return self._normalize_policy(self._parse_json_content(content), snapshot)
 
 
 def _draw_bbox(rgb_bgr: np.ndarray, bbox: Any) -> np.ndarray:

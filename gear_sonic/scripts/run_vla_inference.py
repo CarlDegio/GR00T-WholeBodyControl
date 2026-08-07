@@ -80,10 +80,10 @@ class InferenceConfig:
     action_publish_rate: int = 50
     """Rate at which individual actions are published to the C++ control loop (Hz)."""
 
-    action_horizon: int = 70
+    action_horizon: int = 50
     """Action horizon of the VLA policy (number of future actions per inference)."""
 
-    rate: float = 1 / 0.6
+    rate: float = 1 / 0.5
     """Rate at which we run the forward pass of the VLA policy (Hz)."""
 
     # Camera
@@ -141,7 +141,7 @@ def print_green(x):
 JPEG_VIDEO_MARKER = "__opencv_jpeg_rgb__"
 JPEG_VIDEO_QUALITY = 95
 # Hold completed chunks so latency compensation selects points farther into the trajectory.
-SIMULATED_INFERENCE_DELAY_SECONDS = 0.2
+SIMULATED_INFERENCE_DELAY_SECONDS = 0.0
 
 
 def encode_rgb_video_frame_as_jpeg(image: np.ndarray) -> dict:
