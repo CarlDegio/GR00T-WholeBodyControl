@@ -96,11 +96,27 @@ class LaviraPlannerRuntime:
     def _send(self, mode: str, **kwargs: Any) -> None:
         self.publish(build_navigation_message(mode=mode, generation=self.generation, **kwargs))
 
+    @staticmethod
+    def _discard_queued(queue_: queue.Queue) -> None:
+        try:
+            queue_.get_nowait()
+        except queue.Empty:
+            pass
+
+    @classmethod
+    def _put_latest(cls, queue_: queue.Queue, item: Any) -> None:
+        cls._discard_queued(queue_)
+        queue_.put_nowait(item)
+
+    def publish_worker_result(self, item: WorkerResult) -> None:
+        self._put_latest(self.results, item)
+
     def stop(self, reason: str) -> None:
         self.generation += 1
         self.pending_generation = None
         self.state = "listen_wasd"
         self.manual_velocity = (0.0, 0.0, 0.0)
+        self._discard_queued(self.requests)
         self._send("stop")
         self.logger(f"[LaViRA] LISTEN_WASD ({reason})")
 
@@ -119,7 +135,7 @@ class LaviraPlannerRuntime:
             self.pending_generation = self.generation
             self.state = "nav"
             self._send("stop")
-            self.requests.put_nowait(self.generation)
+            self._put_latest(self.requests, self.generation)
             self.logger(f"[LaViRA] NAV generation={self.generation}")
             return "started"
         if normalized in MANUAL:
@@ -195,10 +211,7 @@ def run_inference_worker(
                 item = WorkerResult(generation, runner.run_once(), None)
             except Exception as exc:
                 item = WorkerResult(generation, None, str(exc))
-            try:
-                runtime.results.put_nowait(item)
-            except queue.Full:
-                pass
+            runtime.publish_worker_result(item)
     finally:
         if runner is not None:
             runner.close()

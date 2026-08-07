@@ -7,7 +7,10 @@ from collections import deque
 from dataclasses import dataclass
 import json
 import math
+from pathlib import Path
 import queue
+import signal
+import threading
 import time
 from typing import Any, Literal, Mapping, Sequence
 
@@ -270,11 +273,59 @@ def format_navigation_diagnostics(
     )
 
 
+def format_direction_chain_diagnostics(
+    *,
+    trajectory: np.ndarray,
+    mpc_angular_velocity: float,
+    fastlio_yaw: float,
+    fastlio_yaw_delta: float,
+    sonic_target_heading: float,
+) -> str:
+    """Expose the lateral/yaw signs at every navigation control boundary."""
+    path = np.asarray(trajectory, dtype=np.float32).reshape(-1, 2)
+    path_dy = float(path[1, 1] - path[0, 1]) if len(path) >= 2 else 0.0
+    return (
+        "[NavDP direction chain] "
+        f"path_dy={path_dy:+.3f} "
+        f"mpc_wz={float(mpc_angular_velocity):+.3f} "
+        f"fastlio_yaw={float(fastlio_yaw):+.3f} "
+        f"fastlio_dyaw={float(fastlio_yaw_delta):+.3f} "
+        f"sonic_heading={float(sonic_target_heading):+.3f}"
+    )
+
+
+def format_actor_ray_control_text(velocity: Sequence[float]) -> str:
+    """Format the body command actually sent to SONIC."""
+    vx, vy, wz = map(float, velocity)
+    return f"sent speed={math.hypot(vx, vy):.3f} m/s   wz={wz:+.3f} rad/s"
+
+
+def actor_ray_velocity_arrow(
+    velocity: Sequence[float],
+    *,
+    max_speed_mps: float = 0.30,
+    max_length_px: int = 100,
+    preview_s: float = 1.0,
+) -> tuple[tuple[int, int], tuple[int, int]]:
+    """Draw unicycle speed: vx controls length and wz controls deflection."""
+    vx, _vy, wz = map(float, velocity)
+    if abs(vx) <= 1.0e-9:
+        return _VIZ_CENTER, _VIZ_CENTER
+    length = min(abs(vx) / float(max_speed_mps), 1.0) * int(max_length_px)
+    heading = wz * float(preview_s) + (math.pi if vx < 0.0 else 0.0)
+    end = (
+        int(round(_VIZ_CENTER[0] - math.sin(heading) * length)),
+        int(round(_VIZ_CENTER[1] - math.cos(heading) * length)),
+    )
+    return _VIZ_CENTER, end
+
+
 def render_actor_ray_panel(
     ranges_m: np.ndarray,
     *,
     max_range_m: float = 3.0,
     trajectory: np.ndarray | None = None,
+    velocity: Sequence[float] | None = None,
 ) -> np.ndarray:
     """Render the exact REASEN-style normalized 180-ray polar panel."""
     import cv2
@@ -305,9 +356,134 @@ def render_actor_ray_panel(
         for point in pixels:
             if 0 <= point[0] < _VIZ_SIZE and 0 <= point[1] < _VIZ_SIZE:
                 cv2.circle(panel, tuple(point), 3, (0, 255, 255), -1, cv2.LINE_AA)
+    if velocity is not None:
+        arrow_start, arrow_end = actor_ray_velocity_arrow(velocity)
+        if arrow_end == arrow_start:
+            cv2.circle(panel, arrow_start, 5, (255, 255, 0), -1, cv2.LINE_AA)
+        else:
+            cv2.arrowedLine(
+                panel,
+                arrow_start,
+                arrow_end,
+                (255, 255, 0),
+                4,
+                cv2.LINE_AA,
+                tipLength=0.22,
+            )
+        cv2.putText(
+            panel,
+            format_actor_ray_control_text(velocity),
+            (14, 72),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.55,
+            (80, 255, 255),
+            2,
+            cv2.LINE_AA,
+        )
     cv2.putText(panel, f"min={normalized.min():.3f}  mean={normalized.mean():.3f}  max={normalized.max():.3f}", (14, _VIZ_SIZE - 36), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (210, 210, 210), 1, cv2.LINE_AA)
-    cv2.putText(panel, "red: occupied | gray: no hit | yellow dots: raw NavDP positions", (14, _VIZ_SIZE - 16), cv2.FONT_HERSHEY_SIMPLEX, 0.39, (210, 210, 210), 1, cv2.LINE_AA)
+    cv2.putText(panel, "red: occupied | yellow: NavDP | cyan arrow: sent velocity", (14, _VIZ_SIZE - 16), cv2.FONT_HERSHEY_SIMPLEX, 0.39, (210, 210, 210), 1, cv2.LINE_AA)
     return panel
+
+
+class ActorRayVideoRecorder:
+    """Atomically publish a finalized MP4 after the active recording closes."""
+
+    def __init__(
+        self,
+        output_dir: str | Path,
+        *,
+        fps: float = 20.0,
+        generation: int | None = None,
+    ) -> None:
+        self.output_dir = Path(output_dir)
+        self.fps = float(fps)
+        self.generation = generation
+        self.output_path: Path | None = None
+        self.working_path: Path | None = None
+        self._writer = None
+
+    def write(self, panel: np.ndarray) -> None:
+        frame = np.asarray(panel, dtype=np.uint8)
+        if frame.ndim != 3 or frame.shape[2] != 3:
+            raise ValueError("ActorRay recording frame must be an HxWx3 BGR image")
+        if self._writer is None:
+            self.output_dir.mkdir(parents=True, exist_ok=True)
+            prefix = (
+                "actorray_"
+                if self.generation is None
+                else f"actorray_g{self.generation:06d}_"
+            )
+            timestamp = time.strftime("%Y%m%d_%H%M%S")
+            stem = f"{prefix}{timestamp}_{time.time_ns() % 1_000_000_000:09d}"
+            self.output_path = self.output_dir / f"{stem}.mp4"
+            self.working_path = self.output_dir / f".{stem}.recording.mp4"
+            height, width = frame.shape[:2]
+            import imageio_ffmpeg
+
+            writer = imageio_ffmpeg.write_frames(
+                str(self.working_path),
+                (width, height),
+                pix_fmt_in="bgr24",
+                pix_fmt_out="yuv420p",
+                fps=self.fps,
+                codec="libx264",
+                quality=6,
+                macro_block_size=2,
+                output_params=["-movflags", "+faststart"],
+            )
+            writer.send(None)
+            self._writer = writer
+            print(f"[NavDP] recording ActorRay video: {self.working_path}", flush=True)
+        self._writer.send(np.ascontiguousarray(frame))
+
+    def close(self) -> None:
+        if self._writer is not None:
+            self._writer.close()
+            self._writer = None
+            if self.working_path is not None and self.output_path is not None:
+                self.working_path.replace(self.output_path)
+                print(f"[NavDP] finalized ActorRay video: {self.output_path}", flush=True)
+
+
+class ActorRayRecordingSession:
+    """Own exactly one ActorRay video for each active navigation generation."""
+
+    def __init__(self, output_dir: str | Path, *, fps: float = 20.0) -> None:
+        self.output_dir = Path(output_dir)
+        self.fps = float(fps)
+        self._recorder: ActorRayVideoRecorder | None = None
+        self.output_path: Path | None = None
+
+    def start(self, generation: int) -> None:
+        self.stop()
+        self._recorder = ActorRayVideoRecorder(
+            self.output_dir,
+            fps=self.fps,
+            generation=generation,
+        )
+        self.output_path = None
+
+    def write(self, panel: np.ndarray) -> None:
+        if self._recorder is None:
+            return
+        self._recorder.write(panel)
+        self.output_path = self._recorder.output_path
+
+    def stop(self) -> None:
+        if self._recorder is not None:
+            self._recorder.close()
+            self.output_path = self._recorder.output_path
+            self._recorder = None
+
+
+def install_shutdown_signal_handlers() -> None:
+    """Route tmux/process termination signals through the normal cleanup path."""
+
+    def request_shutdown(_signum, _frame) -> None:
+        raise KeyboardInterrupt
+
+    for signum in (signal.SIGHUP, signal.SIGINT, signal.SIGTERM):
+        signal.signal(signum, request_shutdown)
 
 
 def compose_reasan_navigation_view(
@@ -321,6 +497,7 @@ def compose_reasan_navigation_view(
     world_goal: Sequence[float] | None = None,
     robot_history: np.ndarray | None = None,
     world_span_m: float = 10.0,
+    velocity: Sequence[float] | None = None,
 ) -> np.ndarray:
     import cv2
 
@@ -352,7 +529,12 @@ def compose_reasan_navigation_view(
     return np.concatenate(
         (
             physical,
-            render_actor_ray_panel(ranges_m, max_range_m=max_range_m, trajectory=path),
+            render_actor_ray_panel(
+                ranges_m,
+                max_range_m=max_range_m,
+                trajectory=path,
+                velocity=velocity,
+            ),
             world,
         ),
         axis=1,
@@ -549,13 +731,16 @@ XNAVDP_G1_MPC_DEFAULTS = {
     "horizon_steps": 30,
     "desired_velocity": 0.3,
     "max_linear_velocity": 0.3,
-    "max_angular_velocity": 0.5,
+    "max_angular_velocity": 0.8,
     "reference_gap": 3,
     "dt": 0.1,
     "reference_trajectory_length_m": 2.0,
-    "minimum_desired_velocity": 0.05,
+    "minimum_desired_velocity": 0.0,
     "interpolation_ratio": 50,
     "lookahead_points": 10,
+    "linear_control_weight": 5.0,
+    "angular_control_weight": 0.02,
+    "curvature_speed_gain": 0.15,
 }
 
 
@@ -566,15 +751,33 @@ def xnavdp_control_to_body_velocity(
     return float(linear_velocity), 0.0, float(angular_velocity)
 
 
+def sonic_heading_from_mpc(
+    *,
+    fastlio_yaw: float,
+    fastlio_to_sonic_offset: float,
+    mpc_angular_velocity: float,
+    heading_preview_s: float,
+) -> float:
+    """Preview SONIC's absolute heading far enough to survive planner smoothing."""
+    sonic_wz = xnavdp_control_to_body_velocity(0.0, mpc_angular_velocity)[2]
+    return math.remainder(
+        float(fastlio_yaw)
+        + float(fastlio_to_sonic_offset)
+        + sonic_wz * float(heading_preview_s),
+        2.0 * math.pi,
+    )
+
+
 def xnavdp_adaptive_speed(
     trajectory_length_m: float,
     maximum_curvature: float,
     *,
     desired_velocity: float = 0.3,
     max_linear_velocity: float = 0.3,
-    max_angular_velocity: float = 0.5,
+    max_angular_velocity: float = 0.8,
     reference_trajectory_length_m: float = 2.0,
-    minimum_desired_velocity: float = 0.05,
+    minimum_desired_velocity: float = 0.0,
+    curvature_speed_gain: float = 0.15,
 ) -> float:
     """Match X-NavDP's length- and curvature-limited reference speed."""
     length_scale = min(
@@ -583,7 +786,10 @@ def xnavdp_adaptive_speed(
     )
     length_limit = float(desired_velocity) * length_scale
     curvature = max(float(maximum_curvature), 1.0e-6)
-    curvature_limit = min(float(max_linear_velocity), float(max_angular_velocity) / curvature)
+    curvature_limit = min(
+        float(max_linear_velocity),
+        float(curvature_speed_gain) * float(max_angular_velocity) / curvature,
+    )
     return max(
         float(minimum_desired_velocity),
         min(float(max_linear_velocity), length_limit, curvature_limit),
@@ -614,28 +820,6 @@ def prepare_internnav_world_reference(
     )
 
 
-def mpc_twist_to_sonic_target(
-    *,
-    linear_velocity: float,
-    angular_velocity: float,
-    odom_yaw: float,
-    sonic_yaw_offset: float,
-    preview_s: float = 0.5,
-    max_heading_step_deg: float = 10.0,
-) -> tuple[float, float]:
-    """Convert an MPC unicycle command to SONIC's absolute world heading."""
-    measured_heading = math.remainder(
-        float(odom_yaw) + float(sonic_yaw_offset), 2.0 * math.pi
-    )
-    max_step = math.radians(float(max_heading_step_deg))
-    heading_step = float(
-        np.clip(float(angular_velocity) * float(preview_s), -max_step, max_step)
-    )
-    return max(0.0, float(linear_velocity)), math.remainder(
-        measured_heading + heading_step, 2.0 * math.pi
-    )
-
-
 class InternNavMpcController:
     """X-NavDP G1 nonlinear MPC adapted to SONIC's 10 Hz planner."""
 
@@ -646,12 +830,15 @@ class InternNavMpcController:
         horizon_steps: int = 30,
         desired_velocity: float = 0.3,
         max_linear_velocity: float = 0.3,
-        max_angular_velocity: float = 0.5,
+        max_angular_velocity: float = 0.8,
         reference_gap: int = 3,
         dt: float = 0.1,
         reference_trajectory_length_m: float = 2.0,
-        minimum_desired_velocity: float = 0.05,
+        minimum_desired_velocity: float = 0.0,
         lookahead_points: int = 10,
+        linear_control_weight: float = 5.0,
+        angular_control_weight: float = 0.02,
+        curvature_speed_gain: float = 0.15,
     ) -> None:
         import casadi as ca
 
@@ -664,6 +851,9 @@ class InternNavMpcController:
         self.reference_trajectory_length_m = float(reference_trajectory_length_m)
         self.minimum_desired_velocity = float(minimum_desired_velocity)
         self.lookahead_points = int(lookahead_points)
+        self.linear_control_weight = float(linear_control_weight)
+        self.angular_control_weight = float(angular_control_weight)
+        self.curvature_speed_gain = float(curvature_speed_gain)
         self.reference_count = self.horizon_steps // self.reference_gap + 1
         self.world_reference = np.asarray(world_reference, dtype=np.float64).reshape(-1, 2)
         if len(self.world_reference) < 2:
@@ -696,7 +886,9 @@ class InternNavMpcController:
             optimizer.subject_to(states[index + 1, :] == next_state)
 
         state_weight = np.diag([10.0, 10.0, 0.0])
-        control_weight = np.diag([0.05, 0.05])
+        control_weight = np.diag(
+            [self.linear_control_weight, self.angular_control_weight]
+        )
         objective = 0
         for index in range(self.horizon_steps):
             objective += ca.mtimes(
@@ -772,6 +964,7 @@ class InternNavMpcController:
             max_angular_velocity=self.max_angular_velocity,
             reference_trajectory_length_m=self.reference_trajectory_length_m,
             minimum_desired_velocity=self.minimum_desired_velocity,
+            curvature_speed_gain=self.curvature_speed_gain,
         )
 
     def _select_reference(self, pose: Pose2D) -> np.ndarray:
@@ -812,6 +1005,164 @@ class InternNavMpcController:
         self._last_controls = np.asarray(solution.value(self._controls))
         self._last_states = np.asarray(solution.value(self._states))
         return float(self._last_controls[0, 0]), float(self._last_controls[0, 1])
+
+
+@dataclass(frozen=True)
+class MpcSolveRequest:
+    generation: int
+    reference_version: int
+    world_reference: np.ndarray
+    pose: Pose2D
+
+
+@dataclass(frozen=True)
+class MpcSolveResult:
+    generation: int
+    reference_version: int
+    control: tuple[float, float] | None
+    completed_time: float
+    elapsed_s: float
+    error: str | None = None
+    return_status: str = "unknown"
+
+
+class AsyncMpcSolver:
+    """Own the CasADi controller on a worker thread and keep only latest work."""
+
+    def __init__(self, *, controller_factory=InternNavMpcController) -> None:
+        self._controller_factory = controller_factory
+        self._requests: queue.Queue[MpcSolveRequest | None] = queue.Queue(maxsize=1)
+        self._results: queue.Queue[MpcSolveResult] = queue.Queue(maxsize=1)
+        self._closed = False
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    @staticmethod
+    def _replace(queue_: queue.Queue, item) -> None:
+        try:
+            queue_.get_nowait()
+        except queue.Empty:
+            pass
+        queue_.put_nowait(item)
+
+    def submit(self, request: MpcSolveRequest) -> None:
+        if not self._closed:
+            self._replace(self._requests, request)
+
+    def poll_latest(self) -> MpcSolveResult | None:
+        latest = None
+        while True:
+            try:
+                latest = self._results.get_nowait()
+            except queue.Empty:
+                return latest
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        self._replace(self._requests, None)
+        self._thread.join(timeout=1.0)
+
+    def _run(self) -> None:
+        controller = None
+        reference_version = -1
+        while True:
+            request = self._requests.get()
+            if request is None:
+                return
+            started = time.perf_counter()
+            control = None
+            error = None
+            return_status = "unknown"
+            try:
+                if controller is None:
+                    controller = self._controller_factory(request.world_reference)
+                elif request.reference_version != reference_version:
+                    controller.update_reference(request.world_reference)
+                reference_version = request.reference_version
+                control = tuple(map(float, controller.solve(request.pose)))
+                try:
+                    return_status = controller._optimizer.stats().get(
+                        "return_status", "unknown"
+                    )
+                except Exception:
+                    return_status = "success"
+            except Exception as exc:
+                error = str(exc)
+                try:
+                    return_status = controller._optimizer.stats().get(
+                        "return_status", "unknown"
+                    )
+                    controller._last_controls = None
+                    controller._last_states = None
+                except Exception:
+                    pass
+            self._replace(
+                self._results,
+                MpcSolveResult(
+                    generation=request.generation,
+                    reference_version=request.reference_version,
+                    control=control,
+                    completed_time=time.monotonic(),
+                    elapsed_s=time.perf_counter() - started,
+                    error=error,
+                    return_status=return_status,
+                ),
+            )
+
+
+class LatestMessageWorker:
+    """Process expensive sensor messages off the ROS executor, newest first."""
+
+    def __init__(self, processor) -> None:
+        self._processor = processor
+        self._messages: queue.Queue[Any | None] = queue.Queue(maxsize=1)
+        self._closed = False
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def submit(self, message: Any) -> None:
+        if self._closed:
+            return
+        try:
+            self._messages.get_nowait()
+        except queue.Empty:
+            pass
+        self._messages.put_nowait(message)
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        try:
+            self._messages.get_nowait()
+        except queue.Empty:
+            pass
+        self._messages.put_nowait(None)
+        self._thread.join(timeout=1.0)
+
+    def _run(self) -> None:
+        while True:
+            message = self._messages.get()
+            if message is None:
+                return
+            try:
+                self._processor(message)
+            except Exception as exc:
+                print(f"[NavDP] sensor processing failed: {exc}", flush=True)
+
+
+def fresh_mpc_control(
+    control: tuple[float, float],
+    *,
+    result_time: float,
+    now: float,
+    timeout_s: float,
+) -> tuple[float, float]:
+    """Use a successful MPC result only for a bounded amount of time."""
+    return control if now - result_time <= timeout_s else (0.0, 0.0)
+
 
 def should_abort_nav_for_lidar(
     *,
@@ -932,14 +1283,18 @@ class NavDPPlannerConfig:
     slam_cloud_topic: str = "/cloud_registered_1"
     control_hz: float = 20.0
     mpc_hz: float = 10.0
-    heading_preview_s: float = 0.5
-    max_heading_step_deg: float = 10.0
-    goal_tolerance_m: float = 0.40
+    mpc_result_timeout_s: float = 0.30
+    heading_preview_s: float = 0.6
+    goal_tolerance_m: float = 1.0
     navdp_stop_threshold: float = -4.0
-    radar_timeout_s: float = 0.35
+    radar_timeout_s: float = 0.75
     odom_timeout_s: float = 0.30
-    trajectory_timeout_s: float = 0.50
+    trajectory_timeout_s: float = 2.50
+    navdp_request_timeout_s: float = 10.0
     visualize: bool = True
+    record_actorray: bool = False
+    actorray_output_dir: str = "outputs/navdp"
+    actorray_record_fps: float = 20.0
 
 
 def _quaternion_yaw(x: float, y: float, z: float, w: float) -> float:
@@ -969,6 +1324,22 @@ def _extract_camera_frame(message: Mapping[str, Any]) -> tuple[np.ndarray, np.nd
     return rgb.copy(), depth_raw.astype(np.float32) * scale, info
 
 
+def point_plane_distances(
+    points: np.ndarray,
+    normal: np.ndarray,
+    offset: float,
+) -> np.ndarray:
+    """Evaluate a 3-D plane without dispatching tiny products to threaded BLAS."""
+    values = np.asarray(points)
+    direction = np.asarray(normal)
+    projection = (
+        values[:, 0] * direction[0]
+        + values[:, 1] * direction[1]
+        + values[:, 2] * direction[2]
+    )
+    return np.abs(projection - float(offset))
+
+
 def _remove_ground(points: np.ndarray) -> np.ndarray:
     """Conservative RANSAC plane removal using only low base-frame candidates."""
     values = np.asarray(points, dtype=np.float32).reshape(-1, 3)
@@ -988,7 +1359,12 @@ def _remove_ground(points: np.ndarray) -> np.ndarray:
         normal /= norm
         if abs(float(normal[2])) < math.cos(math.radians(25.0)):
             continue
-        distance = np.abs(candidates @ normal - float(sample[0] @ normal))
+        plane_offset = float(
+            sample[0, 0] * normal[0]
+            + sample[0, 1] * normal[1]
+            + sample[0, 2] * normal[2]
+        )
+        distance = point_plane_distances(candidates, normal, plane_offset)
         inliers = distance <= 0.04
         count = int(inliers.sum())
         if count > best_count:
@@ -1016,6 +1392,19 @@ class _SharedSensors:
         self.robot_history = np.empty((0, 2), dtype=np.float32)
 
 
+def _control_freshness_snapshot(
+    sensors: _SharedSensors,
+) -> tuple[Pose2D | None, float, np.ndarray, float]:
+    """Read timestamps after potentially blocking MPC work, not before it."""
+    with sensors.lock:
+        return (
+            sensors.pose,
+            sensors.pose_time,
+            sensors.points.copy(),
+            sensors.points_time,
+        )
+
+
 def _start_ros(config: NavDPPlannerConfig, sensors: _SharedSensors):
     import rclpy
     from livox_ros_driver2.msg import CustomMsg
@@ -1040,14 +1429,14 @@ def _start_ros(config: NavDPPlannerConfig, sensors: _SharedSensors):
             if not len(sensors.robot_history) or np.linalg.norm(sample[0] - sensors.robot_history[-1]) >= 0.02:
                 sensors.robot_history = np.concatenate((sensors.robot_history, sample), axis=0)[-5000:]
 
-    def lidar_callback(message: CustomMsg) -> None:
+    def process_lidar(message: CustomMsg) -> None:
         points = filter_livox_points(livox_custom_points_to_numpy(message))
         points = _remove_ground(points)
         with sensors.lock:
             sensors.points = points
             sensors.points_time = time.monotonic()
 
-    def slam_cloud_callback(message: PointCloud2) -> None:
+    def process_slam_cloud(message: PointCloud2) -> None:
         raw = np.asarray(
             point_cloud2.read_points(message, field_names=("x", "y", "z"), skip_nans=True)
         )
@@ -1065,10 +1454,19 @@ def _start_ros(config: NavDPPlannerConfig, sensors: _SharedSensors):
             sensors.slam_map_xy = updated
             sensors.slam_map_time = time.monotonic()
 
+    lidar_worker = LatestMessageWorker(process_lidar)
+    slam_worker = LatestMessageWorker(process_slam_cloud)
+
+    def lidar_callback(message: CustomMsg) -> None:
+        lidar_worker.submit(message)
+
+    def slam_cloud_callback(message: PointCloud2) -> None:
+        slam_worker.submit(message)
+
     node.create_subscription(Odometry, config.odom_topic, odom_callback, 10)
     node.create_subscription(CustomMsg, config.lidar_topic, lidar_callback, 10)
     node.create_subscription(PointCloud2, config.slam_cloud_topic, slam_cloud_callback, 2)
-    return rclpy, node
+    return rclpy, node, (lidar_worker, slam_worker)
 
 
 def _navdp_request(
@@ -1077,16 +1475,28 @@ def _navdp_request(
     depth: np.ndarray,
     goal: tuple[float, float],
     *,
-    timeout: float = 1.0,
+    pose: Pose2D | None = None,
+    timeout: float = 10.0,
 ) -> np.ndarray:
     import requests
 
     rgb_encoded, depth_png = _encode_navdp_frames(rgb, depth)
     goal = (float(np.clip(goal[0], 0.0, 10.0)), float(np.clip(goal[1], -10.0, 10.0)))
+    data = {"goal_data": json.dumps({"goal_x": [goal[0]], "goal_y": [goal[1]]})}
+    if pose is not None:
+        half_yaw = 0.5 * float(pose.yaw)
+        data["state_data"] = json.dumps(
+            {
+                "robot_pos": [[float(pose.x), float(pose.y), 0.0]],
+                "robot_quat": [
+                    [0.0, 0.0, math.sin(half_yaw), math.cos(half_yaw)]
+                ],
+            }
+        )
     response = requests.post(
         f"{server.rstrip('/')}/pointgoal_step",
         files={"image": ("image.jpg", rgb_encoded), "depth": ("depth.png", depth_png)},
-        data={"goal_data": json.dumps({"goal_x": [goal[0]], "goal_y": [goal[1]]})},
+        data=data,
         timeout=timeout,
     )
     response.raise_for_status()
@@ -1117,11 +1527,28 @@ def _reset_navdp(
     response.raise_for_status()
 
 
+def shutdown_ros_context(rclpy_module) -> None:
+    """Shut ROS down once when signal handling already began teardown."""
+    if rclpy_module.ok():
+        rclpy_module.shutdown()
+
+
+def spin_ros(rclpy_module, node) -> None:
+    """Spin until shutdown, suppressing only the expected invalid-context exit."""
+    try:
+        rclpy_module.spin(node)
+    except Exception:
+        if rclpy_module.ok():
+            raise
+
+
 def main(config: NavDPPlannerConfig) -> None:
     import cv2
     import threading
     import zmq
     from gear_sonic.camera.composed_camera import ComposedCameraClientSensor
+
+    install_shutdown_signal_handlers()
 
     context = zmq.Context.instance()
     commands = context.socket(zmq.SUB)
@@ -1133,9 +1560,16 @@ def main(config: NavDPPlannerConfig) -> None:
     output.bind(config.output_endpoint)
     camera = ComposedCameraClientSensor(config.camera_host, config.camera_port)
     sensors = _SharedSensors()
-    rclpy, node = _start_ros(config, sensors)
-    ros_thread = threading.Thread(target=rclpy.spin, args=(node,), daemon=True)
+    rclpy, node, sensor_workers = _start_ros(config, sensors)
+    ros_thread = threading.Thread(target=spin_ros, args=(rclpy, node), daemon=True)
     ros_thread.start()
+    actorray_recording = (
+        ActorRayRecordingSession(
+            config.actorray_output_dir, fps=config.actorray_record_fps
+        )
+        if config.record_actorray
+        else None
+    )
 
     generation = 0
     mode = "stop"
@@ -1158,13 +1592,18 @@ def main(config: NavDPPlannerConfig) -> None:
     last_safety_blocked = False
     sonic_planner = SonicPlannerState()
     sonic_fastlio_yaw_offset = 0.0
-    mpc: InternNavMpcController | None = None
+    mpc_solver = AsyncMpcSolver()
+    mpc_reference = np.empty((0, 2), dtype=np.float64)
+    mpc_reference_version = 0
     mpc_linear_velocity = 0.0
     mpc_angular_velocity = 0.0
+    mpc_result_time = 0.0
     mpc_target_heading: float | None = None
     mpc_movement_heading: float | None = None
     next_mpc_update = 0.0
     latest_camera_timestamp = 0.0
+    last_direction_log_time = 0.0
+    previous_direction_pose_yaw: float | None = None
 
     def send_status(state: str, reason: str) -> None:
         status.send_json({"type": STATUS_TYPE, "version": 1, "generation": generation, "state": state, "reason": reason})
@@ -1178,7 +1617,14 @@ def main(config: NavDPPlannerConfig) -> None:
     ) -> None:
         nonlocal inference_busy
         try:
-            result = _navdp_request(config.navdp_server, rgb, depth, goal)
+            result = _navdp_request(
+                config.navdp_server,
+                rgb,
+                depth,
+                goal,
+                pose=inference_pose,
+                timeout=config.navdp_request_timeout_s,
+            )
             item = (request_generation, result, inference_pose, None)
         except Exception as exc:
             item = (request_generation, None, inference_pose, str(exc))
@@ -1203,13 +1649,17 @@ def main(config: NavDPPlannerConfig) -> None:
                     continue
                 generation = command.generation
                 mode = command.mode
+                if actorray_recording is not None:
+                    actorray_recording.stop()
                 trajectory = np.empty((0, 2), dtype=np.float32)
                 invalid_count = 0
                 trajectory_log_pending = False
                 last_safety_blocked = False
-                mpc = None
+                mpc_reference = np.empty((0, 2), dtype=np.float64)
+                mpc_reference_version += 1
                 mpc_linear_velocity = 0.0
                 mpc_angular_velocity = 0.0
+                mpc_result_time = 0.0
                 mpc_target_heading = None
                 mpc_movement_heading = None
                 next_mpc_update = 0.0
@@ -1232,6 +1682,8 @@ def main(config: NavDPPlannerConfig) -> None:
                         sonic_fastlio_yaw_offset = math.remainder(
                             sonic_planner.heading - pose.yaw, 2.0 * math.pi
                         )
+                        if actorray_recording is not None:
+                            actorray_recording.start(generation)
                         send_status("active", "goal_accepted")
 
             frame = camera.read(blocking=False)
@@ -1268,6 +1720,8 @@ def main(config: NavDPPlannerConfig) -> None:
                     print(f"[NavDP] inference failed ({invalid_count}/3): {error}")
                     if invalid_count >= 3:
                         mode = "stop"
+                        if actorray_recording is not None:
+                            actorray_recording.stop()
                         send_status("failed", "three_invalid_trajectories")
                 else:
                     world_reference = (
@@ -1283,10 +1737,8 @@ def main(config: NavDPPlannerConfig) -> None:
                         trajectory = result
                         trajectory_time = time.monotonic()
                         trajectory_log_pending = True
-                        if mpc is None:
-                            mpc = InternNavMpcController(world_reference)
-                        else:
-                            mpc.update_reference(world_reference)
+                        mpc_reference = world_reference.copy()
+                        mpc_reference_version += 1
 
             now = time.monotonic()
             with sensors.lock:
@@ -1299,6 +1751,8 @@ def main(config: NavDPPlannerConfig) -> None:
                 current_local_goal = local_goal_from_world(world_goal, pose)
                 if math.hypot(*current_local_goal) <= config.goal_tolerance_m:
                     mode = "stop"
+                    if actorray_recording is not None:
+                        actorray_recording.stop()
                     send_status("reached", f"goal_within_{config.goal_tolerance_m:g}m")
                 elif not inference_busy and navdp_initialized and latest_rgb is not None and latest_depth is not None:
                     inference_busy = True
@@ -1318,16 +1772,47 @@ def main(config: NavDPPlannerConfig) -> None:
                     ).start()
 
             zero_action_aborted = False
+            mpc_solution_available = False
+            new_mpc_solution = False
+            result = mpc_solver.poll_latest()
+            if (
+                result is not None
+                and result.generation == generation
+                and result.reference_version == mpc_reference_version
+            ):
+                if result.error is None and result.control is not None:
+                    mpc_linear_velocity, mpc_angular_velocity = result.control
+                    mpc_result_time = result.completed_time
+                    mpc_solution_available = True
+                    new_mpc_solution = True
+                else:
+                    print(
+                        f"[NavDP] MPC solve failed after {result.elapsed_s:.3f}s "
+                        f"status={result.return_status}: {result.error}",
+                        flush=True,
+                    )
             if mode == "manual_velocity":
                 velocity = manual
             elif mode == "nav_goal":
-                if now >= next_mpc_update and mpc is not None and pose is not None:
+                if now >= next_mpc_update and len(mpc_reference) and pose is not None:
                     next_mpc_update = now + 1.0 / config.mpc_hz
-                    try:
-                        mpc_linear_velocity, mpc_angular_velocity = mpc.solve(pose)
-                    except Exception as exc:
-                        print(f"[NavDP] MPC solve failed: {exc}")
-                        mpc_linear_velocity, mpc_angular_velocity = 0.0, 0.0
+                    mpc_solver.submit(
+                        MpcSolveRequest(
+                            generation=generation,
+                            reference_version=mpc_reference_version,
+                            world_reference=mpc_reference.copy(),
+                            pose=pose,
+                        )
+                    )
+                effective_control = fresh_mpc_control(
+                    (mpc_linear_velocity, mpc_angular_velocity),
+                    result_time=mpc_result_time,
+                    now=now,
+                    timeout_s=config.mpc_result_timeout_s,
+                )
+                mpc_linear_velocity, mpc_angular_velocity = effective_control
+                mpc_solution_available = mpc_result_time > 0.0
+                if new_mpc_solution:
                     zero_action_aborted = should_abort_nav_for_zero_action(
                         mode=mode,
                         selected_command=(
@@ -1335,20 +1820,45 @@ def main(config: NavDPPlannerConfig) -> None:
                             0.0,
                             mpc_angular_velocity,
                         ),
-                        command_available=True,
+                        command_available=mpc_solution_available,
                     )
-                    sonic_planner.heading = math.remainder(
-                        pose.yaw
-                        + sonic_fastlio_yaw_offset
-                        + mpc_angular_velocity / config.mpc_hz,
-                        2.0 * math.pi,
+                    sonic_planner.heading = sonic_heading_from_mpc(
+                        fastlio_yaw=pose.yaw,
+                        fastlio_to_sonic_offset=sonic_fastlio_yaw_offset,
+                        mpc_angular_velocity=mpc_angular_velocity,
+                        heading_preview_s=config.heading_preview_s,
                     )
+                    if now - last_direction_log_time >= 1.0 and len(trajectory):
+                        fastlio_yaw_delta = (
+                            0.0
+                            if previous_direction_pose_yaw is None
+                            else math.remainder(
+                                pose.yaw - previous_direction_pose_yaw,
+                                2.0 * math.pi,
+                            )
+                        )
+                        print(
+                            format_direction_chain_diagnostics(
+                                trajectory=trajectory,
+                                mpc_angular_velocity=mpc_angular_velocity,
+                                fastlio_yaw=pose.yaw,
+                                fastlio_yaw_delta=fastlio_yaw_delta,
+                                sonic_target_heading=sonic_planner.heading,
+                            ),
+                            flush=True,
+                        )
+                        previous_direction_pose_yaw = pose.yaw
+                        last_direction_log_time = now
                 velocity = xnavdp_control_to_body_velocity(
                     mpc_linear_velocity,
                     mpc_angular_velocity,
                 )
             else:
                 velocity = (0.0, 0.0, 0.0)
+            pose, pose_time, points, points_time = _control_freshness_snapshot(
+                sensors
+            )
+            now = time.monotonic()
             candidate_velocity = velocity
             stale_reason = None
             if now - points_time > config.radar_timeout_s:
@@ -1370,6 +1880,14 @@ def main(config: NavDPPlannerConfig) -> None:
             )).astype(np.float32)
             before_safety = velocity
             velocity = apply_hard_safety(velocity, safety_points, camera_stop=camera_stop)
+            if actorray_recording is not None and mode == "nav_goal":
+                actorray_recording.write(
+                    render_actor_ray_panel(
+                        current_rays,
+                        trajectory=trajectory,
+                        velocity=velocity,
+                    )
+                )
             lidar_aborted = should_abort_nav_for_lidar(
                 mode=mode,
                 before_safety=before_safety,
@@ -1388,10 +1906,14 @@ def main(config: NavDPPlannerConfig) -> None:
                 print(f"[NavDP] navigation stopped: {stop_reason}", flush=True)
                 send_status("stopped", stop_reason)
                 mode = "stop"
+                if actorray_recording is not None:
+                    actorray_recording.stop()
                 trajectory = np.empty((0, 2), dtype=np.float32)
-                mpc = None
+                mpc_reference = np.empty((0, 2), dtype=np.float64)
+                mpc_reference_version += 1
                 mpc_linear_velocity = 0.0
                 mpc_angular_velocity = 0.0
+                mpc_result_time = 0.0
                 mpc_target_heading = None
                 mpc_movement_heading = None
             if (
@@ -1425,6 +1947,7 @@ def main(config: NavDPPlannerConfig) -> None:
                     pose=pose,
                     world_goal=world_goal,
                     robot_history=robot_history,
+                    velocity=velocity,
                 )
                 cv2.imshow("NavDP + MID360 + FAST-LIO world map", canvas)
                 cv2.imshow(
@@ -1439,14 +1962,20 @@ def main(config: NavDPPlannerConfig) -> None:
     except KeyboardInterrupt:
         pass
     finally:
+        mpc_solver.close()
+        for worker in sensor_workers:
+            worker.close()
         for _ in range(3):
             output.send(sonic_planner.message((0.0, 0.0, 0.0)))
         camera.close()
+        shutdown_ros_context(rclpy)
+        ros_thread.join(timeout=1.0)
         node.destroy_node()
-        rclpy.shutdown()
         commands.close(0)
         status.close(0)
         output.close(0)
+        if actorray_recording is not None:
+            actorray_recording.stop()
         cv2.destroyAllWindows()
 
 

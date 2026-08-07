@@ -71,6 +71,31 @@ def test_space_invalidates_generation_and_late_worker_result() -> None:
     assert decoded(messages)[-1]["mode"] == "stop"
 
 
+def test_space_discards_unstarted_request_so_navigation_can_restart() -> None:
+    runtime = LaviraPlannerRuntime(
+        LaviraPlannerConfig("find chair", "chair"), publish=lambda _message: None
+    )
+    assert runtime.handle_key("n", now=1.0) == "started"
+    assert runtime.handle_key(" ", now=1.1) == "cancelled"
+
+    assert runtime.requests.empty()
+    assert runtime.handle_key("n", now=1.2) == "started"
+    assert runtime.requests.get_nowait() == runtime.generation
+
+
+def test_new_worker_result_replaces_stale_full_queue_entry() -> None:
+    runtime = LaviraPlannerRuntime(
+        LaviraPlannerConfig("find chair", "chair"), publish=lambda _message: None
+    )
+    stale = WorkerResult(1, nav_result(), None)
+    current = WorkerResult(3, nav_result(angle_deg=15.0), None)
+    runtime.results.put_nowait(stale)
+
+    runtime.publish_worker_result(current)
+
+    assert runtime.results.get_nowait() is current
+
+
 def test_current_generation_status_returns_to_listen_but_stale_status_is_ignored() -> None:
     runtime = LaviraPlannerRuntime(
         LaviraPlannerConfig("find chair", "chair"), publish=lambda _message: None

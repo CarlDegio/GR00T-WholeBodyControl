@@ -210,14 +210,23 @@ class InferenceLaunchConfig:
     navdp_output_port: int = 5563
     """NavDP planner publisher port consumed by VLA inference."""
 
-    navdp_root: str = "/home/user/Project/NavDP/baselines/navdp"
-    navdp_checkpoint: str = "/home/user/Downloads/navdp-cross-modal.ckpt"
+    navdp_root: str = "/home/user/Project/NavDP/baselines/x-navdp"
+    navdp_checkpoint: str = (
+        "/home/user/Project/NavDP/baselines/x-navdp/checkpoints/x-navdp_posttrain.ckpt"
+    )
     navdp_port: int = 19999
     fastlio_workspace: str = "/home/user/Project/fastlio_humanoid_ws"
     livox_sdk_lib: str = "/home/user/Project/livox_sdk2_install/lib"
     fastlio_config: str = "mid360.yaml"
     lidar_ready_timeout: float = 30.0
     navigation_ready_timeout: float = 60.0
+    navdp_request_timeout_s: float = 10.0
+
+    record_actorray: bool = False
+    """Record the NavDP ActorRay panel, including yellow trajectory points."""
+
+    actorray_output_dir: str = "outputs/navdp"
+    """Directory for finalized per-navigation ActorRay MP4 recordings."""
 
     # Data exporter (optional recording during inference)
     data_exporter: bool = True
@@ -294,6 +303,11 @@ def build_planner_input_command(config: InferenceLaunchConfig, repo_root: Path) 
 
 
 def build_navdp_planner_command(config: InferenceLaunchConfig, repo_root: Path) -> str:
+    recording = (
+        f"--record-actorray --actorray-output-dir {shlex.quote(config.actorray_output_dir)} "
+        if config.record_actorray
+        else ""
+    )
     return (
         "unset COLCON_CURRENT_PREFIX AMENT_PREFIX_PATH CMAKE_PREFIX_PATH; "
         "source /opt/ros/humble/setup.bash && "
@@ -301,15 +315,19 @@ def build_navdp_planner_command(config: InferenceLaunchConfig, repo_root: Path) 
         f"cd {shlex.quote(str(repo_root))} && source .venv_teleop/bin/activate && "
         "python gear_sonic/scripts/navdp_planner.py "
         f"--camera-host {shlex.quote(config.camera_host)} --camera-port {config.camera_port} "
-        f"--navdp-server http://127.0.0.1:{config.navdp_port}"
+        f"--navdp-server http://127.0.0.1:{config.navdp_port} "
+        f"--navdp-request-timeout-s {config.navdp_request_timeout_s} "
+        f"{recording}"
     )
 
 
 def build_navdp_server_command(config: InferenceLaunchConfig) -> str:
     return (
         f"cd {shlex.quote(config.navdp_root)} && "
-        "conda run --no-capture-output -n navdp python navdp_server.py "
-        f"--port {config.navdp_port} --checkpoint {shlex.quote(config.navdp_checkpoint)}"
+        "conda run --no-capture-output -n navdp python -m eval.src.policy_server "
+        f"--port {config.navdp_port} --embodiment humanoid "
+        f"--checkpoint {shlex.quote(config.navdp_checkpoint)} "
+        "--device cuda:0 --real --no-visualization"
     )
 
 
@@ -378,7 +396,10 @@ def _check_prerequisites(config: InferenceLaunchConfig):
                 "--lavira-global-target is required when --planner-input lavira"
             )
         for path, label in (
-            (Path(config.navdp_root) / "navdp_server.py", "NavDP server"),
+            (
+                Path(config.navdp_root) / "eval" / "src" / "policy_server.py",
+                "X-NavDP server",
+            ),
             (Path(config.navdp_checkpoint), "NavDP checkpoint"),
             (Path(config.fastlio_workspace) / "install" / "setup.bash", "FAST-LIO workspace"),
             (Path("/opt/ros/humble/setup.bash"), "ROS2 Humble"),

@@ -31,7 +31,7 @@ def test_parse_pane_ids_rejects_incomplete_layout() -> None:
         _parse_pane_ids("0 %1\n1 %2\n2 %3\n3 %4\n4 %5\n5 %6\n6 %7\n7 %8\n")
 
 
-def test_navdp_stack_commands_use_ros_topics_and_unchanged_external_server() -> None:
+def test_navdp_stack_commands_use_ros_topics_and_official_xnavdp_server() -> None:
     config = InferenceLaunchConfig()
     planner = build_navdp_planner_command(config, Path("/workspace/sonic"))
     server = build_navdp_server_command(config)
@@ -39,9 +39,15 @@ def test_navdp_stack_commands_use_ros_topics_and_unchanged_external_server() -> 
     fastlio = build_fastlio_command(config)
 
     assert "navdp_planner.py" in planner
+    assert "--navdp-request-timeout-s 10.0" in planner
     assert "source /opt/ros/humble/setup.bash" in planner
-    assert "navdp_server.py" in server
-    assert "--checkpoint /home/user/Downloads/navdp-cross-modal.ckpt" in server
+    assert config.navdp_root == "/home/user/Project/NavDP/baselines/x-navdp"
+    assert config.navdp_checkpoint.endswith("/x-navdp_posttrain.ckpt")
+    assert "python -m eval.src.policy_server" in server
+    assert "--embodiment humanoid" in server
+    assert "--real" in server
+    assert "--no-visualization" in server
+    assert f"--checkpoint {config.navdp_checkpoint}" in server
     assert "msg_MID360_launch.py" in livox
     assert "mapping.launch.py" in fastlio
     assert "rviz:=false" in fastlio
