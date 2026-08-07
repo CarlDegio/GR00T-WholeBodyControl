@@ -619,109 +619,186 @@ RGB image:
 {params}
 
 
-## Planning objectives
+Planning procedure
 
-Use the task description and RGB image to:
+Use the task description and RGB image to perform the following steps in order:
 
-1. Identify the primary manipulation target.
-2. Distinguish the primary target from secondary objects, containers, support surfaces, and obstacles.
-3. Select the task-relevant manipulation anchor, such as:
+Identify the primary manipulation target.
 
-   * a handle;
-   * a button;
-   * an opening;
-   * a graspable region;
-   * a contact surface;
-   * an insertion point;
-   * an object center, only when it is appropriate for the task.
-4. Determine the most suitable final horizontal alignment between the manipulation anchor and the robot’s ego-view.
-5. Estimate whether the robot should move closer to or farther from the target.
-6. Generate a continuous multi-step motion sequence that adjusts both the robot’s position and orientation.
+For the current task, select the blue plastic basket as the primary manipulation target.
 
-The objective is not always to align the geometric center of the entire object with the image center. Align the task-relevant manipulation anchor or interaction axis that is most suitable for completing the task.
+Distinguish the primary manipulation target from the paper balls, table, support surfaces, unrelated objects, and possible obstacles.
 
-## Allowed motion commands
+Select the task-relevant manipulation anchor.
 
-* ROTATE_LEFT: rotate counterclockwise by a specified number of degrees.
-* ROTATE_RIGHT: rotate clockwise by a specified number of degrees.
-* MOVE_FORWARD: move forward along the robot’s current heading by a specified number of meters.
-* MOVE_BACKWARD: move backward along the robot’s current heading by a specified number of meters.
+For the current task, use the center of the blue plastic basket as the manipulation anchor.
+
+Determine the desired final horizontal alignment of the manipulation anchor in the robot’s ego-view.
+
+For the current task, align the manipulation anchor with the horizontal center of the camera view.
+
+Compare the horizontal position of the manipulation anchor with the current horizontal center of the camera view and infer the robot’s lateral position relative to the target:
+If the manipulation anchor appears to the right of the camera-view center, the robot is positioned to the left of the target.
+If the manipulation anchor appears to the left of the camera-view center, the robot is positioned to the right of the target.
+If the manipulation anchor appears approximately at the camera-view center, the robot is horizontally aligned with the target.
+Use FAR_LEFT or FAR_RIGHT only when the horizontal displacement is visually substantial.
+
+Determine whether the robot’s current body orientation is turned left or right relative to the desired interaction direction.
+
+For the current task, the desired body-forward direction is perpendicular to the relevant table edge and directed toward the table.
+
+Use TURNED_LEFT when the robot’s body-forward direction points to the left of the desired table-normal direction.
+Use TURNED_RIGHT when the robot’s body-forward direction points to the right of the desired table-normal direction.
+Use ALIGNED when the robot is approximately perpendicular to the relevant table edge and facing the table.
+Determine whether the robot should move closer to or farther from the manipulation target to reach a suitable manipulation distance.
+
+Generate a continuous multi-step motion sequence that adjusts both the robot’s position and orientation.
+
+For the current task, when lateral repositioning is required and the path is safe, prefer the following motion structure:
+
+move backward to create maneuvering space;
+rotate toward the required lateral repositioning direction;
+move forward along the adjusted heading;
+rotate again to restore the desired orientation toward the table.
+
+When the robot is positioned to the left of the target, a rightward repositioning is normally required. Prefer:
+
+MOVE_BACKWARD;
+ROTATE_RIGHT;
+MOVE_FORWARD;
+ROTATE_LEFT.
+
+When the robot is positioned to the right of the target, a leftward repositioning is normally required. Prefer:
+
+MOVE_BACKWARD;
+ROTATE_LEFT;
+MOVE_FORWARD;
+ROTATE_RIGHT.
+
+The final rotation should restore a body orientation approximately perpendicular to the relevant table edge and facing the table.
+
+The preferred backward–rotate–forward–rotate structure is not mandatory when only a direct distance adjustment is required, when the robot is already horizontally aligned, or when the structure would introduce unnecessary motion or collision risk.
+
+The final pose should:
+
+place the center of the blue plastic basket near the horizontal center of the camera view;
+place the robot at a suitable manipulation distance from the table and basket;
+orient the robot approximately perpendicular to the relevant table edge;
+provide a reasonable shared base pose for reaching both paper balls and the basket with the specified hands.
+Allowed motion commands
+ROTATE_LEFT: rotate counterclockwise by a specified number of degrees.
+ROTATE_RIGHT: rotate clockwise by a specified number of degrees.
+MOVE_FORWARD: move forward along the robot’s current heading by a specified number of meters.
+MOVE_BACKWARD: move backward along the robot’s current heading by a specified number of meters.
 
 Direct lateral translation is not available.
 
-## Motion-planning rules
+Motion-planning rules
+Output a complete and coherent sequence containing all base movements needed to reach the estimated manipulation pose.
+Commands must be ordered exactly as they should be executed.
+Each command is defined relative to the robot pose resulting from all previous commands.
+Multiple rotations and translations may be used.
+Do not require a new observation between commands.
+Do not limit the plan to small incremental movements.
+Avoid unnecessary movements and redundant direction changes.
+Prefer a smooth and geometrically consistent trajectory.
+Do not output zero-valued or negative-valued motion commands.
+Translation constraints
+Every MOVE_FORWARD or MOVE_BACKWARD command must specify a distance greater than or equal to 0.3 meters.
+Do not output a translation command with a distance smaller than 0.3 meters.
+If the desired positional correction is smaller than 0.3 meters, do not approximate it using an invalid smaller translation.
+When geometrically appropriate and safe, use a combination of backward movement, rotation, forward movement, and final corrective rotation to produce the required position change.
+Do not output direct lateral movement.
+Rotation constraints
+Every ROTATE_LEFT or ROTATE_RIGHT command must specify an angle greater than or equal to 30 degrees.
+Do not output a rotation command with an angle smaller than 30 degrees.
+If a required standalone net orientation correction is smaller than 30 degrees, it may be achieved using two rotations in opposite directions.
+First rotate by at least 30 degrees in the direction opposite to the required correction, then rotate in the required direction by an angle that produces the desired net correction.
+Every individual rotation in this indirect correction must still be greater than or equal to 30 degrees.
+For example, if a net 10-degree right rotation is required, use ROTATE_LEFT by 30 degrees followed by ROTATE_RIGHT by 40 degrees.
+Use this indirect small-angle correction only when the intermediate rotation is safe and does not create an unnecessary collision or stability risk.
+Do not add an indirect small-angle correction when the required orientation change can already be achieved as part of the lateral repositioning sequence.
+Task and safety constraints
+Do not output arm or hand commands.
+Do not include target-recognition, image-acquisition, or observation commands in the motion sequence.
+Account for the visible table, support surfaces, objects, and obstacles when evaluating motion safety.
+Because no depth image or complete camera calibration is provided, all distances and angles are approximate visual estimates.
+Do not claim that the estimated motion values are geometrically exact.
+If the blue plastic basket cannot be identified, return UNSURE.
+If the relevant table edge or required interaction direction cannot be reasonably inferred, return UNSURE.
+If the required movement cannot be reasonably inferred from the image, return UNSURE.
+Do not invent a motion sequence when the visual evidence is insufficient.
+If the scene appears unsafe for the proposed base motion, return UNSAFE.
+Apply status priority in the following order: UNSAFE first, then UNSURE, then ADJUST.
+Output requirements
 
-* Output a coherent sequence containing all movements needed to reach the estimated manipulation pose.
-* The commands must be ordered exactly as they should be executed.
-* Each command is defined relative to the robot pose resulting from all previous commands.
-* You may output multiple rotations and translations.
-* Do not limit the plan to small incremental movements.
-* Every MOVE_FORWARD or MOVE_BACKWARD command must specify a distance greater than or equal to 0.3 meters.
-* If the desired positional correction is less than 0.3 meters, do not output a translation below 0.3 meters. When geometrically appropriate and safe, prefer an indirect adjustment using backward movement, rotation, forward movement, and a final corrective rotation toward the manipulation target.
-* Do not require a new observation between commands.
-* Use combinations of backward movement, rotation, forward movement, and corrective rotation when lateral repositioning is needed.
-* When producing an indirect lateral adjustment, restore an appropriate final body orientation toward the manipulation target.
-* Avoid unnecessary movements and redundant direction changes.
-* Prefer a smooth and geometrically consistent trajectory.
-* Do not output direct lateral movement.
-* Do not output arm or hand commands.
-* Do not include target-recognition or observation commands in the motion sequence.
-* Because no depth image or camera calibration is provided, distance and angle values are approximate visual estimates.
-* Do not claim that the estimated motion values are geometrically exact.
-* If the target cannot be identified or the required movement cannot be reasonably inferred, return UNSURE instead of inventing a motion sequence.
-* If the scene appears unsafe for the proposed motion, return UNSAFE.
-* When the robot already appears suitably positioned, return READY with an empty command sequence.
+Output only one valid JSON object.
 
-## Output requirements
+Do not include Markdown, code fences, explanations, comments, or any additional text outside the JSON object.
 
-Output only one valid JSON object. Do not include Markdown or additional text.
+Use the following format:
 
-Use this format:
-
-{{
-"status": "READY | ADJUST | UNSURE | UNSAFE",
-"task_interpretation": {{
+{
+"status": "ADJUST | UNSURE | UNSAFE",
+"task_interpretation": {
 "primary_target": "",
 "secondary_targets": [],
 "manipulation_anchor": "",
 "interaction_direction": "",
 "selection_reason": ""
-}},
-"current_alignment": {{
+},
+"current_alignment": {
 "horizontal_position": "FAR_LEFT | LEFT | CENTERED | RIGHT | FAR_RIGHT | UNKNOWN",
 "distance_estimate": "TOO_CLOSE | SUITABLE | TOO_FAR | UNKNOWN",
 "orientation_estimate": "TURNED_LEFT | ALIGNED | TURNED_RIGHT | UNKNOWN"
-}},
-"desired_final_pose": {{
+},
+"desired_final_pose": {
 "target_alignment": "",
 "target_distance": "",
 "target_orientation": ""
-}},
+},
 "command_sequence": [
-{{
+{
 "step": 1,
 "action": "ROTATE_LEFT | ROTATE_RIGHT | MOVE_FORWARD | MOVE_BACKWARD",
-"value": 0.3,
+"value": 30.0,
 "unit": "degrees | meters",
 "purpose": ""
-}}
+}
 ],
 "expected_result": "",
 "confidence": 0.0,
 "limitations": ""
-}}
+}
 
-## Consistency constraints
-
-* READY must have an empty command_sequence.
-* UNSURE must have an empty command_sequence.
-* UNSAFE must have an empty command_sequence.
-* ADJUST must contain at least one command.
-* Rotation commands must use degrees.
-* Translation commands must use meters.
-* Every MOVE_FORWARD or MOVE_BACKWARD value must be greater than or equal to 0.3 meters.
-* Every step number must be consecutive, starting from 1.
-* The expected_result must describe the estimated final robot-to-target alignment after the complete sequence has been executed.
+Field interpretation
+primary_target should identify the blue plastic basket.
+secondary_targets should identify the two paper balls and other task-relevant objects.
+manipulation_anchor should identify the center of the blue plastic basket.
+interaction_direction should describe the desired body-forward direction perpendicular to the relevant table edge and facing the table.
+horizontal_position describes the robot’s estimated lateral position relative to the manipulation anchor, not the anchor’s image position:
+anchor right of image center → robot LEFT or FAR_LEFT;
+anchor left of image center → robot RIGHT or FAR_RIGHT;
+anchor near image center → robot CENTERED.
+distance_estimate should be judged relative to a suitable whole-body manipulation distance from the table and basket.
+orientation_estimate should be judged relative to the desired direction perpendicular to the relevant table edge.
+target_alignment should state that the basket center should be near the horizontal center of the camera view.
+target_orientation should state that the robot should face the table approximately perpendicular to the relevant table edge.
+purpose should briefly explain the geometric role of each command.
+Consistency constraints
+UNSURE must have an empty command_sequence.
+UNSAFE must have an empty command_sequence.
+ADJUST must contain at least one command.
+Rotation commands must use degrees.
+Translation commands must use meters.
+Every rotation-command value must be greater than or equal to 30 degrees.
+Every translation-command value must be greater than or equal to 0.3 meters.
+Every command value must be positive.
+Every step number must be consecutive, starting from 1.
+The action and unit of every command must match.
+confidence must be a number from 0.0 to 1.0.
+expected_result must describe the estimated final robot-to-target position, distance, and orientation after the complete command sequence has been executed.
+For UNSURE or UNSAFE, explain the reason in limitations without inventing unsupported geometry.
 """
 
 
