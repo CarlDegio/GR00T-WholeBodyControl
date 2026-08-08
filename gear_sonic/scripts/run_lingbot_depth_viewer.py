@@ -16,15 +16,20 @@ import cv2
 import numpy as np
 import tyro
 
-from gear_sonic.camera.composed_camera import ComposedCameraClientSensor
 from gear_sonic.camera.sensor_server import ImageMessageSchema, SensorServer
+from gear_sonic.runtime.client import SensorGatewayClient, SensorGatewayClientError
+from gear_sonic.runtime.control_client import ControlGatewaySubscriber
+from gear_sonic.runtime.snapshot import SnapshotRequest
 from gear_sonic.scripts.run_depth_camera_viewer import colorize_depth
+from gear_sonic.runtime.visualization import VisualizationPublisher
 
 
 @dataclass
 class LingBotDepthViewerConfig:
-    camera_host: str = "localhost"
-    camera_port: int = 5555
+    sensor_gateway_endpoint: str = "tcp://127.0.0.1:5560"
+    sensor_gateway_request_timeout_ms: int = 100
+    sensor_gateway_max_age_ms: float = 1000.0
+    sensor_gateway_max_skew_ms: float = 5.0
     publish_port: int = 5564
     ready_file: str = ""
     model: str = "robbyant/lingbot-depth-pretrain-vitl-14-v0.5"
@@ -35,6 +40,104 @@ class LingBotDepthViewerConfig:
     max_depth_m: float = 10.0
     resolution_level: int = 6
     use_fp16: bool = True
+    visualize: bool = True
+    visualization_gateway_endpoint: str = ""
+    control_gateway_endpoint: str = "tcp://127.0.0.1:5565"
+
+
+class LingBotSensorGatewayClient:
+    """Read the chest RGB-D pair from Gateway shared memory only."""
+
+    STREAMS = ("camera/chest_view", "camera/chest_view_depth")
+
+    def __init__(
+        self,
+        endpoint: str,
+        *,
+        request_timeout_ms: int = 100,
+        max_age_ms: float = 1000.0,
+        max_skew_ms: float = 5.0,
+        client: SensorGatewayClient | None = None,
+    ) -> None:
+        self.client = client or SensorGatewayClient(
+            endpoint,
+            request_timeout_ms=request_timeout_ms,
+        )
+        self._owns_client = client is None
+        self.max_age_ms = float(max_age_ms)
+        self.max_skew_ms = float(max_skew_ms)
+        self._last_error = ""
+        self._last_error_time = 0.0
+
+    def read(self, blocking: bool = False, **_kwargs) -> dict[str, Any] | None:
+        if blocking:
+            raise ValueError("blocking Gateway RGB-D reads are unsupported")
+        try:
+            snapshot = self.client.read_snapshot(
+                SnapshotRequest(
+                    streams=self.STREAMS,
+                    max_age_ms=self.max_age_ms,
+                    max_skew_ms=self.max_skew_ms,
+                ),
+                retries=0,
+            )
+        except SensorGatewayClientError as exc:
+            now = time.monotonic()
+            message = str(exc)
+            if message != self._last_error or now - self._last_error_time >= 2.0:
+                print(f"[LingBotDepth] waiting for SensorGateway RGB-D: {message}")
+                self._last_error = message
+                self._last_error_time = now
+            return None
+
+        rgb_frame = snapshot.snapshot.frames[self.STREAMS[0]]
+        depth_frame = snapshot.snapshot.frames[self.STREAMS[1]]
+        rgb_timestamp = (
+            rgb_frame.source_timestamp_ns * 1.0e-9
+            if rgb_frame.source_timestamp_ns > 0
+            else time.time()
+        )
+        depth_timestamp = (
+            depth_frame.source_timestamp_ns * 1.0e-9
+            if depth_frame.source_timestamp_ns > 0
+            else rgb_timestamp
+        )
+        return {
+            "images": {
+                "chest_view": snapshot.arrays[self.STREAMS[0]],
+                "chest_view_depth": snapshot.arrays[self.STREAMS[1]],
+            },
+            "timestamps": {
+                "chest_view": rgb_timestamp,
+                "chest_view_depth": depth_timestamp,
+            },
+            "camera_info": {
+                "chest_view": dict(rgb_frame.attributes.get("camera_info", {}))
+            },
+        }
+
+    def close(self) -> None:
+        if self._owns_client:
+            self.client.close()
+
+
+class LingBotInferenceModeGate:
+    """Keep the model resident while admitting GPU work only in PLANNER mode."""
+
+    def __init__(self) -> None:
+        self.mode = "PLANNER"
+
+    @property
+    def inference_enabled(self) -> bool:
+        return self.mode == "PLANNER"
+
+    def accept(self, command_name: str) -> bool:
+        previous = self.mode
+        if command_name == "select_pose_mode":
+            self.mode = "POSE"
+        elif command_name == "select_planner_mode":
+            self.mode = "PLANNER"
+        return self.mode != previous
 
 
 def configure_lingbot_runtime_environment() -> None:
@@ -208,11 +311,24 @@ def _label(image: np.ndarray, text: str) -> np.ndarray:
 
 def main(config: LingBotDepthViewerConfig) -> None:
     completer = LingBotDepthCompleter(config)
-    client = ComposedCameraClientSensor(
-        server_ip=config.camera_host, port=config.camera_port
+    client = LingBotSensorGatewayClient(
+        config.sensor_gateway_endpoint,
+        request_timeout_ms=config.sensor_gateway_request_timeout_ms,
+        max_age_ms=config.sensor_gateway_max_age_ms,
+        max_skew_ms=config.sensor_gateway_max_skew_ms,
     )
     publisher = SensorServer()
     publisher.start_server(config.publish_port)
+    visualization_publisher = (
+        VisualizationPublisher(config.visualization_gateway_endpoint)
+        if config.visualization_gateway_endpoint
+        else None
+    )
+    mode_commands = ControlGatewaySubscriber(
+        config.control_gateway_endpoint,
+        accepted_names={"select_pose_mode", "select_planner_mode"},
+    )
+    mode_gate = LingBotInferenceModeGate()
     if config.ready_file:
         mark_ready(config.ready_file)
         print(f"[LingBotDepth] model loaded; ready marker: {config.ready_file}")
@@ -230,6 +346,13 @@ def main(config: LingBotDepthViewerConfig) -> None:
     try:
         while True:
             loop_start = time.monotonic()
+            command = mode_commands.read_command()
+            if command is not None and mode_gate.accept(command.name):
+                state = "running" if mode_gate.inference_enabled else "paused"
+                print(
+                    f"[LingBotDepth] GPU inference {state}; "
+                    f"control mode={mode_gate.mode}, model remains loaded"
+                )
             packet = client.read(blocking=False)
             images = packet.get("images", {}) if packet else {}
             rgb = images.get("chest_view")
@@ -274,7 +397,11 @@ def main(config: LingBotDepthViewerConfig) -> None:
                     rgb = cv2.resize(rgb, (raw_m.shape[1], raw_m.shape[0]))
 
                 now = time.monotonic()
-                if pending is None and now - last_submit >= inference_period:
+                if (
+                    mode_gate.inference_enabled
+                    and pending is None
+                    and now - last_submit >= inference_period
+                ):
                     try:
                         intrinsics = normalized_intrinsics(
                             info, width=raw_m.shape[1], height=raw_m.shape[0]
@@ -314,9 +441,17 @@ def main(config: LingBotDepthViewerConfig) -> None:
                             _label(fused_color, "CONSERVATIVE"),
                         ]
                     )
-                cv2.imshow(window, np.hstack(tiles))
+                if not mode_gate.inference_enabled:
+                    tiles[0] = _label(raw_color, "RAW | LINGBOT PAUSED IN POSE")
+                visualization_frame = np.hstack(tiles)
+                if visualization_publisher is not None:
+                    visualization_publisher.publish(
+                        "visualization/lingbot_depth", visualization_frame
+                    )
+                if config.visualize:
+                    cv2.imshow(window, visualization_frame)
 
-            if cv2.waitKey(1) & 0xFF in (ord("q"), 27):
+            if config.visualize and cv2.waitKey(1) & 0xFF in (ord("q"), 27):
                 break
             remaining = period - (time.monotonic() - loop_start)
             if remaining > 0:
@@ -327,6 +462,9 @@ def main(config: LingBotDepthViewerConfig) -> None:
         executor.shutdown(wait=False, cancel_futures=True)
         client.close()
         publisher.stop_server()
+        if visualization_publisher is not None:
+            visualization_publisher.close()
+        mode_commands.close()
         if config.ready_file:
             Path(config.ready_file).expanduser().unlink(missing_ok=True)
         cv2.destroyAllWindows()

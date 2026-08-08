@@ -1,0 +1,163 @@
+from __future__ import annotations
+
+import json
+
+import pytest
+
+from gear_sonic.runtime.config import load_runtime_profile
+from gear_sonic.runtime.endpoints import ENDPOINTS
+from gear_sonic.scripts.lavira_planner import LaviraPlannerConfig
+from gear_sonic.scripts.navdp_planner import NavDPPlannerConfig, XNAVDP_G1_MPC_DEFAULTS
+from gear_sonic.scripts.run_lingbot_depth_viewer import LingBotDepthViewerConfig
+from gear_sonic.scripts.run_vla_inference import InferenceConfig
+
+
+def test_default_profile_reproduces_current_topology_and_timing() -> None:
+    profile = load_runtime_profile()
+
+    assert profile.name == "agent_full_current"
+    for name, address in profile.endpoints.items():
+        assert address.port == ENDPOINTS[name].port
+    assert profile.ros_topics == {
+        "lidar": "/livox/lidar",
+        "lidar_imu": "/livox/imu",
+        "odometry": "/Odometry_loc",
+        "registered_cloud": "/cloud_registered_1",
+    }
+    assert profile.component("vla") == {
+        "embodiment_tag": "unitree_g1_sonic",
+        "prompt": (
+            "Approach the tabletop if necessary, then use the right hand to pick up "
+            "the paper ball and place it into the blue plastic basket, use the left "
+            "hand to place another paper ball into the same basket, and finally "
+            "return both arms to the sides of the body."
+        ),
+        "inference_hz": 2.0,
+        "action_publish_hz": 50,
+        "action_horizon": 50,
+        "control_input": "gateway",
+        "control_gateway_max_age_ms": 1000.0,
+        "sensor_input": "gateway",
+        "sensor_gateway_poll_hz": 50.0,
+        "sensor_gateway_request_timeout_ms": 100,
+        "sensor_gateway_max_age_ms": 1000.0,
+        "sensor_gateway_max_skew_ms": 5.0,
+    }
+    assert profile.component("navdp")["control_hz"] == 20.0
+    assert profile.component("navdp")["mpc_hz"] == 10.0
+    assert profile.component("lingbot_depth")["inference_hz"] == 2.0
+    assert profile.component("data_exporter")["frequency_hz"] == 50
+    assert profile.component("launcher")["control_gateway"] is True
+
+
+def test_profile_parameters_match_current_process_defaults() -> None:
+    profile = load_runtime_profile()
+    lavira = LaviraPlannerConfig(mission="", global_target="")
+    navdp = NavDPPlannerConfig()
+    vla = InferenceConfig()
+    lingbot = LingBotDepthViewerConfig()
+
+    vla_profile = profile.component("vla")
+    assert vla_profile["sensor_input"] == vla.sensor_input
+    assert vla_profile["sensor_gateway_poll_hz"] == vla.sensor_gateway_poll_hz
+    assert (
+        vla_profile["sensor_gateway_request_timeout_ms"]
+        == vla.sensor_gateway_request_timeout_ms
+    )
+    assert vla_profile["sensor_gateway_max_age_ms"] == vla.sensor_gateway_max_age_ms
+    assert (
+        vla_profile["sensor_gateway_max_skew_ms"]
+        == vla.sensor_gateway_max_skew_ms
+    )
+
+    assert profile.component("lavira")["planner_hz"] == lavira.planner_hz
+    assert profile.component("lavira")["camera_timeout_ms"] == lavira.camera_timeout_ms
+    assert profile.component("lavira")["policy_timeout_s"] == lavira.codex_timeout_seconds
+    assert profile.component("lavira")["min_confidence"] == lavira.min_confidence
+
+    navdp_profile = profile.component("navdp")
+    assert navdp_profile["control_hz"] == navdp.control_hz
+    assert navdp_profile["mpc_hz"] == navdp.mpc_hz
+    assert navdp_profile["mpc_result_timeout_s"] == navdp.mpc_result_timeout_s
+    assert navdp_profile["heading_preview_s"] == navdp.heading_preview_s
+    assert navdp_profile["goal_tolerance_m"] == navdp.goal_tolerance_m
+    assert navdp_profile["stop_threshold"] == navdp.navdp_stop_threshold
+    assert navdp_profile["request_timeout_s"] == navdp.navdp_request_timeout_s
+    assert navdp_profile["sensor_input"] == navdp.sensor_input
+    assert navdp_profile["sensor_gateway_poll_hz"] == navdp.sensor_gateway_poll_hz
+    assert (
+        navdp_profile["sensor_gateway_request_timeout_ms"]
+        == navdp.sensor_gateway_request_timeout_ms
+    )
+    assert navdp_profile["sensor_gateway_max_age_ms"] == navdp.sensor_gateway_max_age_ms
+    assert (
+        navdp_profile["sensor_gateway_max_skew_ms"]
+        == navdp.sensor_gateway_max_skew_ms
+    )
+    assert navdp_profile["radar_timeout_s"] == navdp.radar_timeout_s
+    assert navdp_profile["odometry_timeout_s"] == navdp.odom_timeout_s
+    assert navdp_profile["trajectory_timeout_s"] == navdp.trajectory_timeout_s
+    assert navdp_profile["visualize"] is navdp.visualize
+    assert navdp_profile["record_actorray"] is navdp.record_actorray
+    assert profile.component("xnavdp_mpc") == XNAVDP_G1_MPC_DEFAULTS
+
+    lingbot_profile = profile.component("lingbot_depth")
+    assert lingbot_profile["model"] == lingbot.model
+    assert lingbot_profile["device"] == lingbot.device
+    assert lingbot_profile["inference_hz"] == lingbot.inference_hz
+    assert lingbot_profile["display_hz"] == lingbot.display_hz
+    assert lingbot_profile["max_depth_m"] == lingbot.max_depth_m
+    assert lingbot_profile["resolution_level"] == lingbot.resolution_level
+    assert lingbot_profile["use_fp16"] is lingbot.use_fp16
+
+
+def test_partial_overlay_changes_only_selected_values(tmp_path) -> None:
+    overlay = tmp_path / "robot_lab.json"
+    overlay.write_text(
+        json.dumps(
+            {
+                "endpoints": {"camera_server": {"host": "192.168.123.164"}},
+                "components": {
+                    "vla": {"prompt": "pick up the paper ball"},
+                    "launcher": {"data_exporter": False},
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    profile = load_runtime_profile(overlays=[overlay])
+
+    assert profile.endpoint("camera_server").host == "192.168.123.164"
+    assert profile.endpoint("camera_server").port == 5555
+    assert profile.endpoint_uri("camera_server") == "tcp://192.168.123.164:5555"
+    assert profile.endpoint_uri("xnavdp_http") == "http://127.0.0.1:19999"
+    assert profile.component("vla")["prompt"] == "pick up the paper ball"
+    assert profile.component("vla")["action_publish_hz"] == 50
+    assert profile.component("launcher")["data_exporter"] is False
+
+
+def test_profile_rejects_unknown_endpoint_and_port_collisions(tmp_path) -> None:
+    unknown = tmp_path / "unknown.json"
+    unknown.write_text(
+        json.dumps({"endpoints": {"mystery_socket": {"host": "localhost", "port": 6000}}}),
+        encoding="utf-8",
+    )
+    collision = tmp_path / "collision.json"
+    collision.write_text(
+        json.dumps({"endpoints": {"camera_server": {"port": 5550}}}),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="unknown endpoint"):
+        load_runtime_profile(overlays=[unknown])
+    with pytest.raises(ValueError, match="shared by"):
+        load_runtime_profile(overlays=[collision])
+
+
+def test_profile_rejects_unknown_top_level_fields(tmp_path) -> None:
+    overlay = tmp_path / "typo.json"
+    overlay.write_text(json.dumps({"component": {}}), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="unknown runtime profile fields"):
+        load_runtime_profile(overlays=[overlay])

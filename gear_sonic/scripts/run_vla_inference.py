@@ -35,14 +35,19 @@ import math
 import queue
 import threading
 import time
+from typing import Literal
 
 import cv2
+import msgpack_numpy as mnp
 import numpy as np
 import tyro
 import zmq
 
 from gear_sonic.camera.composed_camera import ComposedCameraClientSensor
 from gear_sonic.data.robot_model.instantiation.g1 import instantiate_g1_robot_model
+from gear_sonic.runtime.vla_sensor_gateway import VlaSensorGatewayIngress
+from gear_sonic.runtime.vla_timing import VlaTimingPublisher
+from gear_sonic.runtime.control_client import ControlGatewaySubscriber
 from gear_sonic.utils.data_collection.keyboard_subscriber import (
     DEFAULT_ZMQ_KEYBOARD_PORT,
     ZMQKeyboardSubscriber,
@@ -55,7 +60,6 @@ from gear_sonic.utils.inference.vla_utils import (
     calculate_latency_compensated_index,
     concat_action,
     prepare_observation_for_eval,
-    should_trigger_new_inference,
 )
 from gear_sonic.utils.teleop.solver.hand.g1_gripper_ik_solver import (
     G1GripperInverseKinematicsSolver,
@@ -219,6 +223,27 @@ class InferenceConfig:
     camera_port: int = 5555
     """Camera server port."""
 
+    sensor_input: Literal["legacy", "gateway"] = "gateway"
+    """VLA sensor source; legacy remains available only as a rollback path."""
+
+    sensor_gateway_endpoint: str = "tcp://127.0.0.1:5560"
+    """Local read-only SensorGateway Snapshot endpoint."""
+
+    sensor_gateway_poll_hz: float = 50.0
+    """Background rate for materializing VLA camera and C++ state caches."""
+
+    sensor_gateway_request_timeout_ms: int = 100
+    """Deadline for one local SensorGateway metadata request."""
+
+    sensor_gateway_max_age_ms: float = 1000.0
+    """Maximum accepted Gateway frame and cache age."""
+
+    sensor_gateway_max_skew_ms: float = 5.0
+    """Maximum receive-time skew among the four VLA camera frames."""
+
+    timing_endpoint: str = "tcp://127.0.0.1:5567"
+    """Best-effort VLA timing telemetry endpoint; publishing never blocks inference."""
+
     # ZMQ: Robot state (from C++ zmq_output_handler, g1_debug topic)
     state_zmq_host: str = "localhost"
     """ZMQ host for robot state (g1_debug topic from C++ deploy)."""
@@ -239,6 +264,12 @@ class InferenceConfig:
 
     keyboard_zmq_port: int = DEFAULT_ZMQ_KEYBOARD_PORT
     """ZMQ port for keyboard input."""
+
+    control_input: Literal["legacy", "gateway"] = "gateway"
+    """Operator-control source; legacy remains available only as a rollback path."""
+
+    control_gateway_endpoint: str = "tcp://127.0.0.1:5565"
+    """Structured ControlGateway intent endpoint used when explicitly selected."""
 
     # ZMQ: Planner relay (run_planner_keyboard sidecar -> forward to action port)
     planner_relay_zmq_host: str = "localhost"
@@ -264,10 +295,103 @@ def print_green(x):
     print(f"\033[92m{x}\033[0m")
 
 
+class _MsgpackNumpyPolicyClient:
+    """Policy client using SONIC's fixed msgpack-numpy ZMQ wire format."""
+
+    def __init__(self, host: str, port: int, timeout_ms: int = 15000) -> None:
+        self.host = host
+        self.port = int(port)
+        self.timeout_ms = int(timeout_ms)
+        self.context = zmq.Context()
+        self.socket = None
+        self.last_timing_ms: dict[str, float] = {}
+        self._init_socket()
+
+    def _init_socket(self) -> None:
+        if self.socket is not None:
+            self.socket.close(linger=0)
+        self.socket = self.context.socket(zmq.REQ)
+        self.socket.setsockopt(zmq.LINGER, 0)
+        self.socket.setsockopt(zmq.SNDTIMEO, self.timeout_ms)
+        self.socket.setsockopt(zmq.RCVTIMEO, self.timeout_ms)
+        self.socket.connect(f"tcp://{self.host}:{self.port}")
+
+    def call_endpoint(
+        self,
+        endpoint: str,
+        data: dict | None = None,
+        *,
+        requires_input: bool = True,
+    ):
+        request = {"endpoint": endpoint}
+        if requires_input:
+            request["data"] = data
+        try:
+            started = time.perf_counter()
+            packed = mnp.packb(request)
+            request_pack_ms = (time.perf_counter() - started) * 1000.0
+
+            started = time.perf_counter()
+            self.socket.send(packed)
+            response_bytes = self.socket.recv()
+            policy_roundtrip_ms = (time.perf_counter() - started) * 1000.0
+
+            started = time.perf_counter()
+            response = mnp.unpackb(response_bytes, raw=False)
+            response_unpack_ms = (time.perf_counter() - started) * 1000.0
+            self.last_timing_ms = {
+                "request_pack": request_pack_ms,
+                "policy_roundtrip": policy_roundtrip_ms,
+                "response_unpack": response_unpack_ms,
+            }
+        except zmq.Again:
+            self._init_socket()
+            raise
+        if isinstance(response, dict) and "error" in response:
+            raise RuntimeError(f"Server error: {response['error']}")
+        return response
+
+    def ping(self) -> bool:
+        try:
+            self.call_endpoint("ping", requires_input=False)
+            return True
+        except zmq.ZMQError:
+            return False
+
+    def get_action(self, observation: dict, options: dict | None = None):
+        response = self.call_endpoint(
+            "get_action",
+            {"observation": observation, "options": options},
+        )
+        return tuple(response)
+
+    def close(self) -> None:
+        if self.socket is not None:
+            self.socket.close(linger=0)
+            self.socket = None
+        self.context.term()
+
+
 JPEG_VIDEO_MARKER = "__opencv_jpeg_rgb__"
 JPEG_VIDEO_QUALITY = 95
 # Hold completed chunks so latency compensation selects points farther into the trajectory.
 SIMULATED_INFERENCE_DELAY_SECONDS = 0.0
+
+
+class _TimedObservation(dict):
+    """Observation dict carrying local measurements outside the wire payload."""
+
+    def __init__(self, value: dict, timing_ms: dict[str, float]):
+        super().__init__(value)
+        self.timing_ms = timing_ms
+
+
+class _TimedAction(dict):
+    """Processed action dict carrying measurements outside the action payload."""
+
+    def __init__(self, value: dict, timing_ms: dict[str, float]):
+        super().__init__(value)
+        self.timing_ms = timing_ms
 
 
 def encode_rgb_video_frame_as_jpeg(image: np.ndarray) -> dict:
@@ -395,13 +519,20 @@ def prepare_observation_from_sensors(
     Returns:
         observation dict, or None if sensor data not yet available.
     """
+    observation_started = time.perf_counter()
+    timing_ms: dict[str, float] = {}
+
+    started = time.perf_counter()
     camera_msg = camera_subscriber.read()
+    timing_ms["camera_read"] = (time.perf_counter() - started) * 1000.0
     if camera_msg is None:
         if log_errors:
             print("[DEBUG] prepare_observation: waiting for camera msg..", flush=True)
         return None
 
+    started = time.perf_counter()
     state_msg = state_subscriber.get_msg()
+    timing_ms["state_read"] = (time.perf_counter() - started) * 1000.0
     if state_msg is None:
         if log_errors:
             print("[DEBUG] prepare_observation: waiting for state msg..", flush=True)
@@ -412,26 +543,20 @@ def prepare_observation_from_sensors(
     if missing_image_keys:
         raise ValueError(f"Missing required camera images: {missing_image_keys}")
 
-    cam_img = camera_msg["images"]["ego_view"]
-
     qpos = robot_model.get_configuration_from_actuated_joints(
         body_actuated_joint_values=state_msg["body_q"],
         left_hand_actuated_joint_values=state_msg["left_hand_q"],
         right_hand_actuated_joint_values=state_msg["right_hand_q"],
     )
 
+    started = time.perf_counter()
     video = {
-        "ego_view": encode_rgb_video_frame_as_jpeg(cam_img[np.newaxis, np.newaxis]),
-        "chest_view": encode_rgb_video_frame_as_jpeg(
-            camera_msg["images"]["chest_view"][np.newaxis, np.newaxis]
-        ),
-        "left_wrist": encode_rgb_video_frame_as_jpeg(
-            camera_msg["images"]["left_wrist"][np.newaxis, np.newaxis]
-        ),
-        "right_wrist": encode_rgb_video_frame_as_jpeg(
-            camera_msg["images"]["right_wrist"][np.newaxis, np.newaxis]
-        ),
+        name: encode_rgb_video_frame_as_jpeg(
+            camera_msg["images"][name][np.newaxis, np.newaxis]
+        )
+        for name in required_image_keys
     }
+    timing_ms["jpeg_encode"] = (time.perf_counter() - started) * 1000.0
 
     observation = {
         "video": video,
@@ -454,7 +579,19 @@ def prepare_observation_from_sensors(
         projected_gravity, dtype=np.float32
     )[np.newaxis, np.newaxis]
 
-    return observation
+    timestamp = np.asarray(camera_msg["timestamps"]["ego_view"]).reshape(-1)
+    if timestamp.size:
+        raw_timestamp = float(timestamp[-1])
+        if math.isfinite(raw_timestamp):
+            # Camera timestamps use Unix seconds in the legacy stream. Avoid
+            # reporting nonsense when a test or alternate source uses another clock.
+            age_ms = (time.time() - raw_timestamp) * 1000.0
+            if 0.0 <= age_ms <= 60_000.0:
+                timing_ms["frame_age"] = age_ms
+    timing_ms["observation_build"] = (
+        time.perf_counter() - observation_started
+    ) * 1000.0
+    return _TimedObservation(observation, timing_ms)
 
 
 def run_policy_inference_and_process(policy, observation, robot_model):
@@ -464,8 +601,13 @@ def run_policy_inference_and_process(policy, observation, robot_model):
         processed_action dict or None on error.
     """
     try:
+        policy_started = time.perf_counter()
         action, _info = policy.get_action(observation)
+        policy_total_ms = (time.perf_counter() - policy_started) * 1000.0
+        timing_ms = dict(getattr(policy, "last_timing_ms", {}))
+        timing_ms.setdefault("policy_roundtrip", policy_total_ms)
 
+        postprocess_started = time.perf_counter()
         action.pop("task_progress", None)
         action.pop("action.task_progress", None)
 
@@ -479,7 +621,10 @@ def run_policy_inference_and_process(policy, observation, robot_model):
             return None
 
         processed_action = concat_action(robot_model, action)
-        return processed_action
+        timing_ms["action_postprocess"] = (
+            time.perf_counter() - postprocess_started
+        ) * 1000.0
+        return _TimedAction(processed_action, timing_ms)
     except Exception as e:
         print(f"Error in inference: {e}")
         import traceback
@@ -496,36 +641,61 @@ def _inference_worker_loop(
     prepare_obs_fn,
     inference_fn,
     simulated_inference_delay_seconds: float = SIMULATED_INFERENCE_DELAY_SECONDS,
+    timing_callback=None,
 ):
     """Persistent worker thread for async inference."""
     while not stop_event.is_set():
         try:
             try:
-                inference_queue.get(timeout=0.1)
+                request_generation = inference_queue.get(timeout=0.1)
             except queue.Empty:
                 continue
 
+            # ``None`` keeps the worker helper backward-compatible with old
+            # callers while production requests always carry a generation.
+            if request_generation is None:
+                request_generation = 0
+
             busy_event.set()
             try:
+                worker_started = time.perf_counter()
                 observation = prepare_obs_fn()
                 if observation is None:
                     print("[DEBUG] Worker thread: Observation is None, skipping", flush=True)
                     continue
 
+                timing_ms = dict(getattr(observation, "timing_ms", {}))
                 inference_start_time = time.monotonic()
                 processed_action = inference_fn(observation)
+                timing_ms.update(getattr(processed_action, "timing_ms", {}))
+                timing_ms["worker_total"] = (
+                    time.perf_counter() - worker_started
+                ) * 1000.0
+                if timing_callback is not None:
+                    try:
+                        timing_callback(timing_ms)
+                    except Exception:
+                        # Diagnostics are deliberately best-effort and must not
+                        # alter policy scheduling or produce repetitive logs.
+                        pass
 
                 if processed_action is not None:
                     if stop_event.wait(simulated_inference_delay_seconds):
                         continue
                     try:
-                        result_queue.put_nowait((processed_action, inference_start_time))
+                        result_queue.put_nowait(
+                            (request_generation, processed_action, inference_start_time)
+                        )
                     except queue.Full:
                         try:
                             result_queue.get_nowait()
-                            result_queue.put_nowait((processed_action, inference_start_time))
+                            result_queue.put_nowait(
+                                (request_generation, processed_action, inference_start_time)
+                            )
                         except queue.Empty:
-                            result_queue.put_nowait((processed_action, inference_start_time))
+                            result_queue.put_nowait(
+                                (request_generation, processed_action, inference_start_time)
+                            )
             finally:
                 busy_event.clear()
         except Exception as e:
@@ -533,6 +703,54 @@ def _inference_worker_loop(
             import traceback
 
             traceback.print_exc()
+
+
+def _pose_policy_is_active(cpp_loop_running: bool, cpp_mode: str, pause_loop: bool) -> bool:
+    """Return whether a fresh VLA inference/action is allowed to run."""
+    return cpp_loop_running and cpp_mode == "POSE" and not pause_loop
+
+
+def _vla_inference_is_due(
+    worker_is_busy: bool,
+    request_queue_is_empty: bool,
+    time_since_request: float,
+    inference_interval: float,
+) -> bool:
+    """Schedule observations independently from robot action/mode gating."""
+    return (
+        not worker_is_busy
+        and request_queue_is_empty
+        and time_since_request >= inference_interval
+    )
+
+
+def _should_schedule_vla_inference(
+    *,
+    cpp_mode: str,
+    worker_is_busy: bool,
+    request_queue_is_empty: bool,
+    time_since_request: float,
+    inference_interval: float,
+) -> bool:
+    """Capture POSE observations even when action publication is paused."""
+
+    return cpp_mode == "POSE" and _vla_inference_is_due(
+        worker_is_busy=worker_is_busy,
+        request_queue_is_empty=request_queue_is_empty,
+        time_since_request=time_since_request,
+        inference_interval=inference_interval,
+    )
+
+
+def _drain_queue(target: queue.Queue) -> int:
+    """Remove queued work/results without waiting and return the item count."""
+    drained = 0
+    while True:
+        try:
+            target.get_nowait()
+            drained += 1
+        except queue.Empty:
+            return drained
 
 
 # ---------------------------------------------------------------------------
@@ -552,10 +770,9 @@ def main(config: InferenceConfig):
 
     robot_model = instantiate_g1_robot_model(waist_location="lower_and_upper_body")
 
-    # Isaac-GR00T PolicyClient
-    from gr00t.policy.server_client import PolicyClient
-
-    n1_policy = PolicyClient(host=config.host, port=config.port)
+    n1_policy = _MsgpackNumpyPolicyClient(host=config.host, port=config.port)
+    timing_publisher = VlaTimingPublisher(config.timing_endpoint)
+    print_green("Policy wire protocol: msgpack_numpy")
 
     print(f"Connecting to PolicyServer at {config.host}:{config.port}...")
     if n1_policy.ping():
@@ -563,14 +780,32 @@ def main(config: InferenceConfig):
     else:
         print("WARNING: PolicyServer not reachable. Inference will fail until server is up.")
 
-    state_subscriber = ZMQStateSubscriber(
-        host=config.state_zmq_host,
-        port=config.state_zmq_port,
-    )
-
-    camera_subscriber = ComposedCameraClientSensor(
-        server_ip=config.camera_host, port=config.camera_port
-    )
+    if config.sensor_input == "legacy":
+        state_subscriber = ZMQStateSubscriber(
+            host=config.state_zmq_host,
+            port=config.state_zmq_port,
+        )
+        camera_subscriber = ComposedCameraClientSensor(
+            server_ip=config.camera_host, port=config.camera_port
+        )
+        print_green("VLA sensors: legacy camera and C++ ZMQ subscribers")
+    elif config.sensor_input == "gateway":
+        gateway_ingress = VlaSensorGatewayIngress(
+            config.sensor_gateway_endpoint,
+            poll_hz=config.sensor_gateway_poll_hz,
+            request_timeout_ms=config.sensor_gateway_request_timeout_ms,
+            max_age_ms=config.sensor_gateway_max_age_ms,
+            max_skew_ms=config.sensor_gateway_max_skew_ms,
+        )
+        gateway_ingress.start()
+        # Preserve the two legacy method contracts used by the unchanged VLA
+        # observation and mode-switch code. All Gateway I/O stays on the
+        # ingress worker thread.
+        state_subscriber = gateway_ingress
+        camera_subscriber = gateway_ingress
+        print_green(f"VLA sensors: Gateway cache at {config.sensor_gateway_endpoint}")
+    else:
+        raise ValueError(f"unsupported VLA sensor input: {config.sensor_input!r}")
 
     zmq_context = zmq.Context()
     zmq_socket = zmq_context.socket(zmq.PUB)
@@ -581,9 +816,27 @@ def main(config: InferenceConfig):
     )
     print_green(f"Using embodiment tag: {config.embodiment_tag}")
 
-    keyboard_listener = ZMQKeyboardSubscriber(
-        port=config.keyboard_zmq_port, host=config.keyboard_zmq_host
-    )
+    if config.control_input == "gateway":
+        keyboard_listener = ControlGatewaySubscriber(
+            config.control_gateway_endpoint,
+            accepted_names={
+                "start_recording",
+                "stop_recording_success",
+                "stop_recording_failure",
+                "select_pose_mode",
+                "toggle_control_loop",
+                "select_planner_mode",
+                "toggle_policy_pause",
+                "toggle_left_hand_initial_pose",
+                "toggle_right_hand_initial_pose",
+                "set_prompt",
+                "legacy_passthrough",
+            },
+        )
+    else:
+        keyboard_listener = ZMQKeyboardSubscriber(
+            port=config.keyboard_zmq_port, host=config.keyboard_zmq_host
+        )
 
     planner_relay_sub = zmq_context.socket(zmq.SUB)
     planner_relay_sub.setsockopt_string(zmq.SUBSCRIBE, "planner")
@@ -725,8 +978,14 @@ def main(config: InferenceConfig):
                 planner_heading_alignment.clear()
 
             cmd_msg = build_command_message(start=start, stop=not start, planner=planner)
-            zmq_socket.send(cmd_msg)
-            time.sleep(0.01)
+            # This is a low-frequency state transition sent over PUB/SUB.
+            # A single packet can be lost during subscriber reconnects or a
+            # busy mode transition, while the Python side would otherwise
+            # optimistically update ``cpp_mode``. Repeat the idempotent
+            # command over a short window before publishing planner data.
+            for _ in range(5):
+                zmq_socket.send(cmd_msg)
+                time.sleep(0.02)
             if start and planner and planner_entry_yaw is not None:
                 # Do not let the C++ planner's default facing direction act in
                 # the gap before the first fresh sidecar command arrives.
@@ -757,7 +1016,29 @@ def main(config: InferenceConfig):
     cached_action_chunk = None
     action_chunk_index = 0
     last_inference_time = 0.0
+    last_inference_request_time = 0.0
     inference_interval = 1.0 / config.rate
+
+    inference_queue = queue.Queue(maxsize=1)
+    result_queue = queue.Queue(maxsize=1)
+    inference_generation = 0
+
+    def invalidate_inference(reason: str):
+        """Invalidate cached, queued, and currently-running inference work."""
+        nonlocal cached_action_chunk, action_chunk_index, last_inference_time
+        nonlocal last_inference_request_time
+        nonlocal inference_generation
+        inference_generation += 1
+        cached_action_chunk = None
+        action_chunk_index = 0
+        last_inference_time = 0.0
+        last_inference_request_time = 0.0
+        queued = _drain_queue(inference_queue)
+        results = _drain_queue(result_queue)
+        print(
+            f"[VLA] invalidated inference generation {inference_generation}: {reason} "
+            f"(queued={queued}, results={results})"
+        )
 
     zmq_frame_counter = 0
 
@@ -778,6 +1059,7 @@ def main(config: InferenceConfig):
             if new_prompt:
                 old_prompt = language_prompt_ref[0]
                 language_prompt_ref[0] = new_prompt
+                invalidate_inference("prompt changed")
                 print_green(f'Inference prompt changed: "{old_prompt}" -> "{new_prompt}"')
             else:
                 print("Received empty prompt change -- ignoring.")
@@ -793,9 +1075,7 @@ def main(config: InferenceConfig):
             print("Switch to pose mode")
             zmq_frame_counter = 0
             print("Reset ZMQ frame counter")
-            cached_action_chunk = None
-            action_chunk_index = 0
-            print("Cleared cached action chunk")
+            invalidate_inference("entering POSE mode")
             if cpp_mode == "PLANNER":
                 if not publish_initial_pose():
                     print("Warning: POSE transition preparation failed; remaining in PLANNER mode")
@@ -813,15 +1093,13 @@ def main(config: InferenceConfig):
             print("Switch to planner mode")
             zmq_frame_counter = 0
             print("Reset ZMQ frame counter")
-            cached_action_chunk = None
-            action_chunk_index = 0
-            print("Cleared cached action chunk")
+            invalidate_inference("entering PLANNER mode")
             if cpp_mode == "POSE":
                 print("Switching to PLANNER mode")
                 if send_cpp_control_command(start=True, planner=True):
                     print("Switched to PLANNER mode (from POSE mode)")
                 else:
-                    print("Warning: Failed to switch to PLANNER mode")          
+                    print("Warning: Failed to switch to PLANNER mode")
             elif cpp_mode == "PLANNER":
                 print("Warning: C++ loop is already in PLANNER mode")
             else:
@@ -831,6 +1109,9 @@ def main(config: InferenceConfig):
                 print("Warning: C++ loop is in PLANNER mode - press 'i' to switch to POSE mode")
             else:
                 pause_loop = not pause_loop
+                invalidate_inference(
+                    "POSE policy resumed" if not pause_loop else "POSE policy paused"
+                )
                 print(f"{'Paused' if pause_loop else 'Resumed'} policy loop")
                 if pause_loop:
                     print("Policy loop paused (C++ loop still running - press 'k' to stop)")
@@ -838,6 +1119,7 @@ def main(config: InferenceConfig):
                     print("Policy loop resumed (C++ loop still running - press 'k' to stop)")
 
         elif key == "k":
+            invalidate_inference("C++ control toggled")
             if cpp_loop_running:
                 current_planner = cpp_mode == "PLANNER"
                 print(f"Stopping C++ control loop (from {cpp_mode} mode)...")
@@ -866,8 +1148,6 @@ def main(config: InferenceConfig):
     language_prompt_ref: list[str] = [config.prompt]
     print(f"Starting the policy loop with language prompt: {language_prompt_ref[0]}")
 
-    inference_queue = queue.Queue(maxsize=1)
-    result_queue = queue.Queue(maxsize=1)
     inference_stop_event = threading.Event()
     inference_busy_event = threading.Event()
 
@@ -891,6 +1171,7 @@ def main(config: InferenceConfig):
                 robot_model=robot_model,
             ),
         ),
+        kwargs={"timing_callback": timing_publisher.publish},
         daemon=True,
     )
     inference_worker_thread.start()
@@ -902,31 +1183,55 @@ def main(config: InferenceConfig):
 
             # Consume result first so last_inference_time is fresh before trigger check
             try:
-                processed_action, inference_start_time = result_queue.get_nowait()
+                result_generation, processed_action, inference_start_time = (
+                    result_queue.get_nowait()
+                )
                 inference_delay = time.monotonic() - inference_start_time
-                action_chunk_index = calculate_latency_compensated_index(
-                    inference_delay, config.action_publish_rate, config.action_horizon
-                )
-                cached_action_chunk = processed_action
-                last_inference_time = time.monotonic()
-                print_green(
-                    f'New action chunk (prompt: "{language_prompt_ref[0]}", '
-                    f"latency: {inference_delay:.3f}s)"
-                )
+                if (
+                    result_generation == inference_generation
+                    and _pose_policy_is_active(cpp_loop_running, cpp_mode, pause_loop)
+                ):
+                    action_chunk_index = calculate_latency_compensated_index(
+                        inference_delay, config.action_publish_rate, config.action_horizon
+                    )
+                    cached_action_chunk = processed_action
+                    last_inference_time = time.monotonic()
+                    print_green(
+                        f'New action chunk (prompt: "{language_prompt_ref[0]}", '
+                        f"latency: {inference_delay:.3f}s)"
+                    )
+                elif result_generation != inference_generation:
+                    print(
+                        f"[VLA] dropped stale inference generation {result_generation}; "
+                        f"active={inference_generation}, mode={cpp_mode}, "
+                        f"paused={pause_loop}, latency={inference_delay:.3f}s"
+                    )
+                else:
+                    # This can only be a request that was already in flight
+                    # when POSE was paused or switched to PLANNER. Its action
+                    # is discarded and no new observation is scheduled.
+                    print(
+                        f"[VLA] inference received; action held "
+                        f"(mode={cpp_mode}, paused={pause_loop}, "
+                        f"latency={inference_delay:.3f}s)"
+                    )
             except queue.Empty:
                 pass
 
             worker_is_busy = inference_busy_event.is_set()
-            should_start = should_trigger_new_inference(
-                cached_chunk_exists=(cached_action_chunk is not None),
-                inference_thread_running=worker_is_busy,
-                time_since_last_inference=(time.monotonic() - last_inference_time),
+            now = time.monotonic()
+            should_start = _should_schedule_vla_inference(
+                cpp_mode=cpp_mode,
+                worker_is_busy=worker_is_busy,
+                request_queue_is_empty=inference_queue.empty(),
+                time_since_request=(now - last_inference_request_time),
                 inference_interval=inference_interval,
             )
 
             if should_start:
                 try:
-                    inference_queue.put_nowait(None)
+                    inference_queue.put_nowait(inference_generation)
+                    last_inference_request_time = now
                 except queue.Full:
                     pass
 
@@ -1031,6 +1336,8 @@ def main(config: InferenceConfig):
         zmq_context.term()
         state_subscriber.close()
         keyboard_listener.close()
+        n1_policy.close()
+        timing_publisher.close()
         print("Shutdown complete.")
 
 

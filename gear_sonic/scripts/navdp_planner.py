@@ -16,6 +16,12 @@ from typing import Any, Literal, Mapping, Sequence
 
 import numpy as np
 
+from gear_sonic.runtime.client import (
+    MaterializedSnapshot,
+    SensorGatewayClient,
+)
+from gear_sonic.runtime.contracts import SharedMemoryFrame
+from gear_sonic.runtime.snapshot import SnapshotRequest
 from gear_sonic.utils.teleop.zmq.zmq_planner_sender import build_planner_message
 
 
@@ -186,6 +192,29 @@ def livox_custom_points_to_numpy(message: Any) -> np.ndarray:
         count=3 * len(message.points),
     )
     return values.reshape(-1, 3)
+
+
+def odometry_array_from_message(message: Any) -> np.ndarray:
+    pose = message.pose.pose
+    twist = message.twist.twist
+    return np.asarray(
+        (
+            pose.position.x,
+            pose.position.y,
+            pose.position.z,
+            pose.orientation.x,
+            pose.orientation.y,
+            pose.orientation.z,
+            pose.orientation.w,
+            twist.linear.x,
+            twist.linear.y,
+            twist.linear.z,
+            twist.angular.x,
+            twist.angular.y,
+            twist.angular.z,
+        ),
+        dtype=np.float64,
+    )
 
 
 def actor_ray_from_points(
@@ -1278,6 +1307,12 @@ class NavDPPlannerConfig:
     navdp_server: str = "http://127.0.0.1:19999"
     camera_host: str = "192.168.123.164"
     camera_port: int = 5555
+    sensor_input: Literal["legacy", "gateway"] = "gateway"
+    sensor_gateway_endpoint: str = "tcp://127.0.0.1:5560"
+    sensor_gateway_poll_hz: float = 20.0
+    sensor_gateway_request_timeout_ms: int = 100
+    sensor_gateway_max_age_ms: float = 1000.0
+    sensor_gateway_max_skew_ms: float = 5.0
     lidar_topic: str = "/livox/lidar"
     odom_topic: str = "/Odometry_loc"
     slam_cloud_topic: str = "/cloud_registered_1"
@@ -1292,6 +1327,7 @@ class NavDPPlannerConfig:
     trajectory_timeout_s: float = 2.50
     navdp_request_timeout_s: float = 10.0
     visualize: bool = True
+    visualization_gateway_endpoint: str = ""
     record_actorray: bool = False
     actorray_output_dir: str = "outputs/navdp"
     actorray_record_fps: float = 20.0
@@ -1322,6 +1358,299 @@ def _extract_camera_frame(message: Mapping[str, Any]) -> tuple[np.ndarray, np.nd
         raise ValueError("fresh aligned ego-view RGB-D unavailable")
     scale = float(info.get("depth_scale_m", 0.001))
     return rgb.copy(), depth_raw.astype(np.float32) * scale, info
+
+
+@dataclass(frozen=True)
+class GatewayCameraFrame:
+    rgb: np.ndarray
+    depth_m: np.ndarray
+    camera_info: Mapping[str, Any]
+    source_timestamp_s: float
+
+
+def _update_odometry_state(
+    sensors: _SharedSensors,
+    values: Sequence[float],
+    *,
+    source_timestamp_s: float,
+    received_monotonic_s: float,
+) -> None:
+    state = np.asarray(values, dtype=np.float64).reshape(-1)
+    if state.shape != (13,):
+        raise ValueError(f"odometry vector must have 13 values, got {state.shape}")
+    pose = Pose2D(
+        float(state[0]),
+        float(state[1]),
+        _quaternion_yaw(*map(float, state[3:7])),
+    )
+    timestamp_s = float(source_timestamp_s)
+    if timestamp_s <= 0.0:
+        timestamp_s = time.time()
+    with sensors.lock:
+        sensors.pose = pose
+        sensors.pose_time = float(received_monotonic_s)
+        sensors.pose_history.append((timestamp_s, pose))
+        sample = np.asarray([[pose.x, pose.y]], dtype=np.float32)
+        if (
+            not len(sensors.robot_history)
+            or np.linalg.norm(sample[0] - sensors.robot_history[-1]) >= 0.02
+        ):
+            sensors.robot_history = np.concatenate(
+                (sensors.robot_history, sample), axis=0
+            )[-5000:]
+
+
+def _update_lidar_state(
+    sensors: _SharedSensors,
+    raw_points: np.ndarray,
+    *,
+    received_monotonic_s: float | None,
+) -> None:
+    points = _remove_ground(filter_livox_points(raw_points))
+    timestamp_s = (
+        time.monotonic()
+        if received_monotonic_s is None
+        else float(received_monotonic_s)
+    )
+    with sensors.lock:
+        sensors.points = points
+        sensors.points_time = timestamp_s
+
+
+def _update_slam_cloud_state(
+    sensors: _SharedSensors,
+    xyz: np.ndarray,
+    *,
+    received_monotonic_s: float | None,
+) -> None:
+    values = np.asarray(xyz, dtype=np.float32).reshape(-1, 3)
+    with sensors.lock:
+        pose = sensors.pose
+        previous = sensors.slam_map_xy
+    if pose is None:
+        return
+    updated = update_slam_map(previous, values[:, :2], center_xy=(pose.x, pose.y))
+    timestamp_s = (
+        time.monotonic()
+        if received_monotonic_s is None
+        else float(received_monotonic_s)
+    )
+    with sensors.lock:
+        sensors.slam_map_xy = updated
+        sensors.slam_map_time = timestamp_s
+
+
+def _gateway_camera_frame(snapshot: MaterializedSnapshot) -> GatewayCameraFrame:
+    rgb_stream = "camera/ego_view"
+    depth_stream = "camera/ego_view_depth"
+    rgb_frame = snapshot.snapshot.frames[rgb_stream]
+    depth_frame = snapshot.snapshot.frames[depth_stream]
+    camera_info = dict(rgb_frame.attributes.get("camera_info", {}))
+    timestamp_ns = rgb_frame.source_timestamp_ns or depth_frame.source_timestamp_ns
+    message = {
+        "images": {
+            "ego_view": snapshot.arrays[rgb_stream],
+            "ego_view_depth": snapshot.arrays[depth_stream],
+        },
+        "camera_info": {"ego_view": camera_info},
+    }
+    rgb, depth_m, info = _extract_camera_frame(message)
+    return GatewayCameraFrame(
+        rgb=rgb,
+        depth_m=depth_m,
+        camera_info=info,
+        source_timestamp_s=(
+            float(timestamp_ns) * 1.0e-9 if timestamp_ns > 0 else time.time()
+        ),
+    )
+
+
+class NavDPSensorGatewayIngress:
+    """Asynchronously adapt SensorGateway arrays to NavDP's legacy state."""
+
+    CAMERA_STREAMS = ("camera/ego_view", "camera/ego_view_depth")
+    ODOMETRY_STREAM = "ros/odometry"
+    LIDAR_STREAM = "ros/livox_lidar_xyz"
+    SLAM_CLOUD_STREAM = "ros/registered_cloud_xyz"
+
+    def __init__(
+        self,
+        endpoint: str,
+        sensors: _SharedSensors,
+        *,
+        poll_hz: float = 20.0,
+        request_timeout_ms: int = 100,
+        max_age_ms: float = 1000.0,
+        max_skew_ms: float = 5.0,
+        client: SensorGatewayClient | None = None,
+    ) -> None:
+        if poll_hz <= 0.0:
+            raise ValueError("sensor gateway poll_hz must be positive")
+        if request_timeout_ms <= 0:
+            raise ValueError("sensor gateway request_timeout_ms must be positive")
+        if max_age_ms < 0.0 or max_skew_ms < 0.0:
+            raise ValueError("sensor gateway age and skew cannot be negative")
+        self.sensors = sensors
+        self.poll_hz = float(poll_hz)
+        self.max_age_ms = float(max_age_ms)
+        self.max_skew_ms = float(max_skew_ms)
+        self.client = client or SensorGatewayClient(
+            endpoint,
+            request_timeout_ms=request_timeout_ms,
+        )
+        self._owns_client = client is None
+        self._stop = threading.Event()
+        self._thread = threading.Thread(
+            target=self._run,
+            name="navdp-sensor-gateway",
+            daemon=True,
+        )
+        self._camera_lock = threading.Lock()
+        self._camera: GatewayCameraFrame | None = None
+        self._camera_version = 0
+        self._consumed_camera_version = 0
+        self._last_sequences: dict[str, int] = {}
+        self._last_error = ""
+        self._last_error_print_s = 0.0
+        self._lidar_worker = LatestMessageWorker(self._process_lidar)
+        self._slam_worker = LatestMessageWorker(self._process_slam_cloud)
+        self._closed = False
+
+    def _request(self, streams: tuple[str, ...], *, max_skew_ms: float):
+        return self.client.read_snapshot(
+            SnapshotRequest(
+                streams=streams,
+                max_age_ms=self.max_age_ms,
+                max_skew_ms=max_skew_ms,
+            ),
+            retries=0,
+        )
+
+    def _is_new(self, frame: SharedMemoryFrame) -> bool:
+        sequence = frame.metadata.sequence
+        if self._last_sequences.get(frame.stream) == sequence:
+            return False
+        self._last_sequences[frame.stream] = sequence
+        return True
+
+    def _poll_camera(self) -> None:
+        snapshot = self._request(self.CAMERA_STREAMS, max_skew_ms=self.max_skew_ms)
+        rgb_frame = snapshot.snapshot.frames[self.CAMERA_STREAMS[0]]
+        depth_frame = snapshot.snapshot.frames[self.CAMERA_STREAMS[1]]
+        rgb_is_new = self._is_new(rgb_frame)
+        depth_is_new = self._is_new(depth_frame)
+        if not (rgb_is_new or depth_is_new):
+            return
+        camera = _gateway_camera_frame(snapshot)
+        with self._camera_lock:
+            self._camera = camera
+            self._camera_version += 1
+
+    def _poll_odometry(self) -> None:
+        snapshot = self._request((self.ODOMETRY_STREAM,), max_skew_ms=0.0)
+        frame = snapshot.snapshot.frames[self.ODOMETRY_STREAM]
+        if not self._is_new(frame):
+            return
+        _update_odometry_state(
+            self.sensors,
+            snapshot.arrays[self.ODOMETRY_STREAM],
+            source_timestamp_s=float(frame.source_timestamp_ns) * 1.0e-9,
+            received_monotonic_s=float(frame.metadata.timestamp_ns) * 1.0e-9,
+        )
+
+    def _poll_lidar(self) -> None:
+        snapshot = self._request((self.LIDAR_STREAM,), max_skew_ms=0.0)
+        frame = snapshot.snapshot.frames[self.LIDAR_STREAM]
+        if self._is_new(frame):
+            self._lidar_worker.submit(
+                (
+                    snapshot.arrays[self.LIDAR_STREAM],
+                    float(frame.metadata.timestamp_ns) * 1.0e-9,
+                )
+            )
+
+    def _poll_slam_cloud(self) -> None:
+        snapshot = self._request((self.SLAM_CLOUD_STREAM,), max_skew_ms=0.0)
+        frame = snapshot.snapshot.frames[self.SLAM_CLOUD_STREAM]
+        if self._is_new(frame):
+            self._slam_worker.submit(
+                (
+                    snapshot.arrays[self.SLAM_CLOUD_STREAM],
+                    float(frame.metadata.timestamp_ns) * 1.0e-9,
+                )
+            )
+
+    def _process_lidar(self, item: tuple[np.ndarray, float]) -> None:
+        points, received_s = item
+        _update_lidar_state(
+            self.sensors,
+            points,
+            received_monotonic_s=received_s,
+        )
+
+    def _process_slam_cloud(self, item: tuple[np.ndarray, float]) -> None:
+        points, received_s = item
+        _update_slam_cloud_state(
+            self.sensors,
+            points,
+            received_monotonic_s=received_s,
+        )
+
+    def _report_error(self, exc: Exception) -> None:
+        message = str(exc)
+        now = time.monotonic()
+        if message != self._last_error or now - self._last_error_print_s >= 2.0:
+            print(f"[NavDP] SensorGateway waiting: {message}", flush=True)
+            self._last_error = message
+            self._last_error_print_s = now
+
+    def _run(self) -> None:
+        period_s = 1.0 / self.poll_hz
+        pollers = (
+            self._poll_camera,
+            self._poll_odometry,
+            self._poll_lidar,
+            self._poll_slam_cloud,
+        )
+        while not self._stop.is_set():
+            started = time.monotonic()
+            for poll in pollers:
+                if self._stop.is_set():
+                    break
+                try:
+                    poll()
+                except Exception as exc:
+                    self._report_error(exc)
+            self._stop.wait(max(0.0, period_s - (time.monotonic() - started)))
+
+    def start(self) -> None:
+        self._thread.start()
+
+    def poll_camera(self) -> GatewayCameraFrame | None:
+        with self._camera_lock:
+            if self._camera_version == self._consumed_camera_version:
+                return None
+            self._consumed_camera_version = self._camera_version
+            camera = self._camera
+            if camera is None:
+                return None
+            return GatewayCameraFrame(
+                rgb=camera.rgb.copy(),
+                depth_m=camera.depth_m.copy(),
+                camera_info=dict(camera.camera_info),
+                source_timestamp_s=camera.source_timestamp_s,
+            )
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        self._stop.set()
+        self._thread.join(timeout=1.0)
+        self._lidar_worker.close()
+        self._slam_worker.close()
+        if self._owns_client:
+            self.client.close()
 
 
 def point_plane_distances(
@@ -1416,25 +1745,21 @@ def _start_ros(config: NavDPPlannerConfig, sensors: _SharedSensors):
     node = rclpy.create_node("sonic_navdp_planner")
 
     def odom_callback(message: Odometry) -> None:
-        p, q = message.pose.pose.position, message.pose.pose.orientation
-        pose = Pose2D(p.x, p.y, _quaternion_yaw(q.x, q.y, q.z, q.w))
+        p = message.pose.pose.position
         stamp = float(message.header.stamp.sec) + float(message.header.stamp.nanosec) * 1.0e-9
-        if stamp <= 0.0:
-            stamp = time.time()
-        with sensors.lock:
-            sensors.pose = pose
-            sensors.pose_time = time.monotonic()
-            sensors.pose_history.append((stamp, pose))
-            sample = np.array([[p.x, p.y]], dtype=np.float32)
-            if not len(sensors.robot_history) or np.linalg.norm(sample[0] - sensors.robot_history[-1]) >= 0.02:
-                sensors.robot_history = np.concatenate((sensors.robot_history, sample), axis=0)[-5000:]
+        _update_odometry_state(
+            sensors,
+            odometry_array_from_message(message),
+            source_timestamp_s=stamp,
+            received_monotonic_s=time.monotonic(),
+        )
 
     def process_lidar(message: CustomMsg) -> None:
-        points = filter_livox_points(livox_custom_points_to_numpy(message))
-        points = _remove_ground(points)
-        with sensors.lock:
-            sensors.points = points
-            sensors.points_time = time.monotonic()
+        _update_lidar_state(
+            sensors,
+            livox_custom_points_to_numpy(message),
+            received_monotonic_s=None,
+        )
 
     def process_slam_cloud(message: PointCloud2) -> None:
         raw = np.asarray(
@@ -1444,15 +1769,11 @@ def _start_ros(config: NavDPPlannerConfig, sensors: _SharedSensors):
             xyz = np.column_stack(tuple(raw[name] for name in ("x", "y", "z"))).astype(np.float32)
         else:
             xyz = raw.astype(np.float32, copy=False).reshape(-1, 3)
-        with sensors.lock:
-            pose = sensors.pose
-            previous = sensors.slam_map_xy
-        if pose is None:
-            return
-        updated = update_slam_map(previous, xyz[:, :2], center_xy=(pose.x, pose.y))
-        with sensors.lock:
-            sensors.slam_map_xy = updated
-            sensors.slam_map_time = time.monotonic()
+        _update_slam_cloud_state(
+            sensors,
+            xyz,
+            received_monotonic_s=None,
+        )
 
     lidar_worker = LatestMessageWorker(process_lidar)
     slam_worker = LatestMessageWorker(process_slam_cloud)
@@ -1547,6 +1868,7 @@ def main(config: NavDPPlannerConfig) -> None:
     import threading
     import zmq
     from gear_sonic.camera.composed_camera import ComposedCameraClientSensor
+    from gear_sonic.runtime.visualization import VisualizationPublisher
 
     install_shutdown_signal_handlers()
 
@@ -1558,11 +1880,39 @@ def main(config: NavDPPlannerConfig) -> None:
     status.bind(config.status_endpoint)
     output = context.socket(zmq.PUB)
     output.bind(config.output_endpoint)
-    camera = ComposedCameraClientSensor(config.camera_host, config.camera_port)
+    visualization_publisher = (
+        VisualizationPublisher(config.visualization_gateway_endpoint)
+        if config.visualization_gateway_endpoint
+        else None
+    )
     sensors = _SharedSensors()
-    rclpy, node, sensor_workers = _start_ros(config, sensors)
-    ros_thread = threading.Thread(target=spin_ros, args=(rclpy, node), daemon=True)
-    ros_thread.start()
+    camera: ComposedCameraClientSensor | None = None
+    gateway: NavDPSensorGatewayIngress | None = None
+    rclpy = None
+    node = None
+    ros_thread: threading.Thread | None = None
+    sensor_workers: tuple[LatestMessageWorker, ...] = ()
+    if config.sensor_input == "legacy":
+        camera = ComposedCameraClientSensor(config.camera_host, config.camera_port)
+        rclpy, node, sensor_workers = _start_ros(config, sensors)
+        ros_thread = threading.Thread(
+            target=spin_ros,
+            args=(rclpy, node),
+            daemon=True,
+        )
+        ros_thread.start()
+    elif config.sensor_input == "gateway":
+        gateway = NavDPSensorGatewayIngress(
+            config.sensor_gateway_endpoint,
+            sensors,
+            poll_hz=config.sensor_gateway_poll_hz,
+            request_timeout_ms=config.sensor_gateway_request_timeout_ms,
+            max_age_ms=config.sensor_gateway_max_age_ms,
+            max_skew_ms=config.sensor_gateway_max_skew_ms,
+        )
+        gateway.start()
+    else:
+        raise ValueError(f"unsupported NavDP sensor input: {config.sensor_input!r}")
     actorray_recording = (
         ActorRayRecordingSession(
             config.actorray_output_dir, fps=config.actorray_record_fps
@@ -1635,10 +1985,14 @@ def main(config: NavDPPlannerConfig) -> None:
         inference_busy = False
 
     print(f"[NavDP] command={config.command_endpoint} output={config.output_endpoint}")
-    print(
-        f"[NavDP] ROS lidar={config.lidar_topic} odom={config.odom_topic} "
-        f"slam={config.slam_cloud_topic}"
-    )
+    if config.sensor_input == "legacy":
+        print(
+            f"[NavDP] sensors=legacy camera={config.camera_host}:{config.camera_port} "
+            f"lidar={config.lidar_topic} odom={config.odom_topic} "
+            f"slam={config.slam_cloud_topic}"
+        )
+    else:
+        print(f"[NavDP] sensors=gateway endpoint={config.sensor_gateway_endpoint}")
     period = 1.0 / config.control_hz
     try:
         while True:
@@ -1686,19 +2040,27 @@ def main(config: NavDPPlannerConfig) -> None:
                             actorray_recording.start(generation)
                         send_status("active", "goal_accepted")
 
-            frame = camera.read(blocking=False)
-            if frame is not None:
-                try:
-                    latest_rgb, latest_depth, camera_info = _extract_camera_frame(frame)
-                    timestamps = frame.get("timestamps", {})
-                    latest_camera_timestamp = float(
-                        timestamps.get(
-                            "ego_view",
-                            max(timestamps.values()) if timestamps else time.time(),
+            if camera is not None:
+                frame = camera.read(blocking=False)
+                if frame is not None:
+                    try:
+                        latest_rgb, latest_depth, camera_info = _extract_camera_frame(frame)
+                        timestamps = frame.get("timestamps", {})
+                        latest_camera_timestamp = float(
+                            timestamps.get(
+                                "ego_view",
+                                max(timestamps.values()) if timestamps else time.time(),
+                            )
                         )
-                    )
-                except ValueError:
-                    pass
+                    except ValueError:
+                        pass
+            elif gateway is not None:
+                gateway_camera = gateway.poll_camera()
+                if gateway_camera is not None:
+                    latest_rgb = gateway_camera.rgb
+                    latest_depth = gateway_camera.depth_m
+                    camera_info = gateway_camera.camera_info
+                    latest_camera_timestamp = gateway_camera.source_timestamp_s
             if camera_info is not None and not navdp_initialized:
                 try:
                     _reset_navdp(
@@ -1938,7 +2300,7 @@ def main(config: NavDPPlannerConfig) -> None:
                 trajectory_log_pending = False
             last_safety_blocked = safety_blocked
 
-            if config.visualize:
+            if config.visualize or visualization_publisher is not None:
                 canvas = compose_reasan_navigation_view(
                     points,
                     current_rays,
@@ -1949,13 +2311,19 @@ def main(config: NavDPPlannerConfig) -> None:
                     robot_history=robot_history,
                     velocity=velocity,
                 )
-                cv2.imshow("NavDP + MID360 + FAST-LIO world map", canvas)
-                cv2.imshow(
-                    "NavDP Head RGB-D",
-                    compose_head_rgbd_view(latest_rgb, latest_depth),
-                )
-                if cv2.waitKey(1) & 0xFF == 27:
-                    break
+                head_rgbd = compose_head_rgbd_view(latest_rgb, latest_depth)
+                if visualization_publisher is not None:
+                    visualization_publisher.publish(
+                        "visualization/navdp_navigation", canvas
+                    )
+                    visualization_publisher.publish(
+                        "visualization/navdp_head_rgbd", head_rgbd
+                    )
+                if config.visualize:
+                    cv2.imshow("NavDP + MID360 + FAST-LIO world map", canvas)
+                    cv2.imshow("NavDP Head RGB-D", head_rgbd)
+                    if cv2.waitKey(1) & 0xFF == 27:
+                        break
             delay = period - (time.monotonic() - loop_started)
             if delay > 0:
                 time.sleep(delay)
@@ -1967,15 +2335,21 @@ def main(config: NavDPPlannerConfig) -> None:
             worker.close()
         for _ in range(3):
             output.send(sonic_planner.message((0.0, 0.0, 0.0)))
-        camera.close()
-        shutdown_ros_context(rclpy)
-        ros_thread.join(timeout=1.0)
-        node.destroy_node()
+        if gateway is not None:
+            gateway.close()
+        if camera is not None:
+            camera.close()
+        if rclpy is not None and node is not None and ros_thread is not None:
+            shutdown_ros_context(rclpy)
+            ros_thread.join(timeout=1.0)
+            node.destroy_node()
         commands.close(0)
         status.close(0)
         output.close(0)
         if actorray_recording is not None:
             actorray_recording.stop()
+        if visualization_publisher is not None:
+            visualization_publisher.close()
         cv2.destroyAllWindows()
 
 

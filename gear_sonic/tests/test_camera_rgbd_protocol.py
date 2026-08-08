@@ -134,6 +134,30 @@ def test_rgbd_schema_round_trip_preserves_uint16_and_camera_info():
     assert wire["schema_version"] == 2
 
 
+def test_legacy_base64_jpeg_does_not_claim_policy_channel_compatibility() -> None:
+    image = np.zeros((32, 48, 3), dtype=np.uint8)
+    image[:, :16] = (240, 20, 10)
+    image[:, 16:32] = (15, 230, 25)
+    image[:, 32:] = (5, 30, 220)
+
+    wire = ImageMessageSchema(
+        timestamps={"ego_view": 1.0},
+        images={"ego_view": image},
+    ).serialize()
+    legacy_rgb = ImageMessageSchema.deserialize(wire).images["ego_view"]
+    jpeg_bytes = __import__("base64").b64decode(wire["images"]["ego_view"])
+    direct_bgr = __import__("cv2").imdecode(
+        np.frombuffer(jpeg_bytes, dtype=np.uint8),
+        __import__("cv2").IMREAD_COLOR,
+    )
+    direct_rgb = __import__("cv2").cvtColor(
+        direct_bgr,
+        __import__("cv2").COLOR_BGR2RGB,
+    )
+
+    assert not np.array_equal(direct_rgb, legacy_rgb)
+
+
 def test_depth_encoder_rejects_wrong_dtype_and_shape():
     with pytest.raises(ValueError, match="2D uint16"):
         ImageUtils.encode_depth_image(np.zeros((2, 2), dtype=np.float32))

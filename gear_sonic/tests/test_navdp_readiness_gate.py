@@ -85,3 +85,33 @@ def test_navigation_stage_checks_odom_cloud_camera_and_server(monkeypatch) -> No
     )
     assert topics == ["/Odometry_loc", "/cloud_registered_1"]
     assert endpoints == [("192.168.123.164", 5555), ("127.0.0.1", 19999)]
+
+
+def test_gateway_navigation_stage_requires_a_real_gateway_ping(monkeypatch) -> None:
+    gateway_checks: list[tuple[str, int]] = []
+    monkeypatch.setattr(
+        navdp_readiness_gate,
+        "wait_for_topic_sample",
+        lambda _topic, _timeout: True,
+    )
+    monkeypatch.setattr(
+        navdp_readiness_gate,
+        "wait_for_tcp",
+        lambda _host, _port, _timeout: True,
+    )
+    monkeypatch.setattr(
+        navdp_readiness_gate,
+        "wait_for_sensor_gateway",
+        lambda host, port, _timeout: gateway_checks.append((host, port)) or True,
+    )
+
+    assert navdp_readiness_gate.wait_for_navigation(
+        timeout=60.0,
+        camera_host="192.168.123.164",
+        camera_port=5555,
+        navdp_host="127.0.0.1",
+        navdp_port=19999,
+        require_sensor_gateway=True,
+        sensor_gateway_port=5560,
+    )
+    assert gateway_checks == [("127.0.0.1", 5560)]

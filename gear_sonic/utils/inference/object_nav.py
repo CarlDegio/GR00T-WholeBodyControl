@@ -19,6 +19,8 @@ import numpy as np
 import zmq
 
 from gear_sonic.camera.sensor_server import ImageMessageSchema
+from gear_sonic.runtime.client import SensorGatewayClient, SensorGatewayClientError
+from gear_sonic.runtime.snapshot import SnapshotRequest, TimestampBasis
 from gear_sonic.utils.inference.object_nav_geometry import (
     FORWARD_SPEED,
     FRAME_COUNT,
@@ -298,6 +300,113 @@ class ComposedRGBDCamera:
     def close(self) -> None:
         self._socket.close()
         self._context.term()
+
+
+class SensorGatewayRGBDCamera:
+    """Read raw chest RGB and LingBot-completed depth from shared memory."""
+
+    RGB_STREAM = "camera/chest_view"
+    DEPTH_STREAM = "derived/lingbot_depth"
+
+    def __init__(
+        self,
+        endpoint: str,
+        *,
+        timeout_ms: int = 3000,
+        request_timeout_ms: int = 100,
+        max_age_ms: float = 1000.0,
+        max_skew_ms: float = 5.0,
+        client: SensorGatewayClient | None = None,
+    ) -> None:
+        self.timeout_ms = int(timeout_ms)
+        self.max_age_ms = float(max_age_ms)
+        self.max_skew_ms = float(max_skew_ms)
+        self.client = client or SensorGatewayClient(
+            endpoint, request_timeout_ms=int(request_timeout_ms)
+        )
+        self._owns_client = client is None
+        self._last_timestamp_ns: int | None = None
+
+    @staticmethod
+    def _decode(snapshot) -> RGBDSnapshot:
+        rgb_frame = snapshot.snapshot.frames[SensorGatewayRGBDCamera.RGB_STREAM]
+        depth_frame = snapshot.snapshot.frames[SensorGatewayRGBDCamera.DEPTH_STREAM]
+        rgb = np.asarray(snapshot.arrays[SensorGatewayRGBDCamera.RGB_STREAM])
+        depth_raw = np.asarray(snapshot.arrays[SensorGatewayRGBDCamera.DEPTH_STREAM])
+        if rgb.ndim != 3 or rgb.shape[2] != 3 or rgb.dtype != np.uint8:
+            raise ObjectNavCameraError(
+                f"Gateway chest RGB must be HxWx3 uint8, got {rgb.shape} {rgb.dtype}"
+            )
+        if depth_raw.ndim != 2 or depth_raw.dtype != np.uint16:
+            raise ObjectNavCameraError(
+                f"Gateway LingBot depth must be HxW uint16, got "
+                f"{depth_raw.shape} {depth_raw.dtype}"
+            )
+        if rgb.shape[:2] != depth_raw.shape:
+            raise ObjectNavCameraError("Gateway RGB and LingBot depth shapes do not match")
+        info = dict(depth_frame.attributes.get("camera_info", {}))
+        if not info:
+            info = dict(rgb_frame.attributes.get("camera_info", {}))
+        try:
+            numeric = {
+                name: float(info[name])
+                for name in ("fx", "fy", "cx", "cy", "depth_scale_m")
+            }
+            width = int(info["width"])
+            height = int(info["height"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ObjectNavCameraError("Gateway RGB-D calibration is incomplete") from exc
+        if info.get("depth_aligned_to") != "chest_view":
+            raise ObjectNavCameraError("Gateway LingBot depth is not aligned to chest_view")
+        if (width, height) != (rgb.shape[1], rgb.shape[0]):
+            raise ObjectNavCameraError("Gateway camera_info dimensions do not match RGB-D")
+        timestamp_ns = depth_frame.source_timestamp_ns or rgb_frame.source_timestamp_ns
+        timestamp = timestamp_ns * 1.0e-9 if timestamp_ns > 0 else time.time()
+        return RGBDSnapshot(
+            rgb_bgr=cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR),
+            depth_raw=depth_raw.copy(),
+            depth_mm=depth_raw.astype(np.float32)
+            * np.float32(numeric["depth_scale_m"] * 1000.0),
+            fx=numeric["fx"],
+            fy=numeric["fy"],
+            cx=numeric["cx"],
+            cy=numeric["cy"],
+            depth_scale_m=numeric["depth_scale_m"],
+            depth_aligned_to=str(info["depth_aligned_to"]),
+            timestamp=timestamp,
+        )
+
+    def capture_aligned_rgbd(self, timeout_ms: int | None = None) -> RGBDSnapshot:
+        effective_timeout = self.timeout_ms if timeout_ms is None else int(timeout_ms)
+        deadline = time.monotonic() + effective_timeout / 1000.0
+        last_error: Exception | None = None
+        while time.monotonic() < deadline:
+            try:
+                snapshot = self.client.read_snapshot(
+                    SnapshotRequest(
+                        streams=(self.RGB_STREAM, self.DEPTH_STREAM),
+                        max_age_ms=self.max_age_ms,
+                        max_skew_ms=self.max_skew_ms,
+                        timestamp_basis=TimestampBasis.SOURCE,
+                    ),
+                    retries=1,
+                )
+                depth_frame = snapshot.snapshot.frames[self.DEPTH_STREAM]
+                timestamp_ns = depth_frame.source_timestamp_ns
+                if self._last_timestamp_ns is None or timestamp_ns != self._last_timestamp_ns:
+                    decoded = self._decode(snapshot)
+                    self._last_timestamp_ns = timestamp_ns
+                    return decoded
+            except (SensorGatewayClientError, ObjectNavCameraError) as exc:
+                last_error = exc
+            time.sleep(0.01)
+        raise ObjectNavCameraError(
+            f"timed out waiting for fresh Gateway RGB-D: {last_error or 'no new frame'}"
+        )
+
+    def close(self) -> None:
+        if self._owns_client:
+            self.client.close()
 
 
 def _escape_prompt_value(value: str) -> str:
@@ -852,11 +961,13 @@ class ObjectNavRunner:
         config: ObjectNavConfig,
         camera: Any | None = None,
         codex: Any | None = None,
+        *,
+        own_camera: bool | None = None,
     ):
         if not config.mission.strip() or not config.global_target.strip():
             raise ValueError("mission and global_target are required")
         self.config = config
-        self._owns_camera = camera is None
+        self._owns_camera = camera is None if own_camera is None else bool(own_camera)
         self.camera = camera or ComposedRGBDCamera(
             config.camera_host, config.camera_port, config.camera_timeout_ms
         )

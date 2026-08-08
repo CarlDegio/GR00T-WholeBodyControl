@@ -5,11 +5,14 @@ import types
 
 import numpy as np
 from pathlib import Path
+from types import MappingProxyType
 
 
 sys.modules.setdefault("tyro", types.ModuleType("tyro"))
 
 from gear_sonic.scripts.run_lingbot_depth_viewer import (
+    LingBotInferenceModeGate,
+    LingBotSensorGatewayClient,
     LingBotDepthViewerConfig,
     configure_lingbot_runtime_environment,
     conservative_depth_fusion,
@@ -19,11 +22,181 @@ from gear_sonic.scripts.run_lingbot_depth_viewer import (
     completed_depth_payload,
     mark_ready,
 )
-from gear_sonic.utils.inference.object_nav import ComposedRGBDCamera
+from gear_sonic.runtime.client import MaterializedSnapshot
+from gear_sonic.runtime.contracts import MessageMetadata, SharedMemoryFrame
+from gear_sonic.runtime.snapshot import SensorSnapshot, TimestampBasis
+from gear_sonic.utils.inference.object_nav import (
+    ComposedRGBDCamera,
+    SensorGatewayRGBDCamera,
+)
 
 
 def test_lingbot_viewer_uses_fixed_ten_meter_range_by_default() -> None:
     assert LingBotDepthViewerConfig().max_depth_m == 10.0
+
+
+def test_lingbot_reads_chest_rgbd_from_gateway_shared_memory() -> None:
+    rgb = np.full((2, 3, 3), 17, dtype=np.uint8)
+    depth = np.full((2, 3), 1234, dtype=np.uint16)
+    received_ns = 5_000_000_000
+    frames = {
+        "camera/chest_view": SharedMemoryFrame(
+            metadata=MessageMetadata(
+                source="sensor_gateway", sequence=1, timestamp_ns=received_ns, ttl_ms=1000
+            ),
+            stream="camera/chest_view",
+            shared_memory="fake-rgb",
+            shape=rgb.shape,
+            dtype=rgb.dtype.str,
+            offset_bytes=8,
+            size_bytes=rgb.nbytes,
+            source_timestamp_ns=12_000_000_000,
+            source_clock="camera_unix",
+            attributes={"camera_info": {"fx": 500.0, "depth_scale_m": 0.001}},
+        ),
+        "camera/chest_view_depth": SharedMemoryFrame(
+            metadata=MessageMetadata(
+                source="sensor_gateway", sequence=1, timestamp_ns=received_ns, ttl_ms=1000
+            ),
+            stream="camera/chest_view_depth",
+            shared_memory="fake-depth",
+            shape=depth.shape,
+            dtype=depth.dtype.str,
+            offset_bytes=8,
+            size_bytes=depth.nbytes,
+            source_timestamp_ns=12_000_000_000,
+            source_clock="camera_unix",
+        ),
+    }
+    materialized = MaterializedSnapshot(
+        snapshot=SensorSnapshot(
+            complete=True,
+            reason="",
+            anchor_timestamp_ns=received_ns,
+            timestamp_basis=TimestampBasis.RECEIVE,
+            frames=MappingProxyType(frames),
+            skew_ms=0.0,
+            ages_ms=MappingProxyType({name: 0.0 for name in frames}),
+        ),
+        arrays=MappingProxyType(
+            {"camera/chest_view": rgb, "camera/chest_view_depth": depth}
+        ),
+        attempts=1,
+    )
+
+    class FakeClient:
+        def read_snapshot(self, *_args, **_kwargs):
+            return materialized
+
+    client = LingBotSensorGatewayClient("inproc://unused", client=FakeClient())
+    packet = client.read()
+
+    np.testing.assert_array_equal(packet["images"]["chest_view"], rgb)
+    np.testing.assert_array_equal(packet["images"]["chest_view_depth"], depth)
+    assert packet["timestamps"]["chest_view"] == 12.0
+    assert packet["camera_info"]["chest_view"]["fx"] == 500.0
+
+
+def test_lavira_reads_raw_rgb_and_lingbot_depth_from_one_source_aligned_snapshot() -> None:
+    rgb = np.array(
+        [[[255, 0, 0], [0, 255, 0]], [[0, 0, 255], [255, 255, 255]]],
+        dtype=np.uint8,
+    )
+    depth = np.full((2, 2), 1500, dtype=np.uint16)
+    received_ns = 5_000_000_000
+    camera_info = {
+        "fx": 500.0,
+        "fy": 501.0,
+        "cx": 1.0,
+        "cy": 1.0,
+        "width": 2,
+        "height": 2,
+        "depth_scale_m": 0.001,
+        "depth_aligned_to": "chest_view",
+    }
+    frames = {
+        "camera/chest_view": SharedMemoryFrame(
+            metadata=MessageMetadata(
+                source="sensor_gateway", sequence=1, timestamp_ns=received_ns, ttl_ms=1000
+            ),
+            stream="camera/chest_view",
+            shared_memory="fake-rgb",
+            shape=rgb.shape,
+            dtype=rgb.dtype.str,
+            offset_bytes=8,
+            size_bytes=rgb.nbytes,
+            source_timestamp_ns=12_000_000_000,
+            source_clock="camera_unix",
+            attributes={"camera_info": camera_info},
+        ),
+        "derived/lingbot_depth": SharedMemoryFrame(
+            metadata=MessageMetadata(
+                source="sensor_gateway", sequence=1, timestamp_ns=received_ns, ttl_ms=1000
+            ),
+            stream="derived/lingbot_depth",
+            shared_memory="fake-lingbot",
+            shape=depth.shape,
+            dtype=depth.dtype.str,
+            offset_bytes=8,
+            size_bytes=depth.nbytes,
+            source_timestamp_ns=12_000_000_000,
+            source_clock="camera_unix",
+            attributes={"camera_info": camera_info},
+        ),
+    }
+    materialized = MaterializedSnapshot(
+        snapshot=SensorSnapshot(
+            complete=True,
+            reason="",
+            anchor_timestamp_ns=12_000_000_000,
+            timestamp_basis=TimestampBasis.SOURCE,
+            frames=MappingProxyType(frames),
+            skew_ms=0.0,
+            ages_ms=MappingProxyType({name: 0.0 for name in frames}),
+        ),
+        arrays=MappingProxyType(
+            {"camera/chest_view": rgb, "derived/lingbot_depth": depth}
+        ),
+        attempts=1,
+    )
+
+    class FakeClient:
+        request = None
+
+        def read_snapshot(self, request, **_kwargs):
+            self.request = request
+            return materialized
+
+    fake = FakeClient()
+    camera = SensorGatewayRGBDCamera(
+        "inproc://unused",
+        client=fake,
+        max_age_ms=1000.0,
+        max_skew_ms=5.0,
+    )
+    snapshot = camera.capture_aligned_rgbd()
+
+    assert fake.request.timestamp_basis is TimestampBasis.SOURCE
+    assert fake.request.streams == (
+        "camera/chest_view",
+        "derived/lingbot_depth",
+    )
+    np.testing.assert_array_equal(snapshot.rgb_bgr, rgb[..., ::-1])
+    np.testing.assert_array_equal(snapshot.depth_raw, depth)
+    np.testing.assert_allclose(snapshot.depth_mm, 1500.0)
+    assert snapshot.timestamp == 12.0
+
+
+def test_lingbot_gpu_work_is_gated_by_pose_and_planner_mode() -> None:
+    gate = LingBotInferenceModeGate()
+
+    assert gate.inference_enabled
+    assert gate.accept("select_pose_mode")
+    assert not gate.inference_enabled
+    assert not gate.accept("unrelated_command")
+    assert not gate.inference_enabled
+    assert gate.accept("select_planner_mode")
+    assert gate.inference_enabled
 
 
 def test_prepare_depth_meters_marks_out_of_range_values_invalid() -> None:
