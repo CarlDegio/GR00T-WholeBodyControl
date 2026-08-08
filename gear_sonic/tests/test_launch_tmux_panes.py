@@ -31,6 +31,10 @@ def test_parse_pane_ids_rejects_incomplete_layout() -> None:
         _parse_pane_ids("0 %1\n1 %2\n2 %3\n3 %4\n4 %5\n5 %6\n6 %7\n7 %8\n")
 
 
+def test_vla_action_horizon_defaults_to_fifty() -> None:
+    assert InferenceLaunchConfig().action_horizon == 50
+
+
 def test_navdp_stack_commands_use_ros_topics_and_official_xnavdp_server() -> None:
     config = InferenceLaunchConfig()
     planner = build_navdp_planner_command(config, Path("/workspace/sonic"))

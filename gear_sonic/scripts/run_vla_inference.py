@@ -30,6 +30,8 @@ Keyboard commands (received via ZMQ from the standalone keyboard publisher):
 """
 
 from dataclasses import dataclass
+import json
+import math
 import queue
 import threading
 import time
@@ -63,6 +65,130 @@ from gear_sonic.utils.teleop.zmq.zmq_planner_sender import (
     pack_pose_message,
     build_planner_message
 )
+
+
+PLANNER_HEADER_SIZE = 1280
+
+
+def _wrap_angle(angle: float) -> float:
+    return math.remainder(float(angle), 2.0 * math.pi)
+
+
+def _base_yaw_from_state(state_msg: dict | None) -> float | None:
+    """Return measured robot yaw from a g1_debug state message (wxyz quaternion)."""
+    if state_msg is None or "base_quat" not in state_msg:
+        return None
+    quat = np.asarray(state_msg["base_quat"], dtype=np.float64).reshape(-1)
+    if quat.shape != (4,) or not np.all(np.isfinite(quat)):
+        return None
+    norm = float(np.linalg.norm(quat))
+    if norm <= 1e-8:
+        return None
+    w, x, y, z = quat / norm
+    return math.atan2(2.0 * (w * z + x * y), 1.0 - 2.0 * (y * y + z * z))
+
+
+def _facing_from_yaw(yaw: float) -> list[float]:
+    return [math.cos(yaw), math.sin(yaw), 0.0]
+
+
+def _unpack_planner_message(message: bytes) -> tuple[int, dict[str, np.ndarray]]:
+    """Decode one planner wire message without depending on another script module."""
+    topic = b"planner"
+    if not message.startswith(topic):
+        raise ValueError("planner relay received a message with the wrong topic")
+    header_start = len(topic)
+    payload_start = header_start + PLANNER_HEADER_SIZE
+    if len(message) < payload_start:
+        raise ValueError("planner message is shorter than its header")
+
+    header_bytes = message[header_start:payload_start].split(b"\x00", 1)[0]
+    header = json.loads(header_bytes.decode("utf-8"))
+    endian = "<" if header.get("endian", "le") == "le" else ">"
+    dtype_map = {
+        "f32": np.dtype(endian + "f4"),
+        "f64": np.dtype(endian + "f8"),
+        "i32": np.dtype(endian + "i4"),
+        "i64": np.dtype(endian + "i8"),
+        "u8": np.dtype("u1"),
+        "bool": np.dtype("?"),
+    }
+    fields: dict[str, np.ndarray] = {}
+    offset = payload_start
+    for field in header.get("fields", []):
+        dtype = dtype_map.get(field["dtype"])
+        if dtype is None:
+            raise ValueError(f"unsupported planner dtype: {field['dtype']}")
+        shape = tuple(int(dim) for dim in field["shape"])
+        byte_count = int(np.prod(shape, dtype=np.int64)) * dtype.itemsize
+        end = offset + byte_count
+        if end > len(message):
+            raise ValueError(f"planner field {field['name']} exceeds payload")
+        fields[field["name"]] = np.frombuffer(
+            message[offset:end], dtype=dtype
+        ).reshape(shape).astype(dtype.newbyteorder("="), copy=True)
+        offset = end
+    return int(header.get("v", 1)), fields
+
+
+def _rotate_planner_message(message: bytes, yaw_offset: float) -> bytes:
+    """Rotate planner movement and facing into the active VLA heading frame."""
+    version, fields = _unpack_planner_message(message)
+    cosine, sine = math.cos(yaw_offset), math.sin(yaw_offset)
+    for name in ("movement", "facing"):
+        vector = fields.get(name)
+        if vector is None or vector.size != 3:
+            raise ValueError(f"planner message has invalid {name} field")
+        flat = vector.reshape(3).astype(np.float32, copy=True)
+        x_value, y_value = float(flat[0]), float(flat[1])
+        flat[0] = cosine * x_value - sine * y_value
+        flat[1] = sine * x_value + cosine * y_value
+        fields[name] = flat.reshape(vector.shape)
+    return pack_pose_message(fields, topic="planner", version=version)
+
+
+class PlannerHeadingAlignment:
+    """Hold a fixed planner-to-robot yaw transform for one planner session."""
+
+    def __init__(self):
+        self.target_yaw: float | None = None
+        self.yaw_offset: float | None = None
+        self.last_facing_yaw = 0.0
+
+    def begin(self, target_yaw: float | None) -> None:
+        self.target_yaw = target_yaw
+        self.yaw_offset = None
+        self.last_facing_yaw = 0.0
+
+    def clear(self) -> None:
+        self.target_yaw = None
+        self.yaw_offset = None
+
+    def current_facing(self) -> list[float]:
+        return _facing_from_yaw(self.last_facing_yaw)
+
+    def align(self, message: bytes) -> bytes | None:
+        if self.target_yaw is None:
+            return None
+
+        if self.yaw_offset is None:
+            _version, fields = _unpack_planner_message(message)
+            facing = fields.get("facing")
+            if facing is None or facing.size != 3:
+                raise ValueError("planner message has no valid facing direction")
+            facing = facing.reshape(3)
+            incoming_yaw = math.atan2(float(facing[1]), float(facing[0]))
+            self.yaw_offset = _wrap_angle(self.target_yaw - incoming_yaw)
+            print_green(
+                "[HeadingSync] planner frame aligned: "
+                f"planner_zero={self.target_yaw:+.3f}, incoming_yaw={incoming_yaw:+.3f}, "
+                f"offset={self.yaw_offset:+.3f} rad"
+            )
+        aligned = _rotate_planner_message(message, self.yaw_offset)
+        _version, aligned_fields = _unpack_planner_message(aligned)
+        facing = aligned_fields["facing"].reshape(3)
+        self.last_facing_yaw = math.atan2(float(facing[1]), float(facing[0]))
+        return aligned
 
 
 @dataclass
@@ -465,6 +591,7 @@ def main(config: InferenceConfig):
     planner_relay_sub.connect(
         f"tcp://{config.planner_relay_zmq_host}:{config.planner_relay_zmq_port}"
     )
+    planner_heading_alignment = PlannerHeadingAlignment()
     print_green(
         "Planner relay SUB connected to "
         f"tcp://{config.planner_relay_zmq_host}:{config.planner_relay_zmq_port} "
@@ -512,6 +639,10 @@ def main(config: InferenceConfig):
             print("Error: Cannot read current body_q for initial pose ramp. Aborting.")
             return False
 
+        hold_facing = planner_heading_alignment.current_facing()
+        hold_yaw = math.atan2(hold_facing[1], hold_facing[0])
+        print_green(f"[HeadingSync] holding planner facing {hold_yaw:+.3f} rad during POSE entry")
+
         left_hand = (
             _compute_closed_hand_joints("L")
             if initial_pose_left_hand_closed
@@ -535,11 +666,12 @@ def main(config: InferenceConfig):
             t = min(max(elapsed / duration, 0.0), 1.0)
             alpha = t * t * (3.0 - 2.0 * t)
             q_cmd = (1.0 - alpha) * start_ub + alpha * target_ub
+
             zmq_socket.send(
                 build_planner_message(
                     0,
                     [0.0, 0.0, 0.0],
-                    [1.0, 0.0, 0.0],
+                    hold_facing,
                     speed=-1.0,
                     height=-1.0,
                     upper_body_position=q_cmd.tolist(),
@@ -557,7 +689,7 @@ def main(config: InferenceConfig):
                 build_planner_message(
                     0,
                     [0.0, 0.0, 0.0],
-                    [1.0, 0.0, 0.0],
+                    hold_facing,
                     speed=-1.0,
                     height=-1.0,
                     upper_body_position=target_ub.tolist(),
@@ -576,9 +708,37 @@ def main(config: InferenceConfig):
         """Send C++ control loop start/stop commands via ZMQ."""
         nonlocal cpp_loop_running, cpp_mode
         try:
+            planner_entry_yaw = None
+            if start and planner and cpp_mode != "PLANNER":
+                discarded = _discard_pending_planner_messages(planner_relay_sub)
+                measured_yaw = _base_yaw_from_state(state_subscriber.get_msg(clear=False))
+                # C++ reinitializes the planner heading from the measured base
+                # orientation on every mode switch. In that new planner frame,
+                # the current physical heading is therefore exactly yaw zero.
+                planner_heading_alignment.begin(0.0)
+                planner_entry_yaw = 0.0
+                print(
+                    "[HeadingSync] preparing PLANNER entry: "
+                    f"measured_yaw={measured_yaw}, discarded_stale={discarded}"
+                )
+            elif start and not planner and cpp_mode != "POSE":
+                planner_heading_alignment.clear()
+
             cmd_msg = build_command_message(start=start, stop=not start, planner=planner)
             zmq_socket.send(cmd_msg)
             time.sleep(0.01)
+            if start and planner and planner_entry_yaw is not None:
+                # Do not let the C++ planner's default facing direction act in
+                # the gap before the first fresh sidecar command arrives.
+                zmq_socket.send(
+                    build_planner_message(
+                        0,
+                        [0.0, 0.0, 0.0],
+                        _facing_from_yaw(planner_entry_yaw),
+                        speed=-1.0,
+                        height=-1.0,
+                    )
+                )
             action_str = "start" if start else "stop"
             mode_str = "planner" if planner else "pose"
             cpp_loop_running = start
@@ -633,11 +793,13 @@ def main(config: InferenceConfig):
             print("Switch to pose mode")
             zmq_frame_counter = 0
             print("Reset ZMQ frame counter")
-            publish_initial_pose()
             cached_action_chunk = None
             action_chunk_index = 0
             print("Cleared cached action chunk")
             if cpp_mode == "PLANNER":
+                if not publish_initial_pose():
+                    print("Warning: POSE transition preparation failed; remaining in PLANNER mode")
+                    return
                 print("Switching to POSE mode")
                 if send_cpp_control_command(start=True, planner=False):
                     print("Switched to POSE mode (from PLANNER mode)")
@@ -769,7 +931,11 @@ def main(config: InferenceConfig):
                     pass
 
             if cpp_loop_running and cpp_mode == "PLANNER":
-                _relay_planner_messages(planner_relay_sub, zmq_socket)
+                _relay_planner_messages(
+                    planner_relay_sub,
+                    zmq_socket,
+                    planner_heading_alignment,
+                )
                 print("In Planner mode...", end="", flush=True)
                 _sleep_remaining(t_start, loop_period)
                 print(".", end="", flush=True)
@@ -868,14 +1034,38 @@ def main(config: InferenceConfig):
         print("Shutdown complete.")
 
 
-def _relay_planner_messages(planner_relay_sub: zmq.Socket, action_pub: zmq.Socket) -> int:
-    """Forward all pending planner-sidecar messages from :5558 SUB to :5556 PUB."""
-    relayed = 0
+def _receive_latest_planner_message(planner_relay_sub: zmq.Socket) -> tuple[bytes | None, int]:
+    """Drain the SUB queue and return only its newest planner message."""
+    latest = None
+    received = 0
     while planner_relay_sub.poll(0):
-        message = planner_relay_sub.recv(zmq.NOBLOCK)
-        action_pub.send(message)
-        relayed += 1
-    return relayed
+        latest = planner_relay_sub.recv(zmq.NOBLOCK)
+        received += 1
+    return latest, received
+
+
+def _discard_pending_planner_messages(planner_relay_sub: zmq.Socket) -> int:
+    """Discard planner commands accumulated while VLA POSE mode was active."""
+    _latest, received = _receive_latest_planner_message(planner_relay_sub)
+    return received
+
+
+def _relay_planner_messages(
+    planner_relay_sub: zmq.Socket,
+    action_pub: zmq.Socket,
+    heading_alignment: PlannerHeadingAlignment,
+) -> int:
+    """Forward only the newest planner command in the current VLA heading frame."""
+    message, received = _receive_latest_planner_message(planner_relay_sub)
+    if message is None:
+        return 0
+
+    aligned = heading_alignment.align(message)
+    if aligned is None:
+        print("[HeadingSync] planner relay is waiting for mode-entry alignment")
+        return 0
+    action_pub.send(aligned)
+    return 1
 
 def _sleep_remaining(t_start: float, loop_period: float):
     """Sleep for the remainder of the loop period."""
