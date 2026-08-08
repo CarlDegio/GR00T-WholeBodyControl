@@ -166,14 +166,28 @@ class InferenceLaunchConfig:
     base_pose_mode: Literal["rgb", "rgbd", "rgb_depth_query"] = "rgb"
     """Head-vision input experiment used by the base-pose planner."""
 
+    base_pose_vision_backend: Literal["codex", "qwenvl"] = "codex"
+    """Vision provider used by BasePose planning and depth queries."""
+
     base_pose_task: str = ""
     """Manipulation task for base-pose adjustment; defaults to ``prompt``."""
 
     base_pose_model: str = "gpt-5.6-sol"
     """Codex CLI vision model used by base-pose adjustment."""
 
+    base_pose_qwenvl_model: str = "qwen3-vl-plus"
+    """DashScope Qwen-VL model used when the backend is qwenvl."""
+
+    base_pose_qwenvl_base_url: str = (
+        "https://dashscope-intl.aliyuncs.com/compatible-mode/v1"
+    )
+    """DashScope OpenAI-compatible endpoint used by BasePose."""
+
     base_pose_reasoning_effort: str = "max"
     """Reasoning effort passed to the base-pose model."""
+
+    base_pose_codex_fast: bool = True
+    """Enable the Codex Fast service tier for BasePose inference."""
 
     base_pose_camera_stream: str = "ego_view"
     """Head RGB stream; aligned depth is read from ``<stream>_depth``."""
@@ -207,6 +221,12 @@ class InferenceLaunchConfig:
 
     base_pose_translation_speed: float = 0.3
     """Fixed SONIC forward/backward speed used for model translations (m/s)."""
+
+    base_pose_rotation_scale: float = 1.0
+    """Scale applied to model-authored rotation angles before execution."""
+
+    base_pose_translation_scale: float = 1.0
+    """Scale applied to model-authored translation distances before execution."""
 
     base_pose_transition_pause: float = 0.5
     """Planner IDLE duration between model-authored motion steps (s)."""
@@ -340,12 +360,21 @@ def uses_reasan_avoidance(config: InferenceLaunchConfig) -> bool:
 def _base_pose_planner_command(config: InferenceLaunchConfig, repo_root: Path) -> str:
     task = config.base_pose_task.strip() or config.prompt.strip()
     quoted_root = shlex.quote(str(repo_root))
+    vision_backend = f"--vision-backend {config.base_pose_vision_backend} "
+    if config.base_pose_vision_backend == "qwenvl":
+        vision_backend += (
+            f"--qwenvl-model {shlex.quote(config.base_pose_qwenvl_model)} "
+            f"--qwenvl-base-url {shlex.quote(config.base_pose_qwenvl_base_url)} "
+        )
+    codex_fast = "" if config.base_pose_codex_fast else "--no-codex-fast "
     planner = (
         ".venv_inference/bin/python gear_sonic/scripts/base_pose_planner.py "
         f"--task {shlex.quote(task)} "
         f"--mode {shlex.quote(config.base_pose_mode)} "
+        f"{vision_backend}"
         f"--model {shlex.quote(config.base_pose_model)} "
         f"--reasoning-effort {shlex.quote(config.base_pose_reasoning_effort)} "
+        f"{codex_fast}"
         f"--host {shlex.quote(config.keyboard_planner_host)} "
         f"--port {config.keyboard_planner_port} "
         f"--planner-hz {config.keyboard_planner_publish_rate} "
@@ -353,6 +382,8 @@ def _base_pose_planner_command(config: InferenceLaunchConfig, repo_root: Path) -
         f"--final-stop-count {config.base_pose_final_stop_count} "
         f"--rotation-speed {config.base_pose_rotation_speed} "
         f"--translation-speed {config.base_pose_translation_speed} "
+        f"--rotation-scale {config.base_pose_rotation_scale} "
+        f"--translation-scale {config.base_pose_translation_scale} "
         f"--camera-timeout-ms {config.base_pose_camera_timeout_ms} "
         f"--camera-stream {shlex.quote(config.base_pose_camera_stream)} "
         f"--camera-height-m {config.base_pose_camera_height_m} "
@@ -843,7 +874,7 @@ def main(config: InferenceLaunchConfig):
         if config.planner_input == "lavira":
             print("Starting LaViRA planner (pane 3)...")
         elif config.planner_input == "base_pose":
-            print("Starting GPT base-pose adjustment planner (pane 3)...")
+            print("Starting base-pose adjustment planner (pane 3)...")
         else:
             print("Starting REASEN keyboard (pane 3)...")
         _send_to_pane(pane_ids[3], reasan_keyboard_cmd, wait=1.0)
@@ -912,7 +943,11 @@ def main(config: InferenceLaunchConfig):
     if config.planner_input == "lavira":
         print("    Pane 3: LaViRA AgentNav Planner")
     elif config.planner_input == "base_pose":
-        print(f"    Pane 3: GPT Base Pose Planner ({config.base_pose_mode})")
+        codex_fast = "on" if config.base_pose_codex_fast else "off"
+        print(
+            f"    Pane 3: Base Pose Planner ({config.base_pose_mode}, "
+            f"backend={config.base_pose_vision_backend}, codex_fast={codex_fast})"
+        )
     else:
         print("    Pane 3: REASEN Keyboard")
     if uses_reasan_avoidance(config):

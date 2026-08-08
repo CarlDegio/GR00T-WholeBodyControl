@@ -6,6 +6,8 @@ import json
 import math
 from pathlib import Path
 import struct
+import subprocess
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -18,6 +20,7 @@ from gear_sonic.scripts.base_pose_planner import (
     WorkerResult,
     plan_to_segments,
 )
+import gear_sonic.utils.inference.base_pose as base_pose_module
 from gear_sonic.scripts.lavira_sonic_relay import (
     PlannerState,
     extract_frozen_planner_pose,
@@ -30,6 +33,9 @@ from gear_sonic.utils.inference.base_pose import (
     BasePoseResult,
     BasePoseRunner,
     BasePoseValidationError,
+    CodexStructuredVisionClient,
+    QwenVLStructuredVisionClient,
+    _dashscope_api_key,
     build_base_pose_prompt,
     query_depth_regions,
     validate_base_pose_plan,
@@ -64,6 +70,7 @@ def plan(
             "horizontal_position": "LEFT",
             "distance_estimate": "SUITABLE",
             "orientation_estimate": "TURNED_RIGHT",
+            "theta": 20.0,
         },
         "desired_final_pose": {
             "target_alignment": "workspace centered",
@@ -116,15 +123,24 @@ def test_prompt_requires_point_three_meter_minimum_and_indirect_small_correction
         "greater than or equal to 0.3 meters."
     ) in prompt
     assert (
-        "If the desired positional correction is less than 0.3 meters, do not "
-        "output a translation below 0.3 meters."
+        "If the desired positional correction is smaller than 0.3 meters, do not "
+        "approximate it using an invalid smaller translation."
     ) in prompt
     assert (
-        "Every MOVE_FORWARD or MOVE_BACKWARD value must be greater than or "
-        "equal to 0.3 meters."
+        "When geometrically appropriate and safe, use a combination of backward "
+        "movement, rotation, forward movement, and a final corrective rotation to "
+        "produce the required positional change."
     ) in prompt
-    assert '"value": 0.3' in prompt
+    assert (
+        "Every translation-command value must be greater than or equal to 0.3 "
+        "meters."
+    ) in prompt
     assert '"value": 0.0' not in prompt
+    assert '"theta": 0.0' in prompt
+    assert (
+        "theta is an estimated geometric quantity used for scene reasoning "
+        "and is not itself a motion command."
+    ) in prompt
 
 
 def test_validator_accepts_exact_two_degree_and_point_one_meter_minima() -> None:
@@ -142,6 +158,28 @@ def test_validator_accepts_exact_two_degree_and_point_one_meter_minima() -> None
     value["command_sequence"][0]["value"] = 1.999  # type: ignore[index]
     with pytest.raises(BasePoseValidationError, match="rotation command"):
         validate_base_pose_plan(value)
+
+
+def test_validator_requires_valid_theta() -> None:
+    missing = plan()
+    missing["current_alignment"].pop("theta")  # type: ignore[index]
+    with pytest.raises(BasePoseValidationError, match="invalid object schema"):
+        validate_base_pose_plan(missing)
+
+    negative = plan()
+    negative["current_alignment"]["theta"] = -0.1  # type: ignore[index]
+    with pytest.raises(BasePoseValidationError, match="non-negative"):
+        validate_base_pose_plan(negative)
+
+    unknown = plan()
+    unknown["current_alignment"].update(  # type: ignore[union-attr]
+        {"orientation_estimate": "UNKNOWN", "theta": 1.0}
+    )
+    with pytest.raises(BasePoseValidationError, match="must be 0"):
+        validate_base_pose_plan(unknown)
+
+    unknown["current_alignment"]["theta"] = 0.0  # type: ignore[index]
+    assert validate_base_pose_plan(unknown)["current_alignment"]["theta"] == 0.0
 
 
 @pytest.mark.parametrize(
@@ -201,6 +239,36 @@ def test_adapter_preserves_order_sign_and_exact_model_duration() -> None:
     assert [segment.command.duration for segment in segments] == pytest.approx(
         [math.radians(30.0) / 0.4, 1.0, math.radians(10.0) / 0.4, 2.0]
     )
+
+
+def test_adapter_scales_model_translations_and_rotations() -> None:
+    model_plan = plan(
+        [
+            command(1, "ROTATE_LEFT", 30.0),
+            command(2, "MOVE_FORWARD", 0.4),
+        ]
+    )
+
+    segments = plan_to_segments(
+        model_plan,
+        rotation_speed=0.5,
+        translation_speed=0.2,
+        rotation_scale=1.5,
+        translation_scale=2.0,
+    )
+
+    assert [segment.command.duration for segment in segments] == pytest.approx(
+        [math.radians(45.0) / 0.5, 0.8 / 0.2]
+    )
+
+
+@pytest.mark.parametrize("scale", [0.0, -1.0, math.inf, math.nan])
+@pytest.mark.parametrize("scale_name", ["rotation_scale", "translation_scale"])
+def test_adapter_rejects_invalid_motion_scale(
+    scale_name: str, scale: float
+) -> None:
+    with pytest.raises(ValueError, match=scale_name):
+        plan_to_segments(plan([]), **{scale_name: scale})
 
 
 def test_sequence_controller_inserts_idle_and_space_can_cancel_every_phase() -> None:
@@ -449,6 +517,170 @@ def test_roi_depth_statistics_and_intrinsic_backprojection() -> None:
     )
 
 
+@pytest.mark.parametrize(
+    ("fast", "feature_config", "expects_fast_tier"),
+    [
+        (True, "features.fast_mode=true", True),
+        (False, "features.fast_mode=false", False),
+    ],
+)
+def test_codex_client_sets_explicit_fast_mode(
+    tmp_path: Path,
+    fast: bool,
+    feature_config: str,
+    expects_fast_tier: bool,
+) -> None:
+    calls: list[list[str]] = []
+
+    def runner(command: list[str], **_kwargs: object):
+        calls.append(list(command))
+        if command[1:] == ["login", "status"]:
+            return subprocess.CompletedProcess(
+                command, 0, stdout="Logged in with ChatGPT", stderr=""
+            )
+        return subprocess.CompletedProcess(
+            command, 0, stdout=json.dumps(plan()), stderr=""
+        )
+
+    image_path = tmp_path / "rgb.png"
+    image_path.write_bytes(b"png bytes")
+    client = (
+        CodexStructuredVisionClient(runner=runner)
+        if fast
+        else CodexStructuredVisionClient(fast=False, runner=runner)
+    )
+
+    assert client.run(
+        prompt="plan",
+        image_paths=[image_path],
+        schema={"type": "object"},
+        schema_filename="plan.schema.json",
+        cwd=tmp_path,
+    ) == plan()
+
+    configs = [
+        command[index + 1]
+        for command in calls[1:]
+        for index, value in enumerate(command[:-1])
+        if value == "--config"
+    ]
+    assert feature_config in configs
+    assert ('service_tier="fast"' in configs) is expects_fast_tier
+
+
+def test_dashscope_key_prefers_environment_then_virtualenv_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    env_file = tmp_path / ".env"
+    env_file.write_text("DASHSCOPE_API_KEY=file-key\n", encoding="utf-8")
+    monkeypatch.delenv("DASHSCOPE_API_KEY", raising=False)
+
+    assert _dashscope_api_key(env_file) == "file-key"
+
+    monkeypatch.setenv("DASHSCOPE_API_KEY", "environment-key")
+    assert _dashscope_api_key(env_file) == "environment-key"
+
+
+def test_qwenvl_plus_client_streams_images_schema_and_json(tmp_path: Path) -> None:
+    calls: list[dict[str, object]] = []
+    expected = plan()
+
+    class FakeCompletions:
+        def create(self, **kwargs: object):
+            calls.append(kwargs)
+            return iter(
+                [
+                    SimpleNamespace(
+                        choices=[
+                            SimpleNamespace(
+                                delta=SimpleNamespace(
+                                    reasoning_content="inspect image",
+                                    content=None,
+                                )
+                            )
+                        ]
+                    ),
+                    SimpleNamespace(
+                        choices=[
+                            SimpleNamespace(
+                                delta=SimpleNamespace(
+                                    reasoning_content=None,
+                                    content=json.dumps(expected),
+                                )
+                            )
+                        ]
+                    ),
+                    SimpleNamespace(choices=[], usage=SimpleNamespace(total_tokens=10)),
+                ]
+            )
+
+    client = SimpleNamespace(chat=SimpleNamespace(completions=FakeCompletions()))
+    image_path = tmp_path / "rgb.png"
+    image_path.write_bytes(b"png bytes")
+    schema = {"type": "object", "required": ["status"]}
+    depth_path = tmp_path / "depth.png"
+    depth_path.write_bytes(b"depth png bytes")
+    qwen = QwenVLStructuredVisionClient(client=client)
+
+    result = qwen.run(
+        prompt="plan from ATTACHED_IMAGE_1",
+        image_paths=[image_path, depth_path],
+        schema=schema,
+        schema_filename="plan.schema.json",
+        cwd=tmp_path,
+    )
+
+    assert result == expected
+    assert qwen.last_reasoning_content == "inspect image"
+    assert qwen.last_answer_content == json.dumps(expected)
+    assert calls[0]["model"] == "qwen3-vl-plus"
+    assert calls[0]["stream"] is True
+    assert calls[0]["timeout"] == 600.0
+    assert calls[0]["extra_body"] == {
+        "enable_thinking": True,
+        "thinking_budget": 500,
+    }
+    messages = calls[0]["messages"]
+    assert isinstance(messages, list)
+    content = messages[0]["content"]
+    assert content[0]["image_url"]["url"].startswith("data:image/png;base64,")
+    assert "plan from ATTACHED_IMAGE_1" in content[-1]["text"]
+    assert content[1]["image_url"]["url"].startswith("data:image/png;base64,")
+    assert "ATTACHED_IMAGE_2 is image_url item 2 above." in content[-1]["text"]
+    assert "Return only one JSON object matching this schema" in content[-1]["text"]
+    assert json.loads((tmp_path / "plan.schema.json").read_text()) == schema
+
+
+def test_runner_selects_qwenvl_plus_backend(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, object] = {}
+    fake_client = object()
+
+    def build_qwen(**kwargs: object) -> object:
+        captured.update(kwargs)
+        return fake_client
+
+    monkeypatch.setattr(base_pose_module, "QwenVLStructuredVisionClient", build_qwen)
+    runner = BasePoseRunner(
+        BasePoseConfig(
+            task="adjust pose",
+            vision_backend="qwenvl",
+            qwenvl_model="qwen3-vl-plus",
+            qwenvl_base_url="https://dashscope.example/v1",
+            codex_timeout_seconds=123.0,
+        ),
+        camera=FakeCamera(snapshot(depth=False)),  # type: ignore[arg-type]
+    )
+
+    assert runner.client is fake_client
+    assert captured == {
+        "model": "qwen3-vl-plus",
+        "base_url": "https://dashscope.example/v1",
+        "timeout_seconds": 123.0,
+    }
+
+
 class FakeCamera:
     def __init__(self, value: AlignedRGBDSnapshot):
         self.value = value
@@ -515,6 +747,7 @@ def test_three_modes_use_expected_attachments_and_one_snapshot(
 
     assert camera.captures == 1
     assert [len(call["image_paths"]) for call in client.calls] == image_counts
+    assert '"theta": 0.0' in client.calls[-1]["prompt"]
     assert Path(base_result.output_dir, "rgb.png").is_file()
     assert Path(base_result.output_dir, "validation.json").is_file()
     if depth:

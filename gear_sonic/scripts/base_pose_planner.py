@@ -16,7 +16,7 @@ import termios
 import threading
 import time
 import tty
-from typing import Any, Callable, Iterator, TextIO
+from typing import Any, Callable, Iterator, Literal, TextIO
 
 import zmq
 
@@ -36,8 +36,14 @@ STOP_VELOCITY = (0.0, 0.0, 0.0)
 class BasePosePlannerConfig:
     task: str
     mode: str = "rgb"
+    vision_backend: Literal["codex", "qwenvl"] = "codex"
     model: str = "gpt-5.6-sol"
+    qwenvl_model: str = "qwen3-vl-plus"
+    qwenvl_base_url: str = (
+        "https://dashscope-intl.aliyuncs.com/compatible-mode/v1"
+    )
     reasoning_effort: str = "max"
+    codex_fast: bool = True
     host: str = "*"
     port: int = 5558
     planner_hz: float = 20.0
@@ -45,6 +51,8 @@ class BasePosePlannerConfig:
     final_stop_count: int = 3
     rotation_speed: float = 0.4
     translation_speed: float = 0.3
+    rotation_scale: float = 1.0
+    translation_scale: float = 1.0
     camera_host: str = "localhost"
     camera_port: int = 5555
     camera_timeout_ms: int = 15000
@@ -108,19 +116,30 @@ def plan_to_segments(
     *,
     rotation_speed: float = 0.4,
     translation_speed: float = 0.3,
+    rotation_scale: float = 1.0,
+    translation_scale: float = 1.0,
 ) -> tuple[MotionSegment, ...]:
-    """Map validated model values to fixed-speed commands without changing them."""
+    """Scale validated model values and map them to fixed-speed commands."""
     if not math.isfinite(rotation_speed) or rotation_speed <= 0.0:
         raise ValueError("rotation_speed must be finite and positive")
     if not math.isfinite(translation_speed) or translation_speed <= 0.0:
         raise ValueError("translation_speed must be finite and positive")
+    if not math.isfinite(rotation_scale) or rotation_scale <= 0.0:
+        raise ValueError("rotation_scale must be finite and positive")
+    if not math.isfinite(translation_scale) or translation_scale <= 0.0:
+        raise ValueError("translation_scale must be finite and positive")
     validated = validate_base_pose_plan(plan)
     if validated["status"] != "ADJUST":
         return ()
     segments: list[MotionSegment] = []
     for item in validated["command_sequence"]:
-        value = float(item["value"])
         action = str(item["action"])
+        scale = (
+            rotation_scale
+            if action.startswith("ROTATE_")
+            else translation_scale
+        )
+        value = float(item["value"]) * scale
         if action == "ROTATE_LEFT":
             command = VelocityCommand(
                 0.0, 0.0, rotation_speed, math.radians(value) / rotation_speed
@@ -151,16 +170,28 @@ class BasePoseSequenceController:
         *,
         rotation_speed: float = 0.4,
         translation_speed: float = 0.3,
+        rotation_scale: float = 1.0,
+        translation_scale: float = 1.0,
         transition_pause: float = 0.5,
         stop_duration: float = 0.05,
     ):
-        values = (rotation_speed, translation_speed, stop_duration)
+        values = (
+            rotation_speed,
+            translation_speed,
+            rotation_scale,
+            translation_scale,
+            stop_duration,
+        )
         if not all(math.isfinite(value) and value > 0.0 for value in values):
-            raise ValueError("controller speeds and stop_duration must be positive")
+            raise ValueError(
+                "controller speeds, scales, and stop_duration must be positive"
+            )
         if not math.isfinite(transition_pause) or transition_pause < 0.0:
             raise ValueError("transition_pause must be finite and non-negative")
         self.rotation_speed = rotation_speed
         self.translation_speed = translation_speed
+        self.rotation_scale = rotation_scale
+        self.translation_scale = translation_scale
         self.transition_pause = transition_pause
         self.stop_duration = stop_duration
         self.phase = "idle"
@@ -192,6 +223,8 @@ class BasePoseSequenceController:
             result.plan,
             rotation_speed=self.rotation_speed,
             translation_speed=self.translation_speed,
+            rotation_scale=self.rotation_scale,
+            translation_scale=self.translation_scale,
         )
         if not segments:
             self.cancel()
@@ -261,6 +294,8 @@ class BasePosePlannerRuntime:
         self.controller = BasePoseSequenceController(
             rotation_speed=config.rotation_speed,
             translation_speed=config.translation_speed,
+            rotation_scale=config.rotation_scale,
+            translation_scale=config.translation_scale,
             transition_pause=config.transition_pause,
             stop_duration=1.0 / config.planner_hz,
         )
@@ -380,8 +415,12 @@ class BasePosePlannerRuntime:
                 item.result.plan,
                 rotation_speed=self.config.rotation_speed,
                 translation_speed=self.config.translation_speed,
+                rotation_scale=self.config.rotation_scale,
+                translation_scale=self.config.translation_scale,
             )
             execution = {
+                "rotation_scale": self.config.rotation_scale,
+                "translation_scale": self.config.translation_scale,
                 "rotation_speed_rad_s": self.config.rotation_speed,
                 "translation_speed_m_s": self.config.translation_speed,
                 "transition_pause_s": self.config.transition_pause,
@@ -542,8 +581,12 @@ def _runner_factory(config: BasePosePlannerConfig) -> BasePoseRunner:
         BasePoseConfig(
             task=config.task,
             mode=config.mode,  # type: ignore[arg-type]
+            vision_backend=config.vision_backend,  # type: ignore[arg-type]
             model=config.model,
+            qwenvl_model=config.qwenvl_model,
+            qwenvl_base_url=config.qwenvl_base_url,
             reasoning_effort=config.reasoning_effort,
+            codex_fast=config.codex_fast,
             camera_host=config.camera_host,
             camera_port=config.camera_port,
             camera_timeout_ms=config.camera_timeout_ms,
@@ -589,8 +632,11 @@ def main(config: BasePosePlannerConfig) -> None:
     signal.signal(signal.SIGINT, request_stop)
     signal.signal(signal.SIGTERM, request_stop)
     try:
+        codex_fast = "on" if config.codex_fast else "off"
         print(
-            f"[BasePose] PUB bound to {endpoint}; mode={config.mode}; task={config.task!r}"
+            f"[BasePose] PUB bound to {endpoint}; mode={config.mode}; "
+            f"backend={config.vision_backend}; codex_fast={codex_fast}; "
+            f"task={config.task!r}"
         )
         print("[BasePose] N plan | Space cancel-and-stop | X stop-and-exit")
         with cbreak_terminal():

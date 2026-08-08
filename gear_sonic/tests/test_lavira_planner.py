@@ -194,15 +194,53 @@ def test_base_pose_rgb_uses_ego_camera_without_starting_lingbot() -> None:
     assert "base_pose_planner.py" in command
     assert "--task 'put the cup in the tray'" in command
     assert "--mode rgb" in command
+    assert "--vision-backend codex" in command
     assert "--model gpt-5.6-sol" in command
     assert "--reasoning-effort max" in command
     assert "--codex-timeout-seconds 600.0" in command
+    assert "--rotation-scale 1.0" in command
+    assert "--translation-scale 1.0" in command
+    assert "--no-codex-fast" not in command
     assert "--camera-stream ego_view" in command
     assert "--camera-height-m 1.2" in command
     assert "--camera-host g1-camera --camera-port 5555" in command
     assert ".venv_lingbot_depth" not in command
     assert "run_lingbot_depth_viewer.py" not in command
     assert "--planner-ready-file" not in command
+
+
+def test_base_pose_can_disable_codex_fast() -> None:
+    config = InferenceLaunchConfig(
+        planner_input="base_pose",
+        base_pose_task="put the cup in the tray",
+        base_pose_codex_fast=False,
+    )
+
+    command = build_planner_input_command(config, Path("/workspace/sonic"))
+
+    assert "--no-codex-fast" in command
+
+
+def test_base_pose_can_select_qwenvl_plus_backend() -> None:
+    config = InferenceLaunchConfig(
+        planner_input="base_pose",
+        base_pose_task="put the paper balls in the basket",
+        base_pose_vision_backend="qwenvl",
+        base_pose_qwenvl_model="qwen3-vl-plus",
+        base_pose_qwenvl_base_url="https://dashscope.example/v1",
+        base_pose_rotation_scale=1.25,
+        base_pose_translation_scale=0.75,
+    )
+
+    command = build_planner_input_command(config, Path("/workspace/sonic"))
+
+    assert "--vision-backend qwenvl" in command
+    assert "--qwenvl-model qwen3-vl-plus" in command
+    assert "--qwenvl-base-url https://dashscope.example/v1" in command
+    assert "--rotation-scale 1.25" in command
+    assert "--translation-scale 0.75" in command
+    assert ".venv_inference/bin/python" in command
+    assert ".venv_lingbot_depth" not in command
 
 
 @pytest.mark.parametrize("mode", ["rgbd", "rgb_depth_query"])

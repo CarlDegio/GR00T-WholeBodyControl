@@ -4,10 +4,12 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
+import base64
 import json
 import math
 import os
 import subprocess
+import sys
 import tempfile
 import time
 from typing import Any, Callable, Literal, Mapping, Sequence
@@ -23,6 +25,12 @@ from gear_sonic.scripts.run_depth_camera_viewer import colorize_depth
 
 BasePoseMode = Literal["rgb", "rgbd", "rgb_depth_query"]
 BASE_POSE_MODES = {"rgb", "rgbd", "rgb_depth_query"}
+BasePoseVisionBackend = Literal["codex", "qwenvl"]
+BASE_POSE_VISION_BACKENDS = {"codex", "qwenvl"}
+DEFAULT_QWENVL_PLUS_MODEL = "qwen3-vl-plus"
+DEFAULT_QWENVL_BASE_URL = (
+    "https://dashscope-intl.aliyuncs.com/compatible-mode/v1"
+)
 ALLOWED_ACTIONS = {
     "ROTATE_LEFT",
     "ROTATE_RIGHT",
@@ -54,6 +62,7 @@ CURRENT_ALIGNMENT_KEYS = {
     "horizontal_position",
     "distance_estimate",
     "orientation_estimate",
+    "theta",
 }
 DESIRED_FINAL_POSE_KEYS = {
     "target_alignment",
@@ -108,6 +117,7 @@ BASE_POSE_OUTPUT_SCHEMA: dict[str, Any] = {
                         "UNKNOWN",
                     ]
                 },
+                "theta": {"type": "number", "minimum": 0},
             },
             "required": sorted(CURRENT_ALIGNMENT_KEYS),
             "additionalProperties": False,
@@ -243,8 +253,12 @@ class AlignedRGBDSnapshot:
 class BasePoseConfig:
     task: str
     mode: BasePoseMode = "rgb"
+    vision_backend: BasePoseVisionBackend = "codex"
     model: str = "gpt-5.6-sol"
+    qwenvl_model: str = DEFAULT_QWENVL_PLUS_MODEL
+    qwenvl_base_url: str = DEFAULT_QWENVL_BASE_URL
     reasoning_effort: str = "max"
+    codex_fast: bool = True
     camera_host: str = "localhost"
     camera_port: int = 5555
     camera_timeout_ms: int = 15000
@@ -349,6 +363,13 @@ def validate_base_pose_plan(
         raise BasePoseValidationError("distance_estimate is invalid")
     if alignment["orientation_estimate"] not in ORIENTATION_ESTIMATES:
         raise BasePoseValidationError("orientation_estimate is invalid")
+    theta = _finite_number(alignment["theta"], "current_alignment.theta")
+    if theta < 0.0:
+        raise BasePoseValidationError("current_alignment.theta must be non-negative")
+    if alignment["orientation_estimate"] == "UNKNOWN" and theta != 0.0:
+        raise BasePoseValidationError(
+            "current_alignment.theta must be 0 when orientation is UNKNOWN"
+        )
     desired = _require_exact_keys(
         payload["desired_final_pose"],
         DESIRED_FINAL_POSE_KEYS,
@@ -601,136 +622,176 @@ def build_base_pose_prompt(
         indent=2,
     )
     task = json.dumps([config.task], ensure_ascii=False)
-    return f"""You are a base-pose adjustment planner for a G1 humanoid robot standing near a table and preparing to perform a manipulation task.
+    return (
+        """You are a base-pose adjustment planner for a G1 humanoid robot standing near a table and preparing to perform a manipulation task.
 
-Your goal is to generate a complete and coherent sequence of base movements that places the robot in a suitable pose for manipulation.
+Your goal is to generate a complete and coherent sequence of base movements that places the robot in a suitable pose for performing the manipulation task.
 
 ## Inputs
 
 Task description:
 
-{task}
+"""
+        + task
+        + """
 
 RGB image:
 
 [ATTACHED IMAGE]
 
+"""
+        + params
+        + """
 
-{params}
+## Planning Procedure
 
+Follow the steps below in order, using both the task description and the RGB image.
 
-Planning procedure
+Identify the target manipulation region and the primary manipulation target. Among the objects most strongly related to the manipulation task description, select an object that is relatively large and provides a stable and reliable reference for alignment whenever possible.
 
-Use the task description and RGB image to perform the following steps in order:
+Distinguish the primary manipulation target from other manipulation targets, the tabletop, other support surfaces, and any possible obstacles.
 
-Identify the primary manipulation target.
+The appropriate body orientation should face the manipulation region directly. Determine whether the robot's current body orientation is turned to the left or to the right relative to the desired manipulation direction, and output TURNED_LEFT or TURNED_RIGHT accordingly. Estimate the angle by which the robot should rotate in order to directly face the manipulation region, and denote this estimated angle as theta.
 
-For the current task, select the blue plastic basket as the primary manipulation target.
+Select a task-relevant alignment anchor on the primary manipulation target.
 
-Distinguish the primary manipulation target from the paper balls, table, support surfaces, unrelated objects, and possible obstacles.
+Determine the desired final horizontal position of the alignment anchor in the robot's ego-view image.
 
-Select the task-relevant manipulation anchor.
+Imagine the robot applying the corrective rotation by theta toward the desired manipulation direction. Estimate where the alignment anchor would appear after this rotation. Compare the estimated post-rotation position of the alignment anchor with the horizontal center of the current camera view, and use this comparison together with the overall image geometry to determine the robot's lateral position relative to the target. Output FAR_LEFT or FAR_RIGHT when a substantial lateral repositioning is required.
 
-For the current task, use the center of the blue plastic basket as the manipulation anchor.
+Determine whether the robot should move closer to or farther from the primary manipulation target in order to reach a suitable manipulation distance. The suitable manipulation distance should keep all manipulation targets within the current camera view as much as possible while placing the robot as close to the manipulation region as reasonably possible.
 
-Determine the desired final horizontal alignment of the manipulation anchor in the robot’s ego-view.
+Generate a continuous multi-step motion sequence that adjusts both the robot's position and orientation.
 
-For the current task, align the manipulation anchor with the horizontal center of the camera view.
+When lateral repositioning is required and the path is safe, prefer the following motion structure:
 
-Compare the horizontal position of the manipulation anchor with the current horizontal center of the camera view and infer the robot’s lateral position relative to the target:
-If the manipulation anchor appears to the right of the camera-view center, the robot is positioned to the left of the target.
-If the manipulation anchor appears to the left of the camera-view center, the robot is positioned to the right of the target.
-If the manipulation anchor appears approximately at the camera-view center, the robot is horizontally aligned with the target.
-Use FAR_LEFT or FAR_RIGHT only when the horizontal displacement is visually substantial.
+First move backward to create sufficient maneuvering space for turning and positional adjustment;
 
-Determine whether the robot’s current body orientation is turned left or right relative to the desired interaction direction.
+Then rotate toward the required lateral repositioning direction;
 
-For the current task, the desired body-forward direction is perpendicular to the relevant table edge and directed toward the table.
+Move forward along the adjusted heading;
 
-Use TURNED_LEFT when the robot’s body-forward direction points to the left of the desired table-normal direction.
-Use TURNED_RIGHT when the robot’s body-forward direction points to the right of the desired table-normal direction.
-Use ALIGNED when the robot is approximately perpendicular to the relevant table edge and facing the table.
-Determine whether the robot should move closer to or farther from the manipulation target to reach a suitable manipulation distance.
-
-Generate a continuous multi-step motion sequence that adjusts both the robot’s position and orientation.
-
-For the current task, when lateral repositioning is required and the path is safe, prefer the following motion structure:
-
-move backward to create maneuvering space;
-rotate toward the required lateral repositioning direction;
-move forward along the adjusted heading;
-rotate again to restore the desired orientation toward the table.
+Finally rotate again so that the robot restores an appropriate manipulation orientation facing the manipulation region.
 
 When the robot is positioned to the left of the target, a rightward repositioning is normally required. Prefer:
 
 MOVE_BACKWARD;
+
 ROTATE_RIGHT;
+
 MOVE_FORWARD;
+
 ROTATE_LEFT.
 
 When the robot is positioned to the right of the target, a leftward repositioning is normally required. Prefer:
 
 MOVE_BACKWARD;
+
 ROTATE_LEFT;
+
 MOVE_FORWARD;
+
 ROTATE_RIGHT.
 
-The final rotation should restore a body orientation approximately perpendicular to the relevant table edge and facing the table.
-
-The preferred backward–rotate–forward–rotate structure is not mandatory when only a direct distance adjustment is required, when the robot is already horizontally aligned, or when the structure would introduce unnecessary motion or collision risk.
+The final rotation should restore the robot's body orientation so that it faces the manipulation region and is approximately perpendicular to the relevant table edge when such an edge can be identified.
 
 The final pose should:
 
-place the center of the blue plastic basket near the horizontal center of the camera view;
-place the robot at a suitable manipulation distance from the table and basket;
-orient the robot approximately perpendicular to the relevant table edge;
-provide a reasonable shared base pose for reaching both paper balls and the basket with the specified hands.
-Allowed motion commands
+place the center of the manipulation region near the horizontal center of the camera view;
+
+place the robot at the smallest suitable manipulation distance from the manipulation region while maintaining safe whole-body operation;
+
+orient the robot so that it faces the relevant manipulation region;
+
+provide a reasonable shared base pose that allows the robot to reach the manipulation region using the specified hands.
+
+## Allowed Motion Commands
+
 ROTATE_LEFT: rotate counterclockwise by a specified number of degrees.
+
 ROTATE_RIGHT: rotate clockwise by a specified number of degrees.
-MOVE_FORWARD: move forward along the robot’s current heading by a specified number of meters.
-MOVE_BACKWARD: move backward along the robot’s current heading by a specified number of meters.
+
+MOVE_FORWARD: move forward along the robot's current heading by a specified number of meters.
+
+MOVE_BACKWARD: move backward along the robot's current heading by a specified number of meters.
 
 Direct lateral translation is not available.
 
-Motion-planning rules
-Output a complete and coherent sequence containing all base movements needed to reach the estimated manipulation pose.
+## Motion-Planning Rules
+
+Output a complete and coherent sequence containing all base movements required to reach the estimated manipulation pose.
+
 Commands must be ordered exactly as they should be executed.
+
 Each command is defined relative to the robot pose resulting from all previous commands.
+
 Multiple rotations and translations may be used.
+
 Do not require a new observation between commands.
+
 Do not limit the plan to small incremental movements.
+
 Avoid unnecessary movements and redundant direction changes.
+
 Prefer a smooth and geometrically consistent trajectory.
+
 Do not output zero-valued or negative-valued motion commands.
-Translation constraints
+
+## Translation Constraints
+
 Every MOVE_FORWARD or MOVE_BACKWARD command must specify a distance greater than or equal to 0.3 meters.
+
 Do not output a translation command with a distance smaller than 0.3 meters.
+
 If the desired positional correction is smaller than 0.3 meters, do not approximate it using an invalid smaller translation.
-When geometrically appropriate and safe, use a combination of backward movement, rotation, forward movement, and final corrective rotation to produce the required position change.
+
+When geometrically appropriate and safe, use a combination of backward movement, rotation, forward movement, and a final corrective rotation to produce the required positional change.
+
 Do not output direct lateral movement.
-Rotation constraints
+
+## Rotation Constraints
+
 Every ROTATE_LEFT or ROTATE_RIGHT command must specify an angle greater than or equal to 30 degrees.
+
 Do not output a rotation command with an angle smaller than 30 degrees.
+
 If a required standalone net orientation correction is smaller than 30 degrees, it may be achieved using two rotations in opposite directions.
+
 First rotate by at least 30 degrees in the direction opposite to the required correction, then rotate in the required direction by an angle that produces the desired net correction.
+
 Every individual rotation in this indirect correction must still be greater than or equal to 30 degrees.
+
 For example, if a net 10-degree right rotation is required, use ROTATE_LEFT by 30 degrees followed by ROTATE_RIGHT by 40 degrees.
-Use this indirect small-angle correction only when the intermediate rotation is safe and does not create an unnecessary collision or stability risk.
+
+Use this indirect small-angle correction only when the intermediate rotation is safe and does not create unnecessary collision or stability risk.
+
 Do not add an indirect small-angle correction when the required orientation change can already be achieved as part of the lateral repositioning sequence.
-Task and safety constraints
+
+## Task and Safety Constraints
+
 Do not output arm or hand commands.
+
 Do not include target-recognition, image-acquisition, or observation commands in the motion sequence.
+
 Account for the visible table, support surfaces, objects, and obstacles when evaluating motion safety.
+
 Because no depth image or complete camera calibration is provided, all distances and angles are approximate visual estimates.
+
 Do not claim that the estimated motion values are geometrically exact.
+
 If the blue plastic basket cannot be identified, return UNSURE.
+
 If the relevant table edge or required interaction direction cannot be reasonably inferred, return UNSURE.
+
 If the required movement cannot be reasonably inferred from the image, return UNSURE.
+
 Do not invent a motion sequence when the visual evidence is insufficient.
+
 If the scene appears unsafe for the proposed base motion, return UNSAFE.
+
 Apply status priority in the following order: UNSAFE first, then UNSURE, then ADJUST.
-Output requirements
+
+## Output Requirements
 
 Output only one valid JSON object.
 
@@ -750,7 +811,8 @@ Use the following format:
 "current_alignment": {
 "horizontal_position": "FAR_LEFT | LEFT | CENTERED | RIGHT | FAR_RIGHT | UNKNOWN",
 "distance_estimate": "TOO_CLOSE | SUITABLE | TOO_FAR | UNKNOWN",
-"orientation_estimate": "TURNED_LEFT | ALIGNED | TURNED_RIGHT | UNKNOWN"
+"orientation_estimate": "TURNED_LEFT | ALIGNED | TURNED_RIGHT | UNKNOWN",
+"theta": 0.0
 },
 "desired_final_pose": {
 "target_alignment": "",
@@ -771,35 +833,101 @@ Use the following format:
 "limitations": ""
 }
 
-Field interpretation
-primary_target should identify the blue plastic basket.
-secondary_targets should identify the two paper balls and other task-relevant objects.
-manipulation_anchor should identify the center of the blue plastic basket.
-interaction_direction should describe the desired body-forward direction perpendicular to the relevant table edge and facing the table.
-horizontal_position describes the robot’s estimated lateral position relative to the manipulation anchor, not the anchor’s image position:
-anchor right of image center → robot LEFT or FAR_LEFT;
-anchor left of image center → robot RIGHT or FAR_RIGHT;
-anchor near image center → robot CENTERED.
-distance_estimate should be judged relative to a suitable whole-body manipulation distance from the table and basket.
-orientation_estimate should be judged relative to the desired direction perpendicular to the relevant table edge.
-target_alignment should state that the basket center should be near the horizontal center of the camera view.
-target_orientation should state that the robot should face the table approximately perpendicular to the relevant table edge.
+## Field Interpretation
+
+primary_target should identify the blue plastic basket as the primary manipulation target.
+
+secondary_targets should identify the two paper balls and any other task-relevant objects.
+
+manipulation_anchor should identify a task-relevant alignment anchor on the primary manipulation target. For the current task, the center of the blue plastic basket should normally be used as the manipulation anchor.
+
+interaction_direction should describe the desired body-forward direction facing the manipulation region. When the relevant table edge can be identified, this direction should be approximately perpendicular to the table edge and directed toward the manipulation region.
+
+horizontal_position describes the robot's estimated lateral position relative to the manipulation region after accounting for the estimated orientation correction theta, rather than simply describing the raw image position of the manipulation anchor.
+
+If the estimated post-rotation manipulation anchor remains substantially to the right of the camera-view center, the robot is positioned to the LEFT or FAR_LEFT of the desired manipulation position.
+
+If the estimated post-rotation manipulation anchor remains substantially to the left of the camera-view center, the robot is positioned to the RIGHT or FAR_RIGHT of the desired manipulation position.
+
+If the estimated post-rotation manipulation anchor is near the camera-view center, the robot is approximately CENTERED relative to the desired manipulation position.
+
+Use FAR_LEFT or FAR_RIGHT when the estimated lateral displacement is visually substantial and meaningful base repositioning is required.
+
+distance_estimate should be judged relative to a suitable whole-body manipulation distance from the manipulation region. The preferred distance should keep all task-relevant manipulation targets visible whenever reasonably possible while placing the robot as close to the manipulation region as is appropriate for safe manipulation.
+
+orientation_estimate should be judged relative to the desired body orientation facing the manipulation region.
+
+Use TURNED_LEFT when the robot's current body-forward direction points to the left of the desired manipulation direction.
+
+Use TURNED_RIGHT when the robot's current body-forward direction points to the right of the desired manipulation direction.
+
+Use ALIGNED when the robot already approximately faces the desired manipulation direction.
+
+theta should represent the estimated magnitude, in degrees, of the corrective body rotation required for the robot to face the manipulation region from its current orientation.
+
+theta describes only the magnitude of the estimated orientation correction. The rotation direction is determined by orientation_estimate:
+
+TURNED_LEFT means the robot should normally rotate right by approximately theta degrees to face the manipulation region.
+
+TURNED_RIGHT means the robot should normally rotate left by approximately theta degrees to face the manipulation region.
+
+ALIGNED means theta should be approximately 0 degrees.
+
+If the required orientation correction cannot be reasonably estimated from the image, orientation_estimate should be UNKNOWN and theta should be 0.0.
+
+theta is an estimated geometric quantity used for scene reasoning and is not itself a motion command. Therefore, theta is not subject to the minimum 30-degree individual rotation-command constraint.
+
+target_alignment should state that the center of the manipulation region should be near the horizontal center of the camera view.
+
+target_distance should describe the desired manipulation distance, keeping the robot as close as reasonably possible while maintaining a safe and useful whole-body manipulation pose and preserving visibility of the relevant manipulation targets whenever possible.
+
+target_orientation should state that the robot should face the manipulation region. When a relevant table edge is identifiable, the robot should be approximately perpendicular to that edge.
+
 purpose should briefly explain the geometric role of each command.
-Consistency constraints
+
+## Consistency Constraints
+
 UNSURE must have an empty command_sequence.
+
 UNSAFE must have an empty command_sequence.
+
 ADJUST must contain at least one command.
+
 Rotation commands must use degrees.
+
 Translation commands must use meters.
+
 Every rotation-command value must be greater than or equal to 30 degrees.
+
 Every translation-command value must be greater than or equal to 0.3 meters.
+
 Every command value must be positive.
+
 Every step number must be consecutive, starting from 1.
+
 The action and unit of every command must match.
+
+theta must be a non-negative numerical value representing degrees.
+
+theta is an approximate visual estimate and must not be described as geometrically exact.
+
+When orientation_estimate is TURNED_LEFT, theta represents the approximate magnitude of the required rightward corrective rotation.
+
+When orientation_estimate is TURNED_RIGHT, theta represents the approximate magnitude of the required leftward corrective rotation.
+
+When orientation_estimate is ALIGNED, theta should be approximately 0.0.
+
+When orientation_estimate is UNKNOWN, theta must be 0.0.
+
+The command sequence does not need to contain a single rotation command exactly equal to theta. The required orientation correction may be distributed across multiple rotations as part of the complete position-and-orientation adjustment trajectory.
+
 confidence must be a number from 0.0 to 1.0.
-expected_result must describe the estimated final robot-to-target position, distance, and orientation after the complete command sequence has been executed.
+
+expected_result must describe the estimated final robot-to-manipulation-region position, distance, and orientation after the complete command_sequence has been executed.
+
 For UNSURE or UNSAFE, explain the reason in limitations without inventing unsupported geometry.
 """
+    )
 
 
 def build_depth_query_prompt(
@@ -971,12 +1099,14 @@ class CodexStructuredVisionClient:
         *,
         model: str = "gpt-5.6-sol",
         reasoning_effort: str = "max",
+        fast: bool = True,
         timeout_seconds: float = 600.0,
         codex_bin: str | None = None,
         runner: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
     ):
         self.model = model
         self.reasoning_effort = reasoning_effort
+        self.fast = bool(fast)
         self.timeout_seconds = float(timeout_seconds)
         self.codex_bin = codex_bin or os.environ.get("CODEX_BIN", "codex")
         self.runner = runner
@@ -1050,6 +1180,11 @@ class CodexStructuredVisionClient:
             "--config",
             f'model_reasoning_effort="{self.reasoning_effort}"',
         ]
+        command.extend(
+            ("--config", f"features.fast_mode={str(self.fast).lower()}")
+        )
+        if self.fast:
+            command.extend(("--config", 'service_tier="fast"'))
         for path in resolved_images:
             command.extend(("--image", str(path)))
         command.extend(("--output-schema", str(schema_path), prompt))
@@ -1074,6 +1209,163 @@ class CodexStructuredVisionClient:
         return value
 
 
+def _dashscope_api_key(env_file: str | Path | None = None) -> str:
+    key = os.environ.get("DASHSCOPE_API_KEY", "").strip()
+    if key:
+        return key
+    path = Path(env_file) if env_file is not None else Path(sys.prefix) / ".env"
+    if path.is_file():
+        for raw_line in path.read_text(encoding="utf-8").splitlines():
+            line = raw_line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            name, value = line.split("=", 1)
+            if name.strip() == "DASHSCOPE_API_KEY" and value.strip():
+                return value.strip().strip("\"'")
+    raise RuntimeError(
+        "Qwen-VL requires DASHSCOPE_API_KEY in the environment or "
+        f"{path}"
+    )
+
+
+class QwenVLStructuredVisionClient:
+    """Call Qwen-VL Plus through DashScope's OpenAI-compatible API."""
+
+    def __init__(
+        self,
+        *,
+        model: str = DEFAULT_QWENVL_PLUS_MODEL,
+        base_url: str = DEFAULT_QWENVL_BASE_URL,
+        timeout_seconds: float = 600.0,
+        thinking_budget: int = 500,
+        api_key: str | None = None,
+        env_file: str | Path | None = None,
+        client: Any | None = None,
+    ):
+        self.model = model
+        self.base_url = base_url
+        self.timeout_seconds = float(timeout_seconds)
+        self.thinking_budget = int(thinking_budget)
+        self.last_reasoning_content = ""
+        self.last_answer_content = ""
+        if self.thinking_budget <= 0:
+            raise ValueError("Qwen-VL thinking_budget must be positive")
+        if client is not None:
+            self.client = client
+            return
+        key = api_key or _dashscope_api_key(env_file)
+        try:
+            from openai import OpenAI
+        except ImportError as exc:
+            raise RuntimeError(
+                "Qwen-VL requires the openai package in .venv_inference"
+            ) from exc
+        import httpx
+
+        proxy = (
+            os.environ.get("HTTPS_PROXY")
+            or os.environ.get("https_proxy")
+            or os.environ.get("HTTP_PROXY")
+            or os.environ.get("http_proxy")
+        )
+        http_client = (
+            httpx.Client(proxy=proxy) if proxy else httpx.Client(trust_env=False)
+        )
+        self.client = OpenAI(
+            api_key=key,
+            base_url=base_url,
+            http_client=http_client,
+        )
+
+    @staticmethod
+    def _parse_json_content(content: str) -> dict[str, Any]:
+        text = content.strip()
+        if not text:
+            raise BasePoseValidationError("Qwen-VL base-pose output is empty")
+        if text.startswith("```") and text.endswith("```"):
+            lines = text.splitlines()
+            if len(lines) >= 3:
+                text = "\n".join(lines[1:-1]).strip()
+        try:
+            value = json.loads(text)
+        except json.JSONDecodeError as exc:
+            raise BasePoseValidationError(
+                "Qwen-VL base-pose output is not valid JSON"
+            ) from exc
+        if not isinstance(value, dict):
+            raise BasePoseValidationError(
+                "Qwen-VL base-pose output must be a JSON object"
+            )
+        return value
+
+    def run(
+        self,
+        *,
+        prompt: str,
+        image_paths: Sequence[str | Path],
+        schema: Mapping[str, Any],
+        schema_filename: str,
+        cwd: str | Path,
+    ) -> dict[str, Any]:
+        resolved_images = [Path(path).resolve() for path in image_paths]
+        for path in resolved_images:
+            if not path.is_file():
+                raise FileNotFoundError(f"model image input not found: {path}")
+        workdir = Path(cwd).resolve()
+        _write_json(workdir / schema_filename, schema)
+        content: list[dict[str, Any]] = []
+        for path in resolved_images:
+            encoded = base64.b64encode(path.read_bytes()).decode("ascii")
+            mime_type = "image/png" if path.suffix.lower() == ".png" else "image/jpeg"
+            content.append(
+                {
+                    "type": "image_url",
+                    "image_url": {"url": f"data:{mime_type};base64,{encoded}"},
+                }
+            )
+        schema_text = json.dumps(schema, ensure_ascii=False, separators=(",", ":"))
+        image_manifest = "\n".join(
+            f"ATTACHED_IMAGE_{index} is image_url item {index} above."
+            for index in range(1, len(resolved_images) + 1)
+        )
+        content.append(
+            {
+                "type": "text",
+                "text": (
+                    f"{image_manifest}\n\n{prompt}\n\n"
+                    "Return only one JSON object matching this schema:\n"
+                    f"{schema_text}"
+                ),
+            }
+        )
+        completion = self.client.chat.completions.create(
+            model=self.model,
+            messages=[{"role": "user", "content": content}],
+            stream=True,
+            timeout=self.timeout_seconds,
+            extra_body={
+                "enable_thinking": True,
+                "thinking_budget": self.thinking_budget,
+            },
+        )
+        reasoning_parts: list[str] = []
+        answer_parts: list[str] = []
+        for chunk in completion:
+            choices = getattr(chunk, "choices", None)
+            if not choices:
+                continue
+            delta = choices[0].delta
+            reasoning = getattr(delta, "reasoning_content", None)
+            if reasoning:
+                reasoning_parts.append(reasoning)
+            answer = getattr(delta, "content", None)
+            if answer:
+                answer_parts.append(answer)
+        self.last_reasoning_content = "".join(reasoning_parts)
+        self.last_answer_content = "".join(answer_parts)
+        return self._parse_json_content(self.last_answer_content)
+
+
 class BasePoseRunner:
     """Capture one observation and obtain one validated model-authored plan."""
 
@@ -1082,11 +1374,15 @@ class BasePoseRunner:
         config: BasePoseConfig,
         *,
         camera: AlignedRGBDCamera | None = None,
-        client: CodexStructuredVisionClient | None = None,
+        client: CodexStructuredVisionClient | QwenVLStructuredVisionClient | None = None,
         monotonic: Callable[[], float] = time.monotonic,
     ):
         if config.mode not in BASE_POSE_MODES:
             raise ValueError(f"unsupported base-pose mode: {config.mode}")
+        if config.vision_backend not in BASE_POSE_VISION_BACKENDS:
+            raise ValueError(
+                f"unsupported base-pose vision backend: {config.vision_backend}"
+            )
         if not config.task.strip():
             raise ValueError("base-pose task must be non-empty")
         if config.depth_visual_max_m <= 0.0:
@@ -1102,11 +1398,21 @@ class BasePoseRunner:
             required_depth_source="lingbot-depth" if require_depth else None,
             timeout_ms=config.camera_timeout_ms,
         )
-        self.client = client or CodexStructuredVisionClient(
-            model=config.model,
-            reasoning_effort=config.reasoning_effort,
-            timeout_seconds=config.codex_timeout_seconds,
-        )
+        if client is not None:
+            self.client = client
+        elif config.vision_backend == "qwenvl":
+            self.client = QwenVLStructuredVisionClient(
+                model=config.qwenvl_model,
+                base_url=config.qwenvl_base_url,
+                timeout_seconds=config.codex_timeout_seconds,
+            )
+        else:
+            self.client = CodexStructuredVisionClient(
+                model=config.model,
+                reasoning_effort=config.reasoning_effort,
+                fast=config.codex_fast,
+                timeout_seconds=config.codex_timeout_seconds,
+            )
 
     def _output_dir(self) -> Path:
         stamp = time.strftime("%Y%m%d_%H%M%S")
