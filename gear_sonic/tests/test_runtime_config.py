@@ -35,9 +35,6 @@ def test_default_profile_reproduces_current_topology_and_timing() -> None:
         "inference_hz": 2.0,
         "action_publish_hz": 50,
         "action_horizon": 50,
-        "control_input": "gateway",
-        "control_gateway_max_age_ms": 1000.0,
-        "sensor_input": "gateway",
         "sensor_gateway_poll_hz": 50.0,
         "sensor_gateway_request_timeout_ms": 100,
         "sensor_gateway_max_age_ms": 1000.0,
@@ -46,8 +43,13 @@ def test_default_profile_reproduces_current_topology_and_timing() -> None:
     assert profile.component("navdp")["control_hz"] == 20.0
     assert profile.component("navdp")["mpc_hz"] == 10.0
     assert profile.component("lingbot_depth")["inference_hz"] == 2.0
-    assert profile.component("data_exporter")["frequency_hz"] == 50
-    assert profile.component("launcher")["control_gateway"] is True
+    assert profile.component("data_exporter") == {
+        "frequency_hz": 50,
+        "sensor_gateway_poll_hz": 50.0,
+        "sensor_gateway_request_timeout_ms": 100,
+        "sensor_gateway_max_age_ms": 1000.0,
+        "sensor_gateway_max_skew_ms": 5.0,
+    }
 
 
 def test_profile_parameters_match_current_process_defaults() -> None:
@@ -58,7 +60,6 @@ def test_profile_parameters_match_current_process_defaults() -> None:
     lingbot = LingBotDepthViewerConfig()
 
     vla_profile = profile.component("vla")
-    assert vla_profile["sensor_input"] == vla.sensor_input
     assert vla_profile["sensor_gateway_poll_hz"] == vla.sensor_gateway_poll_hz
     assert (
         vla_profile["sensor_gateway_request_timeout_ms"]
@@ -70,7 +71,6 @@ def test_profile_parameters_match_current_process_defaults() -> None:
         == vla.sensor_gateway_max_skew_ms
     )
 
-    assert profile.component("lavira")["planner_hz"] == lavira.planner_hz
     assert profile.component("lavira")["camera_timeout_ms"] == lavira.camera_timeout_ms
     assert profile.component("lavira")["policy_timeout_s"] == lavira.codex_timeout_seconds
     assert profile.component("lavira")["min_confidence"] == lavira.min_confidence
@@ -83,7 +83,6 @@ def test_profile_parameters_match_current_process_defaults() -> None:
     assert navdp_profile["goal_tolerance_m"] == navdp.goal_tolerance_m
     assert navdp_profile["stop_threshold"] == navdp.navdp_stop_threshold
     assert navdp_profile["request_timeout_s"] == navdp.navdp_request_timeout_s
-    assert navdp_profile["sensor_input"] == navdp.sensor_input
     assert navdp_profile["sensor_gateway_poll_hz"] == navdp.sensor_gateway_poll_hz
     assert (
         navdp_profile["sensor_gateway_request_timeout_ms"]
@@ -99,6 +98,8 @@ def test_profile_parameters_match_current_process_defaults() -> None:
     assert navdp_profile["trajectory_timeout_s"] == navdp.trajectory_timeout_s
     assert navdp_profile["visualize"] is navdp.visualize
     assert navdp_profile["record_actorray"] is navdp.record_actorray
+    assert navdp_profile["actorray_output_dir"] == navdp.actorray_output_dir
+    assert navdp_profile["actorray_record_fps"] == navdp.actorray_record_fps
     assert profile.component("xnavdp_mpc") == XNAVDP_G1_MPC_DEFAULTS
 
     lingbot_profile = profile.component("lingbot_depth")
@@ -145,7 +146,16 @@ def test_profile_rejects_unknown_endpoint_and_port_collisions(tmp_path) -> None:
     )
     collision = tmp_path / "collision.json"
     collision.write_text(
-        json.dumps({"endpoints": {"camera_server": {"port": 5550}}}),
+        json.dumps(
+            {
+                "endpoints": {
+                    "camera_server": {
+                        "host": "127.0.0.1",
+                        "port": ENDPOINTS["policy_server"].port,
+                    }
+                }
+            }
+        ),
         encoding="utf-8",
     )
 

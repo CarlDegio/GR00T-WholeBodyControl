@@ -3,10 +3,7 @@ ZMQ utilities for subscribing to robot state and config from the C++ deploy proc
 
 Provides:
 - ``ZMQStateSubscriber`` — non-blocking SUB on the ``g1_debug`` topic
-- ``poll_robot_config_zmq`` — one-shot CONFIG topic reader
 """
-
-import time
 
 import msgpack
 import msgpack_numpy as mnp
@@ -14,7 +11,6 @@ import numpy as np
 import zmq
 
 STATE_ZMQ_TOPIC = "g1_debug"
-CONFIG_ZMQ_TOPIC = "robot_config"
 DEFAULT_STATE_ZMQ_PORT = 5557
 
 
@@ -90,49 +86,3 @@ class ZMQStateSubscriber:
             self.close()
         except Exception:
             pass
-
-
-def poll_robot_config_zmq(host: str, port: int, timeout_sec: float = 0) -> dict:
-    """Wait for the ``robot_config`` message from the C++ ZMQ publisher.
-
-    The publisher re-sends the config every ~2 s, so this simply polls with a
-    short receive timeout until a message arrives or *timeout_sec* elapses.
-
-    Args:
-        timeout_sec: Max seconds to wait. ``0`` means wait indefinitely.
-
-    Returns the decoded config dict.
-
-    Raises:
-        TimeoutError: If *timeout_sec* > 0 and no message is received in time.
-    """
-    mnp.patch()
-    ctx = zmq.Context()
-    sub = ctx.socket(zmq.SUB)
-    sub.setsockopt_string(zmq.SUBSCRIBE, CONFIG_ZMQ_TOPIC)
-    sub.setsockopt(zmq.RCVTIMEO, 500)
-    sub.setsockopt(zmq.CONFLATE, 1)
-    sub.connect(f"tcp://{host}:{port}")
-
-    if timeout_sec > 0:
-        print(f"[Config] Waiting up to {timeout_sec}s for robot_config on tcp://{host}:{port} ...")
-    else:
-        print(f"[Config] Waiting for robot_config on tcp://{host}:{port} ... is gear_sonic_deploy running?")
-    deadline = (time.monotonic() + timeout_sec) if timeout_sec > 0 else None
-    try:
-        while True:
-            if deadline is not None and time.monotonic() >= deadline:
-                raise TimeoutError(
-                    f"[Config] No robot_config received on tcp://{host}:{port} "
-                    f"within {timeout_sec}s. Is the C++ deploy process running?"
-                )
-            try:
-                raw = sub.recv()
-                config = _unpack_msgpack_zmq(raw, CONFIG_ZMQ_TOPIC)
-                print(f"[Config] Received robot_config ({len(config)} fields)")
-                return config
-            except zmq.Again:
-                pass
-    finally:
-        sub.close()
-        ctx.term()

@@ -1,14 +1,14 @@
 """
 Sonic VLA data exporter for G1 -- NO ROS 2 DEPENDENCY.
 
-All data sources use ZMQ:
-  1. Robot state  -> ZMQ SUB on ``g1_debug`` topic (port 5557, from C++ zmq_output_handler)
-  2. SMPL pose    -> ZMQ SUB on ``pose`` topic     (port 5556, from pico_manager_thread_server)
-  3. Camera       -> ZMQ/TCP via ComposedCameraClientSensor
+SensorGateway supplies camera frames, robot state, and robot config.  Typed
+ControlGateway commands drive episode recording.  Raw SMPL ``pose``, ``planner``,
+and ``manager_state`` messages remain on the Sonic ZMQ wire because those
+streams are not part of SensorGateway.
 
-Robot config (``script_config`` in info.json) is read from the ``robot_config``
-ZMQ topic re-published every ~2 s by the C++ process.  If the config is not
-received within the timeout the exporter exits with an error.
+Robot config (``script_config`` in info.json) is cached from the C++
+``robot_config`` topic by SensorGateway.  If the config is not received within
+the timeout the exporter exits with an error.
 
 Virtual environment setup (run from repo root):
     bash install_scripts/install_data_collection.sh
@@ -40,16 +40,16 @@ from gear_sonic.data.features_sonic_vla import (
     get_wrist_camera_features,
     get_wrist_camera_modality_config,
 )
-from gear_sonic.camera.composed_camera import ComposedCameraClientSensor
+from gear_sonic.runtime.config import load_runtime_profile
+from gear_sonic.runtime.control_client import ControlGatewaySubscriber
+from gear_sonic.runtime.data_exporter_sensor_gateway import (
+    DataExporterSensorGatewayIngress,
+)
 from gear_sonic.utils.data_collection.episode_state import EpisodeState
-from gear_sonic.utils.data_collection.keyboard_subscriber import ZMQKeyboardSubscriber
+from gear_sonic.utils.data_collection.recording_controls import select_recording_key
 from gear_sonic.utils.data_collection.telemetry import Telemetry
 from gear_sonic.utils.data_collection.text_to_speech import TextToSpeech
 from gear_sonic.utils.data_collection.transforms import compute_projected_gravity, quat_to_rot6d
-from gear_sonic.utils.data_collection.zmq_state_subscriber import (
-    ZMQStateSubscriber,
-    poll_robot_config_zmq,
-)
 
 # ---------------------------------------------------------------------------
 # Config
@@ -59,6 +59,12 @@ from gear_sonic.utils.data_collection.zmq_state_subscriber import (
 @dataclass
 class SonicDataExporterConfig:
     """CLI config for the ROS-free Sonic data exporter."""
+
+    profile: str = ""
+    """Runtime profile containing Gateway endpoints and DataExporter timing."""
+
+    overlay: tuple[str, ...] = ()
+    """Optional runtime-profile overlays, applied left-to-right."""
 
     # Dataset
     dataset_name: str | None = None
@@ -70,17 +76,6 @@ class SonicDataExporterConfig:
     root_output_dir: str = "outputs"
     """Root output directory."""
 
-    data_collection_frequency: int = 50
-    """Data collection frequency (Hz)."""
-
-
-    # Camera
-    camera_host: str = "localhost"
-    """Camera server host."""
-
-    camera_port: int = 5555
-    """Camera server port."""
-
     # ZMQ: Sonic / SMPL pose (from pico_manager_thread_server)
     sonic_zmq_host: str = "localhost"
     """ZMQ host for Sonic SMPL pose messages."""
@@ -88,16 +83,9 @@ class SonicDataExporterConfig:
     sonic_zmq_port: int = 5556
     """ZMQ port for Sonic SMPL pose messages."""
 
-    # ZMQ: Robot state (from C++ zmq_output_handler, g1_debug topic)
-    state_zmq_host: str = "localhost"
-    """ZMQ host for robot state (g1_debug topic from C++ deploy)."""
-
-    state_zmq_port: int = 5557
-    """ZMQ port for robot state (same socket as robot_config topic)."""
-
     # Robot config
     robot_config_timeout: float = 0
-    """Seconds to wait for the ZMQ robot_config message at startup (0 = wait forever)."""
+    """Seconds to wait for Gateway robot_config at startup (0 = wait forever)."""
 
     record_wrist_cameras: bool = False
     """Record wrist camera streams (left_wrist, right_wrist). Requires cameras to be available."""
@@ -218,27 +206,24 @@ class TimingThresholdMonitor:
 class GrootDataCollector:
     """Collects data from G1 robot in Sonic CPP + SMPL mode -- no ROS 2.
 
-    Data sources (all ZMQ):
-      - ``g1_debug`` topic        -> proprio (body_q, hand_q, actions, base_quat, ...)
+    Data sources:
+      - SensorGateway             -> camera and proprio state
+      - ControlGateway            -> typed recording commands
       - ``pose`` topic            -> SMPL pose (smpl_joints, body_quat_w, hand_joints, ...)
       - ``planner`` topic         -> planner commands (vr_position, vr_orientation, ...)
       - ``manager_state`` topic   -> current stream mode + toggle flags
-      - Camera client             -> ego-view images
     """
 
     def __init__(
         self,
-        camera_host: str,
-        camera_port: int,
         data_exporter: Gr00tDataExporter,
         robot_model,
+        sensor_gateway: DataExporterSensorGatewayIngress,
+        control_gateway_endpoint: str,
         text_to_speech=None,
         frequency: int = 20,
         sonic_data_zmq_host: str = "localhost",
         sonic_data_zmq_port: int = 5556,
-        state_zmq_host: str = "localhost",
-        state_zmq_port: int = 5557,
-        decode_camera_images: bool = True,
     ):
         self.text_to_speech = text_to_speech
         self.frequency = frequency
@@ -247,12 +232,14 @@ class GrootDataCollector:
         self.robot_model = robot_model
 
         self._episode_state = EpisodeState()
-        self._keyboard_listener = ZMQKeyboardSubscriber()
-
-        self._image_subscriber = ComposedCameraClientSensor(
-            server_ip=camera_host,
-            port=camera_port,
-            decode_images=decode_camera_images,
+        self._sensor_gateway = sensor_gateway
+        self._control_listener = ControlGatewaySubscriber(
+            control_gateway_endpoint,
+            accepted_names={
+                "start_recording",
+                "stop_recording_success",
+                "stop_recording_failure",
+            },
         )
 
         self.obs_act_buffer = deque(maxlen=100)
@@ -267,11 +254,6 @@ class GrootDataCollector:
 
         self._manager_toggle_dc = False
         self._manager_toggle_da = False
-
-        self._state_subscriber = ZMQStateSubscriber(
-            host=state_zmq_host,
-            port=state_zmq_port,
-        )
 
         self._sonic_zmq_ctx = None
         self._sonic_zmq_socket = None
@@ -317,9 +299,9 @@ class GrootDataCollector:
         if say and self.text_to_speech is not None:
             self.text_to_speech.say(message, blocking=blocking)
 
-    def _poll_state_zmq(self):
-        """Poll the ``g1_debug`` ZMQ topic for robot state (non-blocking)."""
-        msg = self._state_subscriber.get_msg(clear=True)
+    def _poll_state_gateway(self):
+        """Read the latest cached ``g1_debug`` state without blocking."""
+        msg = self._sensor_gateway.read_state(clear=True)
         if msg is None:
             return
 
@@ -346,14 +328,17 @@ class GrootDataCollector:
         self.latest_proprio_msg = msg
 
     def _check_recording_commands(self):
-        """Check keyboard + ZMQ toggle flags for recording commands."""
-        key = self._keyboard_listener.read_msg()
+        """Check typed ControlGateway commands and manager toggle flags."""
+        command = self._control_listener.read_command()
+        key = select_recording_key(
+            None if command is None else command.name,
+            pico_abort=self._manager_toggle_da,
+            pico_toggle=self._manager_toggle_dc,
+        )
 
         if self._manager_toggle_da:
-            key = "x"
             self._manager_toggle_da = False
         elif self._manager_toggle_dc:
-            key = "c"
             self._manager_toggle_dc = False
 
         if key == "c":
@@ -891,10 +876,11 @@ class GrootDataCollector:
         except Exception as e:
             self._print_and_say(f"Error saving episode: {e}", blocking=True)
 
-        try:
-            self._state_subscriber.close()
-        except Exception:
-            pass
+        for gateway_client in [self._control_listener, self._sensor_gateway]:
+            try:
+                gateway_client.close()
+            except Exception:
+                pass
         for sock in [self._sonic_zmq_socket]:
             if sock is not None:
                 try:
@@ -916,13 +902,13 @@ class GrootDataCollector:
                 t_start = time.monotonic()
                 with self.telemetry.timer("total_loop"):
                     with self.telemetry.timer("poll_state"):
-                        self._poll_state_zmq()
+                        self._poll_state_gateway()
 
                     with self.telemetry.timer("poll_sonic"):
                         self._poll_sonic_zmq_messages()
 
                     with self.telemetry.timer("poll_image"):
-                        img_msg = self._image_subscriber.read()
+                        img_msg = self._sensor_gateway.read_camera()
                         if img_msg is not None:
                             self.latest_image_msg = img_msg
 
@@ -960,6 +946,15 @@ class GrootDataCollector:
 
 
 def main(config: SonicDataExporterConfig):
+    profile = load_runtime_profile(
+        config.profile or None,
+        overlays=config.overlay,
+    )
+    exporter_settings = profile.component("data_exporter")
+    frequency = int(exporter_settings["frequency_hz"])
+    if frequency <= 0:
+        raise ValueError("data_exporter.frequency_hz must be positive")
+
     g1_rm = get_g1_robot_model()
 
     dataset_features = get_features_sonic_vla(g1_rm)
@@ -987,45 +982,68 @@ def main(config: SonicDataExporterConfig):
 
     text_to_speech = TextToSpeech() if config.text_to_speech else None
 
-    robot_config = poll_robot_config_zmq(
-        config.state_zmq_host, config.state_zmq_port, config.robot_config_timeout
-    )
-
-    data_exporter = Gr00tDataExporter.create(
-        save_root=f"{config.root_output_dir}/{config.dataset_name}",
-        fps=config.data_collection_frequency,
-        features=dataset_features,
-        modality_config=modality_config,
-        task=config.task_prompt,
+    camera_names = ["ego_view"]
+    if config.record_wrist_cameras:
+        camera_names.extend(("left_wrist", "right_wrist"))
+    if config.record_chest_camera:
+        camera_names.append("chest_view")
+    gateway_ingress = DataExporterSensorGatewayIngress(
+        profile.endpoint_uri("sensor_gateway_metadata"),
+        camera_names=tuple(camera_names),
         defer_video_encoding=config.defer_video_encoding,
-        video_encoder_threads=config.video_encoder_threads,
-        script_config={
-            **robot_config,
-            "record_wrist_cameras": config.record_wrist_cameras,
-            "record_chest_camera": config.record_chest_camera,
-            "defer_video_encoding": config.defer_video_encoding,
-            "video_encoder_threads": config.video_encoder_threads,
-        },
+        poll_hz=float(exporter_settings["sensor_gateway_poll_hz"]),
+        request_timeout_ms=int(
+            exporter_settings["sensor_gateway_request_timeout_ms"]
+        ),
+        max_age_ms=float(exporter_settings["sensor_gateway_max_age_ms"]),
+        max_skew_ms=float(exporter_settings["sensor_gateway_max_skew_ms"]),
     )
-    if config.defer_video_encoding:
-        print(
-            "[Camera] Deferred video encoding enabled — caching encoded frames in memory "
-            f"and using up to {config.video_encoder_threads} encoder threads when saving"
+    gateway_ingress.start()
+    print(
+        "[Config] Waiting for robot_config from SensorGateway "
+        f"{profile.endpoint_uri('sensor_gateway_metadata')} ..."
+    )
+    try:
+        robot_config = gateway_ingress.wait_for_robot_config(
+            config.robot_config_timeout
         )
+        print(f"[Config] Received robot_config ({len(robot_config)} fields)")
 
-    data_collector = GrootDataCollector(
-        frequency=config.data_collection_frequency,
-        data_exporter=data_exporter,
-        robot_model=g1_rm,
-        camera_host=config.camera_host,
-        camera_port=config.camera_port,
-        text_to_speech=text_to_speech,
-        sonic_data_zmq_host=config.sonic_zmq_host,
-        sonic_data_zmq_port=config.sonic_zmq_port,
-        state_zmq_host=config.state_zmq_host,
-        state_zmq_port=config.state_zmq_port,
-        decode_camera_images=not config.defer_video_encoding,
-    )
+        data_exporter = Gr00tDataExporter.create(
+            save_root=f"{config.root_output_dir}/{config.dataset_name}",
+            fps=frequency,
+            features=dataset_features,
+            modality_config=modality_config,
+            task=config.task_prompt,
+            defer_video_encoding=config.defer_video_encoding,
+            video_encoder_threads=config.video_encoder_threads,
+            script_config={
+                **robot_config,
+                "record_wrist_cameras": config.record_wrist_cameras,
+                "record_chest_camera": config.record_chest_camera,
+                "defer_video_encoding": config.defer_video_encoding,
+                "video_encoder_threads": config.video_encoder_threads,
+            },
+        )
+        if config.defer_video_encoding:
+            print(
+                "[Camera] Deferred video encoding enabled — caching encoded frames in memory "
+                f"and using up to {config.video_encoder_threads} encoder threads when saving"
+            )
+
+        data_collector = GrootDataCollector(
+            frequency=frequency,
+            data_exporter=data_exporter,
+            robot_model=g1_rm,
+            sensor_gateway=gateway_ingress,
+            control_gateway_endpoint=profile.endpoint_uri("control_gateway_dispatch"),
+            text_to_speech=text_to_speech,
+            sonic_data_zmq_host=config.sonic_zmq_host,
+            sonic_data_zmq_port=config.sonic_zmq_port,
+        )
+    except Exception:
+        gateway_ingress.close()
+        raise
     data_collector.run()
 
 

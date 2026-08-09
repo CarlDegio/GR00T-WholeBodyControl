@@ -363,6 +363,7 @@ class CameraZmqIngress:
             received_ns=received_ns,
         )
         schema = ImageMessageSchema.deserialize(payload)
+        encoded_schema = ImageMessageSchema.deserialize(payload, decode_images=False)
         count = 0
         for name, image in schema.images.items():
             if not isinstance(image, np.ndarray):
@@ -373,6 +374,8 @@ class CameraZmqIngress:
                 "encoding": "numpy",
                 "camera_info": dict(schema.camera_info.get(base_name, {})),
             }
+            if not name.endswith("_depth"):
+                attributes["color_order"] = "RGB"
             self.core.publish_array(
                 f"camera/{name}",
                 image,
@@ -383,6 +386,29 @@ class CameraZmqIngress:
                 attributes=attributes,
             )
             count += 1
+
+            encoded = encoded_schema.images.get(name)
+            if name.endswith("_depth") or not isinstance(encoded, bytes | bytearray | str):
+                continue
+            if isinstance(encoded, str):
+                encoded_array = np.frombuffer(encoded.encode("utf-8"), dtype=np.uint8).copy()
+                wire_encoding = "base64_jpeg"
+            else:
+                encoded_array = np.frombuffer(encoded, dtype=np.uint8).copy()
+                wire_encoding = "jpeg_bytes"
+            self.core.publish_array(
+                f"camera_encoded/{name}",
+                encoded_array,
+                received_ns=received_ns,
+                source_timestamp_ns=max(0, int(timestamp_s * 1_000_000_000)),
+                source_clock="camera_unix" if timestamp_s > 0.0 else "unknown",
+                expected_hz=self.expected_hz,
+                attributes={
+                    "encoding": wire_encoding,
+                    "decoded_color_order": "RGB",
+                    "camera_info": dict(schema.camera_info.get(base_name, {})),
+                },
+            )
         return count
 
     def close(self) -> None:
@@ -457,7 +483,7 @@ class LingBotDepthZmqIngress:
 
 
 class CppStateZmqIngress:
-    """Copy the untouched topic-stripped C++ msgpack state into shared memory."""
+    """Copy untouched C++ state and robot-config msgpack into shared memory."""
 
     def __init__(
         self,
@@ -476,40 +502,65 @@ class CppStateZmqIngress:
         self.socket.setsockopt(zmq.CONFLATE, 1)
         self.socket.setsockopt(zmq.LINGER, 0)
         self.socket.connect(endpoint)
+        self.config_topic = b"robot_config"
+        self.config_socket = context.socket(zmq.SUB)
+        self.config_socket.setsockopt(zmq.SUBSCRIBE, self.config_topic)
+        self.config_socket.setsockopt(zmq.CONFLATE, 1)
+        self.config_socket.setsockopt(zmq.LINGER, 0)
+        self.config_socket.connect(endpoint)
         self.core.register_endpoint(
             "source/cpp_state",
             expected_hz=self.expected_hz,
         )
 
     def poll_once(self, timeout_ms: int = 0) -> int:
-        if not self.socket.poll(timeout_ms, zmq.POLLIN):
-            return 0
-        received_ns = time.monotonic_ns()
-        raw = self.socket.recv()
-        payload = raw[len(self.topic) :]
-        state = msgpack.unpackb(payload, raw=False, object_hook=mnp.decode)
-        timestamp_s = float(state.get("ros_timestamp", 0.0))
-        self.core.observe_endpoint(
-            "source/cpp_state",
-            expected_hz=self.expected_hz,
-            received_ns=received_ns,
-        )
-        self.core.publish_array(
-            "cpp/state_msgpack",
-            np.frombuffer(payload, dtype=np.uint8).copy(),
-            received_ns=received_ns,
-            source_timestamp_ns=max(0, int(timestamp_s * 1_000_000_000)),
-            source_clock="ros_time" if timestamp_s > 0.0 else "unknown",
-            expected_hz=self.expected_hz,
-            attributes={
-                "encoding": "msgpack",
-                "topic": self.topic.decode("utf-8"),
-                "upstream_index": int(state.get("index", -1)),
-            },
-        )
-        return 1
+        count = 0
+        if self.socket.poll(timeout_ms, zmq.POLLIN):
+            received_ns = time.monotonic_ns()
+            raw = self.socket.recv()
+            payload = raw[len(self.topic) :]
+            state = msgpack.unpackb(payload, raw=False, object_hook=mnp.decode)
+            timestamp_s = float(state.get("ros_timestamp", 0.0))
+            self.core.observe_endpoint(
+                "source/cpp_state",
+                expected_hz=self.expected_hz,
+                received_ns=received_ns,
+            )
+            self.core.publish_array(
+                "cpp/state_msgpack",
+                np.frombuffer(payload, dtype=np.uint8).copy(),
+                received_ns=received_ns,
+                source_timestamp_ns=max(0, int(timestamp_s * 1_000_000_000)),
+                source_clock="ros_time" if timestamp_s > 0.0 else "unknown",
+                expected_hz=self.expected_hz,
+                attributes={
+                    "encoding": "msgpack",
+                    "topic": self.topic.decode("utf-8"),
+                    "upstream_index": int(state.get("index", -1)),
+                },
+            )
+            count += 1
+
+        if self.config_socket.poll(0, zmq.POLLIN):
+            received_ns = time.monotonic_ns()
+            raw = self.config_socket.recv()
+            payload = raw[len(self.config_topic) :]
+            msgpack.unpackb(payload, raw=False, object_hook=mnp.decode)
+            self.core.publish_array(
+                "cpp/robot_config_msgpack",
+                np.frombuffer(payload, dtype=np.uint8).copy(),
+                received_ns=received_ns,
+                source_clock="unknown",
+                attributes={
+                    "encoding": "msgpack",
+                    "topic": self.config_topic.decode("utf-8"),
+                },
+            )
+            count += 1
+        return count
 
     def close(self) -> None:
+        self.config_socket.close(linger=0)
         self.socket.close(linger=0)
 
 

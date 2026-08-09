@@ -1,6 +1,6 @@
 # Data Collection for VLA
 
-Record teleop demonstrations as [LeRobot](https://github.com/huggingface/lerobot) datasets for post-training with [Isaac-GR00T](https://github.com/NVIDIA/Isaac-GR00T). The data exporter runs alongside the SONIC deployment and VR teleop stack, capturing robot state, SMPL teleop poses, and camera images at a configurable frequency.
+Record teleop demonstrations as [LeRobot](https://github.com/huggingface/lerobot) datasets. The data exporter runs alongside the SONIC deployment and VR teleop stack, capturing robot state, SMPL teleop poses, and camera images at the frequency configured in the runtime profile.
 
 ```{admonition} Deployment model
 :class: important
@@ -138,14 +138,9 @@ Once the systemd service is running, the camera server starts automatically when
 
 ### Connecting from the workstation
 
-On your workstation, the data exporter and camera viewer connect to the robot's camera server over the network. Pass the robot's IP address (the G1 robot's default IP is `192.168.123.164`):
+On your workstation, SensorGateway and the camera viewer connect to the robot's camera server over the network. DataExporter reads the local SensorGateway cache. Pass the robot's IP address (the G1 robot's default IP is `192.168.123.164`) to the launcher:
 
 ```sh
-# Data exporter
-python gear_sonic/scripts/run_data_exporter.py \
-    --task-prompt "pick up the cup" \
-    --camera-host 192.168.123.164 --camera-port 5555
-
 # Camera viewer (to verify the feed)
 python gear_sonic/scripts/run_camera_viewer.py \
     --camera-host 192.168.123.164 --camera-port 5555
@@ -170,43 +165,30 @@ The camera server publishes a single msgpack-encoded payload per frame cycle con
 }
 ```
 
-Images are JPEG-compressed (quality 80) and either base64-encoded strings or raw JPEG bytes (when MJPEG on-device encoding is enabled). The data exporter's `ComposedCameraClientSensor` handles both formats automatically.
+Images are JPEG-compressed (quality 80) and either base64-encoded strings or raw JPEG bytes (when MJPEG on-device encoding is enabled). SensorGateway preserves those encoded values for DataExporter's deferred-video path while also publishing decoded RGB arrays for inference consumers.
 
 ---
 
 ## Architecture
 
-The data exporter receives data from three ZMQ sources. The C++ deployment, PICO teleop, and data exporter all run **offboard on the workstation**. The camera server runs **onboard the robot** and streams frames to the workstation over the network.
+SensorGateway is the only DataExporter boundary for camera, `g1_debug`, and `robot_config`; ControlGateway supplies typed recording commands. Raw `pose`, `planner`, and `manager_state` remain direct because they are not SensorGateway streams. The C++ deployment, gateways, PICO teleop, and data exporter all run **offboard on the workstation**.
 
 ```text
-    Workstation (offboard)                           Robot (onboard)
-┌──────────────────────┐  ┌──────────────────────┐  ┌───────────────┐
-│  C++ deploy          │  │  pico_manager         │  │  Camera       │
-│  (zmq_output_handler)│  │  _thread_server.py    │  │  server       │
-│                      │  │                       │  │  (OAK cameras)│
-│  port 5557           │  │  port 5556            │  │  port 5555    │
-│  topics: g1_debug,   │  │  topic: pose          │  │  (JPEG/ZMQ)   │
-│          robot_config│  │  (SMPL body params)   │  │               │
-└──────────┬───────────┘  └──────────┬────────────┘  └──────┬────────┘
-           │                         │                       │
-           └────────────┬────────────┘───────────────────────┘
-                        │              (network)
-               ┌────────▼────────┐
-               │  run_data_      │
-               │  exporter.py    │
-               │  (workstation)  │
-               │                 │
-               │  LeRobot dataset│
-               │  (parquet + mp4)│
-               └─────────────────┘
+ C++ g1_debug/config ───> SensorGateway ──┐
+ Camera server (robot) ─> SensorGateway ──┤
+ PICO pose/planner/manager ───────────────┼─> run_data_exporter.py
+ Operator console ──────> ControlGateway ─┘             │
+                                                        ▼
+                                            LeRobot parquet + MP4
 ```
 
 | Source | Runs on | ZMQ Topic | Default Port | Provides |
 |---|---|---|---|---|
-| C++ deployment | Workstation | `g1_debug` | 5557 | Joint positions, velocities, IMU quaternion |
-| C++ deployment | Workstation | `robot_config` | 5557 | One-shot robot configuration at startup |
-| PICO teleop streamer | Workstation | `pose` | 5556 | SMPL body parameters (teleop target poses) |
-| Camera server | Robot | *(raw TCP)* | 5555 | JPEG-compressed camera images (ego view + optional wrist views) |
+| SensorGateway | Workstation | `cpp/state_msgpack` | 5560 | Cached joint state copied from `g1_debug` |
+| SensorGateway | Workstation | `cpp/robot_config_msgpack` | 5560 | Cached robot configuration at startup |
+| SensorGateway | Workstation | `camera[_encoded]/*` | 5560 | Decoded RGB or original JPEG camera values |
+| ControlGateway | Workstation | typed recording commands | 5565 | Start, successful stop, and failed stop |
+| PICO teleop streamer | Workstation | `pose`, `planner`, `manager_state` | 5556 | Teleop targets and controller toggles |
 
 ---
 
@@ -216,7 +198,7 @@ There are two ways to run the data collection stack: an **all-in-one tmux launch
 
 ### Option A: All-in-One Tmux Launch (Recommended)
 
-The launcher starts all components in a single tmux session with four panes:
+The launcher starts the existing four data-collection panes plus a `gateways` window containing SensorGateway and ControlGateway:
 
 ```text
 ┌───────────────────────┬───────────────────────┐
@@ -271,7 +253,7 @@ Common options:
 | `--camera-host` | `localhost` | Camera server host (e.g., `192.168.123.164` for real robot) |
 | `--camera-port` | `5555` | Camera server port |
 | `--no-camera-viewer` | *(viewer on)* | Disable the camera viewer pane |
-| `--data-exporter-frequency` | `50` | Recording frequency (Hz) |
+| `--runtime-profile` | `gear_sonic/config/launch_inference.yaml` | Gateway endpoints and recording frequency |
 | `--deploy-checkpoint` | *(default)* | Custom checkpoint path for deploy.sh |
 | `--deploy-obs-config` | *(default)* | Custom observation config for deploy.sh |
 | `--deploy-planner` | *(default)* | Custom planner model path for deploy.sh |
@@ -308,8 +290,8 @@ python gear_sonic/scripts/run_sim_loop.py \
 
 The `--enable-image-publish` and `--enable-offscreen` flags are required so the
 sim renders camera images and streams them over ZMQ on the specified port.
-The data exporter subscribes to this port the same way it subscribes to a
-physical camera server.
+SensorGateway subscribes to this port the same way it subscribes to a physical
+camera server.
 
 For real robot deployment, skip this terminal and see [VR Whole-Body Teleop](vr_wholebody_teleop.md) instead.
 
@@ -329,14 +311,33 @@ source .venv_teleop/bin/activate
 python gear_sonic/scripts/pico_manager_thread_server.py --manager
 ```
 
-**Terminal 4 — Data Exporter:**
+**Terminal 4 — SensorGateway:**
+
+```bash
+source .venv_teleop/bin/activate
+python gear_sonic/scripts/run_sensor_gateway.py \
+    --no-enable-lingbot-depth --no-enable-ros \
+    --no-enable-visualization --no-enable-vla-timing
+```
+
+For simulation, add `--camera-host localhost`; for the real-robot default profile,
+the configured camera host is used.
+
+**Terminal 5 — ControlGateway:**
+
+```bash
+source .venv_teleop/bin/activate
+python gear_sonic/scripts/run_control_gateway.py
+```
+
+**Terminal 6 — Data Exporter:**
 
 ```bash
 source .venv_data_collection/bin/activate
 python gear_sonic/scripts/run_data_exporter.py --task-prompt "pick up the cup"
 ```
 
-**Terminal 5 (optional) — Camera Viewer:**
+**Terminal 7 (optional) — Camera Viewer:**
 
 ```bash
 source .venv_data_collection/bin/activate
@@ -349,7 +350,7 @@ All options are provided via CLI flags — no interactive prompts.  Key flags:
 |---|---|---|
 | `--task-prompt` | `"demo"` | Language task description for this session |
 | `--dataset-name` | *(auto: timestamp)* | Dataset name.  Omit to create a new one, or pass an existing name to append episodes |
-| `--data-collection-frequency` | `50` | Recording frequency (Hz) |
+| `--profile` | default runtime profile | Gateway endpoints and recording frequency |
 | `--root-output-dir` | `outputs` | Parent directory for saved datasets |
 
 ```{tip}
@@ -359,7 +360,7 @@ is not specified, a timestamped name is generated automatically.
 
 ### Recording Controls
 
-There are two ways to control recording: **PICO VR controllers** (recommended during teleop) or **keyboard over ZMQ**.
+There are two ways to control recording: **PICO VR controllers** (recommended during teleop) or typed commands from ControlGateway.
 
 **PICO VR Controllers (via `manager_state` topic):**
 
@@ -370,15 +371,16 @@ There are two ways to control recording: **PICO VR controllers** (recommended du
 
 These buttons work in any manager mode (POSE, PLANNER, etc.) and are independent of the mode-switching controls.
 
-**Keyboard over ZMQ:**
+**Operator console through ControlGateway:**
 
 | Key | Action |
 |---|---|
-| `c` | **Toggle** recording (same as Left Grip + A) |
-| `x` | **Discard** episode (same as Left Grip + B) |
+| `c` / `record-start` | Start recording |
+| `e` / `record-success` | Stop and save the episode |
+| `f` / `record-failure` | Stop and discard the episode |
 
 ```{note}
-Keyboard commands are sent via a separate ZMQ publisher (default port `5580`). The data exporter subscribes to this channel automatically. You can send keys from any ZMQ publisher on that port, or integrate with the C++ deployment's keyboard handler.
+ControlGateway publishes validated typed commands on the runtime profile's `control_gateway_dispatch` endpoint. The removed port-5580 keyboard mirror is no longer part of the runtime.
 ```
 
 ---
@@ -392,7 +394,7 @@ source .venv_data_collection/bin/activate
 python gear_sonic/scripts/run_camera_viewer.py --camera-host localhost --camera-port 5555
 ```
 
-The viewer connects to the same ZMQ camera server used by the data exporter and displays all detected camera streams in a tiled OpenCV window.
+The viewer connects directly to the same camera server ingested by SensorGateway and displays all detected camera streams in a tiled OpenCV window.
 
 **Controls** (OpenCV window must be focused):
 

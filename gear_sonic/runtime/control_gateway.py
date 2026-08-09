@@ -1,9 +1,4 @@
-"""Pure control-ingress logic shared by the console and future GUI.
-
-This first migration stage is intentionally a protocol adapter.  It assigns
-identity and lifetime to operator input while preserving the exact legacy
-string that existing VLA and data-exporter subscribers consume.
-"""
+"""Pure typed control-ingress logic shared by the console and GUI."""
 
 from __future__ import annotations
 
@@ -13,7 +8,7 @@ from typing import Callable, Mapping
 from gear_sonic.runtime.contracts import MessageMetadata, OperatorCommand
 
 
-LEGACY_COMMAND_NAMES = {
+CONSOLE_COMMAND_NAMES = {
     "c": "start_recording",
     "e": "stop_recording_success",
     "f": "stop_recording_failure",
@@ -41,7 +36,7 @@ RECORDING_ALIASES = {
 }
 
 
-def legacy_message_from_console_line(line: str) -> str:
+def normalize_console_line(line: str) -> str:
     """Apply the launcher's existing ``t <prompt>`` console convention."""
 
     if line.startswith("t "):
@@ -49,23 +44,20 @@ def legacy_message_from_console_line(line: str) -> str:
     return line
 
 
-def operator_command_from_legacy(
+def operator_command_from_console_input(
     message: str,
     *,
     metadata: MessageMetadata,
     command_id: str,
 ) -> OperatorCommand:
-    """Describe one legacy message without changing or executing it."""
+    """Translate one normalized console input into a typed command."""
 
     if message.startswith(PROMPT_PREFIX):
         name = "set_prompt"
-        parameters = {
-            "prompt": message[len(PROMPT_PREFIX) :],
-            "legacy_message": message,
-        }
+        parameters = {"prompt": message[len(PROMPT_PREFIX) :]}
     else:
-        name = LEGACY_COMMAND_NAMES.get(message, "legacy_passthrough")
-        parameters = {"legacy_message": message}
+        name = CONSOLE_COMMAND_NAMES.get(message, "unsupported_console_input")
+        parameters = {}
     return OperatorCommand(
         metadata=metadata,
         command_id=command_id,
@@ -76,9 +68,8 @@ def operator_command_from_legacy(
 
 @dataclass(frozen=True)
 class ControlIngressEvent:
-    """One console event represented in both current and future protocols."""
+    """One typed console event."""
 
-    legacy_message: str
     command: OperatorCommand
 
 
@@ -110,42 +101,33 @@ class ControlGatewayCore:
         return self._sequence
 
     def accept_console_line(self, line: str) -> ControlIngressEvent:
-        return self.accept_legacy_message(legacy_message_from_console_line(line))
+        return self.accept_console_message(normalize_console_line(line))
 
-    def accept_legacy_message(self, legacy_message: str) -> ControlIngressEvent:
-        """Create a typed event for a message already in the deployed format."""
+    def accept_console_message(self, message: str) -> ControlIngressEvent:
+        """Create a typed event for a normalized console message."""
         metadata, command_id = self._next_identity()
-        command = operator_command_from_legacy(
-            legacy_message,
+        command = operator_command_from_console_input(
+            message,
             metadata=metadata,
             command_id=command_id,
         )
-        return ControlIngressEvent(
-            legacy_message=legacy_message,
-            command=command,
-        )
+        return ControlIngressEvent(command=command)
 
     def accept_command(
         self,
         name: str,
         *,
         parameters: dict,
-        legacy_message: str = "",
-        mirror_legacy: bool = False,
     ) -> ControlIngressEvent:
         """Create an explicit typed command for non-ambiguous GUI controls."""
 
         metadata, command_id = self._next_identity()
-        values = dict(parameters)
-        values["legacy_message"] = legacy_message
-        values["mirror_legacy"] = bool(mirror_legacy)
         return ControlIngressEvent(
-            legacy_message=legacy_message,
             command=OperatorCommand(
                 metadata=metadata,
                 command_id=command_id,
                 name=name,
-                parameters=values,
+                parameters=dict(parameters),
             ),
         )
 
@@ -179,13 +161,11 @@ class OperatorConsoleRouter:
             value = " "
         if value in RECORDING_ALIASES:
             value = RECORDING_ALIASES[value]
-            return core.accept_legacy_message(value)
+            return core.accept_console_message(value)
         if self.control_mode == "PLANNER" and value in NAVIGATION_KEYS:
             return core.accept_command(
                 "navigation_key",
                 parameters={"key": value},
-                legacy_message=value,
-                mirror_legacy=False,
             )
         event = core.accept_console_line(line)
         if event.command.name == "toggle_control_loop":
@@ -288,10 +268,8 @@ class NavigationControlState:
 @dataclass(frozen=True)
 class RoutedControlCommand:
     command: OperatorCommand
-    legacy_message: str | None
     accepted: bool
     reason: str
-    mirror_legacy: bool
 
 
 class ControlGatewayRouter:
@@ -309,22 +287,16 @@ class ControlGatewayRouter:
         now_ns = int(self._monotonic_ns())
         if command.metadata.is_expired(now_ns):
             return RoutedControlCommand(
-                command, None, False, "expired operator intent", False
+                command, False, "expired operator intent"
             )
         previous = self._last_sequence_by_source.get(command.metadata.source)
         if previous is not None and command.metadata.sequence <= previous:
             return RoutedControlCommand(
-                command, None, False, "duplicate or out-of-order intent", False
+                command, False, "duplicate or out-of-order intent"
             )
-        try:
-            legacy_message = str(command.parameters["legacy_message"])
-        except KeyError:
-            return RoutedControlCommand(command, None, False, "missing legacy_message", False)
         self._last_sequence_by_source[command.metadata.source] = command.metadata.sequence
         return RoutedControlCommand(
             command,
-            legacy_message,
             True,
             "forwarded",
-            bool(command.parameters.get("mirror_legacy", True)),
         )

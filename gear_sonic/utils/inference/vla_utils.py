@@ -34,7 +34,7 @@ def prepare_observation_for_eval(robot_model: RobotModel, obs: dict) -> dict:
 
     Populates ``obs["state"]`` with ``left_arm``, ``right_arm``, ``waist``,
     ``left_leg``, ``right_leg``, ``left_hand``, ``right_hand`` sub-keys
-    using the nested dict format expected by ``Gr00tPolicy``.
+    using the nested dictionary format expected by the OpenPI policy bridge.
 
     Args:
         robot_model: RobotModel instance.

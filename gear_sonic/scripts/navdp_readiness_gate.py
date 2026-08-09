@@ -11,19 +11,25 @@ import time
 from typing import Literal
 
 from gear_sonic.runtime.client import SensorGatewayClient, SensorGatewayClientError
+from gear_sonic.runtime.config import load_runtime_profile
+
+_DEFAULT_PROFILE = load_runtime_profile()
+_CAMERA_ENDPOINT = _DEFAULT_PROFILE.endpoint("camera_server")
+_NAVDP_ENDPOINT = _DEFAULT_PROFILE.endpoint("xnavdp_http")
+_SENSOR_GATEWAY_ENDPOINT = _DEFAULT_PROFILE.endpoint("sensor_gateway_metadata")
 
 
 @dataclass
 class ReadinessConfig:
     stage: Literal["lidar", "navigation"]
     timeout: float = 30.0
-    camera_host: str = "192.168.123.164"
-    camera_port: int = 5555
-    navdp_host: str = "127.0.0.1"
-    navdp_port: int = 19999
+    camera_host: str = _CAMERA_ENDPOINT.host
+    camera_port: int = _CAMERA_ENDPOINT.port
+    navdp_host: str = _NAVDP_ENDPOINT.host
+    navdp_port: int = _NAVDP_ENDPOINT.port
     require_sensor_gateway: bool = False
-    sensor_gateway_host: str = "127.0.0.1"
-    sensor_gateway_port: int = 5560
+    sensor_gateway_host: str = _SENSOR_GATEWAY_ENDPOINT.host
+    sensor_gateway_port: int = _SENSOR_GATEWAY_ENDPOINT.port
 
 
 def wait_for_topic_sample(topic: str, timeout: float) -> bool:
@@ -95,8 +101,10 @@ def wait_for_sensor_gateway(host: str, port: int, timeout: float) -> bool:
 
 def wait_for_lidar(timeout: float) -> bool:
     deadline = time.monotonic() + timeout
-    return wait_for_topic_sample("/livox/lidar", _remaining(deadline)) and wait_for_topic_sample(
-        "/livox/imu", _remaining(deadline)
+    return wait_for_topic_sample(
+        _DEFAULT_PROFILE.ros_topics["lidar"], _remaining(deadline)
+    ) and wait_for_topic_sample(
+        _DEFAULT_PROFILE.ros_topics["lidar_imu"], _remaining(deadline)
     )
 
 
@@ -108,13 +116,17 @@ def wait_for_navigation(
     navdp_host: str,
     navdp_port: int,
     require_sensor_gateway: bool = False,
-    sensor_gateway_host: str = "127.0.0.1",
-    sensor_gateway_port: int = 5560,
+    sensor_gateway_host: str = _SENSOR_GATEWAY_ENDPOINT.host,
+    sensor_gateway_port: int = _SENSOR_GATEWAY_ENDPOINT.port,
 ) -> bool:
     deadline = time.monotonic() + timeout
     checks = [
-        lambda: wait_for_topic_sample("/Odometry_loc", _remaining(deadline)),
-        lambda: wait_for_topic_sample("/cloud_registered_1", _remaining(deadline)),
+        lambda: wait_for_topic_sample(
+            _DEFAULT_PROFILE.ros_topics["odometry"], _remaining(deadline)
+        ),
+        lambda: wait_for_topic_sample(
+            _DEFAULT_PROFILE.ros_topics["registered_cloud"], _remaining(deadline)
+        ),
         lambda: wait_for_tcp(camera_host, camera_port, _remaining(deadline)),
         lambda: wait_for_tcp(navdp_host, navdp_port, _remaining(deadline)),
     ]

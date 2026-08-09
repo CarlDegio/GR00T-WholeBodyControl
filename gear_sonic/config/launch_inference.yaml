@@ -16,7 +16,6 @@ endpoints:
   control_gateway_dispatch: {host: 127.0.0.1, port: 5565}
   sensor_gateway_visualization_ingress: {host: 127.0.0.1, port: 5566}
   vla_timing_ingress: {host: 127.0.0.1, port: 5567}
-  operator_keyboard_legacy: {host: 127.0.0.1, port: 5580}
   xnavdp_http: {host: 127.0.0.1, port: 19999}
 ros_topics:
   lidar: /livox/lidar
@@ -29,9 +28,6 @@ components:
     keyboard_planner: true
     planner_input: lavira
     data_exporter: false
-    sensor_gateway: true
-    sensor_shadow: false
-    control_gateway: true
     opencv_viewer: true
     lidar_ready_timeout_s: 30.0
     navigation_ready_timeout_s: 60.0
@@ -45,9 +41,6 @@ components:
     inference_hz: 2.0
     action_publish_hz: 50
     action_horizon: 50
-    control_input: gateway
-    control_gateway_max_age_ms: 1000.0
-    sensor_input: gateway
     sensor_gateway_poll_hz: 50.0
     sensor_gateway_request_timeout_ms: 100
     sensor_gateway_max_age_ms: 1000.0
@@ -55,7 +48,6 @@ components:
   keyboard_planner:
     publish_hz: 20.0
   lavira:
-    planner_hz: 20.0
     camera_timeout_ms: 15000
     policy_timeout_s: 180.0
     min_confidence: 0.6
@@ -64,10 +56,9 @@ components:
     mpc_hz: 10.0
     mpc_result_timeout_s: 0.3
     heading_preview_s: 0.6
-    goal_tolerance_m: 0.7
+    goal_tolerance_m: 1.0
     stop_threshold: -4.0
     request_timeout_s: 10.0
-    sensor_input: gateway
     sensor_gateway_poll_hz: 20.0
     sensor_gateway_request_timeout_ms: 100
     sensor_gateway_max_age_ms: 1000.0
@@ -77,6 +68,8 @@ components:
     trajectory_timeout_s: 2.5
     visualize: true
     record_actorray: false
+    actorray_output_dir: outputs/navdp
+    actorray_record_fps: 20.0
   xnavdp_mpc:
     horizon_steps: 30
     desired_velocity: 0.3
@@ -102,6 +95,10 @@ components:
     ready_timeout_s: 180.0
   data_exporter:
     frequency_hz: 50
+    sensor_gateway_poll_hz: 50.0
+    sensor_gateway_request_timeout_ms: 100
+    sensor_gateway_max_age_ms: 1000.0
+    sensor_gateway_max_skew_ms: 5.0
   sensor_gateway:
     snapshot_history_size: 64
     shared_memory_slots: 8
@@ -120,20 +117,6 @@ components:
     visualization_expected_hz: 20.0
     vla_timing_expected_hz: 2.0
     vla_timing_window_size: 100
-  sensor_shadow:
-    sample_hz: 2.0
-    request_timeout_ms: 1000
-    max_age_ms: 1000.0
-    max_source_skew_ms: 1.0
-    snapshot_retries: 2
-    startup_timeout_s: 30.0
-    summary_interval_s: 2.0
-    camera_streams:
-      - ego_view
-      - ego_view_depth
-      - chest_view
-      - left_wrist
-      - right_wrist
   control_gateway:
     command_ttl_ms: 1000
     heartbeat_hz: 2.0
@@ -154,9 +137,6 @@ launch_inference:
   action_horizon: 50
   camera_host: 192.168.123.164
   camera_port: 5555
-  sensor_gateway: true
-  sensor_shadow: false
-  control_gateway: true
   opencv_viewer: true
   sensor_gateway_port: 5560
   sensor_gateway_visualization_port: 5566
@@ -164,10 +144,6 @@ launch_inference:
   control_gateway_intent_port: 5561
   control_gateway_status_port: 5562
   control_gateway_dispatch_port: 5565
-  keyboard_zmq_port: 5580
-  vla_control_input: gateway
-  sensor_shadow_sample_hz: 2.0
-  vla_sensor_input: gateway
   vla_sensor_gateway_poll_hz: 50.0
   vla_sensor_gateway_request_timeout_ms: 100
   vla_sensor_gateway_max_age_ms: 1000.0
@@ -187,28 +163,20 @@ launch_inference:
   lavira_debug: false
   lavira_host: '*'
   lavira_control_input: gateway
-  lavira_planner_hz: 20.0
   lavira_camera_timeout_ms: 15000
   lavira_depth_port: 5564
   lingbot_ready_timeout: 180.0
   lavira_codex_timeout_seconds: 180.0
   lavira_min_confidence: 0.6
   lavira_output_root: outputs/object_nav
-  navdp_output_port: 5563
   navdp_root: /home/user/Project/NavDP/baselines/x-navdp
   navdp_checkpoint: /home/user/Project/NavDP/baselines/x-navdp/checkpoints/x-navdp_posttrain.ckpt
-  navdp_port: 19999
   fastlio_workspace: /home/user/Project/fastlio_humanoid_ws
   livox_sdk_lib: /home/user/Project/livox_sdk2_install/lib
   fastlio_config: mid360.yaml
   lidar_ready_timeout: 30.0
   navigation_ready_timeout: 60.0
-  navdp_request_timeout_s: 10.0
-  navdp_sensor_input: gateway
-  record_actorray: false
-  actorray_output_dir: outputs/navdp
   data_exporter: false
-  data_exporter_frequency: 50
   record_chest_camera: false
   task_prompt: ''
   dataset_name: ''

@@ -8,20 +8,20 @@ from gear_sonic.runtime.control_gateway import (
     ControlGatewayRouter,
     NavigationControlState,
     OperatorConsoleRouter,
-    legacy_message_from_console_line,
+    normalize_console_line,
 )
 from gear_sonic.scripts.run_control_gateway import resolve_control_gateway_settings
 
 
-def test_console_translation_preserves_the_deployed_legacy_wire() -> None:
-    assert legacy_message_from_console_line("i") == "i"
-    assert legacy_message_from_console_line("t pick up the cup") == (
+def test_console_translation_normalizes_prompt_and_single_key_input() -> None:
+    assert normalize_console_line("i") == "i"
+    assert normalize_console_line("t pick up the cup") == (
         "prompt:pick up the cup"
     )
-    assert legacy_message_from_console_line("") == ""
+    assert normalize_console_line("") == ""
 
 
-def test_core_adds_identity_lifetime_and_semantics_without_state_changes() -> None:
+def test_core_adds_identity_lifetime_and_typed_semantics() -> None:
     timestamps = iter((100, 200, 300))
     core = ControlGatewayCore(
         source="test_console",
@@ -33,36 +33,31 @@ def test_core_adds_identity_lifetime_and_semantics_without_state_changes() -> No
     prompt = core.accept_console_line("t inspect the basket")
     unknown = core.accept_console_line("custom")
 
-    assert pose.legacy_message == "i"
     assert pose.command.name == "select_pose_mode"
     assert pose.command.command_id == "test_console-0"
     assert pose.command.metadata.timestamp_ns == 100
     assert pose.command.metadata.ttl_ms == 750
     assert OperatorCommand.from_json(pose.command.to_json()) == pose.command
 
-    assert prompt.legacy_message == "prompt:inspect the basket"
     assert prompt.command.name == "set_prompt"
     assert prompt.command.parameters["prompt"] == "inspect the basket"
     assert prompt.command.metadata.sequence == 1
 
-    assert unknown.command.name == "legacy_passthrough"
-    assert unknown.command.parameters["legacy_message"] == "custom"
+    assert unknown.command.name == "unsupported_console_input"
+    assert unknown.command.parameters == {}
     assert core.next_sequence == 3
 
 
-def test_navigation_key_is_structured_and_never_hits_legacy_recording_wire() -> None:
+def test_navigation_key_is_a_structured_typed_command() -> None:
     core = ControlGatewayCore(monotonic_ns=lambda: 100)
     event = core.accept_command(
         "navigation_key",
         parameters={"key": "e"},
-        legacy_message="e",
-        mirror_legacy=False,
     )
     routed = ControlGatewayRouter(monotonic_ns=lambda: 101).route(event.command)
 
     assert routed.accepted
-    assert routed.legacy_message == "e"
-    assert not routed.mirror_legacy
+    assert routed.command.parameters == {"key": "e"}
 
 
 def test_console_routes_planner_keys_and_pose_recording_without_e_collision() -> None:
@@ -79,7 +74,6 @@ def test_console_routes_planner_keys_and_pose_recording_without_e_collision() ->
 
     assert planner_e.command.name == "navigation_key"
     assert planner_e.command.parameters["key"] == "e"
-    assert planner_e.command.parameters["mirror_legacy"] is False
     assert start.command.name == "toggle_control_loop"
     assert pose.command.name == "select_pose_mode"
     assert pose_e.command.name == "stop_recording_success"
@@ -93,8 +87,6 @@ def test_gateway_settings_use_reserved_profile_endpoints() -> None:
     args = argparse.Namespace(
         profile="",
         overlay=[],
-        legacy_bind_host="",
-        legacy_port=0,
         intent_bind_host="",
         intent_port=0,
         dispatch_bind_host="",
@@ -106,7 +98,6 @@ def test_gateway_settings_use_reserved_profile_endpoints() -> None:
 
     settings = resolve_control_gateway_settings(args)
 
-    assert settings.legacy_bind_endpoint == "tcp://127.0.0.1:5580"
     assert settings.intent_bind_endpoint == "tcp://127.0.0.1:5561"
     assert settings.dispatch_bind_endpoint == "tcp://127.0.0.1:5565"
     assert settings.status_bind_endpoint == "tcp://127.0.0.1:5562"

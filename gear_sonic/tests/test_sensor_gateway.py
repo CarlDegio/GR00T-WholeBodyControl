@@ -247,6 +247,11 @@ def test_camera_and_cpp_ingress_are_read_only_copies_of_current_wires() -> None:
         "ros_timestamp": 101.0,
         "base_quat": [1.0, 0.0, 0.0, 0.0],
     }
+    robot_config = {
+        "robot": "g1",
+        "joint_names": ["left_hip_pitch", "right_hip_pitch"],
+        "control_dt": 0.02,
+    }
     try:
         assert _publish_until_ingested(
             lambda: camera_server.publish(camera_schema.serialize()),
@@ -256,13 +261,19 @@ def test_camera_and_cpp_ingress_are_read_only_copies_of_current_wires() -> None:
             lambda: cpp_service.publish_state(state),
             state_ingress.poll_once,
         ) == 1
+        assert _publish_until_ingested(
+            lambda: cpp_service.publish_state(robot_config, topic="robot_config"),
+            state_ingress.poll_once,
+        ) == 1
 
         snapshot = core.select(
             SnapshotRequest(
                 streams=(
                     "camera/ego_view",
+                    "camera_encoded/ego_view",
                     "camera/ego_view_depth",
                     "cpp/state_msgpack",
+                    "cpp/robot_config_msgpack",
                 ),
                 max_age_ms=1000.0,
                 max_skew_ms=100.0,
@@ -273,9 +284,17 @@ def test_camera_and_cpp_ingress_are_read_only_copies_of_current_wires() -> None:
             read_shared_memory_frame(snapshot.frames["camera/ego_view"]),
             camera_schema.images["ego_view"],
         )
+        encoded_frame = snapshot.frames["camera_encoded/ego_view"]
+        assert encoded_frame.attributes["encoding"] == "base64_jpeg"
+        encoded_rgb = read_shared_memory_frame(encoded_frame).tobytes().decode("utf-8")
+        assert encoded_rgb == camera_schema.serialize()["images"]["ego_view"]
         assert snapshot.frames["camera/ego_view_depth"].attributes["camera_info"]["fx"] == 500.0
         raw_state = read_shared_memory_frame(snapshot.frames["cpp/state_msgpack"]).tobytes()
         assert msgpack.unpackb(raw_state, raw=False) == state
+        raw_config = read_shared_memory_frame(
+            snapshot.frames["cpp/robot_config_msgpack"]
+        ).tobytes()
+        assert msgpack.unpackb(raw_config, raw=False) == robot_config
         assert cpp_service.receive_command(timeout_ms=0) is None
     finally:
         state_ingress.close()

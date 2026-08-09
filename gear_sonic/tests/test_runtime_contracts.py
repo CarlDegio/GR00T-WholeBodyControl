@@ -19,7 +19,7 @@ def test_current_inference_profile_has_unique_ports() -> None:
     ports = [endpoint.port for endpoint in ENDPOINTS.values()]
 
     assert len(ports) == len(set(ports))
-    assert get_endpoint("policy_server").port == 5550
+    assert get_endpoint("policy_server").port == 29999
     assert get_endpoint("camera_server").port == 5555
     assert get_endpoint("cpp_command").port == 5556
     assert get_endpoint("cpp_state").port == 5557
@@ -27,7 +27,6 @@ def test_current_inference_profile_has_unique_ports() -> None:
     assert get_endpoint("navigation_status").port == 5559
     assert get_endpoint("planner_relay").port == 5563
     assert get_endpoint("lingbot_depth").port == 5564
-    assert get_endpoint("operator_keyboard_legacy").port == 5580
     assert get_endpoint("xnavdp_http").port == 19999
 
 

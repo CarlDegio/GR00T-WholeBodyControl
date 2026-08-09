@@ -115,13 +115,13 @@ class InferenceWorkerDelayTest(unittest.TestCase):
             self.result_queue.get_nowait()
         self.assertEqual(self.worker_errors, [])
 
-    def test_production_delay_advances_50_hz_index_by_ten_points(self):
-        self.assertEqual(SIMULATED_INFERENCE_DELAY_SECONDS, 0.2)
+    def test_production_has_no_simulated_inference_delay(self):
+        self.assertEqual(SIMULATED_INFERENCE_DELAY_SECONDS, 0.0)
         without_delay = calculate_latency_compensated_index(0.1, 50, 70)
         with_delay = calculate_latency_compensated_index(
             0.1 + SIMULATED_INFERENCE_DELAY_SECONDS, 50, 70
         )
-        self.assertEqual(with_delay - without_delay, 10)
+        self.assertEqual(with_delay, without_delay)
 
     def test_worker_preserves_request_generation(self):
         def inference_fn(_observation):

@@ -17,6 +17,7 @@ from gear_sonic.scripts.launch_inference import (
     _parse_pane_ids,
     build_fastlio_command,
     build_control_gateway_command,
+    build_data_exporter_command,
     build_operator_console_command,
     build_operator_interface_command,
     build_livox_command,
@@ -25,7 +26,6 @@ from gear_sonic.scripts.launch_inference import (
     build_navdp_planner_command,
     build_navdp_server_command,
     build_sensor_gateway_command,
-    build_sensor_shadow_command,
     build_vla_inference_command,
     load_inference_launch_config,
     run_readiness_gate,
@@ -56,13 +56,23 @@ def test_parse_pane_ids_rejects_incomplete_layout() -> None:
 
 
 def test_parse_pane_ids_supports_gateways_in_the_inference_window() -> None:
-    output = "\n".join(f"{index} %{index + 1}" for index in range(9))
+    output = "\n".join(f"{index} %{index + 1}" for index in range(8))
 
-    assert _parse_pane_ids(output, 9) == [f"%{index + 1}" for index in range(9)]
+    assert _parse_pane_ids(output, 8) == [f"%{index + 1}" for index in range(8)]
 
 
 def test_vla_action_horizon_defaults_to_fifty() -> None:
     assert InferenceLaunchConfig().action_horizon == 50
+
+
+def test_gateways_are_mandatory_launcher_components() -> None:
+    config = InferenceLaunchConfig()
+    profile = load_runtime_profile()
+
+    assert not hasattr(config, "sensor_gateway")
+    assert not hasattr(config, "control_gateway")
+    assert "sensor_gateway" not in profile.component("launcher")
+    assert "control_gateway" not in profile.component("launcher")
 
 
 def test_yaml_contains_every_launch_parameter() -> None:
@@ -80,28 +90,25 @@ def test_launcher_defaults_match_current_endpoint_inventory() -> None:
     assert config.policy_port == get_endpoint("policy_server").port
     assert config.camera_port == get_endpoint("camera_server").port
     assert config.keyboard_planner_port == get_endpoint("navigation_command").port
-    assert config.navdp_output_port == get_endpoint("planner_relay").port
     assert config.lavira_depth_port == get_endpoint("lingbot_depth").port
-    assert config.navdp_port == get_endpoint("xnavdp_http").port
     assert config.sensor_gateway_port == get_endpoint("sensor_gateway_metadata").port
     assert config.vla_timing_port == get_endpoint("vla_timing_ingress").port
     assert config.control_gateway_intent_port == get_endpoint("control_gateway_intent").port
     assert config.control_gateway_status_port == get_endpoint("control_gateway_status").port
     assert config.control_gateway_dispatch_port == get_endpoint("control_gateway_dispatch").port
-    assert config.keyboard_zmq_port == get_endpoint("operator_keyboard_legacy").port
     assert config.sensor_gateway_visualization_port == get_endpoint(
         "sensor_gateway_visualization_ingress"
     ).port
 
 
-def test_control_gateway_replaces_inline_keyboard_and_preserves_ports() -> None:
+def test_control_gateway_uses_only_typed_gateway_ports() -> None:
     command = build_control_gateway_command(
         InferenceLaunchConfig(),
         Path("/workspace/sonic"),
     )
 
     assert "run_control_gateway.py" in command
-    assert "--legacy-port 5580" in command
+    assert "5580" not in command
     assert "--intent-port 5561" in command
     assert "--dispatch-port 5565" in command
     assert "--status-port 5562" in command
@@ -122,6 +129,27 @@ def test_control_gateway_replaces_inline_keyboard_and_preserves_ports() -> None:
     assert "run_operator_cv_viewer.py" not in operator
 
 
+def test_data_exporter_uses_runtime_profile_gateways_only() -> None:
+    command = build_data_exporter_command(
+        InferenceLaunchConfig(
+            task_prompt="collect a demo",
+            dataset_name="session one",
+            record_chest_camera=True,
+        ),
+        Path("/workspace/sonic"),
+    )
+
+    assert "run_data_exporter.py" in command
+    assert "--profile" in command
+    assert "--task-prompt 'collect a demo'" in command
+    assert "--dataset-name 'session one'" in command
+    assert "--record-chest-camera" in command
+    assert "--camera-host" not in command
+    assert "--camera-port" not in command
+    assert "--state-zmq" not in command
+    assert "--data-collection-frequency" not in command
+
+
 def test_launcher_defaults_match_unified_runtime_profile() -> None:
     config = load_inference_launch_config()
     profile = load_runtime_profile()
@@ -132,9 +160,6 @@ def test_launcher_defaults_match_unified_runtime_profile() -> None:
     assert launcher["keyboard_planner"] is config.keyboard_planner
     assert launcher["planner_input"] == config.planner_input
     assert launcher["data_exporter"] is config.data_exporter
-    assert launcher["sensor_gateway"] is config.sensor_gateway
-    assert launcher["sensor_shadow"] is config.sensor_shadow
-    assert launcher["control_gateway"] is config.control_gateway
     assert launcher["opencv_viewer"] is config.opencv_viewer
     assert launcher["lidar_ready_timeout_s"] == config.lidar_ready_timeout
     assert launcher["navigation_ready_timeout_s"] == config.navigation_ready_timeout
@@ -142,10 +167,8 @@ def test_launcher_defaults_match_unified_runtime_profile() -> None:
     assert vla["prompt"] == config.prompt
     assert vla["action_publish_hz"] == config.action_publish_rate
     assert vla["action_horizon"] == config.action_horizon
-    assert vla["control_input"] == config.vla_control_input
-    assert vla["sensor_input"] == config.vla_sensor_input
     assert vla["sensor_gateway_poll_hz"] == config.vla_sensor_gateway_poll_hz
-    assert profile.component("navdp")["sensor_input"] == config.navdp_sensor_input
+    assert profile.component("navdp")["sensor_gateway_poll_hz"] == 20.0
 
 
 def test_navdp_stack_commands_use_ros_topics_and_official_xnavdp_server() -> None:
@@ -156,12 +179,16 @@ def test_navdp_stack_commands_use_ros_topics_and_official_xnavdp_server() -> Non
     fastlio = build_fastlio_command(config)
 
     assert "navdp_planner.py" in planner
-    assert "--sensor-input gateway" in planner
+    assert "--sensor-input" not in planner
     assert "--sensor-gateway-endpoint tcp://127.0.0.1:5560" in planner
     assert "--no-visualize" in planner
     assert "--visualization-gateway-endpoint tcp://127.0.0.1:5566" in planner
     assert "--sensor-gateway-endpoint tcp://127.0.0.1:5560" in planner
     assert "--navdp-request-timeout-s 10.0" in planner
+    assert "--control-hz 20.0" in planner
+    assert "--mpc-hz 10.0" in planner
+    assert "--goal-tolerance-m 1.0" in planner
+    assert "--output-endpoint 'tcp://*:5563'" in planner
     assert "source /opt/ros/humble/setup.bash" in planner
     assert config.navdp_root == "/home/user/Project/NavDP/baselines/x-navdp"
     assert config.navdp_checkpoint.endswith("/x-navdp_posttrain.ckpt")
@@ -214,7 +241,6 @@ def test_runtime_sidecars_are_read_only_and_navdp_uses_gateway_by_default() -> N
     config = InferenceLaunchConfig(camera_host="192.168.123.164")
     root = Path("/workspace/sonic")
     gateway = build_sensor_gateway_command(config, root)
-    shadow = build_sensor_shadow_command(config, root)
     planner = build_navdp_planner_command(config, root)
 
     assert "run_sensor_gateway.py" in gateway
@@ -226,35 +252,24 @@ def test_runtime_sidecars_are_read_only_and_navdp_uses_gateway_by_default() -> N
     assert "mapping.launch.py" in gateway
     assert "/tmp/sonic_livox_driver.log" in gateway
     assert "/tmp/sonic_fastlio.log" in gateway
-    assert "run_sensor_gateway_shadow.py" in shadow
     assert "--camera-host 192.168.123.164" in gateway
-    assert "--camera-host 192.168.123.164" in shadow
     assert "--rpc-port 5560" in gateway
-    assert "--gateway-port 5560" in shadow
     assert "PYTHONPATH=/workspace/sonic:$PYTHONPATH" in gateway
-    assert "PYTHONPATH=/workspace/sonic:$PYTHONPATH" in shadow
-    assert "cpp_command" not in gateway + shadow
-    assert "5556" not in gateway + shadow
-    assert "--sensor-input gateway" in planner
+    assert "cpp_command" not in gateway
+    assert "5556" not in gateway
+    assert "--sensor-input" not in planner
     assert "--sensor-gateway-endpoint tcp://127.0.0.1:5560" in planner
     assert "run_sensor_gateway" not in planner
 
 
-def test_vla_gateway_input_is_explicit_and_preserves_control_endpoints() -> None:
+def test_vla_uses_only_gateway_inputs_and_preserves_control_endpoints() -> None:
     root = Path("/workspace/sonic")
     gateway = build_vla_inference_command(InferenceLaunchConfig(), root)
-    legacy = build_vla_inference_command(
-        InferenceLaunchConfig(
-            vla_sensor_input="legacy",
-            vla_control_input="legacy",
-        ),
-        root,
-    )
 
-    assert "--sensor-input legacy" in legacy
-    assert "--control-input legacy" in legacy
-    assert "--sensor-input gateway" in gateway
-    assert "--control-input gateway" in gateway
+    assert "--sensor-input" not in gateway
+    assert "--control-input" not in gateway
+    assert "--camera-host" not in gateway
+    assert "--camera-port" not in gateway
     assert "--control-gateway-endpoint tcp://127.0.0.1:5565" in gateway
     assert "--sensor-gateway-endpoint tcp://127.0.0.1:5560" in gateway
     assert "--sensor-gateway-poll-hz 50.0" in gateway
@@ -263,14 +278,16 @@ def test_vla_gateway_input_is_explicit_and_preserves_control_endpoints() -> None
 
 
 def test_navdp_gateway_input_is_explicit_and_keeps_the_same_output_contract() -> None:
-    config = InferenceLaunchConfig(navdp_sensor_input="gateway")
+    config = InferenceLaunchConfig()
 
     planner = build_navdp_planner_command(config, Path("/workspace/sonic"))
 
-    assert "--sensor-input gateway" in planner
+    assert "--sensor-input" not in planner
+    assert "--camera-host" not in planner
+    assert "--camera-port" not in planner
     assert "--sensor-gateway-endpoint tcp://127.0.0.1:5560" in planner
     assert "--navdp-server http://127.0.0.1:19999" in planner
-    assert "--output-endpoint" not in planner
+    assert "--output-endpoint 'tcp://*:5563'" in planner
 
 
 def test_launcher_runs_readiness_gate_synchronously(monkeypatch) -> None:
@@ -303,7 +320,7 @@ def test_gateway_navdp_readiness_requires_the_gateway_rpc(monkeypatch) -> None:
         return Result()
 
     monkeypatch.setattr("gear_sonic.scripts.launch_inference.subprocess.run", run)
-    config = InferenceLaunchConfig(navdp_sensor_input="gateway")
+    config = InferenceLaunchConfig()
 
     assert run_readiness_gate(config, Path("/workspace/sonic"), "navigation")
     shell = commands[0][-1]

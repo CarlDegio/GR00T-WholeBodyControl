@@ -8,13 +8,19 @@ import socket
 import subprocess
 import time
 
+from gear_sonic.runtime.config import load_runtime_profile
+
+_DEFAULT_PROFILE = load_runtime_profile()
+_CAMERA_ENDPOINT = _DEFAULT_PROFILE.endpoint("camera_server")
+_NAVDP_ENDPOINT = _DEFAULT_PROFILE.endpoint("xnavdp_http")
+
 
 @dataclass
 class HealthConfig:
-    camera_host: str = "192.168.123.164"
-    camera_port: int = 5555
-    navdp_host: str = "127.0.0.1"
-    navdp_port: int = 19999
+    camera_host: str = _CAMERA_ENDPOINT.host
+    camera_port: int = _CAMERA_ENDPOINT.port
+    navdp_host: str = _NAVDP_ENDPOINT.host
+    navdp_port: int = _NAVDP_ENDPOINT.port
     interval_s: float = 1.0
 
 
@@ -42,10 +48,10 @@ def main(config: HealthConfig) -> None:
         states = {
             "camera": reachable(config.camera_host, config.camera_port),
             "navdp": reachable(config.navdp_host, config.navdp_port),
-            "lidar": "/livox/lidar" in topics,
-            "imu": "/livox/imu" in topics,
-            "odom": "/Odometry_loc" in topics,
-            "cloud": "/cloud_registered_1" in topics,
+            "lidar": _DEFAULT_PROFILE.ros_topics["lidar"] in topics,
+            "imu": _DEFAULT_PROFILE.ros_topics["lidar_imu"] in topics,
+            "odom": _DEFAULT_PROFILE.ros_topics["odometry"] in topics,
+            "cloud": _DEFAULT_PROFILE.ros_topics["registered_cloud"] in topics,
         }
         summary = " ".join(f"{name}={'OK' if ready else '--'}" for name, ready in states.items())
         print(f"\r[Health] {summary}", end="", flush=True)

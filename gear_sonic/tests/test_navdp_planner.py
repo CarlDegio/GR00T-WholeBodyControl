@@ -18,15 +18,12 @@ from gear_sonic.scripts.navdp_planner import (
     apply_hard_safety,
     base_goal_to_world,
     build_navigation_message,
-    build_planner_velocity_message,
-    camera_point_to_base,
     decode_navigation_message,
     depth_requires_stop,
     filter_livox_points,
     format_navigation_diagnostics,
     integrate_velocity_path,
     local_goal_from_world,
-    livox_custom_points_to_numpy,
     compose_reasan_navigation_view,
     render_actor_ray_panel,
     render_slam_world_panel,
@@ -40,10 +37,6 @@ from gear_sonic.scripts import navdp_planner
 
 def test_runtime_queue_dependency_is_imported_at_module_scope() -> None:
     assert navdp_planner.queue is queue
-
-
-def test_humanoid_fastlio_default_odometry_topic_matches_fork() -> None:
-    assert navdp_planner.NavDPPlannerConfig().odom_topic == "/Odometry_loc"
 
 
 def test_navdp_goal_tolerance_is_one_meter() -> None:
@@ -135,8 +128,7 @@ def test_xnavdp_adaptive_speed_matches_length_and_curvature_limits() -> None:
     assert navdp_planner.xnavdp_adaptive_speed(2.0, 10.0, **kwargs) == pytest.approx(0.012)
 
 
-def test_humanoid_fastlio_registered_cloud_topic_matches_fork() -> None:
-    assert navdp_planner.NavDPPlannerConfig().slam_cloud_topic == "/cloud_registered_1"
+def test_navdp_sensor_state_starts_empty() -> None:
     sensors = navdp_planner._SharedSensors()
     assert sensors.slam_map_xy.shape == (0, 2)
     assert sensors.robot_history.shape == (0, 2)
@@ -307,18 +299,6 @@ def test_xnavdp_request_timeout_defaults_to_ten_seconds(monkeypatch) -> None:
     assert captured["timeout"] == pytest.approx(10.0)
 
 
-def test_livox_custom_message_points_convert_to_xyz_array() -> None:
-    message = SimpleNamespace(points=[
-        SimpleNamespace(x=1.0, y=-0.2, z=0.3),
-        SimpleNamespace(x=2.0, y=0.4, z=-0.5),
-    ])
-
-    points = livox_custom_points_to_numpy(message)
-
-    assert points.dtype == np.float32
-    np.testing.assert_allclose(points, [[1.0, -0.2, 0.3], [2.0, 0.4, -0.5]])
-
-
 def test_reasan_actor_ray_and_world_map_are_present_beside_physical_view() -> None:
     rays = np.full(180, 3.0, dtype=np.float32)
     rays[90] = 0.5
@@ -482,12 +462,6 @@ def test_navigation_protocol_round_trip_preserves_generation_and_goal() -> None:
     )
 
 
-def test_camera_optical_point_maps_right_to_negative_base_y() -> None:
-    assert camera_point_to_base((0.2, 0.1, 2.0)) == pytest.approx(
-        (2.0, -0.2, 0.3)
-    )
-
-
 def test_world_goal_remains_fixed_as_robot_moves_and_rotates() -> None:
     world = base_goal_to_world((2.0, 0.0), Pose2D(1.0, 2.0, np.pi / 2))
     assert world == pytest.approx((1.0, 4.0))
@@ -591,27 +565,6 @@ def test_sonic_directional_packet_separates_translation_from_facing() -> None:
     assert values[1:4] == pytest.approx((0.0, 1.0, 0.0), abs=1e-6)
     assert values[4:7] == pytest.approx((1.0, 0.0, 0.0), abs=1e-6)
     assert values[7] == pytest.approx(0.2)
-
-
-def test_world_path_tangent_preserves_lateral_translation() -> None:
-    heading = navdp_planner.world_path_tangent_heading(
-        np.array([[0.0, 0.0], [0.1, 0.1], [0.2, 0.2]], dtype=np.float64),
-        Pose2D(0.0, 0.0, 0.0),
-    )
-
-    assert heading == pytest.approx(np.pi / 4)
-
-
-def test_arc_safety_velocity_is_expressed_from_measured_heading() -> None:
-    velocity = navdp_planner.arc_target_to_body_velocity(
-        speed=0.3,
-        target_heading=0.6,
-        actual_heading=0.4,
-    )
-
-    assert velocity == pytest.approx(
-        (0.3 * np.cos(0.2), 0.3 * np.sin(0.2), 0.0)
-    )
 
 
 def test_internnav_reference_skips_first_three_points_and_uses_odom_world_frame() -> None:
@@ -865,36 +818,6 @@ def test_point_plane_distances_match_plane_equation_without_matrix_multiply() ->
     assert distances == pytest.approx(np.abs(points @ normal - offset))
 
 
-def test_shutdown_ros_context_is_idempotent() -> None:
-    class FakeRclpy:
-        shutdown_calls = 0
-
-        @staticmethod
-        def ok() -> bool:
-            return False
-
-        @classmethod
-        def shutdown(cls) -> None:
-            cls.shutdown_calls += 1
-
-    navdp_planner.shutdown_ros_context(FakeRclpy)
-
-    assert FakeRclpy.shutdown_calls == 0
-
-
-def test_spin_ros_suppresses_expected_context_error_during_shutdown() -> None:
-    class FakeRclpy:
-        @staticmethod
-        def spin(_node) -> None:
-            raise RuntimeError("context is not valid")
-
-        @staticmethod
-        def ok() -> bool:
-            return False
-
-    navdp_planner.spin_ros(FakeRclpy, object())
-
-
 def test_only_lidar_hard_stop_aborts_active_navigation() -> None:
     assert should_abort_nav_for_lidar(
         mode="nav_goal",
@@ -937,10 +860,3 @@ def test_depth_stop_requires_component_strictly_larger_than_2000_pixels() -> Non
 
     depth.flat[:2001] = 0.11
     assert not depth_requires_stop(depth)
-
-
-def test_sonic_message_uses_existing_planner_contract() -> None:
-    message = build_planner_velocity_message((0.3, -0.1, 0.2), timestamp=8.0)
-    assert message["type"] == "navila_reasan_velocity_command"
-    assert message["velocity"] == {"vx": 0.3, "vy": -0.1, "wz": 0.2}
-    assert message["duration_s"] == pytest.approx(0.05)

@@ -30,7 +30,7 @@ def _convert_lists_to_numpy(value: Any) -> Any:
 
 
 def decode_cpp_state_array(values: np.ndarray) -> dict[str, Any]:
-    """Decode Gateway's untouched C++ payload like ``ZMQStateSubscriber``."""
+    """Decode the untouched C++ msgpack state payload stored by Gateway."""
     payload = np.asarray(values, dtype=np.uint8).reshape(-1).tobytes()
     decoded = msgpack.unpackb(payload, raw=False, object_hook=mnp.decode)
     if not isinstance(decoded, dict):
@@ -73,7 +73,7 @@ def _copy_sensor_value(value: Any) -> Any:
 
 
 class VlaSensorGatewayIngress:
-    """Background Gateway reader exposing VLA's legacy camera/state methods.
+    """Background Gateway reader exposing typed camera and robot-state caches.
 
     Gateway RPC and shared-memory copies stay on this object's worker thread.
     The 50 Hz VLA control loop only reads already materialized local caches.
@@ -193,17 +193,15 @@ class VlaSensorGatewayIngress:
             and (time.monotonic_ns() - received_ns) / 1_000_000.0 <= self.max_age_ms
         )
 
-    def read(self, blocking: bool = False, **_kwargs) -> dict[str, Any] | None:
-        """Match ``ComposedCameraClientSensor.read`` without doing I/O here."""
-        if blocking:
-            raise ValueError("blocking reads are unsupported by SensorGateway cache")
+    def read_camera(self) -> dict[str, Any] | None:
+        """Return the latest fresh four-camera message without blocking."""
         with self._lock:
             if self._camera is None or not self._fresh(self._camera_received_ns):
                 return None
             return _copy_sensor_value(self._camera)
 
-    def get_msg(self, clear: bool = True) -> dict[str, Any] | None:
-        """Match ``ZMQStateSubscriber.get_msg`` against the local state cache."""
+    def read_state(self, *, clear: bool = True) -> dict[str, Any] | None:
+        """Return the latest fresh robot state, optionally consuming it."""
         with self._lock:
             if self._state is None or not self._fresh(self._state_received_ns):
                 return None

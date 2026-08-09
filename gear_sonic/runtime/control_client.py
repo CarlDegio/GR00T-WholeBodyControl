@@ -1,4 +1,4 @@
-"""Clients for the staged ControlGateway migration."""
+"""Typed clients for ControlGateway intents and dispatched commands."""
 
 from __future__ import annotations
 
@@ -38,7 +38,6 @@ class ControlGatewayIntentClient:
         event = self._core.accept_command(
             name,
             parameters=dict(parameters),
-            mirror_legacy=False,
         )
         self._socket.send_string(event.command.to_json())
         return event.command
@@ -52,21 +51,8 @@ class ControlGatewayIntentClient:
             self._context.term()
 
 
-def legacy_message_from_operator_command(command: OperatorCommand) -> str:
-    """Recover the exact compatibility payload carried by a typed intent."""
-
-    message = command.parameters.get("legacy_message")
-    if not isinstance(message, str):
-        raise ValueError("operator command does not contain a string legacy_message")
-    return message
-
-
 class ControlGatewaySubscriber:
-    """Non-blocking latest-value subscriber with TTL/order validation.
-
-    ``read_msg`` deliberately matches ``ZMQKeyboardSubscriber`` so migrated
-    consumers do not need to change their state machine or loop timing.
-    """
+    """Non-blocking typed-command subscriber with TTL/order validation."""
 
     def __init__(
         self,
@@ -96,14 +82,6 @@ class ControlGatewaySubscriber:
         self._closed = False
         print(f"[ControlGatewaySubscriber] Connected to {endpoint}")
 
-    def decode(self, payload: str | bytes) -> str | None:
-        """Validate one typed event and return its unchanged legacy payload."""
-
-        command = self.decode_command(payload)
-        if command is None:
-            return None
-        return legacy_message_from_operator_command(command)
-
     def decode_command(self, payload: str | bytes) -> OperatorCommand | None:
         """Return a validated typed command while retaining TTL/order checks."""
 
@@ -127,16 +105,6 @@ class ControlGatewaySubscriber:
             return None
         try:
             return self.decode_command(payload)
-        except (KeyError, TypeError, ValueError):
-            return None
-
-    def read_msg(self) -> str | None:
-        try:
-            payload = self._socket.recv(zmq.NOBLOCK)
-        except zmq.Again:
-            return None
-        try:
-            return self.decode(payload)
         except (KeyError, TypeError, ValueError):
             return None
 

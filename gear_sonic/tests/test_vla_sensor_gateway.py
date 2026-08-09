@@ -122,8 +122,8 @@ def test_gateway_rpc_never_blocks_the_vla_control_or_inference_threads() -> None
     try:
         started = time.perf_counter()
         ingress.start()
-        assert ingress.read() is None
-        assert ingress.get_msg(clear=False) is None
+        assert ingress.read_camera() is None
+        assert ingress.read_state(clear=False) is None
         assert time.perf_counter() - started < 0.05
     finally:
         ingress.close()
@@ -208,8 +208,8 @@ def test_gateway_ingress_materializes_every_vla_input_and_clear_semantics() -> N
         camera = None
         cpp_state = None
         while time.monotonic() < deadline:
-            camera = ingress.read()
-            cpp_state = ingress.get_msg(clear=False)
+            camera = ingress.read_camera()
+            cpp_state = ingress.read_state(clear=False)
             if camera is not None and cpp_state is not None:
                 break
             time.sleep(0.01)
@@ -219,9 +219,9 @@ def test_gateway_ingress_materializes_every_vla_input_and_clear_semantics() -> N
         for name in VLA_CAMERA_NAMES:
             np.testing.assert_array_equal(camera["images"][name], images[name])
         np.testing.assert_array_equal(cpp_state["body_q"], state["body_q"])
-        assert ingress.get_msg(clear=True) is not None
-        assert ingress.get_msg(clear=False) is None
-        assert ingress.read() is not None
+        assert ingress.read_state(clear=True) is not None
+        assert ingress.read_state(clear=False) is None
+        assert ingress.read_camera() is not None
     finally:
         ingress.close()
         client.close()

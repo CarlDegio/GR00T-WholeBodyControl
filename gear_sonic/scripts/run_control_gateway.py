@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Route typed operator intents to structured and legacy control consumers."""
+"""Route typed operator intents to structured control consumers."""
 
 from __future__ import annotations
 
@@ -29,7 +29,6 @@ from gear_sonic.scripts.navdp_planner import build_navigation_message
 @dataclass(frozen=True)
 class ControlGatewaySettings:
     profile_name: str
-    legacy_bind_endpoint: str
     intent_bind_endpoint: str
     dispatch_bind_endpoint: str
     status_bind_endpoint: str
@@ -43,8 +42,6 @@ def build_argument_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--profile", default="", help="Base runtime YAML profile")
     parser.add_argument("--overlay", action="append", default=[])
-    parser.add_argument("--legacy-bind-host", default="")
-    parser.add_argument("--legacy-port", type=int, default=0)
     parser.add_argument("--intent-bind-host", default="")
     parser.add_argument("--intent-port", type=int, default=0)
     parser.add_argument("--dispatch-bind-host", default="")
@@ -81,9 +78,6 @@ def resolve_control_gateway_settings(args: argparse.Namespace) -> ControlGateway
         raise ValueError("heartbeat_hz must be positive")
     return ControlGatewaySettings(
         profile_name=profile.name,
-        legacy_bind_endpoint=bind_endpoint(
-            "operator_keyboard_legacy", args.legacy_bind_host, args.legacy_port
-        ),
         intent_bind_endpoint=bind_endpoint(
             "control_gateway_intent", args.intent_bind_host, args.intent_port
         ),
@@ -111,14 +105,12 @@ def resolve_control_gateway_settings(args: argparse.Namespace) -> ControlGateway
 def run_control_gateway(settings: ControlGatewaySettings) -> None:
     context = zmq.Context()
     intent_pull = context.socket(zmq.PULL)
-    legacy_pub = context.socket(zmq.PUB)
     dispatch_pub = context.socket(zmq.PUB)
     status_pub = context.socket(zmq.PUB)
     navigation_pub = context.socket(zmq.PUB)
     navigation_status_sub = context.socket(zmq.SUB)
     for socket in (
         intent_pull,
-        legacy_pub,
         dispatch_pub,
         status_pub,
         navigation_pub,
@@ -127,10 +119,9 @@ def run_control_gateway(settings: ControlGatewaySettings) -> None:
         socket.setsockopt(zmq.LINGER, 0)
     for socket in (intent_pull, navigation_status_sub):
         socket.setsockopt(zmq.RCVHWM, 100)
-    for socket in (legacy_pub, dispatch_pub, status_pub, navigation_pub):
+    for socket in (dispatch_pub, status_pub, navigation_pub):
         socket.setsockopt(zmq.SNDHWM, 100)
     intent_pull.bind(settings.intent_bind_endpoint)
-    legacy_pub.bind(settings.legacy_bind_endpoint)
     dispatch_pub.bind(settings.dispatch_bind_endpoint)
     status_pub.bind(settings.status_bind_endpoint)
     navigation_pub.bind(settings.navigation_bind_endpoint)
@@ -147,7 +138,6 @@ def run_control_gateway(settings: ControlGatewaySettings) -> None:
 
     print(f"[ControlGateway] profile={settings.profile_name}")
     print(f"[ControlGateway] intent PULL: {settings.intent_bind_endpoint}")
-    print(f"[ControlGateway] legacy PUB: {settings.legacy_bind_endpoint}")
     print(f"[ControlGateway] dispatch PUB: {settings.dispatch_bind_endpoint}")
     print(f"[ControlGateway] status PUB: {settings.status_bind_endpoint}")
     print(f"[ControlGateway] navigation PUB: {settings.navigation_bind_endpoint}")
@@ -175,7 +165,6 @@ def run_control_gateway(settings: ControlGatewaySettings) -> None:
         event = gateway_events.accept_command(
             name,
             parameters=parameters,
-            mirror_legacy=False,
         )
         dispatch_pub.send_string(event.command.to_json())
 
@@ -297,19 +286,11 @@ def run_control_gateway(settings: ControlGatewaySettings) -> None:
                                 state=str(command.parameters.get("state", "failed")),
                                 reason=str(command.parameters.get("reason", "")),
                             )
-                        elif routed.mirror_legacy:
-                            legacy_pub.send_string(routed.legacy_message or "")
-                            log_control_route(
-                                command.metadata.source,
-                                command.name,
-                                ("VLA", "DataExporter", "typed subscribers"),
-                                legacy_message=routed.legacy_message,
-                            )
                         else:
                             log_control_route(
                                 command.metadata.source,
                                 command.name,
-                                ("typed subscribers",),
+                                ("VLA", "DataExporter", "typed subscribers"),
                             )
                         if command.name not in {
                             "navigation_key",
@@ -386,7 +367,6 @@ def run_control_gateway(settings: ControlGatewaySettings) -> None:
     finally:
         for socket in (
             intent_pull,
-            legacy_pub,
             dispatch_pub,
             status_pub,
             navigation_pub,

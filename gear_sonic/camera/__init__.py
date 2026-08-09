@@ -1,7 +1,7 @@
 """Camera server package for streaming camera images over ZMQ.
 
-Runs on the robot computer and publishes JPEG-encoded frames that the
-data exporter (on the workstation) subscribes to for recording.
+Runs on the robot computer and publishes JPEG-encoded frames that SensorGateway
+ingests for inference and recording consumers on the workstation.
 
 Quickstart (on robot)::
 

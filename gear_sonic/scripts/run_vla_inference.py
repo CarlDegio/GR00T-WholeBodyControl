@@ -1,22 +1,18 @@
-"""
-VLA inference runner — NO ROS 2 DEPENDENCY.
+"""Gateway-backed OpenPI VLA inference runner without a ROS 2 dependency.
 
-Runs an Isaac-GR00T VLA policy against the Sonic whole-body control stack.
-All communication uses ZMQ:
-  1. Robot state  -> ZMQ SUB on ``g1_debug`` topic (from C++ zmq_output_handler)
-  2. Actions out  -> ZMQ PUB (latent protocol v4: motion token + hand joints or planner commands)
-  3. Camera       -> ZMQ/TCP via ComposedCameraClientSensor
-  4. Keyboard     -> ZMQ SUB via ZMQKeyboardSubscriber
-  5. Planner relay -> ZMQ SUB ``planner`` topic (port 5558) from
-     ``keyboard_planner_thread_server.py``; bytes forward to :5556
+Communication paths:
+  1. Robot state and cameras -> SensorGateway snapshot/cache
+  2. Operator commands       -> ControlGateway typed command stream
+  3. Actions out             -> ZMQ PUB (motion token, hands, or planner commands)
+  4. Planner relay           -> ZMQ SUB ``planner`` topic (port 5558), forwarded
+                                to the C++ command endpoint
 
 ``command`` topic (start/stop/mode) is sent only by this script (``k``/``i``/``o``).
 The keyboard planner sidecar sends ``planner`` topic only — no ``command`` overlap.
 
-Uses the Isaac-GR00T PolicyClient (ZMQ REQ/REP) to communicate with a
-running PolicyServer.
+Uses msgpack-numpy over ZMQ REQ/REP to communicate with an OpenPI policy server.
 
-Keyboard commands (received via ZMQ from the standalone keyboard publisher):
+Operator commands (received from ControlGateway):
   k  -> start / stop the C++ control loop (start defaults to PLANNER mode)
   o  -> switch to PLANNER mode (enables relay of WASD sidecar on :5558)
   i  -> switch to POSE mode (VLA latent actions; relay disabled)
@@ -35,26 +31,18 @@ import math
 import queue
 import threading
 import time
-from typing import Literal
-
 import cv2
 import msgpack_numpy as mnp
 import numpy as np
 import tyro
 import zmq
 
-from gear_sonic.camera.composed_camera import ComposedCameraClientSensor
 from gear_sonic.data.robot_model.instantiation.g1 import instantiate_g1_robot_model
 from gear_sonic.runtime.vla_sensor_gateway import VlaSensorGatewayIngress
 from gear_sonic.runtime.vla_timing import VlaTimingPublisher
 from gear_sonic.runtime.control_client import ControlGatewaySubscriber
-from gear_sonic.utils.data_collection.keyboard_subscriber import (
-    DEFAULT_ZMQ_KEYBOARD_PORT,
-    ZMQKeyboardSubscriber,
-)
 from gear_sonic.utils.data_collection.telemetry import Telemetry
 from gear_sonic.utils.data_collection.transforms import compute_projected_gravity
-from gear_sonic.utils.data_collection.zmq_state_subscriber import ZMQStateSubscriber
 from gear_sonic.utils.inference.initial_poses import SONIC_STAND_UPPER_BODY_RAD, VLA_INITIAL_UPPER_BODY_RAD, UPPER_BODY_MUJOCO_INDICES
 from gear_sonic.utils.inference.vla_utils import (
     calculate_latency_compensated_index,
@@ -199,12 +187,12 @@ class PlannerHeadingAlignment:
 class InferenceConfig:
     """CLI config for the VLA inference runner."""
 
-    # Policy server (Isaac-GR00T PolicyServer)
+    # OpenPI policy server
     host: str = "localhost"
-    """The host address of the Isaac-GR00T PolicyServer."""
+    """The host address of the OpenPI policy server."""
 
-    port: int = 5550
-    """The port of the Isaac-GR00T PolicyServer."""
+    port: int = 29999
+    """The port of the OpenPI policy server."""
 
     # Control
     action_publish_rate: int = 50
@@ -215,16 +203,6 @@ class InferenceConfig:
 
     rate: float = 1 / 0.5
     """Rate at which we run the forward pass of the VLA policy (Hz)."""
-
-    # Camera
-    camera_host: str = "localhost"
-    """Camera server host."""
-
-    camera_port: int = 5555
-    """Camera server port."""
-
-    sensor_input: Literal["legacy", "gateway"] = "gateway"
-    """VLA sensor source; legacy remains available only as a rollback path."""
 
     sensor_gateway_endpoint: str = "tcp://127.0.0.1:5560"
     """Local read-only SensorGateway Snapshot endpoint."""
@@ -244,13 +222,6 @@ class InferenceConfig:
     timing_endpoint: str = "tcp://127.0.0.1:5567"
     """Best-effort VLA timing telemetry endpoint; publishing never blocks inference."""
 
-    # ZMQ: Robot state (from C++ zmq_output_handler, g1_debug topic)
-    state_zmq_host: str = "localhost"
-    """ZMQ host for robot state (g1_debug topic from C++ deploy)."""
-
-    state_zmq_port: int = 5557
-    """ZMQ port for robot state (same socket as robot_config topic)."""
-
     # ZMQ: Action output (latent actions to C++ control loop)
     action_zmq_host: str = "localhost"
     """ZMQ host for action output (PUB socket)."""
@@ -258,18 +229,8 @@ class InferenceConfig:
     action_zmq_port: int = 5556
     """ZMQ port for action output."""
 
-    # ZMQ: Keyboard input
-    keyboard_zmq_host: str = "localhost"
-    """ZMQ host for keyboard input."""
-
-    keyboard_zmq_port: int = DEFAULT_ZMQ_KEYBOARD_PORT
-    """ZMQ port for keyboard input."""
-
-    control_input: Literal["legacy", "gateway"] = "gateway"
-    """Operator-control source; legacy remains available only as a rollback path."""
-
     control_gateway_endpoint: str = "tcp://127.0.0.1:5565"
-    """Structured ControlGateway intent endpoint used when explicitly selected."""
+    """Structured ControlGateway command endpoint."""
 
     # ZMQ: Planner relay (run_planner_keyboard sidecar -> forward to action port)
     planner_relay_zmq_host: str = "localhost"
@@ -508,8 +469,7 @@ def get_action_field(action_dict: dict, key: str):
 
 
 def prepare_observation_from_sensors(
-    camera_subscriber,
-    state_subscriber,
+    sensor_gateway: VlaSensorGatewayIngress,
     robot_model,
     language_prompt: str,
     log_errors: bool = False,
@@ -523,7 +483,7 @@ def prepare_observation_from_sensors(
     timing_ms: dict[str, float] = {}
 
     started = time.perf_counter()
-    camera_msg = camera_subscriber.read()
+    camera_msg = sensor_gateway.read_camera()
     timing_ms["camera_read"] = (time.perf_counter() - started) * 1000.0
     if camera_msg is None:
         if log_errors:
@@ -531,7 +491,7 @@ def prepare_observation_from_sensors(
         return None
 
     started = time.perf_counter()
-    state_msg = state_subscriber.get_msg()
+    state_msg = sensor_gateway.read_state()
     timing_ms["state_read"] = (time.perf_counter() - started) * 1000.0
     if state_msg is None:
         if log_errors:
@@ -583,7 +543,7 @@ def prepare_observation_from_sensors(
     if timestamp.size:
         raw_timestamp = float(timestamp[-1])
         if math.isfinite(raw_timestamp):
-            # Camera timestamps use Unix seconds in the legacy stream. Avoid
+            # Camera source timestamps use Unix seconds. Avoid
             # reporting nonsense when a test or alternate source uses another clock.
             age_ms = (time.time() - raw_timestamp) * 1000.0
             if 0.0 <= age_ms <= 60_000.0:
@@ -595,7 +555,7 @@ def prepare_observation_from_sensors(
 
 
 def run_policy_inference_and_process(policy, observation, robot_model):
-    """Run policy inference via Isaac-GR00T PolicyClient and process results.
+    """Run OpenPI policy inference and process the returned action chunk.
 
     Returns:
         processed_action dict or None on error.
@@ -780,32 +740,15 @@ def main(config: InferenceConfig):
     else:
         print("WARNING: PolicyServer not reachable. Inference will fail until server is up.")
 
-    if config.sensor_input == "legacy":
-        state_subscriber = ZMQStateSubscriber(
-            host=config.state_zmq_host,
-            port=config.state_zmq_port,
-        )
-        camera_subscriber = ComposedCameraClientSensor(
-            server_ip=config.camera_host, port=config.camera_port
-        )
-        print_green("VLA sensors: legacy camera and C++ ZMQ subscribers")
-    elif config.sensor_input == "gateway":
-        gateway_ingress = VlaSensorGatewayIngress(
-            config.sensor_gateway_endpoint,
-            poll_hz=config.sensor_gateway_poll_hz,
-            request_timeout_ms=config.sensor_gateway_request_timeout_ms,
-            max_age_ms=config.sensor_gateway_max_age_ms,
-            max_skew_ms=config.sensor_gateway_max_skew_ms,
-        )
-        gateway_ingress.start()
-        # Preserve the two legacy method contracts used by the unchanged VLA
-        # observation and mode-switch code. All Gateway I/O stays on the
-        # ingress worker thread.
-        state_subscriber = gateway_ingress
-        camera_subscriber = gateway_ingress
-        print_green(f"VLA sensors: Gateway cache at {config.sensor_gateway_endpoint}")
-    else:
-        raise ValueError(f"unsupported VLA sensor input: {config.sensor_input!r}")
+    gateway_ingress = VlaSensorGatewayIngress(
+        config.sensor_gateway_endpoint,
+        poll_hz=config.sensor_gateway_poll_hz,
+        request_timeout_ms=config.sensor_gateway_request_timeout_ms,
+        max_age_ms=config.sensor_gateway_max_age_ms,
+        max_skew_ms=config.sensor_gateway_max_skew_ms,
+    )
+    gateway_ingress.start()
+    print_green(f"VLA sensors: Gateway cache at {config.sensor_gateway_endpoint}")
 
     zmq_context = zmq.Context()
     zmq_socket = zmq_context.socket(zmq.PUB)
@@ -816,27 +759,21 @@ def main(config: InferenceConfig):
     )
     print_green(f"Using embodiment tag: {config.embodiment_tag}")
 
-    if config.control_input == "gateway":
-        keyboard_listener = ControlGatewaySubscriber(
-            config.control_gateway_endpoint,
-            accepted_names={
-                "start_recording",
-                "stop_recording_success",
-                "stop_recording_failure",
-                "select_pose_mode",
-                "toggle_control_loop",
-                "select_planner_mode",
-                "toggle_policy_pause",
-                "toggle_left_hand_initial_pose",
-                "toggle_right_hand_initial_pose",
-                "set_prompt",
-                "legacy_passthrough",
-            },
-        )
-    else:
-        keyboard_listener = ZMQKeyboardSubscriber(
-            port=config.keyboard_zmq_port, host=config.keyboard_zmq_host
-        )
+    control_listener = ControlGatewaySubscriber(
+        config.control_gateway_endpoint,
+        accepted_names={
+            "start_recording",
+            "stop_recording_success",
+            "stop_recording_failure",
+            "select_pose_mode",
+            "toggle_control_loop",
+            "select_planner_mode",
+            "toggle_policy_pause",
+            "toggle_left_hand_initial_pose",
+            "toggle_right_hand_initial_pose",
+            "set_prompt",
+        },
+    )
 
     planner_relay_sub = zmq_context.socket(zmq.SUB)
     planner_relay_sub.setsockopt_string(zmq.SUBSCRIBE, "planner")
@@ -881,7 +818,7 @@ def main(config: InferenceConfig):
         zero_vel = np.zeros(17, dtype=np.float32)
         target_ub = np.array(VLA_INITIAL_UPPER_BODY_RAD, dtype=np.float32)
 
-        state_msg = state_subscriber.get_msg(clear=False)
+        state_msg = gateway_ingress.read_state(clear=False)
         start_ub = None
         if state_msg is not None and "body_q" in state_msg:
             body_q = np.asarray(state_msg["body_q"], dtype=np.float32)
@@ -964,7 +901,9 @@ def main(config: InferenceConfig):
             planner_entry_yaw = None
             if start and planner and cpp_mode != "PLANNER":
                 discarded = _discard_pending_planner_messages(planner_relay_sub)
-                measured_yaw = _base_yaw_from_state(state_subscriber.get_msg(clear=False))
+                measured_yaw = _base_yaw_from_state(
+                    gateway_ingress.read_state(clear=False)
+                )
                 # C++ reinitializes the planner heading from the measured base
                 # orientation on every mode switch. In that new planner frame,
                 # the current physical heading is therefore exactly yaw zero.
@@ -1042,21 +981,20 @@ def main(config: InferenceConfig):
 
     zmq_frame_counter = 0
 
-    PROMPT_MSG_PREFIX = "prompt:"
-
-    def check_keyboard_input():
+    def check_control_input():
         nonlocal pause_loop, cpp_loop_running, cpp_mode
         nonlocal initial_pose_left_hand_closed, initial_pose_right_hand_closed
         nonlocal cached_action_chunk, action_chunk_index, last_inference_time
         nonlocal zmq_frame_counter
 
-        key = keyboard_listener.read_msg()
-        if key is None:
+        command = control_listener.read_command()
+        if command is None:
             return
 
-        if key.startswith(PROMPT_MSG_PREFIX):
-            new_prompt = key[len(PROMPT_MSG_PREFIX):]
-            if new_prompt:
+        command_name = command.name
+        if command_name == "set_prompt":
+            new_prompt = command.parameters.get("prompt")
+            if isinstance(new_prompt, str) and new_prompt:
                 old_prompt = language_prompt_ref[0]
                 language_prompt_ref[0] = new_prompt
                 invalidate_inference("prompt changed")
@@ -1065,13 +1003,13 @@ def main(config: InferenceConfig):
                 print("Received empty prompt change -- ignoring.")
             return
 
-        if key == "c":
-            print("Keyboard: 'c' (start recording -- handled by data exporter)")
-        elif key == "e":
-            print("Keyboard: 'e' (stop recording success -- handled by data exporter)")
-        elif key == "f":
-            print("Keyboard: 'f' (stop recording failure -- handled by data exporter)")
-        elif key == "i":
+        if command_name == "start_recording":
+            print("Start recording command received; handled by data exporter")
+        elif command_name == "stop_recording_success":
+            print("Successful recording stop received; handled by data exporter")
+        elif command_name == "stop_recording_failure":
+            print("Failed recording stop received; handled by data exporter")
+        elif command_name == "select_pose_mode":
             print("Switch to pose mode")
             zmq_frame_counter = 0
             print("Reset ZMQ frame counter")
@@ -1089,7 +1027,7 @@ def main(config: InferenceConfig):
                 print("Warning: C++ loop is already in POSE mode")
             else:
                 print("Warning: C++ loop is not running")
-        elif key == "o":
+        elif command_name == "select_planner_mode":
             print("Switch to planner mode")
             zmq_frame_counter = 0
             print("Reset ZMQ frame counter")
@@ -1104,7 +1042,7 @@ def main(config: InferenceConfig):
                 print("Warning: C++ loop is already in PLANNER mode")
             else:
                 print("Warning: C++ loop is not running")
-        elif key == "p":
+        elif command_name == "toggle_policy_pause":
             if cpp_mode == "PLANNER":
                 print("Warning: C++ loop is in PLANNER mode - press 'i' to switch to POSE mode")
             else:
@@ -1118,7 +1056,7 @@ def main(config: InferenceConfig):
                 else:
                     print("Policy loop resumed (C++ loop still running - press 'k' to stop)")
 
-        elif key == "k":
+        elif command_name == "toggle_control_loop":
             invalidate_inference("C++ control toggled")
             if cpp_loop_running:
                 current_planner = cpp_mode == "PLANNER"
@@ -1132,12 +1070,12 @@ def main(config: InferenceConfig):
                     print("Press 'i' to send initial pose and switch to POSE mode")
                     if pause_loop:
                         print("Note: Policy loop is paused - press 'p' to resume")
-        elif key == "[":
+        elif command_name == "toggle_left_hand_initial_pose":
             initial_pose_left_hand_closed = not initial_pose_left_hand_closed
             print(
                 f"Initial pose left hand: {'closed' if initial_pose_left_hand_closed else 'open'}"
             )
-        elif key == "]":
+        elif command_name == "toggle_right_hand_initial_pose":
             initial_pose_right_hand_closed = not initial_pose_right_hand_closed
             print(
                 f"Initial pose right hand: "
@@ -1159,8 +1097,7 @@ def main(config: InferenceConfig):
             inference_stop_event,
             inference_busy_event,
             lambda: prepare_observation_from_sensors(
-                camera_subscriber=camera_subscriber,
-                state_subscriber=state_subscriber,
+                sensor_gateway=gateway_ingress,
                 robot_model=robot_model,
                 language_prompt=language_prompt_ref[0],
                 log_errors=True,
@@ -1179,7 +1116,7 @@ def main(config: InferenceConfig):
     try:
         while True:
             t_start = time.monotonic()
-            check_keyboard_input()
+            check_control_input()
 
             # Consume result first so last_inference_time is fresh before trigger check
             try:
@@ -1334,8 +1271,8 @@ def main(config: InferenceConfig):
         planner_relay_sub.close()
         zmq_socket.close()
         zmq_context.term()
-        state_subscriber.close()
-        keyboard_listener.close()
+        gateway_ingress.close()
+        control_listener.close()
         n1_policy.close()
         timing_publisher.close()
         print("Shutdown complete.")

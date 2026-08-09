@@ -35,7 +35,7 @@ def unpack_policy_message(payload: bytes) -> Any:
 
 
 class FakePolicyServer:
-    """Small compatible subset of Isaac-GR00T's REQ/REP PolicyServer."""
+    """Small compatible subset of the OpenPI REQ/REP policy server."""
 
     def __init__(
         self,

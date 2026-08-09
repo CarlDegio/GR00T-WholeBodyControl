@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from types import MappingProxyType, SimpleNamespace
+from types import MappingProxyType
 import threading
 import time
 
@@ -18,8 +18,6 @@ from gear_sonic.scripts.navdp_planner import (
     _extract_camera_frame,
     _gateway_camera_frame,
     _update_odometry_state,
-    livox_custom_points_to_numpy,
-    odometry_array_from_message,
 )
 
 
@@ -84,20 +82,6 @@ def _snapshot(
     )
 
 
-def _odometry_message(values: np.ndarray, stamp_s: int = 123) -> SimpleNamespace:
-    position = SimpleNamespace(x=values[0], y=values[1], z=values[2])
-    orientation = SimpleNamespace(
-        x=values[3], y=values[4], z=values[5], w=values[6]
-    )
-    linear = SimpleNamespace(x=values[7], y=values[8], z=values[9])
-    angular = SimpleNamespace(x=values[10], y=values[11], z=values[12])
-    return SimpleNamespace(
-        header=SimpleNamespace(stamp=SimpleNamespace(sec=stamp_s, nanosec=0)),
-        pose=SimpleNamespace(pose=SimpleNamespace(position=position, orientation=orientation)),
-        twist=SimpleNamespace(twist=SimpleNamespace(linear=linear, angular=angular)),
-    )
-
-
 def test_gateway_camera_builds_the_same_navdp_rgb_depth_and_intrinsics() -> None:
     rgb = np.arange(36, dtype=np.uint8).reshape(3, 4, 3)
     depth = np.arange(12, dtype=np.uint16).reshape(3, 4) + 100
@@ -133,22 +117,13 @@ def test_gateway_camera_builds_the_same_navdp_rgb_depth_and_intrinsics() -> None
     assert gateway.source_timestamp_s == pytest.approx(123.0)
 
 
-def test_gateway_odometry_uses_the_exact_legacy_vector_and_internal_pose() -> None:
+def test_gateway_odometry_updates_internal_pose() -> None:
     values = np.asarray(
         [1.0, -2.0, 0.4, 0.0, 0.0, 0.0, 1.0, 0.3, 0.0, 0.0, 0.0, 0.0, 0.2],
         dtype=np.float64,
     )
-    message = _odometry_message(values)
-    legacy_values = odometry_array_from_message(message)
-    legacy = _SharedSensors()
     gateway = _SharedSensors()
 
-    _update_odometry_state(
-        legacy,
-        legacy_values,
-        source_timestamp_s=123.0,
-        received_monotonic_s=10.0,
-    )
     _update_odometry_state(
         gateway,
         values.copy(),
@@ -156,22 +131,13 @@ def test_gateway_odometry_uses_the_exact_legacy_vector_and_internal_pose() -> No
         received_monotonic_s=10.0,
     )
 
-    np.testing.assert_array_equal(legacy_values, values)
-    assert gateway.pose == legacy.pose
-    assert gateway.pose_time == legacy.pose_time
-    assert list(gateway.pose_history) == list(legacy.pose_history)
-    np.testing.assert_array_equal(gateway.robot_history, legacy.robot_history)
-
-
-def test_gateway_lidar_array_is_identical_to_the_legacy_custom_message_array() -> None:
-    points = [
-        SimpleNamespace(x=1.0, y=0.2, z=-0.1),
-        SimpleNamespace(x=0.8, y=-0.4, z=0.3),
-    ]
-    legacy = livox_custom_points_to_numpy(SimpleNamespace(points=points))
-    gateway = np.asarray([[1.0, 0.2, -0.1], [0.8, -0.4, 0.3]], dtype=np.float32)
-
-    np.testing.assert_array_equal(gateway, legacy)
+    assert gateway.pose is not None
+    assert gateway.pose.x == pytest.approx(1.0)
+    assert gateway.pose.y == pytest.approx(-2.0)
+    assert gateway.pose.yaw == pytest.approx(0.0)
+    assert gateway.pose_time == pytest.approx(10.0)
+    assert list(gateway.pose_history) == [(123.0, gateway.pose)]
+    np.testing.assert_array_equal(gateway.robot_history, [[1.0, -2.0]])
 
 
 class _BlockingClient:

@@ -16,7 +16,6 @@ from gear_sonic.runtime.client import (
 from gear_sonic.runtime.control_client import (
     ControlGatewayIntentClient,
     ControlGatewaySubscriber,
-    legacy_message_from_operator_command,
 )
 from gear_sonic.runtime.contracts import (
     CommandAck,
@@ -32,8 +31,6 @@ from gear_sonic.runtime.control_gateway import (
     NavigationControlAction,
     NavigationControlState,
     RoutedControlCommand,
-    legacy_message_from_console_line,
-    operator_command_from_legacy,
 )
 from gear_sonic.runtime.diagnostics import (
     EndpointHealth,
@@ -98,8 +95,5 @@ __all__ = [
     "default_runtime_profile_path",
     "get_endpoint",
     "load_runtime_profile",
-    "legacy_message_from_console_line",
-    "legacy_message_from_operator_command",
-    "operator_command_from_legacy",
     "read_shared_memory_frame",
 ]

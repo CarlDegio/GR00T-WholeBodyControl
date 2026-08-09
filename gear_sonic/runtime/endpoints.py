@@ -62,9 +62,9 @@ def _build_endpoints() -> Mapping[str, EndpointSpec]:
     endpoints = (
         EndpointSpec(
             "policy_server",
-            5550,
+            29999,
             Transport.ZMQ,
-            "Isaac-GR00T PolicyServer",
+            "OpenPI policy server",
             ("run_vla_inference",),
             purpose="VLA observation request and action response",
         ),
@@ -73,7 +73,7 @@ def _build_endpoints() -> Mapping[str, EndpointSpec]:
             5555,
             Transport.ZMQ,
             "ComposedCamera server",
-            ("run_vla_inference", "LingBot Depth", "NavDP health monitor"),
+            ("SensorGateway",),
             purpose="Raw robot RGB-D and wrist camera streams",
         ),
         EndpointSpec(
@@ -89,7 +89,7 @@ def _build_endpoints() -> Mapping[str, EndpointSpec]:
             5557,
             Transport.ZMQ,
             "SONIC C++ deploy",
-            ("run_vla_inference", "data exporter"),
+            ("SensorGateway", "replay_sonic_zmq"),
             purpose="g1_debug and robot_config state topics",
         ),
         EndpointSpec(
@@ -125,14 +125,6 @@ def _build_endpoints() -> Mapping[str, EndpointSpec]:
             purpose="Completed chest depth ingress copied into shared memory",
         ),
         EndpointSpec(
-            "operator_keyboard_legacy",
-            5580,
-            Transport.ZMQ,
-            "SonicControlGateway legacy mirror",
-            ("run_vla_inference", "data exporter"),
-            purpose="Legacy unstructured keyboard events",
-        ),
-        EndpointSpec(
             "xnavdp_http",
             19999,
             Transport.HTTP,
@@ -145,7 +137,7 @@ def _build_endpoints() -> Mapping[str, EndpointSpec]:
             5560,
             Transport.ZMQ,
             "SonicSensorGateway",
-            ("future gateway clients",),
+            ("VLA", "NavDP", "LaViRA", "LingBot Depth", "data exporter"),
             purpose="Shared-memory snapshots, health, and readiness queries",
         ),
         EndpointSpec(
@@ -169,7 +161,7 @@ def _build_endpoints() -> Mapping[str, EndpointSpec]:
             5565,
             Transport.ZMQ,
             "SonicControlGateway",
-            ("future VLA, navigation, and data-exporter clients",),
+            ("VLA", "LaViRA", "LingBot Depth", "data exporter"),
             purpose="Validated structured control commands for consumers",
         ),
         EndpointSpec(

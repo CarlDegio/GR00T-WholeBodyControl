@@ -1,28 +1,8 @@
-"""
-All-in-one tmux launcher for SONIC VLA inference.
+"""All-in-one tmux launcher for SONIC VLA inference.
 
-Starts the inference stack in a single tmux session:
-
-    Window 0 — inference (4 panes):
-    ┌───────────────────────┬───────────────────────┐
-    │ Pane 0: C++ Deploy    │ Pane 1: VLA Inference │
-    │ (gear_sonic_deploy)   │ (.venv_inference)     │
-    ├───────────────────────┼───────────────────────┤
-    │ Pane 2: Keyboard Pub  │ Pane 3: Keyboard Planner │
-    │ (.venv_inference)     │ (.venv_inference)│
-    └───────────────────────┴───────────────────────┘
-
-    Window 1 — keyboard planner (only when --keyboard-planner is passed):
-    ┌─────────────────────────────────────────────────┐
-    │ Keyboard Planner (keyboard_planner_thread_server.py)│
-    │ (.venv_inference)                                 │
-    └─────────────────────────────────────────────────┘
-
-    Window 2 — sim  (only when --sim is passed):
-    ┌─────────────────────────────────────────────────┐
-    │ MuJoCo Simulator (run_sim_loop.py)              │
-    │ (.venv_sim)                                     │
-    └─────────────────────────────────────────────────┘
+The inference window always contains eight panes: C++ deploy, operator CLI,
+VLA, LaViRA, NavDP planner/server, SensorGateway, and ControlGateway. Simulation
+and data collection use optional additional windows.
 
 Prerequisites:
     - tmux installed (sudo apt install tmux)
@@ -30,7 +10,7 @@ Prerequisites:
         bash install_scripts/install_inference.sh     -> .venv_inference
         bash install_scripts/install_data_collection.sh -> .venv_data_collection (optional, for recording)
     - gear_sonic_deploy built (see docs)
-    - Isaac-GR00T PolicyServer running separately
+    - OpenPI policy server running separately
 
 Usage (from repo root — no venv activation needed):
     python gear_sonic/scripts/launch_inference.py                        # real robot
@@ -77,6 +57,8 @@ _bootstrap_venv()
 
 import tyro
 import yaml
+
+from gear_sonic.runtime.config import load_runtime_profile  # noqa: E402
 
 
 def default_launch_config_path() -> Path:
@@ -127,10 +109,10 @@ class InferenceLaunchConfig:
 
     # VLA inference options
     policy_host: str = "localhost"
-    """Isaac-GR00T PolicyServer host."""
+    """OpenPI policy server host."""
 
-    policy_port: int = 5550
-    """Isaac-GR00T PolicyServer port."""
+    policy_port: int = 29999
+    """OpenPI policy server port."""
 
     embodiment_tag: str = "unitree_g1_sonic"
     """Embodiment tag for policy inference."""
@@ -150,15 +132,6 @@ class InferenceLaunchConfig:
 
     camera_port: int = 5555
     """Camera server port."""
-
-    sensor_gateway: bool = True
-    """Start the read-only SensorGateway in a separate runtime window."""
-
-    sensor_shadow: bool = False
-    """Deprecated legacy comparison process; disabled to avoid duplicate decoding."""
-
-    control_gateway: bool = True
-    """Start the typed ControlGateway router and legacy compatibility mirror."""
 
     opencv_viewer: bool = True
     """Start the standalone OpenCV visualization process under the SensorGateway pane."""
@@ -180,18 +153,6 @@ class InferenceLaunchConfig:
 
     control_gateway_dispatch_port: int = 5565
     """Validated structured commands published to migrated consumers."""
-
-    keyboard_zmq_port: int = 5580
-    """Legacy keyboard mirror retained for existing VLA and exporter clients."""
-
-    vla_control_input: Literal["legacy", "gateway"] = "gateway"
-    """VLA operator-control source; legacy is retained as a rollback option."""
-
-    sensor_shadow_sample_hz: float = 2.0
-    """Low-rate legacy-versus-Gateway comparison frequency."""
-
-    vla_sensor_input: Literal["legacy", "gateway"] = "gateway"
-    """VLA sensor source; legacy is retained as a rollback option."""
 
     vla_sensor_gateway_poll_hz: float = 50.0
     """Background Gateway cache update rate used by VLA."""
@@ -250,9 +211,6 @@ class InferenceLaunchConfig:
     lavira_control_input: Literal["tty", "gateway"] = "gateway"
     """LaViRA navigation keys come from its own pane or ControlGateway."""
 
-    lavira_planner_hz: float = 20.0
-    """LaViRA velocity publication rate (Hz)."""
-
     lavira_camera_timeout_ms: int = 15000
     """LaViRA pure LingBot RGB-D receive timeout (ms)."""
 
@@ -271,35 +229,18 @@ class InferenceLaunchConfig:
     lavira_output_root: str = "outputs/object_nav"
     """Directory where LaViRA stores ObjectNav diagnostics."""
 
-    navdp_output_port: int = 5563
-    """NavDP planner publisher port consumed by VLA inference."""
-
     navdp_root: str = "/home/user/Project/NavDP/baselines/x-navdp"
     navdp_checkpoint: str = (
         "/home/user/Project/NavDP/baselines/x-navdp/checkpoints/x-navdp_posttrain.ckpt"
     )
-    navdp_port: int = 19999
     fastlio_workspace: str = "/home/user/Project/fastlio_humanoid_ws"
     livox_sdk_lib: str = "/home/user/Project/livox_sdk2_install/lib"
     fastlio_config: str = "mid360.yaml"
     lidar_ready_timeout: float = 30.0
     navigation_ready_timeout: float = 60.0
-    navdp_request_timeout_s: float = 10.0
-    navdp_sensor_input: Literal["legacy", "gateway"] = "gateway"
-    """NavDP sensor source; legacy remains available only as a rollback path."""
-
-    record_actorray: bool = False
-    """Record the NavDP ActorRay panel, including yellow trajectory points."""
-
-    actorray_output_dir: str = "outputs/navdp"
-    """Directory for finalized per-navigation ActorRay MP4 recordings."""
-
     # Data exporter (optional recording during inference)
     data_exporter: bool = True
     """Start the data exporter pane for recording during inference."""
-
-    data_exporter_frequency: int = 50
-    """Data collection frequency (Hz) for the data exporter."""
 
     record_chest_camera: bool = False
     """Record chest camera stream (chest_view) in the dataset."""
@@ -398,11 +339,16 @@ SESSION_NAME = "sonic_inference"
 LINGBOT_READY_FILE = Path("/tmp/sonic_lingbot_ready")
 
 
+def _runtime_profile(config: InferenceLaunchConfig):
+    return load_runtime_profile(config.config)
+
+
 def build_vla_inference_command(
     config: InferenceLaunchConfig,
     repo_root: Path,
 ) -> str:
     """Build VLA command with an explicit, manually selected sensor source."""
+    planner_relay_port = _runtime_profile(config).endpoint("planner_relay").port
     return (
         f"cd {shlex.quote(str(repo_root))} && "
         "source .venv_inference/bin/activate && "
@@ -413,9 +359,6 @@ def build_vla_inference_command(
         f"--prompt {shlex.quote(config.prompt)} "
         f"--action-publish-rate {config.action_publish_rate} "
         f"--action-horizon {config.action_horizon} "
-        f"--camera-host {shlex.quote(config.camera_host)} "
-        f"--camera-port {config.camera_port} "
-        f"--sensor-input {config.vla_sensor_input} "
         f"--sensor-gateway-endpoint tcp://127.0.0.1:{config.sensor_gateway_port} "
         f"--sensor-gateway-poll-hz {config.vla_sensor_gateway_poll_hz} "
         f"--sensor-gateway-request-timeout-ms "
@@ -423,12 +366,10 @@ def build_vla_inference_command(
         f"--sensor-gateway-max-age-ms {config.vla_sensor_gateway_max_age_ms} "
         f"--sensor-gateway-max-skew-ms {config.vla_sensor_gateway_max_skew_ms} "
         f"--timing-endpoint tcp://127.0.0.1:{config.vla_timing_port} "
-        f"--control-input {config.vla_control_input} "
         f"--control-gateway-endpoint tcp://127.0.0.1:"
         f"{config.control_gateway_dispatch_port} "
-        f"--keyboard-zmq-port {config.keyboard_zmq_port} "
         "--planner-relay-zmq-host localhost "
-        f"--planner-relay-zmq-port {config.navdp_output_port}"
+        f"--planner-relay-zmq-port {planner_relay_port}"
     )
 
 
@@ -436,19 +377,39 @@ def build_control_gateway_command(
     config: InferenceLaunchConfig,
     repo_root: Path,
 ) -> str:
-    """Build the unified console command while preserving the 5580 wire."""
+    """Build the typed ControlGateway router command."""
+    navigation_status_port = _runtime_profile(config).endpoint("navigation_status").port
 
     return (
         f"cd {shlex.quote(str(repo_root))} && "
         "source .venv_inference/bin/activate && "
         "python gear_sonic/scripts/run_control_gateway.py "
-        f"--legacy-port {config.keyboard_zmq_port} "
         f"--intent-port {config.control_gateway_intent_port} "
         f"--dispatch-port {config.control_gateway_dispatch_port} "
         f"--status-port {config.control_gateway_status_port} "
         f"--navigation-port {config.keyboard_planner_port} "
-        "--navigation-status-port 5559"
+        f"--navigation-status-port {navigation_status_port}"
     )
+
+
+def build_data_exporter_command(
+    config: InferenceLaunchConfig,
+    repo_root: Path,
+) -> str:
+    """Build DataExporter with runtime-profile Gateway inputs only."""
+    task_prompt = config.task_prompt or config.prompt
+    command = (
+        f"cd {shlex.quote(str(repo_root))} && "
+        "source .venv_data_collection/bin/activate && "
+        "python gear_sonic/scripts/run_data_exporter.py "
+        f"--profile {shlex.quote(config.config)} "
+        f"--task-prompt {shlex.quote(task_prompt)}"
+    )
+    if config.dataset_name:
+        command += f" --dataset-name {shlex.quote(config.dataset_name)}"
+    if config.record_chest_camera:
+        command += " --record-chest-camera"
+    return command
 
 
 def build_operator_console_command(
@@ -539,33 +500,56 @@ def build_lingbot_command(config: InferenceLaunchConfig, repo_root: Path) -> str
 
 
 def build_navdp_planner_command(config: InferenceLaunchConfig, repo_root: Path) -> str:
+    profile = _runtime_profile(config)
+    settings = profile.component("navdp")
     recording = (
-        f"--record-actorray --actorray-output-dir {shlex.quote(config.actorray_output_dir)} "
-        if config.record_actorray
+        "--record-actorray "
+        f"--actorray-output-dir {shlex.quote(str(settings['actorray_output_dir']))} "
+        f"--actorray-record-fps {settings['actorray_record_fps']} "
+        if settings["record_actorray"]
         else ""
     )
+    navigation_status = profile.endpoint("navigation_status")
+    planner_relay = profile.endpoint("planner_relay")
     return (
         "unset COLCON_CURRENT_PREFIX AMENT_PREFIX_PATH CMAKE_PREFIX_PATH; "
         "source /opt/ros/humble/setup.bash && "
         f"source {shlex.quote(config.fastlio_workspace)}/install/setup.bash && "
         f"cd {shlex.quote(str(repo_root))} && source .venv_teleop/bin/activate && "
         "python gear_sonic/scripts/navdp_planner.py "
-        f"--camera-host {shlex.quote(config.camera_host)} --camera-port {config.camera_port} "
-        f"--sensor-input {config.navdp_sensor_input} "
-        f"--sensor-gateway-endpoint tcp://127.0.0.1:{config.sensor_gateway_port} "
-        f"--navdp-server http://127.0.0.1:{config.navdp_port} "
-        f"--navdp-request-timeout-s {config.navdp_request_timeout_s} "
+        f"--command-endpoint {shlex.quote(profile.endpoint_uri('navigation_command'))} "
+        f"--status-endpoint {shlex.quote(f'tcp://*:{navigation_status.port}')} "
+        f"--output-endpoint {shlex.quote(f'tcp://*:{planner_relay.port}')} "
+        f"--sensor-gateway-endpoint "
+        f"{shlex.quote(profile.endpoint_uri('sensor_gateway_metadata'))} "
+        f"--navdp-server {shlex.quote(profile.endpoint_uri('xnavdp_http'))} "
+        f"--sensor-gateway-poll-hz {settings['sensor_gateway_poll_hz']} "
+        f"--sensor-gateway-request-timeout-ms "
+        f"{settings['sensor_gateway_request_timeout_ms']} "
+        f"--sensor-gateway-max-age-ms {settings['sensor_gateway_max_age_ms']} "
+        f"--sensor-gateway-max-skew-ms {settings['sensor_gateway_max_skew_ms']} "
+        f"--control-hz {settings['control_hz']} "
+        f"--mpc-hz {settings['mpc_hz']} "
+        f"--mpc-result-timeout-s {settings['mpc_result_timeout_s']} "
+        f"--heading-preview-s {settings['heading_preview_s']} "
+        f"--goal-tolerance-m {settings['goal_tolerance_m']} "
+        f"--navdp-stop-threshold {settings['stop_threshold']} "
+        f"--radar-timeout-s {settings['radar_timeout_s']} "
+        f"--odom-timeout-s {settings['odometry_timeout_s']} "
+        f"--trajectory-timeout-s {settings['trajectory_timeout_s']} "
+        f"--navdp-request-timeout-s {settings['request_timeout_s']} "
         f"--no-visualize --visualization-gateway-endpoint "
-        f"tcp://127.0.0.1:{config.sensor_gateway_visualization_port} "
+        f"{shlex.quote(profile.endpoint_uri('sensor_gateway_visualization_ingress'))} "
         f"{recording}"
     )
 
 
 def build_navdp_server_command(config: InferenceLaunchConfig) -> str:
+    navdp_port = _runtime_profile(config).endpoint("xnavdp_http").port
     return (
         f"cd {shlex.quote(config.navdp_root)} && "
         "conda run --no-capture-output -n navdp python -m eval.src.policy_server "
-        f"--port {config.navdp_port} --embodiment humanoid "
+        f"--port {navdp_port} --embodiment humanoid "
         f"--checkpoint {shlex.quote(config.navdp_checkpoint)} "
         "--device cuda:0 --real --no-visualization"
     )
@@ -668,32 +652,16 @@ def build_sensor_gateway_command(config: InferenceLaunchConfig, repo_root: Path)
     )
 
 
-def build_sensor_shadow_command(config: InferenceLaunchConfig, repo_root: Path) -> str:
-    ros_mode = "" if config.keyboard_planner and not config.sim else "--no-enable-ros "
-    return (
-        "unset COLCON_CURRENT_PREFIX AMENT_PREFIX_PATH CMAKE_PREFIX_PATH; "
-        "source /opt/ros/humble/setup.bash && "
-        f"source {shlex.quote(config.fastlio_workspace)}/install/setup.bash && "
-        f"cd {shlex.quote(str(repo_root))} && source .venv_teleop/bin/activate && "
-        f"PYTHONPATH={shlex.quote(str(repo_root))}:$PYTHONPATH "
-        "python gear_sonic/scripts/run_sensor_gateway_shadow.py "
-        f"--gateway-port {config.sensor_gateway_port} "
-        f"--camera-host {shlex.quote(config.camera_host)} "
-        f"--camera-port {config.camera_port} "
-        f"--sample-hz {config.sensor_shadow_sample_hz} "
-        f"{ros_mode}"
-    )
-
-
 def run_readiness_gate(
     config: InferenceLaunchConfig, repo_root: Path, stage: Literal["lidar", "navigation"]
 ) -> bool:
+    navdp_endpoint = _runtime_profile(config).endpoint("xnavdp_http")
     timeout = (
         config.lidar_ready_timeout if stage == "lidar" else config.navigation_ready_timeout
     )
     gateway_requirement = (
         f"--require-sensor-gateway --sensor-gateway-port {config.sensor_gateway_port} "
-        if stage == "navigation" and config.navdp_sensor_input == "gateway"
+        if stage == "navigation"
         else ""
     )
     command = (
@@ -704,7 +672,8 @@ def run_readiness_gate(
         f"python gear_sonic/scripts/navdp_readiness_gate.py --stage {stage} "
         f"--timeout {timeout} "
         f"--camera-host {shlex.quote(config.camera_host)} --camera-port {config.camera_port} "
-        f"--navdp-host 127.0.0.1 --navdp-port {config.navdp_port} "
+        f"--navdp-host {shlex.quote(navdp_endpoint.host)} "
+        f"--navdp-port {navdp_endpoint.port} "
         f"{gateway_requirement}"
     )
     return subprocess.run(
@@ -731,25 +700,6 @@ def _dotenv_has_nonempty_value(path: Path, name: str) -> bool:
 def _check_prerequisites(config: InferenceLaunchConfig):
     """Verify that required tools and venvs exist."""
     errors = []
-
-    if config.sensor_shadow and not config.sensor_gateway:
-        errors.append("--sensor-shadow requires --sensor-gateway")
-    if (
-        config.keyboard_planner
-        and config.navdp_sensor_input == "gateway"
-        and not config.sensor_gateway
-    ):
-        errors.append("--navdp-sensor-input gateway requires --sensor-gateway")
-    if config.vla_sensor_input == "gateway" and not config.sensor_gateway:
-        errors.append("--vla-sensor-input gateway requires --sensor-gateway")
-    if config.vla_control_input == "gateway" and not config.control_gateway:
-        errors.append("--vla-control-input gateway requires --control-gateway")
-    if (
-        config.planner_input == "lavira"
-        and config.lavira_control_input == "gateway"
-        and not config.control_gateway
-    ):
-        errors.append("--lavira-control-input gateway requires --control-gateway")
 
     if not shutil.which("tmux"):
         errors.append("tmux is not installed. Install with: sudo apt install tmux")
@@ -964,19 +914,14 @@ def main(config: InferenceLaunchConfig):
     print(f"  Action rate:     {config.action_publish_rate} Hz")
     print(f"  Action horizon:  {config.action_horizon}")
     print(f"  Camera:          {config.camera_host}:{config.camera_port}")
-    print(f"  Sensor gateway:  {'Yes' if config.sensor_gateway else 'No'}")
-    print(f"  Sensor shadow:   {'Yes' if config.sensor_shadow else 'No'}")
     print(f"  Data exporter:   {'Yes' if config.data_exporter else 'No'}")
     if config.data_exporter:
-        print(f"    DC frequency:  {config.data_exporter_frequency} Hz")
         print(f"    Task prompt:   {exporter_prompt}")
         print(f"    Chest camera:  {'Yes' if config.record_chest_camera else 'No'}")
     print(f"  PC IP:           {_get_local_ip()}")
     print("=" * 60)
 
-    runtime_pane_count = int(config.sensor_gateway) + int(
-        config.sensor_gateway and config.sensor_shadow
-    ) + int(config.control_gateway)
+    runtime_pane_count = 2
     pane_ids = _create_tmux_session(6 + runtime_pane_count)
     print(f"Created tmux session: {SESSION_NAME}")
 
@@ -1032,36 +977,25 @@ def main(config: InferenceLaunchConfig):
     if not _check_pane_alive(pane_ids[0]):
         print("WARNING: C++ deploy pane may have failed to start.")
 
-    # Start the two Gateway boundaries before their clients. Structured
-    # consumers remain opt-in; ControlGateway mirrors the deployed 5580 wire.
+    # Start the two mandatory Gateway boundaries before their clients.
     runtime_panes = pane_ids[6:]
     runtime_index = 0
-    if config.sensor_gateway:
-        print(
-            "Starting SensorGateway with background ROS/OpenCV/LingBot services "
-            f"(pane {6 + runtime_index})..."
-        )
-        _send_to_pane(
-            runtime_panes[runtime_index],
-            build_sensor_gateway_command(config, repo_root),
-            wait=1.0,
-        )
-        runtime_index += 1
-        if config.sensor_shadow:
-            print(f"Starting legacy/Gateway sensor shadow (pane {6 + runtime_index})...")
-            _send_to_pane(
-                runtime_panes[runtime_index],
-                build_sensor_shadow_command(config, repo_root),
-                wait=1.0,
-            )
-            runtime_index += 1
-    if config.control_gateway:
-        print(f"Starting ControlGateway router (pane {6 + runtime_index})...")
-        _send_to_pane(
-            runtime_panes[runtime_index],
-            build_control_gateway_command(config, repo_root),
-            wait=1.0,
-        )
+    print(
+        "Starting SensorGateway with background ROS/OpenCV/LingBot services "
+        f"(pane {6 + runtime_index})..."
+    )
+    _send_to_pane(
+        runtime_panes[runtime_index],
+        build_sensor_gateway_command(config, repo_root),
+        wait=1.0,
+    )
+    runtime_index += 1
+    print(f"Starting ControlGateway router (pane {6 + runtime_index})...")
+    _send_to_pane(
+        runtime_panes[runtime_index],
+        build_control_gateway_command(config, repo_root),
+        wait=1.0,
+    )
 
     # --- Pane 2: VLA Inference ---
     inference_cmd = build_vla_inference_command(config, repo_root)
@@ -1110,19 +1044,7 @@ def main(config: InferenceLaunchConfig):
         subprocess.run(
             ["tmux", "new-window", "-t", SESSION_NAME, "-n", "data_exporter"],
         )
-        exporter_cmd = (
-            f"cd {repo_root} && "
-            f"source .venv_data_collection/bin/activate && "
-            f"python gear_sonic/scripts/run_data_exporter.py "
-            f"--task-prompt '{exporter_prompt}' "
-            f"--data-collection-frequency {config.data_exporter_frequency} "
-            f"--camera-host {config.camera_host} "
-            f"--camera-port {config.camera_port}"
-        )
-        if config.dataset_name:
-            exporter_cmd += f" --dataset-name '{config.dataset_name}'"
-        if config.record_chest_camera:
-            exporter_cmd += " --record-chest-camera"
+        exporter_cmd = build_data_exporter_command(config, repo_root)
         subprocess.run(
             ["tmux", "send-keys", "-t", f"{SESSION_NAME}:data_exporter", exporter_cmd, "C-m"],
         )
@@ -1151,14 +1073,9 @@ def main(config: InferenceLaunchConfig):
     print("    Pane 4: NavDP Continuous Planner + Safety")
     print("    Pane 5: NavDP Server")
     runtime_label_index = 6
-    if config.sensor_gateway:
-        print(f"    Pane {runtime_label_index}: Read-only SensorGateway")
-        runtime_label_index += 1
-        if config.sensor_shadow:
-            print(f"    Pane {runtime_label_index}: Legacy/Gateway Sensor Shadow")
-            runtime_label_index += 1
-    if config.control_gateway:
-        print(f"    Pane {runtime_label_index}: ControlGateway Router")
+    print(f"    Pane {runtime_label_index}: Read-only SensorGateway")
+    runtime_label_index += 1
+    print(f"    Pane {runtime_label_index}: ControlGateway Router")
     if config.data_exporter:
         print("    Window 'data_exporter':")
         print("      Data Exporter (.venv_data_collection)")

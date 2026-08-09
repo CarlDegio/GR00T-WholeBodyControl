@@ -18,6 +18,12 @@ Starts the full data collection stack in a single tmux session:
     │ (.venv_sim)                                     │
     └─────────────────────────────────────────────────┘
 
+    Window — gateways:
+    ┌────────────────────────┬────────────────────────┐
+    │ SensorGateway          │ ControlGateway         │
+    │ camera/state/config    │ typed recording input  │
+    └────────────────────────┴────────────────────────┘
+
 Prerequisites:
     - tmux installed (sudo apt install tmux)
     - Virtual environments set up:
@@ -35,6 +41,7 @@ Usage (from repo root — no venv activation needed):
 from dataclasses import dataclass
 from pathlib import Path
 import os
+import shlex
 import shutil
 import signal
 import socket
@@ -132,8 +139,10 @@ class DataCollectionLaunchConfig:
     dataset_name: str = ""
     """Dataset name for the data exporter. Leave empty to auto-generate from timestamp."""
 
-    data_exporter_frequency: int = 50
-    """Data collection frequency (Hz) for the data exporter."""
+    runtime_profile: str = str(
+        Path(__file__).resolve().parent.parent / "config" / "launch_inference.yaml"
+    )
+    """Runtime profile used by SensorGateway, ControlGateway, and DataExporter."""
 
     record_wrist_cameras: bool = False
     """Record wrist camera streams (left_wrist, right_wrist) in the dataset."""
@@ -149,10 +158,10 @@ class DataCollectionLaunchConfig:
     """Start the camera viewer pane."""
 
     camera_host: str = "localhost"
-    """Camera server host (shared by data exporter and viewer)."""
+    """Camera server host used by SensorGateway and the direct viewer."""
 
     camera_port: int = 5555
-    """Camera server port (shared by data exporter and viewer)."""
+    """Camera server port used by SensorGateway and the direct viewer."""
 
 
 SESSION_NAME = "sonic_data_collection"
@@ -291,7 +300,6 @@ def main(config: DataCollectionLaunchConfig):
     if config.deploy_checkpoint:
         print(f"  Checkpoint:      {config.deploy_checkpoint}")
     print(f"  Camera:          {config.camera_host}:{config.camera_port}")
-    print(f"  DC frequency:    {config.data_exporter_frequency} Hz")
     print(f"  Camera viewer:   {'Yes' if config.camera_viewer else 'No'}")
     print(f"  Wrist cameras:   {'Yes' if config.record_wrist_cameras else 'No'}")
     print(f"  Chest camera:    {'Yes' if config.record_chest_camera else 'No'}")
@@ -302,6 +310,61 @@ def main(config: DataCollectionLaunchConfig):
 
     _create_tmux_session()
     print(f"Created tmux session: {SESSION_NAME}")
+
+    # Gateway window: DataExporter has no direct camera/state/control sockets.
+    subprocess.run(
+        ["tmux", "new-window", "-t", SESSION_NAME, "-n", "gateways"],
+        check=True,
+    )
+    subprocess.run(
+        ["tmux", "split-window", "-h", "-t", f"{SESSION_NAME}:gateways"],
+        check=True,
+    )
+    profile_arg = shlex.quote(config.runtime_profile)
+    sensor_gateway_cmd = (
+        f"cd {shlex.quote(str(repo_root))} && "
+        "source .venv_teleop/bin/activate && "
+        "python gear_sonic/scripts/run_sensor_gateway.py "
+        f"--profile {profile_arg} "
+        f"--camera-host {shlex.quote(config.camera_host)} "
+        f"--camera-port {config.camera_port} "
+        "--no-enable-lingbot-depth --no-enable-ros "
+        "--no-enable-visualization --no-enable-vla-timing"
+    )
+    control_gateway_cmd = (
+        f"cd {shlex.quote(str(repo_root))} && "
+        "source .venv_teleop/bin/activate && "
+        "python gear_sonic/scripts/run_control_gateway.py "
+        f"--profile {profile_arg}"
+    )
+    subprocess.run(
+        [
+            "tmux",
+            "send-keys",
+            "-t",
+            f"{SESSION_NAME}:gateways.0",
+            sensor_gateway_cmd,
+            "C-m",
+        ],
+        check=True,
+    )
+    subprocess.run(
+        [
+            "tmux",
+            "send-keys",
+            "-t",
+            f"{SESSION_NAME}:gateways.1",
+            control_gateway_cmd,
+            "C-m",
+        ],
+        check=True,
+    )
+    print("Starting SensorGateway and ControlGateway (window: gateways)...")
+    time.sleep(2.0)
+    subprocess.run(
+        ["tmux", "select-window", "-t", f"{SESSION_NAME}:data_collection"],
+        check=True,
+    )
 
     # --- Window 1 (sim only): MuJoCo Simulator ---
     if config.sim:
@@ -388,16 +451,14 @@ def main(config: DataCollectionLaunchConfig):
 
     # --- Pane 1 (top-right): Data Exporter ---
     exporter_cmd = (
-        f"cd {repo_root} && "
-        f"source .venv_data_collection/bin/activate && "
-        f"python gear_sonic/scripts/run_data_exporter.py "
-        f"--task-prompt '{config.task_prompt}' "
-        f"--data-collection-frequency {config.data_exporter_frequency} "
-        f"--camera-host {config.camera_host} "
-        f"--camera-port {config.camera_port}"
+        f"cd {shlex.quote(str(repo_root))} && "
+        "source .venv_data_collection/bin/activate && "
+        "python gear_sonic/scripts/run_data_exporter.py "
+        f"--profile {profile_arg} "
+        f"--task-prompt {shlex.quote(config.task_prompt)}"
     )
     if config.dataset_name:
-        exporter_cmd += f" --dataset-name '{config.dataset_name}'"
+        exporter_cmd += f" --dataset-name {shlex.quote(config.dataset_name)}"
     if config.record_wrist_cameras:
         exporter_cmd += " --record-wrist-cameras"
     if config.record_chest_camera:
@@ -429,6 +490,7 @@ def main(config: DataCollectionLaunchConfig):
     print("    Pane 2 (top-right):    Data Exporter  <-- you are here")
     if config.camera_viewer:
         print("    Pane 3 (bottom-right): Camera Viewer")
+    print("  Window 'gateways': SensorGateway | ControlGateway")
     print()
     print("  ** deploy.sh (pane 0) is waiting for confirmation —")
     print("     click on pane 0 and press Enter to proceed **")
