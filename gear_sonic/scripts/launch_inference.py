@@ -491,7 +491,7 @@ def build_lingbot_command(config: InferenceLaunchConfig, repo_root: Path) -> str
         f"PYTHONPATH={quoted_root} {quoted_root}/.venv_lingbot_depth/bin/python "
         "gear_sonic/scripts/run_lingbot_depth_viewer.py "
         f"--sensor-gateway-endpoint tcp://127.0.0.1:{config.sensor_gateway_port} "
-        f"--publish-port {config.lavira_depth_port} --ready-file $ready_file "
+        f"--publish-port {config.lavira_depth_port} --ready-file {ready_file} "
         "--no-visualize --visualization-gateway-endpoint "
         f"tcp://127.0.0.1:{config.sensor_gateway_visualization_port} "
         "--control-gateway-endpoint tcp://127.0.0.1:"

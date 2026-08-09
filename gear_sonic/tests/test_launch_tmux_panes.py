@@ -217,6 +217,8 @@ def test_lingbot_uses_control_gateway_for_pose_planner_gpu_gating() -> None:
     assert "run_lingbot_depth_viewer.py" in command
     assert "run_lingbot_depth_viewer.py" not in planner_command
     assert "sonic_lingbot_ready" in planner_command
+    assert "--ready-file /tmp/sonic_lingbot_ready" in command
+    assert "$ready_file" not in command
     assert "--sensor-gateway-endpoint tcp://127.0.0.1:5560" in command
     assert "run_lingbot_depth_viewer.py --camera-host" not in command
     assert "--control-gateway-endpoint tcp://127.0.0.1:5565" in command
