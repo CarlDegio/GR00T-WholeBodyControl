@@ -39,8 +39,8 @@ def test_runtime_queue_dependency_is_imported_at_module_scope() -> None:
     assert navdp_planner.queue is queue
 
 
-def test_navdp_goal_tolerance_is_one_meter() -> None:
-    assert navdp_planner.NavDPPlannerConfig().goal_tolerance_m == pytest.approx(1.0)
+def test_navdp_goal_tolerance_matches_production_profile() -> None:
+    assert navdp_planner.NavDPPlannerConfig().goal_tolerance_m == pytest.approx(0.5)
 
 
 def test_navdp_runs_unthrottled_inference_with_ten_hz_mpc() -> None:

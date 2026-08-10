@@ -578,6 +578,16 @@ def build_fastlio_command(config: InferenceLaunchConfig) -> str:
     )
 
 
+def build_fastlio_supervisor_command(config: InferenceLaunchConfig) -> str:
+    return (
+        "python gear_sonic/scripts/run_fastlio_supervisor.py "
+        f"--profile {shlex.quote(config.config)} "
+        f"--config-file {shlex.quote(config.fastlio_config)} "
+        "--control-gateway-endpoint tcp://127.0.0.1:"
+        f"{config.control_gateway_intent_port}"
+    )
+
+
 def build_slam_debug_command(config: InferenceLaunchConfig) -> str:
     """Record the raw inputs and outputs needed to replay a FAST-LIO failure."""
     profile = _runtime_profile(config)
@@ -639,8 +649,7 @@ def build_sensor_gateway_command(config: InferenceLaunchConfig, repo_root: Path)
                 ),
                 (
                     "fastlio_pid",
-                    "ros2 launch fast_lio mapping.launch.py "
-                    f"config_file:={shlex.quote(config.fastlio_config)} rviz:=false",
+                    build_fastlio_supervisor_command(config),
                     fastlio_log,
                 ),
             )

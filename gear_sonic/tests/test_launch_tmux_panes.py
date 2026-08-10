@@ -16,6 +16,7 @@ from gear_sonic.scripts.launch_inference import (
     _dotenv_has_nonempty_value,
     _parse_pane_ids,
     build_fastlio_command,
+    build_fastlio_supervisor_command,
     build_slam_debug_command,
     build_control_gateway_command,
     build_data_exporter_command,
@@ -83,7 +84,7 @@ def test_yaml_contains_every_launch_parameter() -> None:
     assert loaded.lavira_mission == "blue basket"
     assert loaded.lavira_global_target == "blue basket"
     assert loaded.lavira_vision_backend == "qwenvl"
-    assert loaded.slam_debug is False
+    assert loaded.slam_debug is True
 
 
 def test_launcher_defaults_match_current_endpoint_inventory() -> None:
@@ -179,6 +180,7 @@ def test_navdp_stack_commands_use_ros_topics_and_official_xnavdp_server() -> Non
     server = build_navdp_server_command(config)
     livox = build_livox_command(config)
     fastlio = build_fastlio_command(config)
+    fastlio_supervisor = build_fastlio_supervisor_command(config)
 
     assert "navdp_planner.py" in planner
     assert "--sensor-input" not in planner
@@ -189,7 +191,7 @@ def test_navdp_stack_commands_use_ros_topics_and_official_xnavdp_server() -> Non
     assert "--navdp-request-timeout-s 10.0" in planner
     assert "--control-hz 20.0" in planner
     assert "--mpc-hz 10.0" in planner
-    assert "--goal-tolerance-m 1.0" in planner
+    assert "--goal-tolerance-m 0.5" in planner
     assert "--output-endpoint 'tcp://*:5563'" in planner
     assert "source /opt/ros/humble/setup.bash" in planner
     assert config.navdp_root == "/home/user/Project/NavDP/baselines/x-navdp"
@@ -202,6 +204,9 @@ def test_navdp_stack_commands_use_ros_topics_and_official_xnavdp_server() -> Non
     assert "msg_MID360_launch.py" in livox
     assert "mapping.launch.py" in fastlio
     assert "rviz:=false" in fastlio
+    assert "run_fastlio_supervisor.py" in fastlio_supervisor
+    assert "--config-file mid360.yaml" in fastlio_supervisor
+    assert "--control-gateway-endpoint tcp://127.0.0.1:5561" in fastlio_supervisor
     assert "mid360_reasan_open3d.py" not in " ".join((planner, server, livox, fastlio))
 
 
@@ -253,7 +258,8 @@ def test_runtime_sidecars_are_read_only_and_navdp_uses_gateway_by_default() -> N
     assert "run_lingbot_depth_viewer.py" in gateway
     assert "/tmp/sonic_lingbot.log" in gateway
     assert "msg_MID360_launch.py" in gateway
-    assert "mapping.launch.py" in gateway
+    assert "run_fastlio_supervisor.py" in gateway
+    assert "--control-gateway-endpoint tcp://127.0.0.1:5561" in gateway
     assert "/tmp/sonic_livox_driver.log" in gateway
     assert "/tmp/sonic_fastlio.log" in gateway
     assert "ros2 bag record" not in gateway

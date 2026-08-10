@@ -120,6 +120,14 @@ components:
   control_gateway:
     command_ttl_ms: 1000
     heartbeat_hz: 2.0
+  slam_recovery:
+    # Normal NavDP motion is capped at 0.3 m/s and 0.8 rad/s. These limits only
+    # catch estimator motion that is clearly outside the commanded envelope.
+    startup_grace_s: 5.0
+    max_planar_speed_m_s: 1.5
+    max_position_step_m: 1.0
+    max_yaw_rate_rad_s: 2.5
+    consecutive_samples: 3
 launch_inference:
   sim: false
   deploy_input_type: zmq_manager
@@ -175,7 +183,7 @@ launch_inference:
   livox_sdk_lib: /home/user/Project/livox_sdk2_install/lib
   fastlio_config: mid360.yaml
   # Preserve raw LiDAR/IMU plus FAST-LIO odometry/cloud in outputs/slam_debug/.
-  slam_debug: false
+  slam_debug: true
   lidar_ready_timeout: 30.0
   navigation_ready_timeout: 60.0
   data_exporter: false
