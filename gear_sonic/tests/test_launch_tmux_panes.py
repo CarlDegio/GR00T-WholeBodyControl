@@ -16,6 +16,7 @@ from gear_sonic.scripts.launch_inference import (
     _dotenv_has_nonempty_value,
     _parse_pane_ids,
     build_fastlio_command,
+    build_slam_debug_command,
     build_control_gateway_command,
     build_data_exporter_command,
     build_operator_console_command,
@@ -82,6 +83,7 @@ def test_yaml_contains_every_launch_parameter() -> None:
     assert loaded.lavira_mission == "blue basket"
     assert loaded.lavira_global_target == "blue basket"
     assert loaded.lavira_vision_backend == "qwenvl"
+    assert loaded.slam_debug is False
 
 
 def test_launcher_defaults_match_current_endpoint_inventory() -> None:
@@ -254,6 +256,7 @@ def test_runtime_sidecars_are_read_only_and_navdp_uses_gateway_by_default() -> N
     assert "mapping.launch.py" in gateway
     assert "/tmp/sonic_livox_driver.log" in gateway
     assert "/tmp/sonic_fastlio.log" in gateway
+    assert "ros2 bag record" not in gateway
     assert "--camera-host 192.168.123.164" in gateway
     assert "--rpc-port 5560" in gateway
     assert "PYTHONPATH=/workspace/sonic:$PYTHONPATH" in gateway
@@ -262,6 +265,27 @@ def test_runtime_sidecars_are_read_only_and_navdp_uses_gateway_by_default() -> N
     assert "--sensor-input" not in planner
     assert "--sensor-gateway-endpoint tcp://127.0.0.1:5560" in planner
     assert "run_sensor_gateway" not in planner
+
+
+def test_slam_debug_records_raw_inputs_and_fastlio_outputs_per_run() -> None:
+    config = InferenceLaunchConfig(slam_debug=True)
+    root = Path("/workspace/sonic")
+
+    recorder = build_slam_debug_command(config)
+    gateway = build_sensor_gateway_command(config, root)
+
+    assert 'ros2 bag record -o "$slam_debug_dir/rosbag"' in recorder
+    assert "/livox/lidar" in recorder
+    assert "/livox/imu" in recorder
+    assert "/Odometry_loc" in recorder
+    assert "/cloud_registered_1" in recorder
+    assert "outputs/slam_debug/$(date +%Y%m%d_%H%M%S_%N)" in gateway
+    assert "[SLAM debug] recording to $slam_debug_dir" in gateway
+    assert '>"$slam_debug_dir/livox_driver.log"' in gateway
+    assert '>"$slam_debug_dir/fastlio.log"' in gateway
+    assert '>"$slam_debug_dir/rosbag.log"' in gateway
+    assert "/tmp/sonic_livox_driver.log" not in gateway
+    assert "/tmp/sonic_fastlio.log" not in gateway
 
 
 def test_vla_uses_only_gateway_inputs_and_preserves_control_endpoints() -> None:

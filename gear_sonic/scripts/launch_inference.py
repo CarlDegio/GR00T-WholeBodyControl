@@ -236,6 +236,9 @@ class InferenceLaunchConfig:
     fastlio_workspace: str = "/home/user/Project/fastlio_humanoid_ws"
     livox_sdk_lib: str = "/home/user/Project/livox_sdk2_install/lib"
     fastlio_config: str = "mid360.yaml"
+    slam_debug: bool = False
+    """Record raw LiDAR/IMU and FAST-LIO outputs for each real-robot run."""
+
     lidar_ready_timeout: float = 30.0
     navigation_ready_timeout: float = 60.0
     # Data exporter (optional recording during inference)
@@ -575,6 +578,14 @@ def build_fastlio_command(config: InferenceLaunchConfig) -> str:
     )
 
 
+def build_slam_debug_command(config: InferenceLaunchConfig) -> str:
+    """Record the raw inputs and outputs needed to replay a FAST-LIO failure."""
+    profile = _runtime_profile(config)
+    topic_roles = ("lidar", "lidar_imu", "odometry", "registered_cloud")
+    topics = " ".join(shlex.quote(profile.ros_topics[role]) for role in topic_roles)
+    return f'ros2 bag record -o "$slam_debug_dir/rosbag" {topics}'
+
+
 def build_sensor_gateway_command(config: InferenceLaunchConfig, repo_root: Path) -> str:
     ros_mode = "" if config.keyboard_planner and not config.sim else "--no-enable-ros "
     setup = (
@@ -594,20 +605,43 @@ def build_sensor_gateway_command(config: InferenceLaunchConfig, repo_root: Path)
         f"--vla-timing-port {config.vla_timing_port} "
         f"{ros_mode}"
     )
+    ros_stack_enabled = config.keyboard_planner and not config.sim
+    slam_debug_enabled = config.slam_debug and ros_stack_enabled
+    slam_debug_setup = ""
+    livox_log = "/tmp/sonic_livox_driver.log"
+    fastlio_log = "/tmp/sonic_fastlio.log"
+    if slam_debug_enabled:
+        debug_root = shlex.quote(str(repo_root / "outputs" / "slam_debug"))
+        slam_debug_setup = (
+            f"slam_debug_dir={debug_root}/$(date +%Y%m%d_%H%M%S_%N); "
+            'mkdir -p "$slam_debug_dir"; '
+            'echo "[SLAM debug] recording to $slam_debug_dir"; '
+        )
+        livox_log = '"$slam_debug_dir/livox_driver.log"'
+        fastlio_log = '"$slam_debug_dir/fastlio.log"'
+
     background_commands: list[tuple[str, str, str]] = []
-    if config.keyboard_planner and not config.sim:
+    if ros_stack_enabled:
+        if slam_debug_enabled:
+            background_commands.append(
+                (
+                    "slam_debug_pid",
+                    build_slam_debug_command(config),
+                    '"$slam_debug_dir/rosbag.log"',
+                )
+            )
         background_commands.extend(
             (
                 (
                     "livox_pid",
                     "ros2 launch livox_ros_driver2 msg_MID360_launch.py",
-                    "/tmp/sonic_livox_driver.log",
+                    livox_log,
                 ),
                 (
                     "fastlio_pid",
                     "ros2 launch fast_lio mapping.launch.py "
                     f"config_file:={shlex.quote(config.fastlio_config)} rviz:=false",
-                    "/tmp/sonic_fastlio.log",
+                    fastlio_log,
                 ),
             )
         )
@@ -643,6 +677,7 @@ def build_sensor_gateway_command(config: InferenceLaunchConfig, repo_root: Path)
     pid_names = " ".join(f"${pid_name}" for pid_name, _, _ in background_commands)
     return (
         setup
+        + slam_debug_setup
         + ready_file_setup
         + launch_background
         + gateway
@@ -989,6 +1024,8 @@ def main(config: InferenceLaunchConfig):
         build_sensor_gateway_command(config, repo_root),
         wait=1.0,
     )
+    if config.slam_debug and config.keyboard_planner and not config.sim:
+        print("SLAM/IMU debug recording: outputs/slam_debug/<launch timestamp>/")
     runtime_index += 1
     print(f"Starting ControlGateway router (pane {6 + runtime_index})...")
     _send_to_pane(
