@@ -103,6 +103,19 @@ def test_renderer_rejects_artifact_path_escape(tmp_path) -> None:
         render_review_samples(run_dir)
 
 
+def test_renderer_rejects_absolute_artifact_path(tmp_path) -> None:
+    run_dir = synthetic_sampled_run(tmp_path)
+    jsonl = run_dir / "raw_servo_frames.jsonl"
+    rows = [json.loads(line) for line in jsonl.read_text().splitlines()]
+    rows[0]["review_artifacts"]["raw_rgb"] = str(
+        run_dir / "review_samples/raw/000000.png"
+    )
+    jsonl.write_text("\n".join(json.dumps(row) for row in rows) + "\n")
+
+    with pytest.raises(ValueError, match="must be relative"):
+        render_review_samples(run_dir)
+
+
 def test_renderer_returns_empty_for_legacy_log(tmp_path) -> None:
     run_dir = tmp_path / "legacy"
     run_dir.mkdir()

@@ -35,6 +35,8 @@ def _atomic_write_bytes(path: Path, contents: bytes) -> None:
 
 
 def _resolve_artifact(run_dir: Path, relative: str, description: str) -> Path:
+    if Path(relative).is_absolute():
+        raise ValueError(f"{description} must be relative to run directory")
     candidate = (run_dir / relative).resolve()
     try:
         candidate.relative_to(run_dir)
