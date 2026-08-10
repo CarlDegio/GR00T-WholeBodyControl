@@ -105,3 +105,35 @@ Diagnostics for each request are written below
 `outputs/base_pose_adjustment/<timestamp>/`. Global cancellation/failure events
 that occur before a request directory is known are appended to
 `outputs/base_pose_adjustment/runtime_events.jsonl`.
+
+For lightweight offline review, raw YOLOE runs also sample review artifacts in
+this per-run layout:
+
+```text
+review_samples/
+  raw/
+    000000.png
+    000005.png
+  masks/
+    000000_target.png
+    000000_table.png
+    000005_target.png
+review_reconstructed/
+  000000.jpg
+  000005.jpg
+```
+
+The default stride of five is about 2 Hz at the 10 Hz detector rate. A
+20-second 640x480 run is expected to add roughly 12--18 MB. To replay the most
+recently modified raw-YOLOE run after it has finished, use:
+
+```bash
+source .venv_inference/bin/activate
+RUN_DIR="$(find outputs/base_pose_adjustment -maxdepth 1 -type d \
+  -name 'raw_yoloe_*' -printf '%T@ %p\n' | sort -nr | sed -n '1s/^[^ ]* //p')"
+test -n "$RUN_DIR"
+python gear_sonic/scripts/replay_raw_yoloe_servo.py "$RUN_DIR"
+```
+
+This post-run-only script writes reconstructed images under
+`review_reconstructed/`; it never starts YOLOE or sends control commands.
