@@ -56,7 +56,7 @@ components:
     mpc_hz: 10.0
     mpc_result_timeout_s: 0.3
     heading_preview_s: 0.6
-    goal_tolerance_m: 1.0
+    goal_tolerance_m: 0.5
     stop_threshold: -4.0
     request_timeout_s: 10.0
     sensor_gateway_poll_hz: 20.0
