@@ -141,6 +141,19 @@ def test_prompt_requires_point_three_meter_minimum_and_indirect_small_correction
         "theta is an estimated geometric quantity used for scene reasoning "
         "and is not itself a motion command."
     ) in prompt
+    assert (
+        "primary_target should identify the blue plastic basket as the primary "
+        "manipulation target."
+    ) in prompt
+    assert (
+        "interaction_direction should describe the desired body-forward direction "
+        "facing the manipulation region. When the relevant table edge can be "
+        "identified, this direction should be approximately perpendicular to the "
+        "table edge and directed toward the manipulation region."
+    ) in prompt
+    assert (
+        "Do not output direct lateral movement.\n\n## Rotation Constraints"
+    ) in prompt
 
 
 def test_validator_accepts_exact_two_degree_and_point_one_meter_minima() -> None:
@@ -668,6 +681,7 @@ def test_runner_selects_qwenvl_plus_backend(
             vision_backend="qwenvl",
             qwenvl_model="qwen3-vl-plus",
             qwenvl_base_url="https://dashscope.example/v1",
+            qwenvl_thinking_budget=2048,
             codex_timeout_seconds=123.0,
         ),
         camera=FakeCamera(snapshot(depth=False)),  # type: ignore[arg-type]
@@ -678,6 +692,7 @@ def test_runner_selects_qwenvl_plus_backend(
         "model": "qwen3-vl-plus",
         "base_url": "https://dashscope.example/v1",
         "timeout_seconds": 123.0,
+        "thinking_budget": 2048,
     }
 
 

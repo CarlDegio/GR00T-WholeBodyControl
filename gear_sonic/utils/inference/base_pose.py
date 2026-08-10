@@ -257,6 +257,7 @@ class BasePoseConfig:
     model: str = "gpt-5.6-sol"
     qwenvl_model: str = DEFAULT_QWENVL_PLUS_MODEL
     qwenvl_base_url: str = DEFAULT_QWENVL_BASE_URL
+    qwenvl_thinking_budget: int = 500
     reasoning_effort: str = "max"
     codex_fast: bool = True
     camera_host: str = "localhost"
@@ -779,9 +780,9 @@ Because no depth image or complete camera calibration is provided, all distances
 
 Do not claim that the estimated motion values are geometrically exact.
 
-If the blue plastic basket cannot be identified, return UNSURE.
+If the main target cannot be identified, return UNSURE.
 
-If the relevant table edge or required interaction direction cannot be reasonably inferred, return UNSURE.
+If the required interaction direction cannot be reasonably inferred, return UNSURE.
 
 If the required movement cannot be reasonably inferred from the image, return UNSURE.
 
@@ -835,13 +836,13 @@ Use the following format:
 
 ## Field Interpretation
 
-primary_target should identify the blue plastic basket as the primary manipulation target.
+primary_target should identify  the primary manipulation target.
 
-secondary_targets should identify the two paper balls and any other task-relevant objects.
+secondary_targets should identify other task-relevant objects.
 
-manipulation_anchor should identify a task-relevant alignment anchor on the primary manipulation target. For the current task, the center of the blue plastic basket should normally be used as the manipulation anchor.
+manipulation_anchor should identify a task-relevant alignment anchor on the primary manipulation target.
 
-interaction_direction should describe the desired body-forward direction facing the manipulation region. When the relevant table edge can be identified, this direction should be approximately perpendicular to the table edge and directed toward the manipulation region.
+interaction_direction should describe the desired body-forward direction facing the manipulation region. 
 
 horizontal_position describes the robot's estimated lateral position relative to the manipulation region after accounting for the estimated orientation correction theta, rather than simply describing the raw image position of the manipulation anchor.
 
@@ -1405,6 +1406,7 @@ class BasePoseRunner:
                 model=config.qwenvl_model,
                 base_url=config.qwenvl_base_url,
                 timeout_seconds=config.codex_timeout_seconds,
+                thinking_budget=config.qwenvl_thinking_budget,
             )
         else:
             self.client = CodexStructuredVisionClient(

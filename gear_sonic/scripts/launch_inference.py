@@ -183,6 +183,9 @@ class InferenceLaunchConfig:
     )
     """DashScope OpenAI-compatible endpoint used by BasePose."""
 
+    base_pose_qwenvl_thinking_budget: int = 500
+    """Maximum Qwen-VL reasoning-token budget per inference call."""
+
     base_pose_reasoning_effort: str = "max"
     """Reasoning effort passed to the base-pose model."""
 
@@ -365,6 +368,8 @@ def _base_pose_planner_command(config: InferenceLaunchConfig, repo_root: Path) -
         vision_backend += (
             f"--qwenvl-model {shlex.quote(config.base_pose_qwenvl_model)} "
             f"--qwenvl-base-url {shlex.quote(config.base_pose_qwenvl_base_url)} "
+            f"--qwenvl-thinking-budget "
+            f"{config.base_pose_qwenvl_thinking_budget} "
         )
     codex_fast = "" if config.base_pose_codex_fast else "--no-codex-fast "
     planner = (
@@ -946,7 +951,8 @@ def main(config: InferenceLaunchConfig):
         codex_fast = "on" if config.base_pose_codex_fast else "off"
         print(
             f"    Pane 3: Base Pose Planner ({config.base_pose_mode}, "
-            f"backend={config.base_pose_vision_backend}, codex_fast={codex_fast})"
+            f"backend={config.base_pose_vision_backend}, codex_fast={codex_fast}, "
+            f"qwenvl_thinking_budget={config.base_pose_qwenvl_thinking_budget})"
         )
     else:
         print("    Pane 3: REASEN Keyboard")

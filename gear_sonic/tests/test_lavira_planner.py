@@ -228,6 +228,7 @@ def test_base_pose_can_select_qwenvl_plus_backend() -> None:
         base_pose_vision_backend="qwenvl",
         base_pose_qwenvl_model="qwen3-vl-plus",
         base_pose_qwenvl_base_url="https://dashscope.example/v1",
+        base_pose_qwenvl_thinking_budget=2048,
         base_pose_rotation_scale=1.25,
         base_pose_translation_scale=0.75,
     )
@@ -237,6 +238,7 @@ def test_base_pose_can_select_qwenvl_plus_backend() -> None:
     assert "--vision-backend qwenvl" in command
     assert "--qwenvl-model qwen3-vl-plus" in command
     assert "--qwenvl-base-url https://dashscope.example/v1" in command
+    assert "--qwenvl-thinking-budget 2048" in command
     assert "--rotation-scale 1.25" in command
     assert "--translation-scale 0.75" in command
     assert ".venv_inference/bin/python" in command

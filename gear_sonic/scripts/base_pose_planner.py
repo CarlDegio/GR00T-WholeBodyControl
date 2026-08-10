@@ -42,6 +42,7 @@ class BasePosePlannerConfig:
     qwenvl_base_url: str = (
         "https://dashscope-intl.aliyuncs.com/compatible-mode/v1"
     )
+    qwenvl_thinking_budget: int = 500
     reasoning_effort: str = "max"
     codex_fast: bool = True
     host: str = "*"
@@ -585,6 +586,7 @@ def _runner_factory(config: BasePosePlannerConfig) -> BasePoseRunner:
             model=config.model,
             qwenvl_model=config.qwenvl_model,
             qwenvl_base_url=config.qwenvl_base_url,
+            qwenvl_thinking_budget=config.qwenvl_thinking_budget,
             reasoning_effort=config.reasoning_effort,
             codex_fast=config.codex_fast,
             camera_host=config.camera_host,
@@ -636,6 +638,7 @@ def main(config: BasePosePlannerConfig) -> None:
         print(
             f"[BasePose] PUB bound to {endpoint}; mode={config.mode}; "
             f"backend={config.vision_backend}; codex_fast={codex_fast}; "
+            f"qwenvl_thinking_budget={config.qwenvl_thinking_budget}; "
             f"task={config.task!r}"
         )
         print("[BasePose] N plan | Space cancel-and-stop | X stop-and-exit")
