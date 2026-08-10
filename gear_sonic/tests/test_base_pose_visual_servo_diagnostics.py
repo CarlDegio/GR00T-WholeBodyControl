@@ -3,10 +3,19 @@
 from __future__ import annotations
 
 import json
+import math
 
 import cv2
 import numpy as np
 
+from gear_sonic.scripts.base_pose_planner import BasePosePlannerConfig
+from gear_sonic.utils.inference.base_pose_visual_servo import (
+    RawServoEvent,
+    RawServoObservation,
+    RawServoRuntime,
+    TableGeometry,
+    TargetGeometry,
+)
 from gear_sonic.utils.inference.base_pose_visual_servo_diagnostics import (
     DetectionFrameData,
     FrameDiagnosticsWriter,
@@ -165,3 +174,63 @@ def test_sampled_frame_records_null_for_missing_table_mask(tmp_path) -> None:
     assert review["raw_rgb"] == "review_samples/raw/000005.png"
     assert review["target_mask"] == "review_samples/masks/000005_target.png"
     assert review["table_mask"] is None
+
+
+def test_sampled_png_failure_hard_stops_visual_servo(tmp_path, monkeypatch) -> None:
+    def fail_encode_png(*_args, **_kwargs) -> bytes:
+        raise OSError("injected review PNG failure")
+
+    monkeypatch.setattr(
+        FrameDiagnosticsWriter, "_encode_png", staticmethod(fail_encode_png)
+    )
+    messages: list[str] = []
+    runtime = RawServoRuntime(
+        BasePosePlannerConfig(task="align", output_root=str(tmp_path)),
+        publish=messages.append,
+        logger=lambda _: None,
+    )
+    assert runtime.handle_key("n", now=1.0) == "started"
+    output_dir = tmp_path / "run"
+    output_dir.mkdir()
+
+    accepted = runtime.accept_event(
+        RawServoEvent(
+            generation=1,
+            kind="initialized",
+            output_dir=str(output_dir),
+            frame=diagnostic_frame(0, include_table=True),
+            observation=RawServoObservation(
+                camera_timestamp=0.0,
+                target=TargetGeometry(
+                    forward_m=0.6,
+                    right_m=0.0,
+                    body_xyz_m=(0.6, 0.0, 0.8),
+                    valid_depth_pixels=1000,
+                    valid_ratio=1.0,
+                    median_depth_m=1.0,
+                ),
+                table=TableGeometry(
+                    yaw_error_rad=math.radians(20.0),
+                    line_length_m=0.7,
+                    inlier_count=200,
+                    residual_m=0.005,
+                    line_center_xy_m=(1.0, 0.0),
+                ),
+                target_track_id=11,
+                surface_track_id=22,
+                target_bbox_xyxy=(24.0, 12.0, 44.0, 32.0),
+                image_width=64,
+            ),
+        ),
+        now=1.1,
+    )
+
+    assert accepted
+    assert runtime.phase == "idle"
+    assert runtime.controller.terminal_reason == (
+        "diagnostic write failed: injected review PNG failure"
+    )
+    assert len(messages) == 4
+    assert all("\"vx\":0.0" in message for message in messages[-3:])
+    assert all("\"vy\":0.0" in message for message in messages[-3:])
+    assert all("\"wz\":0.0" in message for message in messages[-3:])
