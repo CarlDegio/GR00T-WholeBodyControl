@@ -1185,7 +1185,6 @@ class VisualServoController:
     def reset(self, now: float) -> None:
         self.start_time = float(now)
         self.last_update_time = float(now)
-        self.last_raw_target: tuple[float, float] | None = None
         self.filtered: np.ndarray | None = None
         self.current = ServoCommand(0.0, 0.0, 0.0, self.command_ttl_s)
         self.phase = ServoPhase.YAW_ALIGN
@@ -1306,14 +1305,6 @@ class VisualServoController:
 
     def _update_filter(self, observation: RawServoObservation) -> tuple[float, float, float]:
         raw_target = (observation.target.forward_m, observation.target.right_m)
-        if self.last_raw_target is not None:
-            jump = math.hypot(
-                raw_target[0] - self.last_raw_target[0],
-                raw_target[1] - self.last_raw_target[1],
-            )
-            if jump > 0.15:
-                raise ValueError("target position jump")
-        self.last_raw_target = raw_target
         yaw_sample = (
             observation.table.yaw_error_rad
             if observation.table is not None
@@ -1348,10 +1339,7 @@ class VisualServoController:
         limited = self._check_limits(now)
         if limited is not None:
             return limited
-        try:
-            forward_error, right_error, yaw_error = self._update_filter(observation)
-        except ValueError as exc:
-            return self.note_invalid(str(exc), hard=False, now=now, integrated=True)
+        forward_error, right_error, yaw_error = self._update_filter(observation)
 
         if (
             self.phase is not ServoPhase.VERTICAL_RECENTER

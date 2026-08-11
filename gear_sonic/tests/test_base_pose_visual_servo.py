@@ -794,6 +794,25 @@ def test_controller_holds_zero_until_thirtieth_missing_frame() -> None:
     assert controller.terminal_reason == "tracking lost: target absent"
 
 
+def test_large_valid_target_position_change_resets_tracking_loss_streak() -> None:
+    controller = VisualServoController()
+    controller.reset(1.0)
+    controller.phase = ServoPhase.TRANSLATE_TARGET
+    controller.update(observation(forward=1.0), now=1.1)
+
+    for index in range(29):
+        controller.note_invalid(
+            "missing tracked target", hard=False, now=1.2 + 0.1 * index
+        )
+
+    command = controller.update(observation(forward=1.30), now=4.1)
+
+    assert controller.last_errors[0] == pytest.approx(0.305)
+    assert command.velocity != (0.0, 0.0, 0.0)
+    assert controller.invalid_frames == 0
+    assert controller.terminal_reason is None
+
+
 def test_valid_target_resets_missing_frame_streak_and_resumes_motion() -> None:
     controller = VisualServoController()
     controller.reset(1.0)
