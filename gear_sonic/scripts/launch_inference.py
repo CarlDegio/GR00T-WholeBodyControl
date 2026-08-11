@@ -163,7 +163,9 @@ class InferenceLaunchConfig:
     planner_input: Literal["keyboard", "lavira", "base_pose"] = "keyboard"
     """SONIC planner command source used in pane 3."""
 
-    base_pose_mode: Literal["rgb", "rgbd", "rgb_depth_query"] = "rgb"
+    base_pose_mode: Literal[
+        "rgb", "rgbd", "rgb_depth_query", "raw_yoloe_servo"
+    ] = "rgb"
     """Head-vision input experiment used by the base-pose planner."""
 
     base_pose_vision_backend: Literal["codex", "qwenvl"] = "codex"
@@ -186,7 +188,7 @@ class InferenceLaunchConfig:
     base_pose_qwenvl_thinking_budget: int = 500
     """Maximum Qwen-VL reasoning-token budget per inference call."""
 
-    base_pose_reasoning_effort: str = "max"
+    base_pose_reasoning_effort: str = "xhigh"
     """Reasoning effort passed to the base-pose model."""
 
     base_pose_codex_fast: bool = True
@@ -198,10 +200,10 @@ class InferenceLaunchConfig:
     base_pose_camera_height_m: float = 1.2
     """Head camera optical-center height above the ground (m)."""
 
-    base_pose_camera_pitch_deg: float = -47.6
+    base_pose_camera_pitch_deg: float = -25.0
     """Head camera optical-axis pitch under the positive-upward convention."""
 
-    base_pose_vertical_fov_deg: float = 55.2
+    base_pose_vertical_fov_deg: float = 43.077882
     """Full head-camera vertical field of view."""
 
     base_pose_camera_forward_offset_m: float = 0.0
@@ -209,6 +211,38 @@ class InferenceLaunchConfig:
 
     base_pose_camera_lateral_offset_m: float = 0.0
     """Configured camera optical-center left/right offset from the base."""
+
+    base_pose_camera_roll_deg: float = 0.0
+    """Approximate head-camera roll relative to the robot body."""
+
+    base_pose_camera_yaw_deg: float = 0.0
+    """Approximate head-camera yaw relative to the robot body."""
+
+    base_pose_raw_yoloe_model_path: str = (
+        "tools/yoloe26m/weights/yoloe-26m-seg.pt"
+    )
+    """Local YOLOE-26M segmentation checkpoint for raw visual servo."""
+
+    base_pose_raw_target_distance_m: float = 0.80
+    """Desired raw-depth target standoff for closed-loop alignment."""
+
+    base_pose_raw_forward_tolerance_m: float = 0.10
+    """Raw-servo forward completion tolerance in meters."""
+
+    base_pose_raw_lateral_tolerance_m: float = 0.10
+    """Raw-servo lateral completion tolerance in meters."""
+
+    base_pose_raw_max_lateral_speed_m_s: float = 0.16
+    """Maximum raw-servo request and final relay lateral speed in m/s."""
+
+    base_pose_raw_horizontal_guard_fraction: float = 0.25
+    """Raw-servo side protection margin; 0.25 means enter outside 25--75%."""
+
+    base_pose_raw_horizontal_recovery_fraction: float = 0.30
+    """Raw-servo recovery margin; 0.30 means resume inside 30--70%."""
+
+    base_pose_orientation_telemetry_port: int = 5565
+    """Local relay-to-raw-servo measured-yaw telemetry port."""
 
     base_pose_depth_port: int = 5564
     """Local pure LingBot RGB-D stream used by the two depth modes."""
@@ -393,14 +427,31 @@ def _base_pose_planner_command(config: InferenceLaunchConfig, repo_root: Path) -
         f"--camera-stream {shlex.quote(config.base_pose_camera_stream)} "
         f"--camera-height-m {config.base_pose_camera_height_m} "
         f"--camera-pitch-deg {config.base_pose_camera_pitch_deg} "
+        f"--camera-roll-deg {config.base_pose_camera_roll_deg} "
+        f"--camera-yaw-deg {config.base_pose_camera_yaw_deg} "
         f"--vertical-fov-deg {config.base_pose_vertical_fov_deg} "
         f"--camera-forward-offset-m {config.base_pose_camera_forward_offset_m} "
         f"--camera-lateral-offset-m {config.base_pose_camera_lateral_offset_m} "
         f"--depth-visual-max-m {config.base_pose_depth_visual_max_m} "
         f"--codex-timeout-seconds {config.base_pose_codex_timeout_seconds} "
-        f"--output-root {shlex.quote(config.base_pose_output_root)}"
+        f"--output-root {shlex.quote(config.base_pose_output_root)} "
+        f"--raw-yoloe-model-path "
+        f"{shlex.quote(config.base_pose_raw_yoloe_model_path)} "
+        f"--raw-target-distance-m {config.base_pose_raw_target_distance_m} "
+        f"--raw-forward-tolerance-m "
+        f"{config.base_pose_raw_forward_tolerance_m} "
+        f"--raw-lateral-tolerance-m "
+        f"{config.base_pose_raw_lateral_tolerance_m} "
+        f"--raw-max-lateral-speed-m-s "
+        f"{config.base_pose_raw_max_lateral_speed_m_s} "
+        f"--raw-horizontal-guard-fraction "
+        f"{config.base_pose_raw_horizontal_guard_fraction} "
+        f"--raw-horizontal-recovery-fraction "
+        f"{config.base_pose_raw_horizontal_recovery_fraction} "
+        f"--raw-orientation-telemetry-source "
+        f"tcp://127.0.0.1:{config.base_pose_orientation_telemetry_port}"
     )
-    if config.base_pose_mode == "rgb":
+    if config.base_pose_mode in {"rgb", "raw_yoloe_servo"}:
         return (
             f"cd {quoted_root} && "
             f"{planner} --camera-host {shlex.quote(config.camera_host)} "
@@ -497,12 +548,20 @@ def build_planner_input_command(config: InferenceLaunchConfig, repo_root: Path) 
 def build_reasan_planner_command(config: InferenceLaunchConfig, repo_root: Path) -> str:
     """Build rule-based safety or a direct planner-input-to-SONIC relay."""
     if config.planner_input == "base_pose":
+        orientation_telemetry = (
+            f" --orientation-telemetry-output "
+            f"'tcp://*:{config.base_pose_orientation_telemetry_port}'"
+            if config.base_pose_mode == "raw_yoloe_servo"
+            else ""
+        )
         return (
             f"cd {shlex.quote(str(repo_root))} && "
             f"source .venv_teleop/bin/activate && "
             f"python gear_sonic/scripts/lavira_sonic_relay.py "
             f"--source tcp://127.0.0.1:{config.keyboard_planner_port} "
-            f"--output 'tcp://*:{config.reasan_planner_port}' --hz 20"
+            f"--output 'tcp://*:{config.reasan_planner_port}' --hz 20 "
+            f"--max-lateral-speed-m-s {config.base_pose_raw_max_lateral_speed_m_s}"
+            f"{orientation_telemetry}"
         )
     common = (
         f"cd {repo_root} && "
@@ -562,7 +621,7 @@ def _check_prerequisites(config: InferenceLaunchConfig):
                 "--base-pose-task or --prompt is required when --planner-input base_pose"
             )
         if (
-            config.base_pose_mode != "rgb"
+            config.base_pose_mode not in {"rgb", "raw_yoloe_servo"}
             and not (repo_root / ".venv_lingbot_depth" / "bin" / "python").exists()
         ):
             errors.append(

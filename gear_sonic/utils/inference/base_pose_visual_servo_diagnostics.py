@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 import json
-from typing import Any, Mapping
+import queue
+import threading
+from typing import Any, Callable, Mapping
 
 import cv2
 import numpy as np
@@ -48,14 +50,12 @@ def _phase_name(value: Any) -> str | None:
 
 
 class FrameDiagnosticsWriter:
-    """Write one JSONL record and one annotated JPEG for every camera frame."""
+    """Write frame telemetry and sampled source artifacts for offline review."""
 
     def __init__(self, output_dir: str | Path, *, review_stride: int = 5):
         if review_stride <= 0:
             raise ValueError("review_stride must be positive")
         self.output_dir = Path(output_dir).resolve()
-        self.frames_dir = self.output_dir / "frames"
-        self.frames_dir.mkdir(parents=True, exist_ok=True)
         self.jsonl_path = self.output_dir / "raw_servo_frames.jsonl"
         self.review_stride = int(review_stride)
         self.review_raw_dir = self.output_dir / "review_samples" / "raw"
@@ -123,12 +123,18 @@ class FrameDiagnosticsWriter:
         return {
             "phase": _phase_name(value.get("phase")),
             "resume_phase": _phase_name(value.get("resume_phase")),
+            "vertical_resume_phase": _phase_name(
+                value.get("vertical_resume_phase")
+            ),
             "transition_reason": value.get("transition_reason"),
             "filtered_errors": value.get("filtered_errors"),
             "invalid_frames": value.get("invalid_frames"),
             "stable_frames": value.get("stable_frames"),
             "yaw_stable_frames": value.get("yaw_stable_frames"),
             "recenter_stable_frames": value.get("recenter_stable_frames"),
+            "vertical_recenter_stable_frames": value.get(
+                "vertical_recenter_stable_frames"
+            ),
         }
 
     @staticmethod
@@ -140,108 +146,28 @@ class FrameDiagnosticsWriter:
             "duration_s": float(value.get("duration_s", 0.0)),
         }
 
-    @staticmethod
-    def _blend_mask(image: np.ndarray, mask: np.ndarray | None, color: tuple[int, int, int]) -> None:
-        if mask is None or mask.shape != image.shape[:2]:
-            return
-        selected = mask.astype(bool)
-        image[selected] = (
-            image[selected].astype(np.float32) * 0.58
-            + np.asarray(color, dtype=np.float32) * 0.42
-        ).astype(np.uint8)
-
-    @staticmethod
-    def _draw_box(
-        image: np.ndarray,
-        bbox: tuple[float, float, float, float] | None,
-        color: tuple[int, int, int],
-        label: str,
-    ) -> None:
-        if bbox is None:
-            return
-        x1, y1, x2, y2 = (int(round(item)) for item in bbox)
-        cv2.rectangle(image, (x1, y1), (x2, y2), color, 2)
-        cv2.putText(
-            image,
-            label,
-            (max(0, x1), max(14, y1 - 5)),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.48,
-            color,
-            1,
-            cv2.LINE_AA,
-        )
-
-    def _annotate(
-        self,
-        frame: DetectionFrameData,
-        controller: Mapping[str, Any],
-        command: Mapping[str, float],
-    ) -> np.ndarray:
-        image = cv2.cvtColor(np.asarray(frame.rgb), cv2.COLOR_RGB2BGR)
-        self._blend_mask(image, frame.surface_mask, (190, 70, 30))
-        self._blend_mask(image, frame.target_mask, (40, 190, 40))
-        self._draw_box(
-            image,
-            frame.surface_bbox_xyxy,
-            (255, 130, 50),
-            f"table id={frame.surface_track_id}",
-        )
-        self._draw_box(
-            image,
-            frame.target_bbox_xyxy,
-            (30, 255, 30),
-            f"target id={frame.target_track_id}",
-        )
-        height, width = image.shape[:2]
-        for fraction, color in (
-            (0.08, (30, 30, 255)),
-            (0.43, (0, 180, 255)),
-            (0.50, (255, 255, 255)),
-            (0.57, (0, 180, 255)),
-            (0.92, (30, 30, 255)),
-        ):
-            x = int(round(width * fraction))
-            cv2.line(image, (x, 0), (x, height - 1), color, 1)
-        errors = controller.get("filtered_errors")
-        error_text = "errors=null"
-        if errors is not None and len(errors) == 3:
-            error_text = "e f/r/y=" + "/".join(f"{float(item):+.3f}" for item in errors)
-        lines = (
-            f"frame={frame.frame_index} phase={controller.get('phase')} kind={frame.perception_kind}",
-            error_text,
-            f"cmd vx/vy/wz={command['vx']:+.3f}/{command['vy']:+.3f}/{command['wz']:+.3f}",
-        )
-        if frame.perception_error:
-            lines += (f"error={frame.perception_error}",)
-        for index, line in enumerate(lines):
-            origin = (6, 18 + index * 18)
-            cv2.putText(image, line, origin, cv2.FONT_HERSHEY_SIMPLEX, 0.46, (0, 0, 0), 3, cv2.LINE_AA)
-            cv2.putText(image, line, origin, cv2.FONT_HERSHEY_SIMPLEX, 0.46, (255, 255, 255), 1, cv2.LINE_AA)
-        return image
-
     def write(
         self,
         frame: DetectionFrameData,
         *,
-        controller_state: Mapping[str, Any],
-        command: Mapping[str, Any],
+        controller_state: Mapping[str, Any] | None,
+        command: Mapping[str, Any] | None,
+        control_applied: bool = True,
+        orientation: Mapping[str, Any] | None = None,
     ) -> None:
-        controller = self._controller(controller_state)
-        normalized_command = self._command(command)
+        applied = bool(control_applied)
+        if applied and (controller_state is None or command is None):
+            raise ValueError("applied diagnostic frame requires control metadata")
+        controller = None if not applied else self._controller(controller_state)
+        normalized_command = None if not applied else self._command(command)
         review_artifacts = self._write_review_artifacts(frame)
-        image = self._annotate(frame, controller, normalized_command)
-        ok, encoded = cv2.imencode(".jpg", image, [cv2.IMWRITE_JPEG_QUALITY, 90])
-        if not ok:
-            raise OSError(f"failed to encode diagnostic frame {frame.frame_index}")
-        image_name = f"{int(frame.frame_index):06d}.jpg"
-        _atomic_write_bytes(self.frames_dir / image_name, encoded.tobytes())
         record = {
             "frame_index": int(frame.frame_index),
             "camera_timestamp": float(frame.camera_timestamp),
             "perception_kind": frame.perception_kind,
             "perception_error": frame.perception_error,
-            "annotated_image": f"frames/{image_name}",
+            "control_applied": applied,
+            "annotated_image": None,
             "review_artifacts": review_artifacts,
             "detections": {
                 "target": self._detection(
@@ -264,7 +190,226 @@ class FrameDiagnosticsWriter:
             },
             "controller": controller,
             "command": normalized_command,
+            "orientation": None if orientation is None else dict(orientation),
         }
         with self.jsonl_path.open("a", encoding="utf-8") as handle:
             handle.write(json.dumps(record, ensure_ascii=False, allow_nan=False) + "\n")
             handle.flush()
+
+
+@dataclass(frozen=True)
+class _ProducedFrame:
+    generation: int
+    output_dir: Path
+    frame: DetectionFrameData
+
+
+@dataclass(frozen=True)
+class _ControlDecision:
+    generation: int
+    frame_index: int
+    control_applied: bool
+    controller_state: Mapping[str, Any] | None
+    command: Mapping[str, Any] | None
+    orientation: Mapping[str, Any] | None
+
+
+@dataclass(frozen=True)
+class _CloseWriter:
+    drain: bool
+
+
+def _owned_frame(frame: DetectionFrameData) -> DetectionFrameData:
+    return replace(
+        frame,
+        rgb=np.asarray(frame.rgb).copy(),
+        target_mask=(
+            None if frame.target_mask is None else np.asarray(frame.target_mask).copy()
+        ),
+        surface_mask=(
+            None if frame.surface_mask is None else np.asarray(frame.surface_mask).copy()
+        ),
+        target_geometry=(
+            None if frame.target_geometry is None else dict(frame.target_geometry)
+        ),
+        table_geometry=(
+            None if frame.table_geometry is None else dict(frame.table_geometry)
+        ),
+    )
+
+
+class AsyncFrameDiagnosticsWriter:
+    """Join produced frames with control decisions and write them off-thread."""
+
+    def __init__(
+        self,
+        *,
+        logger: Callable[[str], None] = print,
+        writer_factory: Callable[[str | Path], FrameDiagnosticsWriter] = (
+            FrameDiagnosticsWriter
+        ),
+    ):
+        self.logger = logger
+        self.writer_factory = writer_factory
+        self._items: queue.Queue[object] = queue.Queue()
+        self._submit_lock = threading.Lock()
+        self._closed = False
+        self._frames: dict[tuple[int, int], _ProducedFrame] = {}
+        self._decisions: dict[tuple[int, int], _ControlDecision] = {}
+        self._next_index: dict[int, int] = {}
+        self._writers: dict[int, FrameDiagnosticsWriter] = {}
+        self._disabled: set[int] = set()
+        self._thread = threading.Thread(
+            target=self._run,
+            name="raw-servo-diagnostics",
+            daemon=True,
+        )
+        self._thread.start()
+
+    def submit_frame(
+        self,
+        generation: int,
+        output_dir: str | Path,
+        frame: DetectionFrameData,
+    ) -> None:
+        item = _ProducedFrame(
+            int(generation),
+            Path(output_dir).resolve(),
+            _owned_frame(frame),
+        )
+        with self._submit_lock:
+            if self._closed:
+                raise RuntimeError("diagnostic writer is closed")
+            self._items.put_nowait(item)
+
+    def submit_decision(
+        self,
+        generation: int,
+        frame_index: int,
+        *,
+        control_applied: bool,
+        controller_state: Mapping[str, Any] | None,
+        command: Mapping[str, Any] | None,
+        orientation: Mapping[str, Any] | None = None,
+    ) -> None:
+        item = _ControlDecision(
+            int(generation),
+            int(frame_index),
+            bool(control_applied),
+            None if controller_state is None else dict(controller_state),
+            None if command is None else dict(command),
+            None if orientation is None else dict(orientation),
+        )
+        with self._submit_lock:
+            if self._closed:
+                raise RuntimeError("diagnostic writer is closed")
+            self._items.put_nowait(item)
+
+    def close(self, *, drain: bool = True) -> None:
+        with self._submit_lock:
+            if self._closed:
+                return
+            self._closed = True
+            self._items.put_nowait(_CloseWriter(bool(drain)))
+        self._thread.join()
+
+    def _discard_generation(self, generation: int) -> None:
+        self._frames = {
+            key: value
+            for key, value in self._frames.items()
+            if key[0] != generation
+        }
+        self._decisions = {
+            key: value
+            for key, value in self._decisions.items()
+            if key[0] != generation
+        }
+        self._next_index.pop(generation, None)
+        self._writers.pop(generation, None)
+
+    def _disable(self, generation: int, output_dir: Path, exc: Exception) -> None:
+        if generation not in self._disabled:
+            self._disabled.add(generation)
+            self.logger(
+                "[RawServo] WARNING diagnostics disabled for "
+                f"{output_dir}: {exc}"
+            )
+        self._discard_generation(generation)
+
+    def _write(
+        self, produced: _ProducedFrame, decision: _ControlDecision
+    ) -> bool:
+        generation = produced.generation
+        if generation in self._disabled:
+            return False
+        try:
+            writer = self._writers.get(generation)
+            if writer is None:
+                writer = self.writer_factory(produced.output_dir)
+                self._writers[generation] = writer
+            writer.write(
+                produced.frame,
+                control_applied=decision.control_applied,
+                controller_state=decision.controller_state,
+                command=decision.command,
+                orientation=decision.orientation,
+            )
+            return True
+        except Exception as exc:
+            self._disable(generation, produced.output_dir, exc)
+            return False
+
+    def _flush_ready(self, generation: int) -> None:
+        next_index = self._next_index.setdefault(generation, 0)
+        while generation not in self._disabled:
+            key = (generation, next_index)
+            produced = self._frames.get(key)
+            decision = self._decisions.get(key)
+            if produced is None or decision is None:
+                return
+            self._frames.pop(key, None)
+            self._decisions.pop(key, None)
+            if not self._write(produced, decision):
+                return
+            next_index += 1
+            self._next_index[generation] = next_index
+
+    def _drain_pending(self) -> None:
+        for key in list(self._frames):
+            if key not in self._decisions:
+                self._decisions[key] = _ControlDecision(
+                    key[0], key[1], False, None, None, None
+                )
+        generations = sorted({key[0] for key in self._frames})
+        for generation in generations:
+            if generation in self._disabled:
+                continue
+            for key in sorted(
+                (key for key in self._frames if key[0] == generation),
+                key=lambda value: value[1],
+            ):
+                produced = self._frames.pop(key)
+                decision = self._decisions.pop(key)
+                if not self._write(produced, decision):
+                    break
+
+    def _run(self) -> None:
+        while True:
+            item = self._items.get()
+            if isinstance(item, _CloseWriter):
+                if item.drain:
+                    self._drain_pending()
+                return
+            if isinstance(item, _ProducedFrame):
+                if item.generation in self._disabled:
+                    continue
+                key = (item.generation, int(item.frame.frame_index))
+                self._frames[key] = item
+                self._flush_ready(item.generation)
+                continue
+            if isinstance(item, _ControlDecision):
+                if item.generation in self._disabled:
+                    continue
+                key = (item.generation, item.frame_index)
+                self._decisions[key] = item
+                self._flush_ready(item.generation)

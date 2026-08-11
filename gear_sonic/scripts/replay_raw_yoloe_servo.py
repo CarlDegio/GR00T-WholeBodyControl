@@ -156,8 +156,8 @@ def render_review_samples(
         _draw_detection(
             image, detections.get("target", {}), (30, 255, 30), "target"
         )
-        controller = row.get("controller", {})
-        command = row.get("command", {})
+        controller = row.get("controller") or {}
+        command = row.get("command") or {}
         lines = (
             f"frame={int(row['frame_index'])} phase={controller.get('phase')}",
             f"errors={controller.get('filtered_errors')}",

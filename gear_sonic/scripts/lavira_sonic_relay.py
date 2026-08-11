@@ -16,6 +16,10 @@ import numpy as np
 import zmq
 
 from gear_sonic.utils.inference.initial_poses import UPPER_BODY_MUJOCO_INDICES
+from gear_sonic.utils.teleop.sonic_orientation_telemetry import (
+    OrientationTracker,
+    encode_orientation_telemetry,
+)
 from gear_sonic.utils.teleop.zmq.zmq_planner_sender import (
     build_command_message,
     build_planner_message,
@@ -23,11 +27,48 @@ from gear_sonic.utils.teleop.zmq.zmq_planner_sender import (
 
 
 COMMAND_MESSAGE_TYPE = "navila_reasan_velocity_command"
-COMMAND_LOWER = np.array([-0.5, -0.15, -1.0], dtype=np.float32)
-COMMAND_UPPER = np.array([1.0, 0.15, 1.0], dtype=np.float32)
+DEFAULT_MAX_LATERAL_SPEED_M_S = 0.16
+COMMAND_LOWER = np.array(
+    [-0.5, -DEFAULT_MAX_LATERAL_SPEED_M_S, -1.0], dtype=np.float32
+)
+COMMAND_UPPER = np.array(
+    [1.0, DEFAULT_MAX_LATERAL_SPEED_M_S, 1.0], dtype=np.float32
+)
 
 
-def decode_velocity_command(raw: bytes | str) -> dict[str, Any]:
+def _bound_velocity_preserving_linear_ratio(
+    velocity: np.ndarray, *, max_lateral_speed_m_s: float
+) -> np.ndarray:
+    limit = float(max_lateral_speed_m_s)
+    if not math.isfinite(limit) or limit <= 0.0:
+        raise ValueError("maximum lateral speed must be finite and positive")
+    representable_limit = np.float32(
+        min(limit, float(np.finfo(np.float32).max))
+    )
+    if float(representable_limit) > limit:
+        representable_limit = np.nextafter(
+            representable_limit, np.float32(0.0)
+        )
+    safe_limit = float(representable_limit)
+    vx, vy, wz = map(float, velocity)
+    scale = 1.0
+    if vx > float(COMMAND_UPPER[0]):
+        scale = min(scale, float(COMMAND_UPPER[0]) / vx)
+    elif vx < float(COMMAND_LOWER[0]):
+        scale = min(scale, float(COMMAND_LOWER[0]) / vx)
+    if abs(vy) > safe_limit:
+        scale = min(scale, safe_limit / abs(vy))
+    return np.asarray(
+        [vx * scale, vy * scale, np.clip(wz, COMMAND_LOWER[2], COMMAND_UPPER[2])],
+        dtype=np.float32,
+    )
+
+
+def decode_velocity_command(
+    raw: bytes | str,
+    *,
+    max_lateral_speed_m_s: float = DEFAULT_MAX_LATERAL_SPEED_M_S,
+) -> dict[str, Any]:
     try:
         message = json.loads(raw)
     except (json.JSONDecodeError, UnicodeDecodeError, TypeError) as exc:
@@ -61,7 +102,9 @@ def decode_velocity_command(raw: bytes | str) -> dict[str, Any]:
         )
     return {
         "duration": duration,
-        "velocity": np.clip(velocity, COMMAND_LOWER, COMMAND_UPPER),
+        "velocity": _bound_velocity_preserving_linear_ratio(
+            velocity, max_lateral_speed_m_s=max_lateral_speed_m_s
+        ),
     }
 
 
@@ -116,6 +159,31 @@ def extract_frozen_planner_pose(state: Any) -> FrozenPlannerPose:
     )
 
 
+def process_robot_state(
+    state: Any,
+    *,
+    now_monotonic_s: float,
+    heading_setpoint_rad: float,
+    orientation_tracker: OrientationTracker | None,
+    freeze_current_upper_body: bool,
+) -> FrozenPlannerPose | None:
+    """Update diagnostic orientation and independently honor pose freezing."""
+    if orientation_tracker is not None:
+        try:
+            orientation_tracker.update_state(
+                state,
+                received_at_monotonic_s=now_monotonic_s,
+                heading_setpoint_rad=heading_setpoint_rad,
+            )
+        except ValueError:
+            # Orientation is observational. A malformed quaternion must not
+            # block planner output or an explicitly requested pose latch.
+            pass
+    if not freeze_current_upper_body:
+        return None
+    return extract_frozen_planner_pose(state)
+
+
 @dataclass
 class PlannerState:
     heading: float = 0.0
@@ -128,6 +196,8 @@ class PlannerState:
         frozen_pose: FrozenPlannerPose | None = None,
     ) -> bytes:
         vx, vy, wz = map(float, velocity)
+        # SONIC Planner accepts a target facing direction, not yaw velocity.
+        # Treat upstream wz as a heading-setpoint slew rate and integrate it.
         self.heading = math.remainder(self.heading + wz * dt, 2.0 * math.pi)
         cosine, sine = math.cos(self.heading), math.sin(self.heading)
         world_x = cosine * vx - sine * vy
@@ -166,10 +236,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output", default="tcp://*:5563")
     parser.add_argument("--hz", type=float, default=20.0)
     parser.add_argument("--timeout", type=float, default=0.7)
+    parser.add_argument(
+        "--max-lateral-speed-m-s",
+        type=float,
+        default=DEFAULT_MAX_LATERAL_SPEED_M_S,
+    )
     parser.add_argument("--freeze-current-upper-body", action="store_true")
     parser.add_argument("--state-host", default="localhost")
     parser.add_argument("--state-port", type=int, default=5557)
     parser.add_argument("--hold-ready-file", default="")
+    parser.add_argument("--orientation-telemetry-output", default="")
     return parser.parse_args()
 
 
@@ -177,6 +253,11 @@ def main() -> None:
     args = parse_args()
     if args.hz <= 0.0 or args.timeout <= 0.0:
         raise ValueError("hz and timeout must be positive")
+    if (
+        not math.isfinite(args.max_lateral_speed_m_s)
+        or args.max_lateral_speed_m_s <= 0.0
+    ):
+        raise ValueError("maximum lateral speed must be finite and positive")
     context = zmq.Context.instance()
     source = context.socket(zmq.SUB)
     source.setsockopt(zmq.SUBSCRIBE, b"")
@@ -186,6 +267,13 @@ def main() -> None:
     output = context.socket(zmq.PUB)
     output.setsockopt(zmq.LINGER, 0)
     output.bind(args.output)
+    orientation_output = None
+    orientation_tracker = None
+    if args.orientation_telemetry_output:
+        orientation_output = context.socket(zmq.PUB)
+        orientation_output.setsockopt(zmq.LINGER, 0)
+        orientation_output.bind(args.orientation_telemetry_output)
+        orientation_tracker = OrientationTracker()
     planner = PlannerState()
     latest = LatestCommand()
     state_subscriber = None
@@ -196,7 +284,7 @@ def main() -> None:
         ready_path.unlink(missing_ok=True)
     if request_path is not None:
         request_path.unlink(missing_ok=True)
-    if args.freeze_current_upper_body:
+    if args.freeze_current_upper_body or orientation_tracker is not None:
         from gear_sonic.utils.data_collection.zmq_state_subscriber import (
             ZMQStateSubscriber,
         )
@@ -215,8 +303,14 @@ def main() -> None:
     signal.signal(signal.SIGTERM, stop)
     print(
         f"[LaViRA Relay] {args.source} -> {args.output}, "
-        f"{args.hz:g} Hz, timeout={args.timeout:g}s"
+        f"{args.hz:g} Hz, timeout={args.timeout:g}s, "
+        f"max_lateral={args.max_lateral_speed_m_s:g}m/s"
     )
+    if args.orientation_telemetry_output:
+        print(
+            "[LaViRA Relay] orientation telemetry -> "
+            f"{args.orientation_telemetry_output}"
+        )
     next_tick = time.monotonic()
     try:
         while running:
@@ -226,38 +320,62 @@ def main() -> None:
                 except zmq.Again:
                     break
                 try:
-                    latest.update(decode_velocity_command(raw), time.monotonic())
+                    latest.update(
+                        decode_velocity_command(
+                            raw,
+                            max_lateral_speed_m_s=args.max_lateral_speed_m_s,
+                        ),
+                        time.monotonic(),
+                    )
                 except ValueError as exc:
                     print(f"[LaViRA Relay] Ignored command: {exc}")
             now = time.monotonic()
             if now >= next_tick:
                 latch_completed = False
                 latch_token = "ready\n"
-                latch_requested = (request_path is None and frozen_pose is None) or (
-                    request_path is not None and request_path.is_file()
+                latch_requested = args.freeze_current_upper_body and (
+                    (request_path is None and frozen_pose is None)
+                    or (request_path is not None and request_path.is_file())
                 )
-                if state_subscriber is not None and latch_requested:
-                    if request_path is not None:
+                if state_subscriber is not None:
+                    if latch_requested and request_path is not None:
                         try:
                             latch_token = request_path.read_text(encoding="utf-8")
                         except OSError:
                             latch_requested = False
                     state = state_subscriber.get_msg(clear=True)
-                    if latch_requested and state is not None:
+                    if state is not None:
+                        sampled_pose = None
                         try:
-                            frozen_pose = extract_frozen_planner_pose(state)
+                            sampled_pose = process_robot_state(
+                                state,
+                                now_monotonic_s=now,
+                                heading_setpoint_rad=planner.heading,
+                                orientation_tracker=orientation_tracker,
+                                freeze_current_upper_body=latch_requested,
+                            )
                         except ValueError as exc:
-                            print(f"[LaViRA Relay] Waiting for valid hold state: {exc}")
-                        else:
+                            if latch_requested:
+                                print(
+                                    "[LaViRA Relay] Waiting for valid hold state: "
+                                    f"{exc}"
+                                )
+                        if sampled_pose is not None:
+                            frozen_pose = sampled_pose
                             latch_completed = True
                             print("[LaViRA Relay] Current upper body and hands latched")
-                output.send(
-                    planner.message(
-                        latest.velocity(now, args.timeout),
-                        period,
-                        frozen_pose=frozen_pose,
-                    )
+                planner_message = planner.message(
+                    latest.velocity(now, args.timeout),
+                    period,
+                    frozen_pose=frozen_pose,
                 )
+                output.send(planner_message)
+                if orientation_output is not None and orientation_tracker is not None:
+                    orientation_output.send_string(
+                        encode_orientation_telemetry(
+                            orientation_tracker.sample(now, planner.heading)
+                        )
+                    )
                 if latch_completed:
                     request_still_valid = True
                     if request_path is not None:
@@ -285,6 +403,8 @@ def main() -> None:
             ready_path.unlink(missing_ok=True)
         if request_path is not None:
             request_path.unlink(missing_ok=True)
+        if orientation_output is not None:
+            orientation_output.close()
         source.close()
         output.close()
 

@@ -23,8 +23,8 @@ from gear_sonic.camera.sensor_server import ImageMessageSchema
 from gear_sonic.scripts.run_depth_camera_viewer import colorize_depth
 
 
-BasePoseMode = Literal["rgb", "rgbd", "rgb_depth_query"]
-BASE_POSE_MODES = {"rgb", "rgbd", "rgb_depth_query"}
+BasePoseMode = Literal["rgb", "rgbd", "rgb_depth_query", "raw_yoloe_servo"]
+BASE_POSE_MODES = {"rgb", "rgbd", "rgb_depth_query", "raw_yoloe_servo"}
 BasePoseVisionBackend = Literal["codex", "qwenvl"]
 BASE_POSE_VISION_BACKENDS = {"codex", "qwenvl"}
 DEFAULT_QWENVL_PLUS_MODEL = "qwen3-vl-plus"
@@ -258,15 +258,15 @@ class BasePoseConfig:
     qwenvl_model: str = DEFAULT_QWENVL_PLUS_MODEL
     qwenvl_base_url: str = DEFAULT_QWENVL_BASE_URL
     qwenvl_thinking_budget: int = 500
-    reasoning_effort: str = "max"
+    reasoning_effort: str = "xhigh"
     codex_fast: bool = True
     camera_host: str = "localhost"
     camera_port: int = 5555
     camera_timeout_ms: int = 15000
     camera_stream: str = "ego_view"
     camera_height_m: float = 1.2
-    camera_pitch_deg: float = -47.6
-    vertical_fov_deg: float = 55.2
+    camera_pitch_deg: float = -25.0
+    vertical_fov_deg: float = 43.077882
     camera_forward_offset_m: float = 0.0
     camera_lateral_offset_m: float = 0.0
     depth_visual_max_m: float = 3.0
@@ -836,13 +836,13 @@ Use the following format:
 
 ## Field Interpretation
 
-primary_target should identify  the primary manipulation target.
+primary_target should identify the blue plastic basket as the primary manipulation target.
 
 secondary_targets should identify other task-relevant objects.
 
 manipulation_anchor should identify a task-relevant alignment anchor on the primary manipulation target.
 
-interaction_direction should describe the desired body-forward direction facing the manipulation region. 
+interaction_direction should describe the desired body-forward direction facing the manipulation region. When the relevant table edge can be identified, this direction should be approximately perpendicular to the table edge and directed toward the manipulation region.
 
 horizontal_position describes the robot's estimated lateral position relative to the manipulation region after accounting for the estimated orientation correction theta, rather than simply describing the raw image position of the manipulation anchor.
 
@@ -1099,7 +1099,7 @@ class CodexStructuredVisionClient:
         self,
         *,
         model: str = "gpt-5.6-sol",
-        reasoning_effort: str = "max",
+        reasoning_effort: str = "xhigh",
         fast: bool = True,
         timeout_seconds: float = 600.0,
         codex_bin: str | None = None,

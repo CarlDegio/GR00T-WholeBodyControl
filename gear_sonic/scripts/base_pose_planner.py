@@ -43,7 +43,7 @@ class BasePosePlannerConfig:
         "https://dashscope-intl.aliyuncs.com/compatible-mode/v1"
     )
     qwenvl_thinking_budget: int = 500
-    reasoning_effort: str = "max"
+    reasoning_effort: str = "xhigh"
     codex_fast: bool = True
     host: str = "*"
     port: int = 5558
@@ -59,13 +59,42 @@ class BasePosePlannerConfig:
     camera_timeout_ms: int = 15000
     camera_stream: str = "ego_view"
     camera_height_m: float = 1.2
-    camera_pitch_deg: float = -47.6
-    vertical_fov_deg: float = 55.2
+    camera_pitch_deg: float = -25.0
+    vertical_fov_deg: float = 43.077882
+    camera_roll_deg: float = 0.0
+    camera_yaw_deg: float = 0.0
     camera_forward_offset_m: float = 0.0
     camera_lateral_offset_m: float = 0.0
     depth_visual_max_m: float = 3.0
     codex_timeout_seconds: float = 600.0
     output_root: str = "outputs/base_pose_adjustment"
+    raw_yoloe_model_path: str = "tools/yoloe26m/weights/yoloe-26m-seg.pt"
+    raw_yoloe_device: str = "0"
+    raw_yoloe_confidence: float = 0.25
+    raw_yoloe_imgsz: int = 640
+    raw_reference_update_interval_frames: int = 5
+    raw_reference_update_min_confidence: float = 0.35
+    raw_reference_update_min_iou: float = 0.50
+    raw_reference_update_freeze_y2_px: float = 75.0
+    raw_reference_update_resume_y2_px: float = 110.0
+    raw_servo_hz: float = 10.0
+    raw_target_distance_m: float = 0.80
+    raw_forward_tolerance_m: float = 0.10
+    raw_lateral_tolerance_m: float = 0.10
+    raw_max_lateral_speed_m_s: float = 0.16
+    raw_horizontal_guard_fraction: float = 0.25
+    raw_horizontal_recovery_fraction: float = 0.30
+    raw_orientation_telemetry_source: str = "tcp://127.0.0.1:5565"
+    raw_camera_width: int = 640
+    raw_camera_height: int = 480
+    raw_camera_fx: float = 607.878662
+    raw_camera_fy: float = 608.063232
+    raw_camera_cx: float = 319.858765
+    raw_camera_cy: float = 259.731140
+    raw_intrinsic_tolerance_px: float = 2.0
+    raw_command_ttl_s: float = 0.15
+    raw_camera_stale_s: float = 0.4
+    raw_max_run_s: float = 60.0
 
 
 @dataclass(frozen=True)
@@ -605,12 +634,117 @@ def _runner_factory(config: BasePosePlannerConfig) -> BasePoseRunner:
     )
 
 
+def _raw_servo_main(
+    config: BasePosePlannerConfig,
+    socket: zmq.Socket,
+    endpoint: str,
+) -> None:
+    from gear_sonic.utils.inference.base_pose_visual_servo import (
+        RawServoRuntime,
+        run_raw_servo_loop,
+        run_raw_servo_worker,
+        validate_raw_servo_dependencies,
+    )
+    from gear_sonic.utils.teleop.sonic_orientation_telemetry import (
+        LatestOrientationTelemetry,
+    )
+
+    validate_raw_servo_dependencies(config)
+    orientation_socket = None
+    orientation_provider = None
+    if config.raw_orientation_telemetry_source:
+        orientation_socket = zmq.Context.instance().socket(zmq.SUB)
+        orientation_socket.setsockopt(zmq.SUBSCRIBE, b"")
+        orientation_socket.setsockopt(zmq.CONFLATE, 1)
+        orientation_socket.setsockopt(zmq.LINGER, 0)
+        orientation_socket.connect(config.raw_orientation_telemetry_source)
+        latest_orientation = LatestOrientationTelemetry()
+        last_warning_at = -math.inf
+
+        def read_orientation(now: float) -> dict[str, float | None] | None:
+            nonlocal last_warning_at
+            while True:
+                try:
+                    raw = orientation_socket.recv(zmq.NOBLOCK)
+                except zmq.Again:
+                    break
+                try:
+                    latest_orientation.update(raw)
+                except ValueError as exc:
+                    if now - last_warning_at >= 1.0:
+                        print(
+                            "[RawServo] WARNING ignored orientation telemetry: "
+                            f"{exc}"
+                        )
+                        last_warning_at = now
+            return latest_orientation.diagnostics(now)
+
+        orientation_provider = read_orientation
+    runtime = RawServoRuntime(
+        config,
+        publish=socket.send_string,
+        orientation_provider=orientation_provider,
+    )
+    worker = threading.Thread(
+        target=run_raw_servo_worker,
+        args=(
+            config,
+            runtime.requests,
+            runtime.events,
+            runtime.gate,
+            runtime.stop_event,
+        ),
+        name="base-pose-raw-yoloe-servo",
+        daemon=True,
+        kwargs={
+            "observation_events": runtime.observation_events,
+            "diagnostics": runtime.diagnostics,
+        },
+    )
+    worker.start()
+    running = True
+
+    def request_stop(_signum: int, _frame: Any) -> None:
+        nonlocal running
+        running = False
+
+    signal.signal(signal.SIGHUP, request_stop)
+    signal.signal(signal.SIGINT, request_stop)
+    signal.signal(signal.SIGTERM, request_stop)
+    try:
+        print(
+            f"[RawServo] PUB bound to {endpoint}; YOLOE={config.raw_yoloe_model_path}; "
+            f"visual_hz={config.raw_servo_hz}; "
+            f"standoff={config.raw_target_distance_m:.3f}m; task={config.task!r}"
+        )
+        print(
+            "[RawServo] N initialize+align | Space cancel-and-stop | X stop-and-exit"
+        )
+        with cbreak_terminal():
+            run_raw_servo_loop(
+                runtime, read_key=read_key_nonblocking, running=lambda: running
+            )
+    finally:
+        runtime.shutdown()
+        worker.join()
+        runtime.flush_diagnostics()
+        if orientation_socket is not None:
+            orientation_socket.close()
+        print("[RawServo] Stopped")
+
+
 def main(config: BasePosePlannerConfig) -> None:
     context = zmq.Context.instance()
     socket = context.socket(zmq.PUB)
     socket.setsockopt(zmq.LINGER, 0)
     endpoint = f"tcp://{config.host}:{config.port}"
     socket.bind(endpoint)
+    if config.mode == "raw_yoloe_servo":
+        try:
+            _raw_servo_main(config, socket, endpoint)
+        finally:
+            socket.close()
+        return
     runtime = BasePosePlannerRuntime(config, publish=socket.send_string)
     worker = threading.Thread(
         target=run_inference_worker,

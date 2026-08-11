@@ -64,6 +64,37 @@ def test_renderer_restores_only_sampled_bbox_and_masks(tmp_path) -> None:
     assert int(first[12, 30, 1]) > int(first[12, 30, 0])
 
 
+def test_renderer_accepts_sampled_frame_with_null_control_metadata(tmp_path) -> None:
+    run_dir = tmp_path / "displaced"
+    writer = FrameDiagnosticsWriter(run_dir)
+    writer.write(
+        review_frame(0, include_table=True),
+        control_applied=False,
+        controller_state=None,
+        command=None,
+    )
+
+    rendered = render_review_samples(run_dir)
+
+    assert [path.name for path in rendered] == ["000000.jpg"]
+    assert cv2.imread(str(rendered[0])) is not None
+
+
+def test_renderer_ignores_missing_legacy_annotated_jpegs(tmp_path) -> None:
+    run_dir = synthetic_sampled_run(tmp_path)
+    jsonl = run_dir / "raw_servo_frames.jsonl"
+    rows = [json.loads(line) for line in jsonl.read_text().splitlines()]
+    for row in rows:
+        if row["review_artifacts"]["sampled"]:
+            row["annotated_image"] = f"frames/{row['frame_index']:06d}.jpg"
+    jsonl.write_text("\n".join(json.dumps(row) for row in rows) + "\n")
+
+    assert not (run_dir / "frames").exists()
+    rendered = render_review_samples(run_dir)
+
+    assert [path.name for path in rendered] == ["000000.jpg", "000005.jpg"]
+
+
 def test_cli_renders_synthetic_run(tmp_path, capsys) -> None:
     run_dir = synthetic_sampled_run(tmp_path)
     output_dir = tmp_path / "cli-output"

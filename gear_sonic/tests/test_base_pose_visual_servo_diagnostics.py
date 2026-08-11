@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import math
+import threading
 
 import cv2
 import numpy as np
@@ -17,6 +18,7 @@ from gear_sonic.utils.inference.base_pose_visual_servo import (
     TargetGeometry,
 )
 from gear_sonic.utils.inference.base_pose_visual_servo_diagnostics import (
+    AsyncFrameDiagnosticsWriter,
     DetectionFrameData,
     FrameDiagnosticsWriter,
 )
@@ -42,7 +44,43 @@ def diagnostic_frame(frame_index: int, *, include_table: bool) -> DetectionFrame
     )
 
 
-def test_writer_records_complete_jsonl_and_annotated_jpeg(tmp_path) -> None:
+def orientation_diagnostics() -> dict[str, float]:
+    return {
+        "actual_yaw_rad": 0.5,
+        "actual_heading_rad": 0.2,
+        "heading_setpoint_rad": 0.25,
+        "heading_lag_rad": 0.05,
+        "state_age_s": 0.02,
+        "telemetry_age_s": 0.01,
+    }
+
+
+def servo_observation() -> RawServoObservation:
+    return RawServoObservation(
+        camera_timestamp=0.0,
+        target=TargetGeometry(
+            forward_m=0.6,
+            right_m=0.0,
+            body_xyz_m=(0.6, 0.0, 0.8),
+            valid_depth_pixels=1000,
+            valid_ratio=1.0,
+            median_depth_m=1.0,
+        ),
+        table=TableGeometry(
+            yaw_error_rad=math.radians(20.0),
+            line_length_m=0.7,
+            inlier_count=200,
+            residual_m=0.005,
+            line_center_xy_m=(1.0, 0.0),
+        ),
+        target_track_id=11,
+        surface_track_id=22,
+        target_bbox_xyxy=(24.0, 12.0, 44.0, 32.0),
+        image_width=64,
+    )
+
+
+def test_writer_records_complete_jsonl_without_online_annotation(tmp_path) -> None:
     target_mask = np.zeros((48, 64), dtype=bool)
     target_mask[12:32, 24:44] = True
     table_mask = np.zeros((48, 64), dtype=bool)
@@ -90,6 +128,7 @@ def test_writer_records_complete_jsonl_and_annotated_jpeg(tmp_path) -> None:
             "recenter_stable_frames": 0,
         },
         command={"vx": 0.0, "vy": 0.0, "wz": 0.05, "duration_s": 0.15},
+        orientation=orientation_diagnostics(),
     )
 
     record = json.loads((tmp_path / "raw_servo_frames.jsonl").read_text())
@@ -98,7 +137,9 @@ def test_writer_records_complete_jsonl_and_annotated_jpeg(tmp_path) -> None:
     assert record["detections"]["target"]["track_id"] == 11
     assert record["geometry"]["target"]["valid_depth_pixels"] == 300
     assert record["command"]["wz"] == 0.05
-    assert (tmp_path / "frames" / "000007.jpg").is_file()
+    assert record["orientation"] == orientation_diagnostics()
+    assert record["annotated_image"] is None
+    assert not (tmp_path / "frames").exists()
 
 
 def test_writer_keeps_null_fields_for_invalid_frame(tmp_path) -> None:
@@ -120,6 +161,25 @@ def test_writer_keeps_null_fields_for_invalid_frame(tmp_path) -> None:
     assert record["geometry"]["table"] is None
     assert record["geometry"]["table_error"] is None
     assert record["perception_error"] == "missing tracked target"
+    assert record["orientation"] is None
+
+
+def test_writer_records_displaced_frame_without_fake_control_metadata(tmp_path) -> None:
+    writer = FrameDiagnosticsWriter(tmp_path)
+
+    writer.write(
+        diagnostic_frame(1, include_table=True),
+        control_applied=False,
+        controller_state=None,
+        command=None,
+    )
+
+    record = json.loads((tmp_path / "raw_servo_frames.jsonl").read_text())
+    assert record["control_applied"] is False
+    assert record["controller"] is None
+    assert record["command"] is None
+    assert record["detections"]["target"]["track_id"] == 11
+    assert record["orientation"] is None
 
 
 def test_writer_saves_lossless_review_artifacts_every_five_frames(tmp_path) -> None:
@@ -135,6 +195,8 @@ def test_writer_saves_lossless_review_artifacts_every_five_frames(tmp_path) -> N
         json.loads(line)
         for line in (tmp_path / "raw_servo_frames.jsonl").read_text().splitlines()
     ]
+    assert all(row["annotated_image"] is None for row in rows)
+    assert not (tmp_path / "frames").exists()
     assert [row["review_artifacts"]["sampled"] for row in rows] == [
         True, False, False, False, False, True
     ]
@@ -176,7 +238,206 @@ def test_sampled_frame_records_null_for_missing_table_mask(tmp_path) -> None:
     assert review["table_mask"] is None
 
 
-def test_sampled_png_failure_hard_stops_visual_servo(tmp_path, monkeypatch) -> None:
+def test_async_writer_drains_rows_in_frame_order(tmp_path) -> None:
+    writer = AsyncFrameDiagnosticsWriter(logger=lambda _message: None)
+    output_dir = tmp_path / "run"
+
+    writer.submit_frame(1, output_dir, diagnostic_frame(1, include_table=True))
+    writer.submit_decision(
+        1,
+        1,
+        control_applied=False,
+        controller_state=None,
+        command=None,
+    )
+    writer.submit_frame(1, output_dir, diagnostic_frame(0, include_table=True))
+    writer.submit_decision(
+        1,
+        0,
+        control_applied=True,
+        controller_state={"phase": "yaw_align"},
+        command={"vx": 0.0, "vy": 0.0, "wz": 0.05, "duration_s": 0.15},
+        orientation=orientation_diagnostics(),
+    )
+    writer.close(drain=True)
+
+    rows = [
+        json.loads(line)
+        for line in (output_dir / "raw_servo_frames.jsonl").read_text().splitlines()
+    ]
+    assert [row["frame_index"] for row in rows] == [0, 1]
+    assert rows[0]["control_applied"] is True
+    assert rows[0]["orientation"] == orientation_diagnostics()
+    assert rows[1]["control_applied"] is False
+    assert rows[1]["orientation"] is None
+
+
+def test_runtime_attaches_latest_orientation_to_applied_frame(tmp_path) -> None:
+    provider_calls: list[float] = []
+
+    def orientation_provider(now: float) -> dict[str, float]:
+        provider_calls.append(now)
+        return orientation_diagnostics()
+
+    runtime = RawServoRuntime(
+        BasePosePlannerConfig(task="align", output_root=str(tmp_path)),
+        publish=lambda _message: None,
+        logger=lambda _message: None,
+        orientation_provider=orientation_provider,
+    )
+    assert runtime.handle_key("n", now=1.0) == "started"
+    output_dir = tmp_path / "run"
+    output_dir.mkdir()
+    frame = diagnostic_frame(0, include_table=True)
+    runtime.diagnostics.submit_frame(1, output_dir, frame)
+
+    assert runtime.accept_event(
+        RawServoEvent(
+            generation=1,
+            kind="initialized",
+            output_dir=str(output_dir),
+            frame=frame,
+            observation=servo_observation(),
+        ),
+        now=1.1,
+    )
+    runtime.flush_diagnostics()
+
+    record = json.loads((output_dir / "raw_servo_frames.jsonl").read_text())
+    assert provider_calls == [1.1]
+    assert record["orientation"] == orientation_diagnostics()
+
+
+def test_runtime_ignores_orientation_provider_failure(tmp_path) -> None:
+    warnings: list[str] = []
+
+    def failed_provider(_now: float) -> None:
+        raise ValueError("bad telemetry")
+
+    runtime = RawServoRuntime(
+        BasePosePlannerConfig(task="align", output_root=str(tmp_path)),
+        publish=lambda _message: None,
+        logger=warnings.append,
+        orientation_provider=failed_provider,
+    )
+    assert runtime.handle_key("n", now=1.0) == "started"
+    output_dir = tmp_path / "run"
+    output_dir.mkdir()
+    frame = diagnostic_frame(0, include_table=True)
+    runtime.diagnostics.submit_frame(1, output_dir, frame)
+
+    accepted = runtime.accept_event(
+        RawServoEvent(
+            generation=1,
+            kind="initialized",
+            output_dir=str(output_dir),
+            frame=frame,
+            observation=servo_observation(),
+        ),
+        now=1.1,
+    )
+    runtime.flush_diagnostics()
+
+    record = json.loads((output_dir / "raw_servo_frames.jsonl").read_text())
+    assert accepted
+    assert runtime.phase == "aligning"
+    assert record["orientation"] is None
+    assert any("bad telemetry" in message for message in warnings)
+
+
+def test_async_writer_submit_does_not_wait_for_blocked_disk(tmp_path) -> None:
+    write_started = threading.Event()
+    release_write = threading.Event()
+
+    class BlockingWriter:
+        def __init__(self, _output_dir) -> None:
+            pass
+
+        def write(self, *_args, **_kwargs) -> None:
+            write_started.set()
+            assert release_write.wait(1.0)
+
+    writer = AsyncFrameDiagnosticsWriter(
+        logger=lambda _message: None,
+        writer_factory=BlockingWriter,
+    )
+    writer.submit_frame(1, tmp_path / "run", diagnostic_frame(0, include_table=True))
+    writer.submit_decision(
+        1,
+        0,
+        control_applied=False,
+        controller_state=None,
+        command=None,
+    )
+    assert write_started.wait(1.0)
+
+    submit_finished = threading.Event()
+
+    def submit_next() -> None:
+        writer.submit_frame(
+            1, tmp_path / "run", diagnostic_frame(1, include_table=True)
+        )
+        submit_finished.set()
+
+    submitter = threading.Thread(target=submit_next)
+    submitter.start()
+    assert submit_finished.wait(0.2)
+    release_write.set()
+    submitter.join(timeout=1.0)
+    writer.close(drain=True)
+
+
+def test_async_writer_failure_disables_only_failed_generation(tmp_path) -> None:
+    warnings: list[str] = []
+
+    class FailingWriter:
+        def __init__(self, _output_dir) -> None:
+            pass
+
+        def write(self, *_args, **_kwargs) -> None:
+            raise OSError("injected disk failure")
+
+    good_dir = tmp_path / "good"
+
+    def writer_factory(output_dir):
+        if str(output_dir).endswith("bad"):
+            return FailingWriter(output_dir)
+        return FrameDiagnosticsWriter(output_dir)
+
+    writer = AsyncFrameDiagnosticsWriter(
+        logger=warnings.append,
+        writer_factory=writer_factory,
+    )
+    for index in range(2):
+        writer.submit_frame(
+            1, tmp_path / "bad", diagnostic_frame(index, include_table=True)
+        )
+        writer.submit_decision(
+            1,
+            index,
+            control_applied=False,
+            controller_state=None,
+            command=None,
+        )
+    writer.submit_frame(2, good_dir, diagnostic_frame(0, include_table=True))
+    writer.submit_decision(
+        2,
+        0,
+        control_applied=False,
+        controller_state=None,
+        command=None,
+    )
+    writer.close(drain=True)
+
+    assert len(warnings) == 1
+    assert "injected disk failure" in warnings[0]
+    row = json.loads((good_dir / "raw_servo_frames.jsonl").read_text())
+    assert row["frame_index"] == 0
+
+
+def test_sampled_png_failure_disables_diagnostics_without_stopping_servo(
+    tmp_path, monkeypatch
+) -> None:
     def fail_encode_png(*_args, **_kwargs) -> bytes:
         raise OSError("injected review PNG failure")
 
@@ -184,21 +445,24 @@ def test_sampled_png_failure_hard_stops_visual_servo(tmp_path, monkeypatch) -> N
         FrameDiagnosticsWriter, "_encode_png", staticmethod(fail_encode_png)
     )
     messages: list[str] = []
+    warnings: list[str] = []
     runtime = RawServoRuntime(
         BasePosePlannerConfig(task="align", output_root=str(tmp_path)),
         publish=messages.append,
-        logger=lambda _: None,
+        logger=warnings.append,
     )
     assert runtime.handle_key("n", now=1.0) == "started"
     output_dir = tmp_path / "run"
     output_dir.mkdir()
 
+    frame = diagnostic_frame(0, include_table=True)
+    runtime.diagnostics.submit_frame(1, output_dir, frame)
     accepted = runtime.accept_event(
         RawServoEvent(
             generation=1,
             kind="initialized",
             output_dir=str(output_dir),
-            frame=diagnostic_frame(0, include_table=True),
+            frame=frame,
             observation=RawServoObservation(
                 camera_timestamp=0.0,
                 target=TargetGeometry(
@@ -224,13 +488,14 @@ def test_sampled_png_failure_hard_stops_visual_servo(tmp_path, monkeypatch) -> N
         ),
         now=1.1,
     )
+    runtime.flush_diagnostics()
 
     assert accepted
-    assert runtime.phase == "idle"
-    assert runtime.controller.terminal_reason == (
-        "diagnostic write failed: injected review PNG failure"
-    )
-    assert len(messages) == 4
-    assert all("\"vx\":0.0" in message for message in messages[-3:])
-    assert all("\"vy\":0.0" in message for message in messages[-3:])
-    assert all("\"wz\":0.0" in message for message in messages[-3:])
+    assert runtime.phase == "aligning"
+    assert not runtime.controller.terminal
+    assert len(messages) == 1
+    diagnostic_warnings = [
+        message for message in warnings if "diagnostics disabled" in message
+    ]
+    assert len(diagnostic_warnings) == 1
+    assert "injected review PNG failure" in diagnostic_warnings[0]

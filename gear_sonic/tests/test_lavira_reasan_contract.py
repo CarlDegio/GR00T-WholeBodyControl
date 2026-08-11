@@ -15,6 +15,7 @@ from gear_sonic.scripts.lavira_planner import (
 from gear_sonic.scripts.lavira_sonic_relay import (
     LatestCommand,
     decode_velocity_command as decode_direct_velocity_command,
+    parse_args as parse_direct_relay_args,
 )
 from gear_sonic.scripts.reasan_planner import (
     apply_rule_based_safety,
@@ -89,15 +90,129 @@ def test_lavira_messages_decode_for_turn_translation_and_stop() -> None:
     assert not translation_bypasses_filter
 
 
+@pytest.mark.parametrize(
+    ("argv", "expected_limit"),
+    [
+        (["lavira_sonic_relay.py"], 0.16),
+        (["lavira_sonic_relay.py", "--max-lateral-speed-m-s", "0.11"], 0.11),
+    ],
+)
+def test_direct_relay_cli_exposes_configurable_lateral_limit(
+    monkeypatch: pytest.MonkeyPatch,
+    argv: list[str],
+    expected_limit: float,
+) -> None:
+    monkeypatch.setattr(sys, "argv", argv)
+
+    args = parse_direct_relay_args()
+
+    assert args.max_lateral_speed_m_s == pytest.approx(expected_limit)
+
+
 def test_direct_relay_decodes_lavira_command_without_reasan() -> None:
     decoded = decode_direct_velocity_command(
         build_reasan_velocity_message(
-            VelocityCommand(0.3, -0.1, 0.2, 1.0), action="move"
+            VelocityCommand(0.2, -0.16, 0.2, 1.0), action="move"
         )
     )
 
-    assert decoded["velocity"].tolist() == pytest.approx([0.3, -0.1, 0.2])
+    assert decoded["velocity"].tolist() == pytest.approx([0.2, -0.16, 0.2])
     assert decoded["duration"] == pytest.approx(1.0)
+
+
+@pytest.mark.parametrize(
+    ("requested_vy", "expected_vy"),
+    [(0.40, 0.16), (-0.40, -0.16)],
+)
+def test_direct_relay_caps_lateral_velocity_at_configured_default(
+    requested_vy: float, expected_vy: float
+) -> None:
+    decoded = decode_direct_velocity_command(
+        build_reasan_velocity_message(
+            VelocityCommand(0.0, requested_vy, 0.0, 1.0), action="move"
+        )
+    )
+
+    assert decoded["velocity"].tolist() == pytest.approx(
+        [0.0, expected_vy, 0.0]
+    )
+
+
+def test_direct_relay_scales_both_linear_axes_to_preserve_ratio() -> None:
+    decoded = decode_direct_velocity_command(
+        build_reasan_velocity_message(
+            VelocityCommand(0.30, 0.20, 0.50, 1.0), action="move"
+        )
+    )
+
+    vx, vy, wz = map(float, decoded["velocity"])
+    assert (vx, vy, wz) == pytest.approx((0.24, 0.16, 0.50))
+    assert vx / vy == pytest.approx(0.30 / 0.20)
+    assert np.hypot(vx, vy) < 0.30
+
+
+def test_direct_relay_accepts_configurable_lateral_limit() -> None:
+    decoded = decode_direct_velocity_command(
+        build_reasan_velocity_message(
+            VelocityCommand(0.30, -0.20, 0.0, 1.0), action="move"
+        ),
+        max_lateral_speed_m_s=0.10,
+    )
+
+    assert decoded["velocity"].tolist() == pytest.approx([0.15, -0.10, 0.0])
+
+
+def test_direct_relay_float32_output_never_exceeds_configured_lateral_limit() -> None:
+    limit = 0.14
+    decoded = decode_direct_velocity_command(
+        build_reasan_velocity_message(
+            VelocityCommand(0.30, 0.20, 0.0, 1.0), action="move"
+        ),
+        max_lateral_speed_m_s=limit,
+    )
+
+    vx, vy, _ = map(float, decoded["velocity"])
+    assert vy <= limit
+    assert vx / vy == pytest.approx(0.30 / 0.20)
+
+
+def test_direct_relay_uses_most_restrictive_linear_scale_for_both_axes() -> None:
+    decoded = decode_direct_velocity_command(
+        build_reasan_velocity_message(
+            VelocityCommand(2.0, 0.40, 0.0, 1.0), action="move"
+        )
+    )
+
+    vx, vy, _ = map(float, decoded["velocity"])
+    assert (vx, vy) == pytest.approx((0.80, 0.16))
+    assert vx / vy == pytest.approx(2.0 / 0.40)
+
+
+@pytest.mark.parametrize(
+    ("requested_vx", "expected_velocity"),
+    [(2.0, [1.0, 0.05, 0.0]), (-1.0, [-0.5, 0.05, 0.0])],
+)
+def test_direct_relay_scales_vy_when_vx_hits_transport_limit(
+    requested_vx: float, expected_velocity: list[float]
+) -> None:
+    decoded = decode_direct_velocity_command(
+        build_reasan_velocity_message(
+            VelocityCommand(requested_vx, 0.10, 0.0, 1.0), action="move"
+        )
+    )
+
+    assert decoded["velocity"].tolist() == pytest.approx(expected_velocity)
+
+
+@pytest.mark.parametrize("limit", [0.0, -0.1, float("nan"), float("inf")])
+def test_direct_relay_rejects_invalid_lateral_limit(limit: float) -> None:
+    with pytest.raises(ValueError, match="lateral speed"):
+        decode_direct_velocity_command(
+            build_reasan_velocity_message(
+                VelocityCommand(0.0, 0.1, 0.0, 1.0), action="move"
+            ),
+            max_lateral_speed_m_s=limit,
+        )
 
 
 def test_direct_relay_zeros_stale_command() -> None:

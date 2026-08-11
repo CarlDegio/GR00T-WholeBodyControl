@@ -196,7 +196,7 @@ def test_base_pose_rgb_uses_ego_camera_without_starting_lingbot() -> None:
     assert "--mode rgb" in command
     assert "--vision-backend codex" in command
     assert "--model gpt-5.6-sol" in command
-    assert "--reasoning-effort max" in command
+    assert "--reasoning-effort xhigh" in command
     assert "--codex-timeout-seconds 600.0" in command
     assert "--rotation-scale 1.0" in command
     assert "--translation-scale 1.0" in command
@@ -219,6 +219,49 @@ def test_base_pose_can_disable_codex_fast() -> None:
     command = build_planner_input_command(config, Path("/workspace/sonic"))
 
     assert "--no-codex-fast" in command
+
+
+def test_raw_base_pose_launch_passes_safety_and_orientation_parameters() -> None:
+    config = InferenceLaunchConfig(
+        planner_input="base_pose",
+        base_pose_mode="raw_yoloe_servo",
+        base_pose_raw_max_lateral_speed_m_s=0.14,
+        base_pose_raw_horizontal_guard_fraction=0.22,
+        base_pose_raw_horizontal_recovery_fraction=0.31,
+        base_pose_orientation_telemetry_port=6001,
+    )
+
+    planner = build_planner_input_command(config, Path("/workspace/sonic"))
+    relay = build_reasan_planner_command(config, Path("/workspace/sonic"))
+
+    assert "--raw-max-lateral-speed-m-s 0.14" in planner
+    assert "--max-lateral-speed-m-s 0.14" in relay
+    assert "--raw-horizontal-guard-fraction 0.22" in planner
+    assert "--raw-horizontal-recovery-fraction 0.31" in planner
+    assert "--raw-orientation-telemetry-source tcp://127.0.0.1:6001" in planner
+    assert "--orientation-telemetry-output 'tcp://*:6001'" in relay
+
+
+def test_base_pose_relay_uses_default_lateral_limit() -> None:
+    config = InferenceLaunchConfig(
+        planner_input="base_pose",
+    )
+
+    relay = build_reasan_planner_command(config, Path("/workspace/sonic"))
+
+    assert "--max-lateral-speed-m-s 0.16" in relay
+
+
+def test_orientation_telemetry_relay_is_raw_base_pose_only() -> None:
+    config = InferenceLaunchConfig(
+        planner_input="base_pose",
+        base_pose_mode="rgb",
+        base_pose_orientation_telemetry_port=6001,
+    )
+
+    relay = build_reasan_planner_command(config, Path("/workspace/sonic"))
+
+    assert "--orientation-telemetry-output" not in relay
 
 
 def test_base_pose_can_select_qwenvl_plus_backend() -> None:

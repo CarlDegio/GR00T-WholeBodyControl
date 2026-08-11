@@ -7,6 +7,7 @@ import math
 from pathlib import Path
 import struct
 import subprocess
+import sys
 from types import SimpleNamespace
 
 import numpy as np
@@ -21,6 +22,7 @@ from gear_sonic.scripts.base_pose_planner import (
     plan_to_segments,
 )
 import gear_sonic.utils.inference.base_pose as base_pose_module
+import gear_sonic.scripts.lavira_sonic_relay as sonic_relay
 from gear_sonic.scripts.lavira_sonic_relay import (
     PlannerState,
     extract_frozen_planner_pose,
@@ -40,6 +42,7 @@ from gear_sonic.utils.inference.base_pose import (
     query_depth_regions,
     validate_base_pose_plan,
 )
+from gear_sonic.utils.teleop.sonic_orientation_telemetry import OrientationTracker
 
 
 def plan(
@@ -798,3 +801,74 @@ def test_current_upper_body_and_hands_are_latched_into_idle_planner_message() ->
     assert len(frozen.upper_body_position) == 17
     assert frozen.left_hand_position == tuple(left)
     assert frozen.right_hand_position == tuple(right)
+
+
+def test_relay_integrates_wz_into_planner_facing_target() -> None:
+    planner = PlannerState()
+    planner.message(np.array([0.0, 0.0, 0.2], dtype=np.float32), 0.05)
+    message = planner.message(
+        np.array([0.0, 0.0, 0.2], dtype=np.float32), 0.05
+    )
+    payload = message[7 + 1280 :]
+    facing = struct.unpack_from("<fff", payload, 16)
+
+    assert planner.heading == pytest.approx(0.02)
+    assert facing == pytest.approx(
+        (math.cos(0.02), math.sin(0.02), 0.0), abs=1.0e-6
+    )
+
+
+def test_relay_orientation_sample_uses_post_integration_heading() -> None:
+    planner = PlannerState()
+    tracker = OrientationTracker()
+    state = {
+        "base_quat": np.array([1.0, 0.0, 0.0, 0.0]),
+        "body_q_measured": np.arange(29, dtype=np.float64),
+        "left_hand_q_measured": np.arange(7, dtype=np.float64),
+        "right_hand_q_measured": np.arange(7, dtype=np.float64),
+    }
+
+    frozen = sonic_relay.process_robot_state(
+        state,
+        now_monotonic_s=10.0,
+        heading_setpoint_rad=planner.heading,
+        orientation_tracker=tracker,
+        freeze_current_upper_body=False,
+    )
+    planner.message(np.array([0.0, 0.0, 0.15], dtype=np.float32), 0.05)
+    sample = tracker.sample(10.05, planner.heading)
+
+    assert frozen is None
+    assert sample.actual_yaw_rad == pytest.approx(0.0)
+    assert sample.heading_setpoint_rad == pytest.approx(0.0075)
+    assert sample.heading_lag_rad == pytest.approx(0.0075)
+
+
+def test_relay_state_processing_freezes_pose_only_when_explicitly_requested() -> None:
+    state = {
+        "base_quat": np.array([1.0, 0.0, 0.0, 0.0]),
+        "body_q_measured": np.arange(29, dtype=np.float64),
+        "left_hand_q_measured": np.arange(7, dtype=np.float64),
+        "right_hand_q_measured": np.arange(7, dtype=np.float64),
+    }
+
+    frozen = sonic_relay.process_robot_state(
+        state,
+        now_monotonic_s=1.0,
+        heading_setpoint_rad=0.0,
+        orientation_tracker=None,
+        freeze_current_upper_body=True,
+    )
+
+    assert frozen is not None
+    assert len(frozen.upper_body_position) == 17
+
+
+def test_relay_orientation_telemetry_is_disabled_by_default(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(sys, "argv", ["lavira_sonic_relay.py"])
+
+    args = sonic_relay.parse_args()
+
+    assert args.orientation_telemetry_output == ""
