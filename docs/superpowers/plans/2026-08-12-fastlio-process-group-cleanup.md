@@ -254,7 +254,7 @@ Run:
 pytest -q \
   gear_sonic/tests/test_fastlio_supervisor.py \
   gear_sonic/tests/test_slam_recovery.py \
-  gear_sonic/tests/test_agent_full_startup.py
+  gear_sonic/tests/test_launch_tmux_panes.py
 python -m py_compile gear_sonic/scripts/run_fastlio_supervisor.py
 ```
 
