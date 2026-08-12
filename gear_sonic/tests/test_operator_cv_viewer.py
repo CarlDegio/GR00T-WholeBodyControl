@@ -44,10 +44,49 @@ def test_composer_leaves_missing_views_black() -> None:
     assert not np.any(canvas)
 
 
-def test_gateway_camera_rgb_is_converted_to_opencv_bgr() -> None:
-    rgb = np.array([[[255, 10, 20]]], dtype=np.uint8)
+def test_non_right_wrist_camera_is_converted_to_bgr_without_rotation() -> None:
+    rgb = np.array(
+        [
+            [[255, 0, 0], [0, 255, 0]],
+            [[0, 0, 255], [255, 255, 0]],
+        ],
+        dtype=np.uint8,
+    )
 
     bgr = gateway_frame_to_bgr(CHEST_RGB_STREAM, rgb)
 
     assert bgr is not None
-    np.testing.assert_array_equal(bgr, np.array([[[20, 10, 255]]], dtype=np.uint8))
+    np.testing.assert_array_equal(
+        bgr,
+        np.array(
+            [
+                [[0, 0, 255], [0, 255, 0]],
+                [[255, 0, 0], [0, 255, 255]],
+            ],
+            dtype=np.uint8,
+        ),
+    )
+
+
+def test_right_wrist_camera_is_converted_to_bgr_and_rotated_180_degrees() -> None:
+    rgb = np.array(
+        [
+            [[255, 0, 0], [0, 255, 0]],
+            [[0, 0, 255], [255, 255, 0]],
+        ],
+        dtype=np.uint8,
+    )
+
+    bgr = gateway_frame_to_bgr(RIGHT_WRIST_RGB_STREAM, rgb)
+
+    assert bgr is not None
+    np.testing.assert_array_equal(
+        bgr,
+        np.array(
+            [
+                [[0, 255, 255], [255, 0, 0]],
+                [[0, 255, 0], [0, 0, 255]],
+            ],
+            dtype=np.uint8,
+        ),
+    )

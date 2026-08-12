@@ -146,7 +146,10 @@ def gateway_frame_to_bgr(stream: str, payload: np.ndarray) -> np.ndarray | None:
     if stream in CAMERA_RGB_STREAMS:
         if array.dtype != np.uint8 or array.ndim != 3 or array.shape[2] != 3:
             return None
-        return cv2.cvtColor(array, cv2.COLOR_RGB2BGR)
+        image = cv2.cvtColor(array, cv2.COLOR_RGB2BGR)
+        if stream == RIGHT_WRIST_RGB_STREAM:
+            return cv2.rotate(image, cv2.ROTATE_180)
+        return image
     raise ValueError(f"unsupported display stream: {stream}")
 
 
