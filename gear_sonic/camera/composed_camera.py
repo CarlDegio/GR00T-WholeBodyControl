@@ -18,7 +18,9 @@ Run ``python -m gear_sonic.camera.composed_camera --help`` for all options.
 """
 
 from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
+import os
 import queue
 import threading
 import time
@@ -132,6 +134,10 @@ class ComposedCameraSensor(Sensor, SensorServer):
         self._observation_spaces: dict[str, Any] = {}
         self._last_frame_timestamps: dict[str, float] = {}
         self._stale_frame_counts: dict[str, int] = {}
+        self._image_encoder_pool = ThreadPoolExecutor(
+            max_workers=min(6, os.cpu_count() or 1),
+            thread_name_prefix="camera-encoder",
+        )
 
         camera_configs = self._get_camera_configs()
 
@@ -523,6 +529,9 @@ class ComposedCameraSensor(Sensor, SensorServer):
                     camera_queue.get_nowait()
             except queue.Empty:
                 pass
+        image_encoder_pool = getattr(self, "_image_encoder_pool", None)
+        if image_encoder_pool is not None:
+            image_encoder_pool.shutdown(wait=True, cancel_futures=True)
         if self.config.run_as_server:
             self.stop_server()
 
@@ -543,7 +552,9 @@ class ComposedCameraSensor(Sensor, SensorServer):
             images=all_images,
             camera_info=all_camera_info,
         )
-        return img_schema.serialize()
+        return img_schema.serialize(
+            executor=getattr(self, "_image_encoder_pool", None)
+        )
 
     def run_server(self):
         """Main server loop — reads, serializes and publishes frames."""
