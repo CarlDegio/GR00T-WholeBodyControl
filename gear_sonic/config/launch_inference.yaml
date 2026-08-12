@@ -183,7 +183,7 @@ launch_inference:
   livox_sdk_lib: /home/user/Project/livox_sdk2_install/lib
   fastlio_config: mid360.yaml
   # Preserve raw LiDAR/IMU plus FAST-LIO odometry/cloud in outputs/slam_debug/.
-  slam_debug: true
+  slam_debug: false
   lidar_ready_timeout: 30.0
   navigation_ready_timeout: 60.0
   data_exporter: false
