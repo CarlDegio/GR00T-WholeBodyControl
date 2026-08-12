@@ -122,13 +122,18 @@ class LingBotSensorGatewayClient:
 
 
 class LingBotInferenceModeGate:
-    """Keep the model resident while admitting GPU work only in PLANNER mode."""
+    """Keep the model resident while admitting frame updates only in PLANNER mode."""
 
     def __init__(self) -> None:
         self.mode = "PLANNER"
 
     @property
     def inference_enabled(self) -> bool:
+        return self.frame_updates_enabled
+
+    @property
+    def frame_updates_enabled(self) -> bool:
+        """Return whether RGB-D reads and visualization updates may run."""
         return self.mode == "PLANNER"
 
     def accept(self, command_name: str) -> bool:
@@ -138,6 +143,13 @@ class LingBotInferenceModeGate:
         elif command_name == "select_planner_mode":
             self.mode = "PLANNER"
         return self.mode != previous
+
+
+def _read_frame_if_enabled(client, mode_gate: LingBotInferenceModeGate):
+    """Read one RGB-D frame unless POSE mode is freezing LingBot updates."""
+    if not mode_gate.frame_updates_enabled:
+        return None
+    return client.read(blocking=False)
 
 
 def configure_lingbot_runtime_environment() -> None:
@@ -349,11 +361,15 @@ def main(config: LingBotDepthViewerConfig) -> None:
             command = mode_commands.read_command()
             if command is not None and mode_gate.accept(command.name):
                 state = "running" if mode_gate.inference_enabled else "paused"
+                visualization_state = (
+                    "running" if mode_gate.frame_updates_enabled else "frozen"
+                )
                 print(
                     f"[LingBotDepth] GPU inference {state}; "
+                    f"visualization {visualization_state}; "
                     f"control mode={mode_gate.mode}, model remains loaded"
                 )
-            packet = client.read(blocking=False)
+            packet = _read_frame_if_enabled(client, mode_gate)
             images = packet.get("images", {}) if packet else {}
             rgb = images.get("chest_view")
             raw_depth = images.get("chest_view_depth")

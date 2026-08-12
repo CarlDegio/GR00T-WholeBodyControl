@@ -14,6 +14,7 @@ from gear_sonic.scripts.run_lingbot_depth_viewer import (
     LingBotInferenceModeGate,
     LingBotSensorGatewayClient,
     LingBotDepthViewerConfig,
+    _read_frame_if_enabled,
     configure_lingbot_runtime_environment,
     conservative_depth_fusion,
     normalized_intrinsics,
@@ -191,12 +192,36 @@ def test_lingbot_gpu_work_is_gated_by_pose_and_planner_mode() -> None:
     gate = LingBotInferenceModeGate()
 
     assert gate.inference_enabled
+    assert gate.frame_updates_enabled
     assert gate.accept("select_pose_mode")
     assert not gate.inference_enabled
+    assert not gate.frame_updates_enabled
     assert not gate.accept("unrelated_command")
     assert not gate.inference_enabled
+    assert not gate.frame_updates_enabled
     assert gate.accept("select_planner_mode")
     assert gate.inference_enabled
+    assert gate.frame_updates_enabled
+
+
+def test_lingbot_pose_mode_freezes_gateway_frame_reads() -> None:
+    class FakeClient:
+        reads = 0
+
+        def read(self, *, blocking: bool):
+            assert not blocking
+            self.reads += 1
+            return {"frame": self.reads}
+
+    client = FakeClient()
+    gate = LingBotInferenceModeGate()
+
+    assert _read_frame_if_enabled(client, gate) == {"frame": 1}
+    assert gate.accept("select_pose_mode")
+    assert _read_frame_if_enabled(client, gate) is None
+    assert client.reads == 1
+    assert gate.accept("select_planner_mode")
+    assert _read_frame_if_enabled(client, gate) == {"frame": 2}
 
 
 def test_prepare_depth_meters_marks_out_of_range_values_invalid() -> None:
