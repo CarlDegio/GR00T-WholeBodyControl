@@ -11,7 +11,7 @@ Usage (on robot)::
         --ego-view-device-id 18443010E1ABC12300 \\
         --port 5555
 
-Supported camera types: ``oak``, ``oak_mono``, ``realsense``,
+Supported camera types: ``oak``, ``oak_mono``, ``realsense``, ``orbbec``,
 ``usb``, or a path to an ``.mp4`` file for replay testing.
 
 Run ``python -m gear_sonic.camera.composed_camera --help`` for all options.
@@ -53,7 +53,7 @@ class ComposedCameraConfig:
     """Camera configuration for the composed camera server."""
 
     ego_view_camera: str | None = "oak"
-    """Camera type for ego view: oak, oak_mono, realsense, zed, usb, or None."""
+    """Camera type for ego view: oak, oak_mono, realsense, orbbec, zed, usb, or None."""
 
     ego_view_device_id: str | None = None
     """Device ID for ego view camera (OAK MxID, RealSense serial, USB /dev/video index)."""
@@ -87,6 +87,9 @@ class ComposedCameraConfig:
 
     realsense_enable_depth: bool = False
     """Whether RealSense cameras should publish depth alongside color."""
+
+    orbbec_enable_depth: bool = False
+    """Whether Orbbec cameras should publish aligned depth alongside color."""
 
     run_as_server: bool = True
     """Run as ZMQ PUB server (set False for in-process usage)."""
@@ -407,6 +410,22 @@ class ComposedCameraSensor(Sensor, SensorServer):
             )
             return RealSenseSensor(
                 config=realsense_config,
+                mount_position=mount_position,
+                device_id=device_id,
+            )
+
+        elif camera_type == "orbbec":
+            from gear_sonic.camera.drivers.orbbec import OrbbecConfig, OrbbecSensor
+
+            print(
+                f"Initializing Orbbec sensor for camera type: {camera_type}, "
+                f"device: {device_id}"
+            )
+            orbbec_config = OrbbecConfig()
+            orbbec_config.fps = self.config.fps
+            orbbec_config.enable_depth = self.config.orbbec_enable_depth
+            return OrbbecSensor(
+                config=orbbec_config,
                 mount_position=mount_position,
                 device_id=device_id,
             )
@@ -751,15 +770,25 @@ class ComposedCameraHttpClient:
             grabber.stop()
 
 
+def run_server_from_config(config: ComposedCameraConfig) -> None:
+    """Run the composed server and always release its camera workers."""
+    composed_camera = ComposedCameraSensor(config)
+    print("Running composed camera server...")
+    try:
+        composed_camera.run_server()
+    except KeyboardInterrupt:
+        print("Stopping camera server...")
+    finally:
+        composed_camera.close()
+
+
 if __name__ == "__main__":
     import tyro
 
     config = tyro.cli(ComposedCameraConfig)
 
     if config.run_as_server:
-        composed_camera = ComposedCameraSensor(config)
-        print("Running composed camera server...")
-        composed_camera.run_server()
+        run_server_from_config(config)
     else:
         composed_client = ComposedCameraClientSensor(server_ip="localhost", port=config.port)
         try:
