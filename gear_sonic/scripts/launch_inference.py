@@ -558,13 +558,48 @@ def build_navdp_server_command(config: InferenceLaunchConfig) -> str:
     )
 
 
+def build_livox_driver_command(config: InferenceLaunchConfig) -> str:
+    user_config_path = (
+        Path(config.fastlio_workspace)
+        / "install"
+        / "livox_ros_driver2"
+        / "share"
+        / "livox_ros_driver2"
+        / "config"
+        / "MID360_config.json"
+    )
+    return (
+        "ros2 run livox_ros_driver2 livox_ros_driver2_node --ros-args "
+        "-r __node:=livox_lidar_publisher "
+        "-r /livox/lidar:=/livox/lidar_raw "
+        "-p xfer_format:=1 "
+        "-p multi_topic:=0 "
+        "-p data_src:=0 "
+        "-p publish_freq:=10.0 "
+        "-p output_data_type:=0 "
+        "-p frame_id:=livox_frame "
+        "-p lvx_file_path:=/home/livox/livox_test.lvx "
+        f"-p user_config_path:={shlex.quote(str(user_config_path))} "
+        "-p cmdline_input_bd_code:=livox0000000001"
+    )
+
+
 def build_livox_command(config: InferenceLaunchConfig) -> str:
     return (
         "unset COLCON_CURRENT_PREFIX AMENT_PREFIX_PATH CMAKE_PREFIX_PATH; "
         "source /opt/ros/humble/setup.bash && "
         f"export LD_LIBRARY_PATH={shlex.quote(config.livox_sdk_lib)}:$LD_LIBRARY_PATH && "
         f"source {shlex.quote(config.fastlio_workspace)}/install/setup.bash && "
-        "ros2 launch livox_ros_driver2 msg_MID360_launch.py"
+        f"{build_livox_driver_command(config)}"
+    )
+
+
+def build_livox_filter_command() -> str:
+    return (
+        "python gear_sonic/scripts/run_livox_front_sector_filter.py "
+        "--input-topic /livox/lidar_raw "
+        "--output-topic /livox/lidar "
+        "--sector-degrees 90"
     )
 
 
@@ -589,7 +624,7 @@ def build_fastlio_supervisor_command(config: InferenceLaunchConfig) -> str:
 
 
 def build_slam_debug_command(config: InferenceLaunchConfig) -> str:
-    """Record the raw inputs and outputs needed to replay a FAST-LIO failure."""
+    """Record filtered LiDAR/IMU inputs and FAST-LIO outputs for replay."""
     profile = _runtime_profile(config)
     topic_roles = ("lidar", "lidar_imu", "odometry", "registered_cloud")
     topics = " ".join(shlex.quote(profile.ros_topics[role]) for role in topic_roles)
@@ -619,6 +654,7 @@ def build_sensor_gateway_command(config: InferenceLaunchConfig, repo_root: Path)
     slam_debug_enabled = config.slam_debug and ros_stack_enabled
     slam_debug_setup = ""
     livox_log = "/tmp/sonic_livox_driver.log"
+    livox_filter_log = "/tmp/sonic_livox_filter.log"
     fastlio_log = "/tmp/sonic_fastlio.log"
     if slam_debug_enabled:
         debug_root = shlex.quote(str(repo_root / "outputs" / "slam_debug"))
@@ -628,10 +664,25 @@ def build_sensor_gateway_command(config: InferenceLaunchConfig, repo_root: Path)
             'echo "[SLAM debug] recording to $slam_debug_dir"; '
         )
         livox_log = '"$slam_debug_dir/livox_driver.log"'
+        livox_filter_log = '"$slam_debug_dir/livox_filter.log"'
         fastlio_log = '"$slam_debug_dir/fastlio.log"'
 
     background_commands: list[tuple[str, str, str]] = []
     if ros_stack_enabled:
+        background_commands.extend(
+            (
+                (
+                    "livox_pid",
+                    build_livox_driver_command(config),
+                    livox_log,
+                ),
+                (
+                    "livox_filter_pid",
+                    build_livox_filter_command(),
+                    livox_filter_log,
+                ),
+            )
+        )
         if slam_debug_enabled:
             background_commands.append(
                 (
@@ -640,18 +691,11 @@ def build_sensor_gateway_command(config: InferenceLaunchConfig, repo_root: Path)
                     '"$slam_debug_dir/rosbag.log"',
                 )
             )
-        background_commands.extend(
+        background_commands.append(
             (
-                (
-                    "livox_pid",
-                    "ros2 launch livox_ros_driver2 msg_MID360_launch.py",
-                    livox_log,
-                ),
-                (
-                    "fastlio_pid",
-                    build_fastlio_supervisor_command(config),
-                    fastlio_log,
-                ),
+                "fastlio_pid",
+                build_fastlio_supervisor_command(config),
+                fastlio_log,
             )
         )
     if config.opencv_viewer:
