@@ -1,6 +1,8 @@
 import importlib
 import sys
+import threading
 import types
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import numpy as np
@@ -134,6 +136,56 @@ def test_rgbd_schema_round_trip_preserves_uint16_and_camera_info():
     assert wire["schema_version"] == 2
 
 
+def test_schema_parallel_serialization_preserves_order_and_payload(monkeypatch):
+    """Catch a fallback to serial encoding or a parallel wire-format change."""
+    rgb_a = np.zeros((16, 24, 3), dtype=np.uint8)
+    rgb_a[:, :8] = (240, 20, 10)
+    rgb_b = np.full((16, 24, 3), (15, 120, 230), dtype=np.uint8)
+    depth_a = np.arange(16 * 24, dtype=np.uint16).reshape(16, 24)
+    depth_b = np.full((16, 24), 2345, dtype=np.uint16)
+    schema = ImageMessageSchema(
+        timestamps={
+            "ego_view": 1.0,
+            "ego_view_depth": 1.0,
+            "chest_view": 2.0,
+            "chest_view_depth": 2.0,
+        },
+        images={
+            "ego_view": rgb_a,
+            "ego_view_depth": depth_a,
+            "chest_view": rgb_b,
+            "chest_view_depth": depth_b,
+        },
+        camera_info={"chest_view": {"depth_scale_m": 0.001}},
+    )
+    serial_wire = schema.serialize()
+
+    original_rgb_encoder = ImageUtils.encode_image
+    original_depth_encoder = ImageUtils.encode_depth_image
+    all_encoders_started = threading.Barrier(4)
+
+    def encode_rgb_after_barrier(image):
+        all_encoders_started.wait(timeout=2.0)
+        return original_rgb_encoder(image)
+
+    def encode_depth_after_barrier(image):
+        all_encoders_started.wait(timeout=2.0)
+        return original_depth_encoder(image)
+
+    monkeypatch.setattr(ImageUtils, "encode_image", encode_rgb_after_barrier)
+    monkeypatch.setattr(ImageUtils, "encode_depth_image", encode_depth_after_barrier)
+
+    with ThreadPoolExecutor(max_workers=4) as executor:
+        parallel_wire = schema.serialize(executor=executor)
+
+    assert list(parallel_wire["images"]) == list(schema.images)
+    assert parallel_wire == serial_wire
+    decoded = ImageMessageSchema.deserialize(parallel_wire)
+    np.testing.assert_array_equal(decoded.images["ego_view_depth"], depth_a)
+    np.testing.assert_array_equal(decoded.images["chest_view_depth"], depth_b)
+    assert decoded.camera_info == schema.camera_info
+
+
 def test_legacy_base64_jpeg_does_not_claim_policy_channel_compatibility() -> None:
     image = np.zeros((32, 48, 3), dtype=np.uint8)
     image[:, :16] = (240, 20, 10)
@@ -249,3 +301,74 @@ def test_composed_camera_enables_depth_only_for_chest_and_merges_camera_info(mon
         )
     ).asdict()
     assert result["camera_info"] == {"chest_view": {"fx": 500.0}}
+
+
+def test_composed_camera_serializes_images_with_owned_executor(monkeypatch):
+    """Catch composed serialization bypassing its parallel encoder pool."""
+    from gear_sonic.camera.composed_camera import ComposedCameraSensor
+
+    original_rgb_encoder = ImageUtils.encode_image
+    original_depth_encoder = ImageUtils.encode_depth_image
+    all_encoders_started = threading.Barrier(4)
+
+    def encode_rgb_after_barrier(image):
+        all_encoders_started.wait(timeout=2.0)
+        return original_rgb_encoder(image)
+
+    def encode_depth_after_barrier(image):
+        all_encoders_started.wait(timeout=2.0)
+        return original_depth_encoder(image)
+
+    monkeypatch.setattr(ImageUtils, "encode_image", encode_rgb_after_barrier)
+    monkeypatch.setattr(ImageUtils, "encode_depth_image", encode_depth_after_barrier)
+
+    composed = object.__new__(ComposedCameraSensor)
+    composed._image_encoder_pool = ThreadPoolExecutor(max_workers=4)
+    message = {
+        "ego_view": {
+            "timestamps": {"ego_view": 1.0, "ego_view_depth": 1.0},
+            "images": {
+                "ego_view": np.zeros((8, 8, 3), dtype=np.uint8),
+                "ego_view_depth": np.ones((8, 8), dtype=np.uint16),
+            },
+            "camera_info": {},
+        },
+        "chest_view": {
+            "timestamps": {"chest_view": 2.0, "chest_view_depth": 2.0},
+            "images": {
+                "chest_view": np.zeros((8, 8, 3), dtype=np.uint8),
+                "chest_view_depth": np.full((8, 8), 2, dtype=np.uint16),
+            },
+            "camera_info": {},
+        },
+    }
+    try:
+        wire = composed.serialize_message(message)
+    finally:
+        composed._image_encoder_pool.shutdown(wait=True, cancel_futures=True)
+
+    assert list(wire["images"]) == [
+        "ego_view",
+        "ego_view_depth",
+        "chest_view",
+        "chest_view_depth",
+    ]
+
+
+def test_composed_camera_close_shuts_down_encoder_pool():
+    """Catch encoder threads surviving after the camera server closes."""
+    from gear_sonic.camera.composed_camera import ComposedCameraConfig, ComposedCameraSensor
+
+    composed = object.__new__(ComposedCameraSensor)
+    composed.config = ComposedCameraConfig(ego_view_camera=None, server=False)
+    composed.camera_queues = {}
+    composed.camera_threads = {}
+    composed.shutdown_events = {}
+    composed._image_encoder_pool = ThreadPoolExecutor(max_workers=1)
+
+    try:
+        composed.close()
+        with pytest.raises(RuntimeError, match="cannot schedule new futures"):
+            composed._image_encoder_pool.submit(lambda: None)
+    finally:
+        composed._image_encoder_pool.shutdown(wait=True, cancel_futures=True)
