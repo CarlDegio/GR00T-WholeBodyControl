@@ -76,28 +76,67 @@ def _start_fastlio(config_file: str) -> subprocess.Popen:
     return subprocess.Popen(command, start_new_session=True)
 
 
-def _signal_process_group(process: subprocess.Popen, signum: signal.Signals) -> None:
-    if process.poll() is None:
-        os.killpg(process.pid, signum)
+def _process_group_exists(process_group_id: int) -> bool:
+    try:
+        os.killpg(process_group_id, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def _wait_for_process_group_exit(
+    process: subprocess.Popen,
+    process_group_id: int,
+    timeout_s: float,
+) -> bool:
+    deadline = time.monotonic() + timeout_s
+    while True:
+        # Reap the launch parent when it exits, but keep the group as the
+        # ownership/liveness boundary because mapping descendants may remain.
+        process.poll()
+        if not _process_group_exists(process_group_id):
+            return True
+        remaining_s = deadline - time.monotonic()
+        if remaining_s <= 0.0:
+            return False
+        time.sleep(min(0.05, remaining_s))
+
+
+def _signal_process_group(
+    process_group_id: int,
+    signum: signal.Signals,
+) -> None:
+    os.killpg(process_group_id, signum)
 
 
 def _stop_fastlio(process: subprocess.Popen) -> None:
-    if process.poll() is not None:
+    process_group_id = process.pid
+    if not _process_group_exists(process_group_id):
+        process.poll()
         return
+
     for signum, timeout_s in (
         (signal.SIGINT, 5.0),
         (signal.SIGTERM, 2.0),
         (signal.SIGKILL, 1.0),
     ):
         try:
-            _signal_process_group(process, signum)
+            _signal_process_group(process_group_id, signum)
         except ProcessLookupError:
+            process.poll()
             return
-        try:
-            process.wait(timeout=timeout_s)
+        if _wait_for_process_group_exit(
+            process,
+            process_group_id,
+            timeout_s,
+        ):
             return
-        except subprocess.TimeoutExpired:
-            continue
+
+    raise RuntimeError(
+        f"FAST-LIO process group {process_group_id} survived SIGKILL"
+    )
 
 
 def _cancel_navigation_and_stop_fastlio(
