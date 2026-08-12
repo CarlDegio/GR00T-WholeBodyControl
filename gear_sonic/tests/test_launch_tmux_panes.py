@@ -23,8 +23,6 @@ from gear_sonic.scripts.launch_inference import (
     build_operator_console_command,
     build_operator_interface_command,
     build_livox_command,
-    build_livox_driver_command,
-    build_livox_filter_command,
     build_lingbot_command,
     build_planner_input_command,
     build_navdp_planner_command,
@@ -181,8 +179,6 @@ def test_navdp_stack_commands_use_ros_topics_and_official_xnavdp_server() -> Non
     planner = build_navdp_planner_command(config, Path("/workspace/sonic"))
     server = build_navdp_server_command(config)
     livox = build_livox_command(config)
-    driver = build_livox_driver_command(config)
-    lidar_filter = build_livox_filter_command()
     fastlio = build_fastlio_command(config)
     fastlio_supervisor = build_fastlio_supervisor_command(config)
 
@@ -205,20 +201,7 @@ def test_navdp_stack_commands_use_ros_topics_and_official_xnavdp_server() -> Non
     assert "--real" in server
     assert "--no-visualization" in server
     assert f"--checkpoint {config.navdp_checkpoint}" in server
-    assert "ros2 run livox_ros_driver2 livox_ros_driver2_node" in livox
-    assert "ros2 run livox_ros_driver2 livox_ros_driver2_node" in driver
-    assert "-r /livox/lidar:=/livox/lidar_raw" in driver
-    assert "-p xfer_format:=1" in driver
-    assert "-p multi_topic:=0" in driver
-    assert "-p data_src:=0" in driver
-    assert "-p publish_freq:=10.0" in driver
-    assert "-p output_data_type:=0" in driver
-    assert "-p frame_id:=livox_frame" in driver
-    assert "MID360_config.json" in driver
-    assert "run_livox_front_sector_filter.py" in lidar_filter
-    assert "--input-topic /livox/lidar_raw" in lidar_filter
-    assert "--output-topic /livox/lidar" in lidar_filter
-    assert "--sector-degrees 90" in lidar_filter
+    assert "msg_MID360_launch.py" in livox
     assert "mapping.launch.py" in fastlio
     assert "rviz:=false" in fastlio
     assert "run_fastlio_supervisor.py" in fastlio_supervisor
@@ -274,12 +257,10 @@ def test_runtime_sidecars_are_read_only_and_navdp_uses_gateway_by_default() -> N
     assert "/tmp/sonic_opencv_viewer.log" in gateway
     assert "run_lingbot_depth_viewer.py" in gateway
     assert "/tmp/sonic_lingbot.log" in gateway
-    assert "ros2 run livox_ros_driver2 livox_ros_driver2_node" in gateway
-    assert "run_livox_front_sector_filter.py" in gateway
+    assert "msg_MID360_launch.py" in gateway
     assert "run_fastlio_supervisor.py" in gateway
     assert "--control-gateway-endpoint tcp://127.0.0.1:5561" in gateway
     assert "/tmp/sonic_livox_driver.log" in gateway
-    assert "/tmp/sonic_livox_filter.log" in gateway
     assert "/tmp/sonic_fastlio.log" in gateway
     assert "ros2 bag record" not in gateway
     assert "--camera-host 192.168.123.164" in gateway
@@ -292,29 +273,6 @@ def test_runtime_sidecars_are_read_only_and_navdp_uses_gateway_by_default() -> N
     assert "run_sensor_gateway" not in planner
 
 
-def test_livox_filter_is_between_driver_and_fastlio_and_participates_in_cleanup() -> None:
-    config = InferenceLaunchConfig(
-        opencv_viewer=False,
-        planner_input="keyboard",
-        slam_debug=False,
-    )
-
-    gateway = build_sensor_gateway_command(config, Path("/workspace/sonic"))
-
-    driver_index = gateway.index("ros2 run livox_ros_driver2")
-    filter_index = gateway.index("run_livox_front_sector_filter.py")
-    fastlio_index = gateway.index("run_fastlio_supervisor.py")
-    assert driver_index < filter_index < fastlio_index
-    assert "/tmp/sonic_livox_driver.log" in gateway
-    assert "/tmp/sonic_livox_filter.log" in gateway
-    assert "/tmp/sonic_fastlio.log" in gateway
-    assert "livox_pid=$!" in gateway
-    assert "livox_filter_pid=$!" in gateway
-    assert "fastlio_pid=$!" in gateway
-    assert "kill $livox_pid $livox_filter_pid $fastlio_pid" in gateway
-    assert "wait $livox_pid $livox_filter_pid $fastlio_pid" in gateway
-
-
 def test_slam_debug_records_raw_inputs_and_fastlio_outputs_per_run() -> None:
     config = InferenceLaunchConfig(slam_debug=True)
     root = Path("/workspace/sonic")
@@ -324,14 +282,12 @@ def test_slam_debug_records_raw_inputs_and_fastlio_outputs_per_run() -> None:
 
     assert 'ros2 bag record -o "$slam_debug_dir/rosbag"' in recorder
     assert "/livox/lidar" in recorder
-    assert "/livox/lidar_raw" not in recorder
     assert "/livox/imu" in recorder
     assert "/Odometry_loc" in recorder
     assert "/cloud_registered_1" in recorder
     assert "outputs/slam_debug/$(date +%Y%m%d_%H%M%S_%N)" in gateway
     assert "[SLAM debug] recording to $slam_debug_dir" in gateway
     assert '>"$slam_debug_dir/livox_driver.log"' in gateway
-    assert '>"$slam_debug_dir/livox_filter.log"' in gateway
     assert '>"$slam_debug_dir/fastlio.log"' in gateway
     assert '>"$slam_debug_dir/rosbag.log"' in gateway
     assert "/tmp/sonic_livox_driver.log" not in gateway
