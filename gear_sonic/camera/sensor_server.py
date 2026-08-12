@@ -1,6 +1,7 @@
 """ZMQ PUB/SUB transport and image serialisation for the camera server."""
 
 import base64
+from concurrent.futures import Executor
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any
@@ -116,20 +117,35 @@ class ImageMessageSchema:
     images: dict[str, Any]
     camera_info: dict[str, Any] = field(default_factory=dict)
 
-    def serialize(self) -> dict[str, Any]:
+    @staticmethod
+    def _encode_image_value(key: str, image: Any) -> str | bytes | bytearray:
+        if key.endswith("_depth"):
+            return ImageUtils.encode_depth_image(image)
+        if isinstance(image, bytes | bytearray):
+            return image
+        return ImageUtils.encode_image(image)
+
+    def serialize(self, executor: Executor | None = None) -> dict[str, Any]:
         serialized_msg: dict[str, Any] = {
             "schema_version": 2,
             "timestamps": self.timestamps,
             "images": {},
             "camera_info": self.camera_info,
         }
-        for key, image in self.images.items():
-            if key.endswith("_depth"):
-                serialized_msg["images"][key] = ImageUtils.encode_depth_image(image)
-            elif isinstance(image, bytes | bytearray):
-                serialized_msg["images"][key] = image
-            else:
-                serialized_msg["images"][key] = ImageUtils.encode_image(image)
+        if executor is None:
+            encoded_images = [
+                self._encode_image_value(key, image)
+                for key, image in self.images.items()
+            ]
+        else:
+            futures = [
+                executor.submit(self._encode_image_value, key, image)
+                for key, image in self.images.items()
+            ]
+            encoded_images = [future.result() for future in futures]
+        serialized_msg["images"] = dict(
+            zip(self.images, encoded_images, strict=True)
+        )
         return serialized_msg
 
     @staticmethod

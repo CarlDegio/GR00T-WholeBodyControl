@@ -1,6 +1,8 @@
 import importlib
 import sys
+import threading
 import types
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import numpy as np
@@ -132,6 +134,56 @@ def test_rgbd_schema_round_trip_preserves_uint16_and_camera_info():
     assert decoded.images["chest_view_depth"].dtype == np.uint16
     assert decoded.camera_info == schema.camera_info
     assert wire["schema_version"] == 2
+
+
+def test_schema_parallel_serialization_preserves_order_and_payload(monkeypatch):
+    """Catch a fallback to serial encoding or a parallel wire-format change."""
+    rgb_a = np.zeros((16, 24, 3), dtype=np.uint8)
+    rgb_a[:, :8] = (240, 20, 10)
+    rgb_b = np.full((16, 24, 3), (15, 120, 230), dtype=np.uint8)
+    depth_a = np.arange(16 * 24, dtype=np.uint16).reshape(16, 24)
+    depth_b = np.full((16, 24), 2345, dtype=np.uint16)
+    schema = ImageMessageSchema(
+        timestamps={
+            "ego_view": 1.0,
+            "ego_view_depth": 1.0,
+            "chest_view": 2.0,
+            "chest_view_depth": 2.0,
+        },
+        images={
+            "ego_view": rgb_a,
+            "ego_view_depth": depth_a,
+            "chest_view": rgb_b,
+            "chest_view_depth": depth_b,
+        },
+        camera_info={"chest_view": {"depth_scale_m": 0.001}},
+    )
+    serial_wire = schema.serialize()
+
+    original_rgb_encoder = ImageUtils.encode_image
+    original_depth_encoder = ImageUtils.encode_depth_image
+    all_encoders_started = threading.Barrier(4)
+
+    def encode_rgb_after_barrier(image):
+        all_encoders_started.wait(timeout=2.0)
+        return original_rgb_encoder(image)
+
+    def encode_depth_after_barrier(image):
+        all_encoders_started.wait(timeout=2.0)
+        return original_depth_encoder(image)
+
+    monkeypatch.setattr(ImageUtils, "encode_image", encode_rgb_after_barrier)
+    monkeypatch.setattr(ImageUtils, "encode_depth_image", encode_depth_after_barrier)
+
+    with ThreadPoolExecutor(max_workers=4) as executor:
+        parallel_wire = schema.serialize(executor=executor)
+
+    assert list(parallel_wire["images"]) == list(schema.images)
+    assert parallel_wire == serial_wire
+    decoded = ImageMessageSchema.deserialize(parallel_wire)
+    np.testing.assert_array_equal(decoded.images["ego_view_depth"], depth_a)
+    np.testing.assert_array_equal(decoded.images["chest_view_depth"], depth_b)
+    assert decoded.camera_info == schema.camera_info
 
 
 def test_legacy_base64_jpeg_does_not_claim_policy_channel_compatibility() -> None:
