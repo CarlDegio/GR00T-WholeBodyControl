@@ -15,7 +15,6 @@ from gear_sonic.scripts.navdp_planner import (
     NavigationCommand,
     Pose2D,
     SonicPlannerState,
-    apply_hard_safety,
     base_goal_to_world,
     build_navigation_message,
     decode_navigation_message,
@@ -29,7 +28,6 @@ from gear_sonic.scripts.navdp_planner import (
     render_slam_world_panel,
     local_trajectory_to_world,
     update_slam_map,
-    should_abort_nav_for_lidar,
     should_abort_nav_for_zero_action,
 )
 from gear_sonic.scripts import navdp_planner
@@ -491,57 +489,35 @@ def test_actor_ray_uses_3d_range_and_full_vertical_field() -> None:
     assert rays[90] == pytest.approx(np.sqrt(5.0))
 
 
+def test_near_radar_point_is_visualized_without_stopping_control_output() -> None:
+    velocity, rays, camera_stop = navdp_planner._prepare_control_output(
+        (0.3, 0.0, 0.1),
+        np.array([[0.09, 0.0, 0.0]], dtype=np.float32),
+        np.ones((60, 60), dtype=np.float32),
+    )
+
+    assert velocity == pytest.approx((0.3, 0.0, 0.1))
+    assert rays[90] == pytest.approx(0.09)
+    assert not camera_stop
+
+
+def test_depth_stop_still_zeros_control_output() -> None:
+    depth = np.ones((60, 60), dtype=np.float32)
+    depth.flat[:2001] = 0.09
+
+    velocity, _, camera_stop = navdp_planner._prepare_control_output(
+        (0.3, 0.0, 0.1),
+        np.empty((0, 3), dtype=np.float32),
+        depth,
+    )
+
+    assert velocity == (0.0, 0.0, 0.0)
+    assert camera_stop
+
+
 def test_runtime_has_no_actor_ray_temporal_filter_state() -> None:
     sensors = navdp_planner._SharedSensors()
     assert not hasattr(sensors, "ray_history")
-
-
-def test_forward_135_degree_sector_stops_translation_but_not_pure_turning() -> None:
-    points = np.array([[0.09, 0.0, 0.0]], dtype=np.float32)
-
-    assert apply_hard_safety((0.3, 0.0, 0.1), points, camera_stop=False) == (
-        0.0,
-        0.0,
-        0.0,
-    )
-    assert apply_hard_safety((0.0, 0.0, 0.4), points, camera_stop=False) == (
-        0.0,
-        0.0,
-        0.4,
-    )
-    assert apply_hard_safety((-0.2, 0.0, 0.0), points, camera_stop=False) == (
-        -0.2,
-        0.0,
-        0.0,
-    )
-    assert apply_hard_safety(
-        (0.3, 0.0, 0.0), np.array([[0.11, 0.0, 0.0]], dtype=np.float32), camera_stop=False
-    ) == (0.3, 0.0, 0.0)
-
-
-@pytest.mark.parametrize(
-    ("velocity", "obstacle"),
-    [
-        ((0.0, 0.15, 0.0), (0.0, 0.09, 0.0)),
-        ((0.0, -0.15, 0.0), (0.0, -0.09, 0.0)),
-        ((-0.3, 0.0, 0.0), (-0.09, 0.0, 0.0)),
-        ((0.2, 0.1, 0.0), (0.08, 0.04, 0.0)),
-    ],
-)
-def test_hard_safety_rotates_sector_with_xy_translation(
-    velocity: tuple[float, float, float], obstacle: tuple[float, float, float]
-) -> None:
-    assert apply_hard_safety(
-        velocity, np.array([obstacle], dtype=np.float32), camera_stop=False
-    ) == (0.0, 0.0, 0.0)
-
-
-def test_lateral_motion_ignores_obstacle_outside_its_motion_sector() -> None:
-    assert apply_hard_safety(
-        (0.0, 0.15, 0.0),
-        np.array([[0.0, -0.35, 0.0]], dtype=np.float32),
-        camera_stop=False,
-    ) == (0.0, 0.15, 0.0)
 
 
 def test_sonic_arc_packet_uses_same_world_direction_for_motion_and_facing() -> None:
@@ -816,27 +792,6 @@ def test_point_plane_distances_match_plane_equation_without_matrix_multiply() ->
     distances = navdp_planner.point_plane_distances(points, normal, offset)
 
     assert distances == pytest.approx(np.abs(points @ normal - offset))
-
-
-def test_only_lidar_hard_stop_aborts_active_navigation() -> None:
-    assert should_abort_nav_for_lidar(
-        mode="nav_goal",
-        before_safety=(0.3, 0.0, 0.0),
-        after_safety=(0.0, 0.0, 0.0),
-        camera_stop=False,
-    )
-    assert not should_abort_nav_for_lidar(
-        mode="nav_goal",
-        before_safety=(0.3, 0.0, 0.0),
-        after_safety=(0.0, 0.0, 0.0),
-        camera_stop=True,
-    )
-    assert not should_abort_nav_for_lidar(
-        mode="manual_velocity",
-        before_safety=(0.3, 0.0, 0.0),
-        after_safety=(0.0, 0.0, 0.0),
-        camera_stop=False,
-    )
 
 
 def test_valid_zero_macro_action_aborts_navigation_but_waiting_does_not() -> None:

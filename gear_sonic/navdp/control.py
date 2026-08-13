@@ -15,34 +15,8 @@ from gear_sonic.navdp.navigation import (
     Pose2D,
     local_trajectory_to_world,
 )
-from gear_sonic.navdp.visualization import actor_ray_from_points
 from gear_sonic.runtime.config import load_runtime_profile
 from gear_sonic.utils.teleop.zmq.zmq_planner_sender import build_planner_message
-
-
-def apply_hard_safety(
-    velocity: Sequence[float],
-    points_base: np.ndarray,
-    *,
-    camera_stop: bool,
-    stop_distance_m: float = 0.10,
-    half_sector_deg: float = 67.5,
-) -> tuple[float, float, float]:
-    command = tuple(map(float, velocity))
-    if camera_stop:
-        return 0.0, 0.0, 0.0
-    if math.hypot(command[0], command[1]) <= 1e-9:
-        return command
-    points = np.asarray(points_base, dtype=np.float32).reshape(-1, 3)
-    if not len(points):
-        return command
-    rays = actor_ray_from_points(points)
-    angles = np.linspace(-180.0, 180.0, len(rays), endpoint=False)
-    motion_angle = math.degrees(math.atan2(command[1], command[0]))
-    angle_error = (angles - motion_angle + 180.0) % 360.0 - 180.0
-    if np.any((np.abs(angle_error) <= half_sector_deg) & (rays <= stop_distance_m)):
-        return 0.0, 0.0, 0.0
-    return command
 
 
 XNAVDP_G1_MPC_DEFAULTS = dict(
@@ -492,24 +466,6 @@ def fresh_mpc_control(
 ) -> tuple[float, float]:
     """Use a successful MPC result only for a bounded amount of time."""
     return control if now - result_time <= timeout_s else (0.0, 0.0)
-
-
-def should_abort_nav_for_lidar(
-    *,
-    mode: str,
-    before_safety: Sequence[float],
-    after_safety: Sequence[float],
-    camera_stop: bool,
-) -> bool:
-    """Return true only when MID-360 hard safety blocked active translation."""
-    before = tuple(map(float, before_safety))
-    after = tuple(map(float, after_safety))
-    return bool(
-        mode == "nav_goal"
-        and not camera_stop
-        and math.hypot(before[0], before[1]) > 1.0e-9
-        and math.hypot(after[0], after[1]) <= 1.0e-9
-    )
 
 
 def should_abort_nav_for_zero_action(

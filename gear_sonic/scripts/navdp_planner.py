@@ -7,7 +7,7 @@ import math
 import queue
 import threading
 import time
-from typing import Any, Mapping
+from typing import Any, Mapping, Sequence
 
 import numpy as np
 
@@ -19,10 +19,8 @@ from gear_sonic.navdp.control import (
     MpcSolveRequest,
     MpcSolveResult,
     SonicPlannerState,
-    apply_hard_safety,
     fresh_mpc_control,
     prepare_internnav_world_reference,
-    should_abort_nav_for_lidar,
     should_abort_nav_for_zero_action,
     sonic_heading_from_mpc,
     xnavdp_adaptive_speed,
@@ -119,7 +117,6 @@ __all__ = [
     "_viz_pixels",
     "actor_ray_from_points",
     "actor_ray_velocity_arrow",
-    "apply_hard_safety",
     "base_goal_to_world",
     "build_navigation_message",
     "closest_timestamped_pose",
@@ -142,13 +139,24 @@ __all__ = [
     "render_actor_ray_panel",
     "render_head_depth_panel",
     "render_slam_world_panel",
-    "should_abort_nav_for_lidar",
     "should_abort_nav_for_zero_action",
     "sonic_heading_from_mpc",
     "update_slam_map",
     "xnavdp_adaptive_speed",
     "xnavdp_control_to_body_velocity",
 ]
+
+
+def _prepare_control_output(
+    velocity: Sequence[float],
+    points: np.ndarray,
+    latest_depth: np.ndarray | None,
+) -> tuple[tuple[float, float, float], np.ndarray, bool]:
+    command = tuple(map(float, velocity))
+    camera_stop = latest_depth is not None and depth_requires_stop(latest_depth)
+    if camera_stop:
+        command = (0.0, 0.0, 0.0)
+    return command, actor_ray_from_points(points), camera_stop
 
 
 def main(config: NavDPPlannerConfig) -> None:
@@ -473,17 +481,9 @@ def main(config: NavDPPlannerConfig) -> None:
                 stale_reason = "trajectory_stale"
             if stale_reason:
                 velocity = (0.0, 0.0, 0.0)
-            camera_stop = latest_depth is not None and depth_requires_stop(latest_depth)
-            current_rays = actor_ray_from_points(points)
-            angles = np.deg2rad(-179.0 + 2.0 * np.arange(180, dtype=np.float32))
-            hit = current_rays < 3.0
-            safety_points = np.column_stack((
-                current_rays[hit] * np.cos(angles[hit]),
-                current_rays[hit] * np.sin(angles[hit]),
-                np.zeros(int(hit.sum())),
-            )).astype(np.float32)
-            before_safety = velocity
-            velocity = apply_hard_safety(velocity, safety_points, camera_stop=camera_stop)
+            velocity, current_rays, camera_stop = _prepare_control_output(
+                velocity, points, latest_depth
+            )
             if actorray_recording is not None and mode == "nav_goal":
                 actorray_recording.write(
                     render_actor_ray_panel(
@@ -492,12 +492,6 @@ def main(config: NavDPPlannerConfig) -> None:
                         velocity=velocity,
                     )
                 )
-            lidar_aborted = should_abort_nav_for_lidar(
-                mode=mode,
-                before_safety=before_safety,
-                after_safety=velocity,
-                camera_stop=camera_stop,
-            )
             output.send(
                 sonic_planner.message(
                     velocity,
@@ -505,8 +499,8 @@ def main(config: NavDPPlannerConfig) -> None:
                 )
             )
             safety_blocked = not np.allclose(velocity, candidate_velocity, atol=1.0e-6)
-            if lidar_aborted or zero_action_aborted:
-                stop_reason = "lidar_hard_stop" if lidar_aborted else "navdp_zero_action"
+            if zero_action_aborted:
+                stop_reason = "navdp_zero_action"
                 print(f"[NavDP] navigation stopped: {stop_reason}", flush=True)
                 send_status("stopped", stop_reason)
                 mode = "stop"
@@ -524,7 +518,7 @@ def main(config: NavDPPlannerConfig) -> None:
                 and len(trajectory)
                 and (trajectory_log_pending or safety_blocked != last_safety_blocked)
             ):
-                reason = stale_reason or ("depth_hard_stop" if camera_stop else "radar_hard_stop" if safety_blocked else "clear")
+                reason = stale_reason or ("depth_hard_stop" if camera_stop else "clear")
                 print(
                     format_navigation_diagnostics(
                         generation=generation,
