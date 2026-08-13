@@ -113,6 +113,11 @@ Gateway RPC 已运行在其现有独立服务线程中。因此主 Gateway 线�
 
 因此，本次优化只删除数据转换和排队开销，不改变已运行系统的时序语义。
 
+实施硬约束：`VlaSensorGatewayIngress._run`、`_request`、`_poll_state`、现有
+age/skew/sequence 检查及轮询顺序保持不变。VLA 热路径不新增时间戳比较、等待
+窗口、重试、sleep、数据配对或调度分支；新增分支只负责区分 binary JPEG 与旧
+Base64 JPEG 的线格式，并立即转换为相同的 JPEG bytes。
+
 ## 7. 降低相机传输延迟
 
 - 相机 PUB socket 的发送高水位调整为 latest-first 所需的小队列（目标 `SNDHWM=1`），保留非阻塞发送；消费者落后时优先丢弃旧帧。
