@@ -1,0 +1,561 @@
+load extensions from /home/unitree/GR00T-WholeBodyControl/.venv_camera/lib/python3.10/site-packages/pyorbbecsdk/extensions
+[ego_view] Initializing camera (attempt 1/10)...
+Initializing Orbbec sensor for camera type: orbbec, device: CPMD464001G
+Device: Orbbec Gemini 345Lg
+    Serial number: CPMD464001G
+    Firmware version: 1.9.03
+Done initializing Orbbec sensor for ego_view: CPMD464001G
+[ego_view] Camera initialized successfully
+[ego_view] Camera ready, waiting 3s before next camera...
+[chest_view] Initializing camera (attempt 1/10)...
+Initializing RealSense sensor for camera type: realsense, device: 408122070390
+Device: Intel RealSense D435I
+    Serial number: 347522071257
+    Firmware version: 5.15.1.55
+Device: Intel RealSense D405
+    Serial number: 218622279421
+    Firmware version: 5.12.14.100
+Device: Intel RealSense D435I
+    Serial number: 408122070390
+    Firmware version: 5.15.1.55
+Device: Intel RealSense D405
+    Serial number: 352122270966
+    Firmware version: 5.15.1.55
+Done initializing RealSense sensor for chest_view: 408122070390
+[chest_view] Camera initialized successfully
+[chest_view] Camera ready, waiting 3s before next camera...
+[left_wrist] Initializing camera (attempt 1/10)...
+Initializing RealSense sensor for camera type: realsense, device: 218622279421
+Device: Intel RealSense D435I
+    Serial number: 347522071257
+    Firmware version: 5.15.1.55
+Device: Intel RealSense D405
+    Serial number: 218622279421
+    Firmware version: 5.12.14.100
+Device: Intel RealSense D435I
+    Serial number: 408122070390
+    Firmware version: 5.15.1.55
+Device: Intel RealSense D405
+    Serial number: 352122270966
+    Firmware version: 5.15.1.55
+Done initializing RealSense sensor for left_wrist: 218622279421
+[left_wrist] Camera initialized successfully
+[left_wrist] Camera ready, waiting 3s before next camera...
+[right_wrist] Initializing camera (attempt 1/10)...
+Initializing RealSense sensor for camera type: realsense, device: 352122270966
+Device: Intel RealSense D435I
+    Serial number: 347522071257
+    Firmware version: 5.15.1.55
+Device: Intel RealSense D405
+    Serial number: 218622279421
+    Firmware version: 5.12.14.100
+Device: Intel RealSense D435I
+    Serial number: 408122070390
+    Firmware version: 5.15.1.55
+Device: Intel RealSense D405
+    Serial number: 352122270966
+    Firmware version: 5.15.1.55
+Done initializing RealSense sensor for right_wrist: 352122270966
+[right_wrist] Camera initialized successfully
+[right_wrist] Camera ready, waiting 3s before next camera...
+Waiting for all cameras to be ready before starting server...
+All 4 cameras ready: {'right_wrist', 'left_wrist', 'ego_view', 'chest_view'}
+Sensor server running at tcp://*:5555
+Running composed camera server...
+Image sending FPS: 30.14
+Image sending FPS: 30.51
+Image sending FPS: 29.61
+Image sending FPS: 30.26
+Image sending FPS: 29.74
+Image sending FPS: 30.13
+Image sending FPS: 30.08
+Image sending FPS: 29.86
+Image sending FPS: 30.25
+[Sensor server] Message sent: 100, message dropped: 0
+Image sending FPS: 29.90
+Image sending FPS: 30.03
+Image sending FPS: 30.10
+Image sending FPS: 29.68
+Image sending FPS: 30.11
+Image sending FPS: 30.91
+Image sending FPS: 28.97
+Image sending FPS: 30.53
+Image sending FPS: 30.42
+Image sending FPS: 28.98
+[Sensor server] Message sent: 200, message dropped: 0
+Image sending FPS: 30.01
+Image sending FPS: 30.37
+Image sending FPS: 30.72
+Image sending FPS: 29.71
+Image sending FPS: 30.02
+Image sending FPS: 29.36
+Image sending FPS: 29.98
+Image sending FPS: 30.58
+Image sending FPS: 29.94
+Image sending FPS: 30.22
+[Sensor server] Message sent: 300, message dropped: 0
+Image sending FPS: 29.88
+Image sending FPS: 29.54
+Image sending FPS: 29.79
+Image sending FPS: 30.79
+Image sending FPS: 29.79
+Image sending FPS: 30.25
+Image sending FPS: 30.16
+Image sending FPS: 29.78
+Image sending FPS: 30.03
+Image sending FPS: 29.81
+[Sensor server] Message sent: 400, message dropped: 0
+Image sending FPS: 30.14
+Image sending FPS: 30.02
+Image sending FPS: 30.18
+Image sending FPS: 29.64
+Image sending FPS: 30.17
+Image sending FPS: 29.99
+Image sending FPS: 29.53
+Image sending FPS: 30.28
+Image sending FPS: 30.38
+Image sending FPS: 30.01
+[Sensor server] Message sent: 500, message dropped: 0
+Image sending FPS: 29.65
+Image sending FPS: 30.14
+Image sending FPS: 29.85
+Image sending FPS: 30.03
+Image sending FPS: 29.87
+Image sending FPS: 30.32
+Image sending FPS: 29.56
+Image sending FPS: 30.05
+Image sending FPS: 29.95
+Image sending FPS: 30.48
+[Sensor server] Message sent: 600, message dropped: 0
+Image sending FPS: 29.95
+Image sending FPS: 29.72
+Image sending FPS: 30.13
+Image sending FPS: 29.85
+Image sending FPS: 29.97
+Image sending FPS: 30.31
+Image sending FPS: 30.35
+Image sending FPS: 29.59
+Image sending FPS: 30.06
+Image sending FPS: 30.28
+[Sensor server] Message sent: 700, message dropped: 0
+Image sending FPS: 29.86
+Image sending FPS: 30.10
+Image sending FPS: 30.04
+Image sending FPS: 29.88
+Image sending FPS: 29.57
+Image sending FPS: 30.38
+Image sending FPS: 29.95
+Image sending FPS: 29.68
+Image sending FPS: 30.58
+Image sending FPS: 29.45
+[Sensor server] Message sent: 800, message dropped: 0
+Image sending FPS: 30.49
+Image sending FPS: 29.75
+Image sending FPS: 30.16
+Image sending FPS: 30.12
+Image sending FPS: 29.91
+Image sending FPS: 29.95
+Image sending FPS: 30.06
+Image sending FPS: 29.93
+Image sending FPS: 29.82
+Image sending FPS: 30.33
+[Sensor server] Message sent: 900, message dropped: 0
+Image sending FPS: 30.12
+Image sending FPS: 29.85
+Image sending FPS: 30.02
+Image sending FPS: 29.71
+Image sending FPS: 30.20
+Image sending FPS: 29.96
+Image sending FPS: 29.74
+Image sending FPS: 30.36
+Image sending FPS: 29.92
+Image sending FPS: 30.01
+[Sensor server] Message sent: 1000, message dropped: 0
+Image sending FPS: 29.80
+Image sending FPS: 30.12
+Image sending FPS: 30.27
+Image sending FPS: 29.72
+Image sending FPS: 29.96
+Image sending FPS: 29.98
+Image sending FPS: 30.08
+Image sending FPS: 30.10
+Image sending FPS: 29.49
+Image sending FPS: 30.29
+[Sensor server] Message sent: 1100, message dropped: 0
+Image sending FPS: 29.57
+Image sending FPS: 30.48
+Image sending FPS: 30.07
+Image sending FPS: 29.59
+Image sending FPS: 30.40
+Image sending FPS: 29.59
+Image sending FPS: 30.16
+Image sending FPS: 29.96
+Image sending FPS: 29.67
+Image sending FPS: 30.08
+[Sensor server] Message sent: 1200, message dropped: 0
+Image sending FPS: 30.33
+Image sending FPS: 29.74
+Image sending FPS: 30.12
+Image sending FPS: 30.16
+Image sending FPS: 29.65
+Image sending FPS: 30.25
+Image sending FPS: 30.07
+Image sending FPS: 29.78
+Image sending FPS: 29.83
+Image sending FPS: 30.43
+[Sensor server] Message sent: 1300, message dropped: 0
+Image sending FPS: 30.23
+Image sending FPS: 29.49
+Image sending FPS: 30.06
+Image sending FPS: 30.09
+Image sending FPS: 30.11
+Image sending FPS: 29.97
+Image sending FPS: 29.99
+Image sending FPS: 29.89
+Image sending FPS: 30.17
+Image sending FPS: 30.19
+[Sensor server] Message sent: 1400, message dropped: 0
+Image sending FPS: 30.06
+Image sending FPS: 30.19
+Image sending FPS: 29.59
+Image sending FPS: 30.17
+Image sending FPS: 29.70
+Image sending FPS: 29.95
+Image sending FPS: 31.11
+Image sending FPS: 29.48
+Image sending FPS: 29.57
+Image sending FPS: 30.37
+[Sensor server] Message sent: 1500, message dropped: 0
+Image sending FPS: 30.00
+Image sending FPS: 29.87
+Image sending FPS: 30.26
+Image sending FPS: 29.88
+Image sending FPS: 29.88
+Image sending FPS: 29.98
+Image sending FPS: 30.05
+Image sending FPS: 30.04
+Image sending FPS: 29.81
+Image sending FPS: 30.03
+[Sensor server] Message sent: 1600, message dropped: 0
+Image sending FPS: 30.65
+Image sending FPS: 30.20
+Image sending FPS: 29.12
+Image sending FPS: 30.74
+Image sending FPS: 29.91
+Image sending FPS: 30.23
+Image sending FPS: 29.75
+Image sending FPS: 29.97
+Image sending FPS: 30.32
+Image sending FPS: 29.56
+[Sensor server] Message sent: 1700, message dropped: 0
+Image sending FPS: 30.33
+Image sending FPS: 30.08
+Image sending FPS: 29.94
+Image sending FPS: 29.82
+Image sending FPS: 30.11
+Image sending FPS: 29.31
+Image sending FPS: 30.60
+Image sending FPS: 29.54
+Image sending FPS: 30.48
+Image sending FPS: 30.15
+[Sensor server] Message sent: 1800, message dropped: 0
+Image sending FPS: 30.06
+Image sending FPS: 29.81
+Image sending FPS: 30.15
+Image sending FPS: 29.93
+Image sending FPS: 29.92
+Image sending FPS: 29.99
+Image sending FPS: 30.20
+Image sending FPS: 29.97
+Image sending FPS: 29.95
+Image sending FPS: 29.76
+[Sensor server] Message sent: 1900, message dropped: 0
+Image sending FPS: 30.33
+Image sending FPS: 29.98
+Image sending FPS: 30.20
+Image sending FPS: 29.83
+Image sending FPS: 30.24
+Image sending FPS: 29.46
+Image sending FPS: 30.23
+Image sending FPS: 29.99
+Image sending FPS: 30.15
+Image sending FPS: 29.94
+[Sensor server] Message sent: 2000, message dropped: 0
+Image sending FPS: 29.89
+Image sending FPS: 30.23
+Image sending FPS: 29.86
+Image sending FPS: 29.90
+Image sending FPS: 29.79
+Image sending FPS: 30.38
+Image sending FPS: 29.79
+Image sending FPS: 30.15
+Image sending FPS: 29.62
+Image sending FPS: 30.20
+[Sensor server] Message sent: 2100, message dropped: 0
+Image sending FPS: 30.03
+Image sending FPS: 30.69
+Image sending FPS: 29.43
+Image sending FPS: 29.93
+Image sending FPS: 30.19
+Image sending FPS: 29.86
+Image sending FPS: 30.21
+Image sending FPS: 29.94
+Image sending FPS: 30.03
+Image sending FPS: 30.08
+[Sensor server] Message sent: 2200, message dropped: 0
+Image sending FPS: 29.67
+Image sending FPS: 30.23
+Image sending FPS: 29.88
+Image sending FPS: 29.73
+Image sending FPS: 30.33
+Image sending FPS: 29.81
+Image sending FPS: 30.29
+Image sending FPS: 30.16
+Image sending FPS: 29.54
+Image sending FPS: 30.37
+[Sensor server] Message sent: 2300, message dropped: 0
+Image sending FPS: 29.96
+Image sending FPS: 29.85
+Image sending FPS: 29.81
+Image sending FPS: 30.49
+Image sending FPS: 29.72
+Image sending FPS: 29.70
+Image sending FPS: 30.39
+Image sending FPS: 29.82
+Image sending FPS: 30.22
+Image sending FPS: 29.83
+[Sensor server] Message sent: 2400, message dropped: 0
+Image sending FPS: 30.11
+Image sending FPS: 30.04
+Image sending FPS: 29.83
+Image sending FPS: 30.35
+Image sending FPS: 29.81
+Image sending FPS: 30.02
+Image sending FPS: 29.82
+Image sending FPS: 30.10
+Image sending FPS: 29.80
+Image sending FPS: 30.17
+[Sensor server] Message sent: 2500, message dropped: 0
+Image sending FPS: 30.11
+Image sending FPS: 29.70
+Image sending FPS: 30.14
+Image sending FPS: 29.92
+Image sending FPS: 29.80
+Image sending FPS: 30.06
+Image sending FPS: 30.44
+Image sending FPS: 29.53
+Image sending FPS: 30.26
+Image sending FPS: 30.14
+[Sensor server] Message sent: 2600, message dropped: 0
+Image sending FPS: 29.79
+Image sending FPS: 30.03
+Image sending FPS: 29.94
+Image sending FPS: 30.20
+Image sending FPS: 29.68
+Image sending FPS: 30.50
+Image sending FPS: 29.52
+Image sending FPS: 30.13
+Image sending FPS: 29.70
+Image sending FPS: 30.43
+[Sensor server] Message sent: 2700, message dropped: 0
+Image sending FPS: 29.93
+Image sending FPS: 30.16
+Image sending FPS: 29.63
+Image sending FPS: 30.42
+Image sending FPS: 29.70
+Image sending FPS: 30.72
+Image sending FPS: 29.60
+Image sending FPS: 29.99
+Image sending FPS: 29.80
+Image sending FPS: 29.94
+[Sensor server] Message sent: 2800, message dropped: 0
+Image sending FPS: 30.26
+Image sending FPS: 30.07
+Image sending FPS: 29.84
+Image sending FPS: 29.82
+Image sending FPS: 30.44
+Image sending FPS: 29.55
+Image sending FPS: 30.27
+Image sending FPS: 29.83
+Image sending FPS: 30.23
+Image sending FPS: 30.11
+[Sensor server] Message sent: 2900, message dropped: 0
+Image sending FPS: 29.71
+Image sending FPS: 30.02
+Image sending FPS: 29.15
+Image sending FPS: 30.20
+Image sending FPS: 30.19
+Image sending FPS: 30.05
+Image sending FPS: 29.91
+Image sending FPS: 29.86
+Image sending FPS: 29.61
+Image sending FPS: 30.10
+[Sensor server] Message sent: 3000, message dropped: 0
+Image sending FPS: 30.42
+Image sending FPS: 30.15
+Image sending FPS: 30.05
+Image sending FPS: 29.77
+Image sending FPS: 30.00
+Image sending FPS: 29.99
+Image sending FPS: 30.29
+Image sending FPS: 30.37
+Image sending FPS: 29.84
+Image sending FPS: 30.10
+[Sensor server] Message sent: 3100, message dropped: 0
+Image sending FPS: 29.63
+Image sending FPS: 29.79
+Image sending FPS: 30.35
+Image sending FPS: 30.25
+Image sending FPS: 29.91
+Image sending FPS: 30.01
+Image sending FPS: 30.37
+Image sending FPS: 29.55
+Image sending FPS: 29.84
+Image sending FPS: 30.63
+[Sensor server] Message sent: 3200, message dropped: 0
+Image sending FPS: 29.95
+Image sending FPS: 30.09
+Image sending FPS: 30.05
+Image sending FPS: 30.19
+Image sending FPS: 29.84
+Image sending FPS: 30.09
+Image sending FPS: 29.81
+Image sending FPS: 30.20
+Image sending FPS: 29.81
+Image sending FPS: 29.97
+[Sensor server] Message sent: 3300, message dropped: 0
+Image sending FPS: 30.24
+Image sending FPS: 29.76
+Image sending FPS: 30.01
+Image sending FPS: 30.23
+Image sending FPS: 30.11
+Image sending FPS: 30.14
+Image sending FPS: 29.76
+Image sending FPS: 30.19
+Image sending FPS: 29.73
+Image sending FPS: 30.51
+[Sensor server] Message sent: 3400, message dropped: 0
+Image sending FPS: 29.99
+Image sending FPS: 29.59
+Image sending FPS: 30.25
+Image sending FPS: 30.53
+Image sending FPS: 29.77
+Image sending FPS: 29.94
+Image sending FPS: 30.19
+Image sending FPS: 30.07
+Image sending FPS: 29.92
+Image sending FPS: 30.19
+[Sensor server] Message sent: 3500, message dropped: 0
+Image sending FPS: 29.93
+Image sending FPS: 29.63
+Image sending FPS: 30.13
+Image sending FPS: 30.19
+Image sending FPS: 29.75
+Image sending FPS: 29.89
+Image sending FPS: 30.31
+Image sending FPS: 29.57
+Image sending FPS: 30.07
+Image sending FPS: 28.32
+[Sensor server] Message sent: 3600, message dropped: 0
+Image sending FPS: 32.42
+Image sending FPS: 29.76
+Image sending FPS: 30.07
+Image sending FPS: 29.83
+Image sending FPS: 29.63
+Image sending FPS: 30.28
+Image sending FPS: 29.57
+Image sending FPS: 30.55
+Image sending FPS: 29.73
+Image sending FPS: 29.44
+[Sensor server] Message sent: 3700, message dropped: 0
+Image sending FPS: 29.93
+Image sending FPS: 30.42
+Image sending FPS: 30.21
+Image sending FPS: 29.63
+Image sending FPS: 30.32
+Image sending FPS: 30.02
+Image sending FPS: 29.87
+Image sending FPS: 30.16
+Image sending FPS: 29.87
+Image sending FPS: 30.29
+[Sensor server] Message sent: 3800, message dropped: 0
+Image sending FPS: 29.81
+Image sending FPS: 30.03
+Image sending FPS: 30.18
+Image sending FPS: 29.56
+Image sending FPS: 30.30
+Image sending FPS: 30.22
+Image sending FPS: 29.76
+Image sending FPS: 30.14
+Image sending FPS: 29.89
+Image sending FPS: 29.68
+[Sensor server] Message sent: 3900, message dropped: 0
+Image sending FPS: 30.10
+Image sending FPS: 30.10
+Image sending FPS: 29.90
+Image sending FPS: 29.86
+Image sending FPS: 30.64
+Image sending FPS: 29.46
+Image sending FPS: 30.10
+Image sending FPS: 30.33
+Image sending FPS: 29.49
+Image sending FPS: 30.14
+[Sensor server] Message sent: 4000, message dropped: 0
+Image sending FPS: 30.20
+Image sending FPS: 29.68
+Image sending FPS: 30.34
+Image sending FPS: 30.63
+Image sending FPS: 29.38
+Image sending FPS: 29.91
+Image sending FPS: 29.78
+Image sending FPS: 30.17
+Image sending FPS: 30.45
+Image sending FPS: 30.07
+[Sensor server] Message sent: 4100, message dropped: 0
+Image sending FPS: 29.58
+Image sending FPS: 30.14
+Image sending FPS: 29.79
+Image sending FPS: 30.03
+Image sending FPS: 30.08
+Image sending FPS: 30.26
+Image sending FPS: 29.82
+Image sending FPS: 29.74
+Image sending FPS: 30.00
+Image sending FPS: 30.21
+[Sensor server] Message sent: 4200, message dropped: 0
+Image sending FPS: 30.00
+Image sending FPS: 30.32
+Image sending FPS: 29.82
+Image sending FPS: 29.91
+Image sending FPS: 29.93
+Image sending FPS: 30.30
+Image sending FPS: 29.86
+Image sending FPS: 30.14
+Image sending FPS: 29.74
+Image sending FPS: 29.93
+[Sensor server] Message sent: 4300, message dropped: 0
+Image sending FPS: 30.03
+Image sending FPS: 30.62
+Image sending FPS: 29.60
+Image sending FPS: 29.86
+Image sending FPS: 29.95
+Image sending FPS: 30.08
+Image sending FPS: 30.77
+Image sending FPS: 29.27
+Image sending FPS: 30.54
+Image sending FPS: 30.02
+[Sensor server] Message sent: 4400, message dropped: 0
+Image sending FPS: 29.09
+Image sending FPS: 30.85
+Image sending FPS: 29.37
+Image sending FPS: 30.72
+Image sending FPS: 29.98
+Image sending FPS: 30.16
+Image sending FPS: 29.30
+Image sending FPS: 30.32
+Image sending FPS: 30.27
+Image sending FPS: 29.89
+[Sensor server] Message sent: 4500, message dropped: 0
+Image sending FPS: 30.07
+Image sending FPS: 30.03
+Image sending FPS: 30.10

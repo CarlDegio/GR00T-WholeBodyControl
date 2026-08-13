@@ -164,9 +164,9 @@ def test_schema_parallel_serialization_preserves_order_and_payload(monkeypatch):
     original_depth_encoder = ImageUtils.encode_depth_image
     all_encoders_started = threading.Barrier(4)
 
-    def encode_rgb_after_barrier(image):
+    def encode_rgb_after_barrier(image, quality=80):
         all_encoders_started.wait(timeout=2.0)
-        return original_rgb_encoder(image)
+        return original_rgb_encoder(image, quality=quality)
 
     def encode_depth_after_barrier(image):
         all_encoders_started.wait(timeout=2.0)
@@ -305,15 +305,15 @@ def test_composed_camera_enables_depth_only_for_chest_and_merges_camera_info(mon
 
 def test_composed_camera_serializes_images_with_owned_executor(monkeypatch):
     """Catch composed serialization bypassing its parallel encoder pool."""
-    from gear_sonic.camera.composed_camera import ComposedCameraSensor
+    from gear_sonic.camera.composed_camera import ComposedCameraConfig, ComposedCameraSensor
 
     original_rgb_encoder = ImageUtils.encode_image
     original_depth_encoder = ImageUtils.encode_depth_image
     all_encoders_started = threading.Barrier(4)
 
-    def encode_rgb_after_barrier(image):
+    def encode_rgb_after_barrier(image, quality=80):
         all_encoders_started.wait(timeout=2.0)
-        return original_rgb_encoder(image)
+        return original_rgb_encoder(image, quality=quality)
 
     def encode_depth_after_barrier(image):
         all_encoders_started.wait(timeout=2.0)
@@ -323,6 +323,7 @@ def test_composed_camera_serializes_images_with_owned_executor(monkeypatch):
     monkeypatch.setattr(ImageUtils, "encode_depth_image", encode_depth_after_barrier)
 
     composed = object.__new__(ComposedCameraSensor)
+    composed.config = ComposedCameraConfig(server=False)
     composed._image_encoder_pool = ThreadPoolExecutor(max_workers=4)
     message = {
         "ego_view": {
@@ -353,6 +354,40 @@ def test_composed_camera_serializes_images_with_owned_executor(monkeypatch):
         "chest_view",
         "chest_view_depth",
     ]
+
+
+def test_composed_camera_applies_software_jpeg_quality_to_rgb_payloads():
+    """Catch a composed-camera quality option that never reaches OpenCV."""
+    from gear_sonic.camera.composed_camera import ComposedCameraConfig, ComposedCameraSensor
+
+    image = np.random.default_rng(0).integers(0, 256, (240, 320, 3), dtype=np.uint8)
+    message = {
+        "ego_view": {
+            "timestamps": {"ego_view": 1.0},
+            "images": {"ego_view": image},
+            "camera_info": {},
+        }
+    }
+
+    payloads = {}
+    for quality in (80, 95):
+        composed = object.__new__(ComposedCameraSensor)
+        composed.config = ComposedCameraConfig(jpeg_quality=quality, server=False)
+        wire = composed.serialize_message(message)
+        decoded = ImageMessageSchema.deserialize(wire).images["ego_view"]
+        assert decoded.shape == image.shape
+        payloads[quality] = wire["images"]["ego_view"]
+
+    assert len(payloads[95]) > len(payloads[80])
+
+
+@pytest.mark.parametrize("quality", [0, 101])
+def test_composed_camera_rejects_invalid_software_jpeg_quality(quality):
+    """Catch an invalid JPEG quality reaching OpenCV without validation."""
+    from gear_sonic.camera.composed_camera import ComposedCameraConfig
+
+    with pytest.raises(ValueError, match="jpeg_quality must be between 1 and 100"):
+        ComposedCameraConfig(jpeg_quality=quality)
 
 
 def test_composed_camera_close_shuts_down_encoder_pool():

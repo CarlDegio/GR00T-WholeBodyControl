@@ -118,14 +118,22 @@ class ImageMessageSchema:
     camera_info: dict[str, Any] = field(default_factory=dict)
 
     @staticmethod
-    def _encode_image_value(key: str, image: Any) -> str | bytes | bytearray:
+    def _encode_image_value(
+        key: str,
+        image: Any,
+        jpeg_quality: int = 80,
+    ) -> str | bytes | bytearray:
         if key.endswith("_depth"):
             return ImageUtils.encode_depth_image(image)
         if isinstance(image, bytes | bytearray):
             return image
-        return ImageUtils.encode_image(image)
+        return ImageUtils.encode_image(image, quality=jpeg_quality)
 
-    def serialize(self, executor: Executor | None = None) -> dict[str, Any]:
+    def serialize(
+        self,
+        executor: Executor | None = None,
+        jpeg_quality: int = 80,
+    ) -> dict[str, Any]:
         serialized_msg: dict[str, Any] = {
             "schema_version": 2,
             "timestamps": self.timestamps,
@@ -134,12 +142,12 @@ class ImageMessageSchema:
         }
         if executor is None:
             encoded_images = [
-                self._encode_image_value(key, image)
+                self._encode_image_value(key, image, jpeg_quality)
                 for key, image in self.images.items()
             ]
         else:
             futures = [
-                executor.submit(self._encode_image_value, key, image)
+                executor.submit(self._encode_image_value, key, image, jpeg_quality)
                 for key, image in self.images.items()
             ]
             encoded_images = [future.result() for future in futures]
@@ -264,8 +272,12 @@ class CameraMountPosition(Enum):
 
 class ImageUtils:
     @staticmethod
-    def encode_image(image: np.ndarray) -> str:
-        _, color_buffer = cv2.imencode(".jpg", image, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
+    def encode_image(image: np.ndarray, quality: int = 80) -> str:
+        _, color_buffer = cv2.imencode(
+            ".jpg",
+            image,
+            [int(cv2.IMWRITE_JPEG_QUALITY), quality],
+        )
         return base64.b64encode(color_buffer).decode("utf-8")
 
     @staticmethod

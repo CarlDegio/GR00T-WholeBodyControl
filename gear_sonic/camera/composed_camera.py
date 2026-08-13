@@ -117,7 +117,12 @@ class ComposedCameraConfig:
     mjpeg_quality: int = 80
     """MJPEG quality 1-100 (only when use_mjpeg=True)."""
 
+    jpeg_quality: int = 80
+    """Software JPEG quality 1-100 for RGB frames encoded on the host."""
+
     def __post_init__(self):
+        if not 1 <= self.jpeg_quality <= 100:
+            raise ValueError("jpeg_quality must be between 1 and 100")
         self.run_as_server = self.server
 
 
@@ -553,7 +558,8 @@ class ComposedCameraSensor(Sensor, SensorServer):
             camera_info=all_camera_info,
         )
         return img_schema.serialize(
-            executor=getattr(self, "_image_encoder_pool", None)
+            executor=getattr(self, "_image_encoder_pool", None),
+            jpeg_quality=self.config.jpeg_quality,
         )
 
     def run_server(self):
