@@ -1,0 +1,112 @@
+{
+  "codec_comparison_ms": {
+    "new": {
+      "max": 0.017397,
+      "mean": 0.0009104770960577458,
+      "min": 0.000165,
+      "p50": 0.00042,
+      "p95": 0.003032
+    },
+    "new_mean": 0.0009104770960577458,
+    "new_p50": 0.00042,
+    "new_p95": 0.003032,
+    "old": {
+      "max": 4.155882,
+      "mean": 0.7509305247084952,
+      "min": 0.47299,
+      "p50": 0.724791,
+      "p95": 0.99827
+    },
+    "old_mean": 0.7509305247084952,
+    "old_p50": 0.724791,
+    "old_p95": 0.99827,
+    "samples": 7204
+  },
+  "decoded_images": 10806,
+  "decoded_images_per_second": 180.0820214123472,
+  "decoded_streams": {
+    "chest_view": {
+      "unique_fps": 30.0136702353912,
+      "unique_frames": 1801
+    },
+    "chest_view_depth": {
+      "unique_fps": 30.0136702353912,
+      "unique_frames": 1801
+    },
+    "ego_view": {
+      "unique_fps": 30.0136702353912,
+      "unique_frames": 1801
+    },
+    "ego_view_depth": {
+      "unique_fps": 30.0136702353912,
+      "unique_frames": 1801
+    },
+    "left_wrist": {
+      "unique_fps": 30.0136702353912,
+      "unique_frames": 1801
+    },
+    "right_wrist": {
+      "unique_fps": 30.0136702353912,
+      "unique_frames": 1801
+    }
+  },
+  "elapsed_seconds": 60.005990133,
+  "encoded_streams": {
+    "chest_view": {
+      "unique_fps": 30.0136702353912,
+      "unique_frames": 1801
+    },
+    "ego_view": {
+      "unique_fps": 30.0136702353912,
+      "unique_frames": 1801
+    },
+    "left_wrist": {
+      "unique_fps": 30.0136702353912,
+      "unique_frames": 1801
+    },
+    "right_wrist": {
+      "unique_fps": 30.0136702353912,
+      "unique_frames": 1801
+    }
+  },
+  "latency_ms": {
+    "gateway_rpc": {
+      "max": 8.802541,
+      "mean": 0.9696855495457127,
+      "min": 0.303853,
+      "p50": 0.670732,
+      "p95": 2.707747
+    },
+    "jpeg_prepare": {
+      "max": 2.047779,
+      "mean": 0.054116587876206705,
+      "min": 0.02524,
+      "p50": 0.051626,
+      "p95": 0.070414
+    },
+    "openpi_decode": {
+      "max": 9.640664,
+      "mean": 4.109878644094264,
+      "min": 3.259208,
+      "p50": 3.972928,
+      "p95": 5.29207
+    },
+    "request_pack": {
+      "max": 2.700606,
+      "mean": 0.0906612481544577,
+      "min": 0.035327,
+      "p50": 0.085125,
+      "p95": 0.120335
+    }
+  },
+  "openpi_decoder": "/home/user/Project/openpi_sonic/scripts/serve_g1_sonic_zmq_policy.py",
+  "requested_duration_seconds": 60.0,
+  "sensor_gateway_endpoint": "ipc:///tmp/sonic_sensor_gateway.ipc",
+  "single_threaded_sequential": true,
+  "vla_bytes_per_request": 344752.45187393524,
+  "vla_bytes_per_second": 40469897.5155231,
+  "vla_mbit_per_second": 323.7591801241848,
+  "vla_request_bytes": 2428436271,
+  "vla_request_fps": 117.38828047645508,
+  "vla_requests": 7044
+}
