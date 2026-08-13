@@ -3,20 +3,18 @@
 from __future__ import annotations
 
 from collections import deque
-import json
 import math
 import time
 from typing import Callable, Mapping
 
 import zmq
 
-
 VLA_TIMING_SCHEMA = "sonic.vla_timing"
 VLA_TIMING_SEGMENTS = (
     "frame_age",
     "camera_read",
     "state_read",
-    "jpeg_encode",
+    "jpeg_prepare",
     "observation_build",
     "request_pack",
     "policy_roundtrip",

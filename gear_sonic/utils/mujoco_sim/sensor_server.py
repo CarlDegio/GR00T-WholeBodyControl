@@ -10,6 +10,10 @@ import msgpack_numpy as m
 import numpy as np
 import zmq
 
+from gear_sonic.camera.constants import PRODUCTION_JPEG_QUALITY
+
+CAMERA_SEND_HWM = 1
+
 
 @dataclass
 class ImageMessageSchema:
@@ -19,9 +23,21 @@ class ImageMessageSchema:
 
     timestamps: Dict[str, float]
     images: Dict[str, np.ndarray]
+    image_shapes: Dict[str, list[int]] = field(default_factory=dict)
 
     def serialize(self) -> Dict[str, Any]:
-        serialized_msg = {"timestamps": self.timestamps, "images": {}}
+        serialized_msg = {
+            "timestamps": self.timestamps,
+            "images": {},
+            "image_shapes": {
+                **self.image_shapes,
+                **{
+                    key: list(image.shape)
+                    for key, image in self.images.items()
+                    if isinstance(image, np.ndarray)
+                },
+            },
+        }
         for key, image in self.images.items():
             serialized_msg["images"][key] = ImageUtils.encode_image(image)
         return serialized_msg
@@ -33,16 +49,23 @@ class ImageMessageSchema:
         for key, value in data.get("images", {}).items():
             if isinstance(value, str):
                 images[key] = ImageUtils.decode_image(value)
+            elif isinstance(value, bytes | bytearray):
+                mat = cv2.imdecode(np.frombuffer(value, dtype=np.uint8), cv2.IMREAD_COLOR)
+                images[key] = mat[..., ::-1]
             else:
                 images[key] = value
-        return ImageMessageSchema(timestamps=timestamps, images=images)
+        return ImageMessageSchema(
+            timestamps=timestamps,
+            images=images,
+            image_shapes=data.get("image_shapes", {}),
+        )
 
 
 class SensorServer:
     def start_server(self, port: int):
         self.context = zmq.Context()
         self.socket = self.context.socket(zmq.PUB)
-        self.socket.setsockopt(zmq.SNDHWM, 20)
+        self.socket.setsockopt(zmq.SNDHWM, CAMERA_SEND_HWM)
         self.socket.setsockopt(zmq.LINGER, 0)
         self.socket.bind(f"tcp://*:{port}")
         print(f"Sensor server running at tcp://*:{port}")
@@ -72,9 +95,16 @@ class SensorServer:
 
 class ImageUtils:
     @staticmethod
-    def encode_image(image: np.ndarray) -> str:
-        _, color_buffer = cv2.imencode(".jpg", image, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
-        return base64.b64encode(color_buffer).decode("utf-8")
+    def encode_image(image: np.ndarray) -> bytes:
+        image_bgr = cv2.cvtColor(np.asarray(image), cv2.COLOR_RGB2BGR)
+        ok, color_buffer = cv2.imencode(
+            ".jpg",
+            image_bgr,
+            [int(cv2.IMWRITE_JPEG_QUALITY), PRODUCTION_JPEG_QUALITY],
+        )
+        if not ok:
+            raise RuntimeError("failed to encode RGB image as JPEG")
+        return color_buffer.tobytes()
 
     @staticmethod
     def decode_image(image: str) -> np.ndarray:

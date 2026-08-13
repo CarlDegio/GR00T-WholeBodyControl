@@ -2,15 +2,14 @@
 
 from __future__ import annotations
 
+from multiprocessing import resource_tracker, shared_memory
 import struct
 import threading
 import uuid
-from multiprocessing import resource_tracker, shared_memory
 
 import numpy as np
 
 from gear_sonic.runtime.contracts import MessageMetadata, SharedMemoryFrame
-
 
 _TOKEN_SIZE = struct.calcsize("<Q")
 _OWNED_SHARED_MEMORY_NAMES: set[str] = set()

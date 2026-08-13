@@ -77,7 +77,11 @@ class ReplayDummySensor(DummySensor):
 
     def serialize(self, data: dict[str, Any]) -> dict[str, Any]:
         serialized_msg = ImageMessageSchema(
-            timestamps=data["timestamp"] if isinstance(data["timestamp"], dict) else {"color_image": data["timestamp"]},
+            timestamps=(
+                data["timestamp"]
+                if isinstance(data["timestamp"], dict)
+                else {"color_image": data["timestamp"]}
+            ),
             images={"color_image": data["color_image"]},
         )
         return serialized_msg.serialize()

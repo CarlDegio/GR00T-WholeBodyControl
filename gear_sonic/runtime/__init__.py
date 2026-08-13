@@ -1,11 +1,5 @@
 """Runtime contracts shared by future SONIC gateways and clients."""
 
-from gear_sonic.runtime.config import (
-    EndpointAddress,
-    RuntimeProfile,
-    default_runtime_profile_path,
-    load_runtime_profile,
-)
 from gear_sonic.runtime.client import (
     MaterializedSnapshot,
     SensorGatewayClient,
@@ -13,9 +7,11 @@ from gear_sonic.runtime.client import (
     SensorGatewayTimeoutError,
     SnapshotUnavailableError,
 )
-from gear_sonic.runtime.control_client import (
-    ControlGatewayIntentClient,
-    ControlGatewaySubscriber,
+from gear_sonic.runtime.config import (
+    EndpointAddress,
+    RuntimeProfile,
+    default_runtime_profile_path,
+    load_runtime_profile,
 )
 from gear_sonic.runtime.contracts import (
     CommandAck,
@@ -23,6 +19,10 @@ from gear_sonic.runtime.contracts import (
     MessageMetadata,
     OperatorCommand,
     SharedMemoryFrame,
+)
+from gear_sonic.runtime.control_client import (
+    ControlGatewayIntentClient,
+    ControlGatewaySubscriber,
 )
 from gear_sonic.runtime.control_gateway import (
     ControlGatewayCore,

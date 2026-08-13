@@ -1,0 +1,157 @@
+{
+  "actual_wire_bytes": 1085841952,
+  "base64_counterfactual_wire_bytes": 1447399673,
+  "base64_counterfactual_wire_bytes_per_second": 24110580.44143602,
+  "base64_counterfactual_wire_mbit_per_second": 192.88464353148814,
+  "binary_images": 10806,
+  "binary_wire_savings_bytes": 361557721,
+  "binary_wire_savings_percent": 24.979812262262406,
+  "decode_ms": {
+    "max": 16.70826099871192,
+    "mean": 9.673097369194572,
+    "min": 7.886173989390954,
+    "p50": 9.281894002924673,
+    "p95": 12.35557600739412
+  },
+  "elapsed_seconds": 60.03172244300367,
+  "endpoint": "tcp://192.168.123.164:5555",
+  "expected_streams": [
+    "ego_view",
+    "ego_view_depth",
+    "chest_view",
+    "chest_view_depth",
+    "left_wrist",
+    "right_wrist"
+  ],
+  "image_dtypes": {
+    "chest_view": "uint8",
+    "chest_view_depth": "uint16",
+    "ego_view": "uint8",
+    "ego_view_depth": "uint16",
+    "left_wrist": "uint8",
+    "right_wrist": "uint8"
+  },
+  "image_shapes": {
+    "chest_view": [
+      480,
+      640,
+      3
+    ],
+    "chest_view_depth": [
+      480,
+      640
+    ],
+    "ego_view": [
+      480,
+      640,
+      3
+    ],
+    "ego_view_depth": [
+      480,
+      640
+    ],
+    "left_wrist": [
+      480,
+      640,
+      3
+    ],
+    "right_wrist": [
+      480,
+      640,
+      3
+    ]
+  },
+  "images": 10806,
+  "images_per_second": 180.00483011727033,
+  "label": "jpeg95-binary-nice0-ab",
+  "latency_ms": {
+    "max": 78.3238410949707,
+    "mean": 41.210861486702875,
+    "min": 18.73040199279785,
+    "p50": 40.65346717834473,
+    "p95": 55.233001708984375
+  },
+  "mean_message_bytes": 602910.5785674625,
+  "message_fps": 30.00080501954505,
+  "messages": 1801,
+  "requested_duration_seconds": 60.0,
+  "streams": {
+    "chest_view": {
+      "latency_ms": {
+        "max": 68.50624084472656,
+        "mean": 42.57714728525385,
+        "min": 19.820213317871094,
+        "p50": 41.85032844543457,
+        "p95": 58.49003791809082
+      },
+      "samples": 1801,
+      "unique_fps": 29.834226424211653,
+      "unique_frames": 1791
+    },
+    "chest_view_depth": {
+      "latency_ms": {
+        "max": 68.50624084472656,
+        "mean": 42.57714728525385,
+        "min": 19.820213317871094,
+        "p50": 41.85032844543457,
+        "p95": 58.49003791809082
+      },
+      "samples": 1801,
+      "unique_fps": 29.834226424211653,
+      "unique_frames": 1791
+    },
+    "ego_view": {
+      "latency_ms": {
+        "max": 78.3238410949707,
+        "mean": 40.857702808073,
+        "min": 26.983261108398438,
+        "p50": 40.64059257507324,
+        "p95": 46.83709144592285
+      },
+      "samples": 1801,
+      "unique_fps": 29.817568564678314,
+      "unique_frames": 1790
+    },
+    "ego_view_depth": {
+      "latency_ms": {
+        "max": 78.3238410949707,
+        "mean": 40.857702808073,
+        "min": 26.983261108398438,
+        "p50": 40.64059257507324,
+        "p95": 46.83709144592285
+      },
+      "samples": 1801,
+      "unique_fps": 29.817568564678314,
+      "unique_frames": 1790
+    },
+    "left_wrist": {
+      "latency_ms": {
+        "max": 70.69873809814453,
+        "mean": 38.76246140441386,
+        "min": 18.73040199279785,
+        "p50": 37.31989860534668,
+        "p95": 56.401729583740234
+      },
+      "samples": 1801,
+      "unique_fps": 29.800910705144975,
+      "unique_frames": 1789
+    },
+    "right_wrist": {
+      "latency_ms": {
+        "max": 75.49476623535156,
+        "mean": 41.633007329149684,
+        "min": 25.83789825439453,
+        "p50": 41.46766662597656,
+        "p95": 48.38132858276367
+      },
+      "samples": 1801,
+      "unique_fps": 29.984147160011712,
+      "unique_frames": 1800
+    }
+  },
+  "warmup_seconds": 5.0,
+  "wire_bytes": 1085841952,
+  "wire_bytes_per_second": 18087802.71182354,
+  "wire_mbit_per_second": 144.70242169458834,
+  "wire_mib_per_second": 17.24987288648943
+}

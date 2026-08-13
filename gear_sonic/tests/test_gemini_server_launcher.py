@@ -116,6 +116,8 @@ def test_build_server_argv_starts_only_ego_view_orbbec():
         "--ego-view-device-id",
         "CPMD464001G",
         "--orbbec-enable-depth",
+        "--jpeg-quality",
+        "95",
         "--port",
         "5555",
     ]

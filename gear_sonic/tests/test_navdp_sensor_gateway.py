@@ -8,6 +8,7 @@ import numpy as np
 import pytest
 import zmq
 
+from gear_sonic.navdp import gateway as navdp_gateway
 from gear_sonic.runtime.client import MaterializedSnapshot, SensorGatewayClient
 from gear_sonic.runtime.contracts import MessageMetadata, SharedMemoryFrame
 from gear_sonic.runtime.sensor_gateway import SensorGatewayCore, SensorGatewayRpc
@@ -115,6 +116,31 @@ def test_gateway_camera_builds_the_same_navdp_rgb_depth_and_intrinsics() -> None
     np.testing.assert_array_equal(gateway.depth_m, legacy_depth)
     assert gateway.camera_info == legacy_info
     assert gateway.source_timestamp_s == pytest.approx(123.0)
+
+
+def test_navdp_rgb_encoder_passes_quality_95_to_opencv(monkeypatch) -> None:
+    """Catch NavDP upload frames being JPEG-encoded below production quality."""
+    import cv2
+
+    real_imencode = cv2.imencode
+    imencode_calls = []
+
+    def capture_imencode(extension, image, parameters=None):
+        imencode_calls.append((extension, parameters))
+        if parameters is None:
+            return real_imencode(extension, image)
+        return real_imencode(extension, image, parameters)
+
+    monkeypatch.setattr(cv2, "imencode", capture_imencode)
+
+    navdp_gateway._encode_navdp_frames(
+        np.zeros((8, 8, 3), dtype=np.uint8), np.ones((8, 8), dtype=np.float32)
+    )
+
+    assert imencode_calls == [
+        (".jpg", [cv2.IMWRITE_JPEG_QUALITY, 95]),
+        (".png", None),
+    ]
 
 
 def test_gateway_odometry_updates_internal_pose() -> None:

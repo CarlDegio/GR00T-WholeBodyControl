@@ -1,0 +1,189 @@
+{
+  "codec_comparison_ms": {
+    "new": {
+      "max": 0.010795,
+      "mean": 0.0008918099666851749,
+      "min": 0.000204,
+      "p50": 0.000474,
+      "p95": 0.002866
+    },
+    "new_mean": 0.0008918099666851749,
+    "new_p50": 0.000474,
+    "new_p95": 0.002866,
+    "old": {
+      "max": 4.060396,
+      "mean": 0.7293659650194336,
+      "min": 0.466541,
+      "p50": 0.712604,
+      "p95": 0.945428
+    },
+    "old_mean": 0.7293659650194336,
+    "old_p50": 0.712604,
+    "old_p95": 0.945428,
+    "samples": 7204
+  },
+  "decoded_physical_images": 10741,
+  "decoded_physical_images_per_second": 179.0119539203959,
+  "decoded_streams": {
+    "chest_view": {
+      "gateway_publication_fps": 30.015876455696215,
+      "gateway_publications": 1801,
+      "gateway_sequence_regressions": 0,
+      "observed_gateway_sequence_gaps": 0,
+      "physical_unique_fps": 29.91587908827024,
+      "physical_unique_frames": 1795,
+      "source_timestamp_missing": 0,
+      "source_timestamp_regressions": 0,
+      "source_timestamp_reuses": 6
+    },
+    "chest_view_depth": {
+      "gateway_publication_fps": 30.015876455696215,
+      "gateway_publications": 1801,
+      "gateway_sequence_regressions": 0,
+      "observed_gateway_sequence_gaps": 0,
+      "physical_unique_fps": 29.91587908827024,
+      "physical_unique_frames": 1795,
+      "source_timestamp_missing": 0,
+      "source_timestamp_regressions": 0,
+      "source_timestamp_reuses": 6
+    },
+    "ego_view": {
+      "gateway_publication_fps": 30.015876455696215,
+      "gateway_publications": 1801,
+      "gateway_sequence_regressions": 0,
+      "observed_gateway_sequence_gaps": 0,
+      "physical_unique_fps": 29.66588566970531,
+      "physical_unique_frames": 1780,
+      "source_timestamp_missing": 0,
+      "source_timestamp_regressions": 0,
+      "source_timestamp_reuses": 21
+    },
+    "ego_view_depth": {
+      "gateway_publication_fps": 30.015876455696215,
+      "gateway_publications": 1801,
+      "gateway_sequence_regressions": 0,
+      "observed_gateway_sequence_gaps": 0,
+      "physical_unique_fps": 29.66588566970531,
+      "physical_unique_frames": 1780,
+      "source_timestamp_missing": 0,
+      "source_timestamp_regressions": 0,
+      "source_timestamp_reuses": 21
+    },
+    "left_wrist": {
+      "gateway_publication_fps": 30.015876455696215,
+      "gateway_publications": 1801,
+      "gateway_sequence_regressions": 0,
+      "observed_gateway_sequence_gaps": 0,
+      "physical_unique_fps": 29.832547948748598,
+      "physical_unique_frames": 1790,
+      "source_timestamp_missing": 0,
+      "source_timestamp_regressions": 0,
+      "source_timestamp_reuses": 11
+    },
+    "right_wrist": {
+      "gateway_publication_fps": 30.015876455696215,
+      "gateway_publications": 1801,
+      "gateway_sequence_regressions": 0,
+      "observed_gateway_sequence_gaps": 0,
+      "physical_unique_fps": 30.015876455696215,
+      "physical_unique_frames": 1801,
+      "source_timestamp_missing": 0,
+      "source_timestamp_regressions": 0,
+      "source_timestamp_reuses": 0
+    }
+  },
+  "elapsed_seconds": 60.001579586,
+  "encoded_streams": {
+    "chest_view": {
+      "gateway_publication_fps": 30.015876455696215,
+      "gateway_publications": 1801,
+      "gateway_sequence_regressions": 0,
+      "observed_gateway_sequence_gaps": 0,
+      "physical_unique_fps": 29.91587908827024,
+      "physical_unique_frames": 1795,
+      "source_timestamp_missing": 0,
+      "source_timestamp_regressions": 0,
+      "source_timestamp_reuses": 6
+    },
+    "ego_view": {
+      "gateway_publication_fps": 30.015876455696215,
+      "gateway_publications": 1801,
+      "gateway_sequence_regressions": 0,
+      "observed_gateway_sequence_gaps": 0,
+      "physical_unique_fps": 29.66588566970531,
+      "physical_unique_frames": 1780,
+      "source_timestamp_missing": 0,
+      "source_timestamp_regressions": 0,
+      "source_timestamp_reuses": 21
+    },
+    "left_wrist": {
+      "gateway_publication_fps": 30.015876455696215,
+      "gateway_publications": 1801,
+      "gateway_sequence_regressions": 0,
+      "observed_gateway_sequence_gaps": 0,
+      "physical_unique_fps": 29.832547948748598,
+      "physical_unique_frames": 1790,
+      "source_timestamp_missing": 0,
+      "source_timestamp_regressions": 0,
+      "source_timestamp_reuses": 11
+    },
+    "right_wrist": {
+      "gateway_publication_fps": 30.015876455696215,
+      "gateway_publications": 1801,
+      "gateway_sequence_regressions": 0,
+      "observed_gateway_sequence_gaps": 0,
+      "physical_unique_fps": 30.015876455696215,
+      "physical_unique_frames": 1801,
+      "source_timestamp_missing": 0,
+      "source_timestamp_regressions": 0,
+      "source_timestamp_reuses": 0
+    }
+  },
+  "latency_ms": {
+    "gateway_rpc": {
+      "max": 8.799203,
+      "mean": 0.7610091298267326,
+      "min": 0.259678,
+      "p50": 0.513063,
+      "p95": 2.234106
+    },
+    "jpeg_prepare": {
+      "max": 2.159326,
+      "mean": 0.04703034554455446,
+      "min": 0.019564,
+      "p50": 0.04514,
+      "p95": 0.067276
+    },
+    "openpi_decode": {
+      "max": 12.792571,
+      "mean": 3.8544950778465346,
+      "min": 3.164235,
+      "p50": 3.717215,
+      "p95": 4.806054
+    },
+    "request_pack": {
+      "max": 1.048159,
+      "mean": 0.0751129827970297,
+      "min": 0.025382,
+      "p50": 0.072414,
+      "p95": 0.111075
+    }
+  },
+  "openpi_decoder": "/home/user/Project/openpi_sonic/scripts/serve_g1_sonic_zmq_policy.py",
+  "requested_duration_seconds": 60.0,
+  "sensor_gateway_endpoint": "ipc:///tmp/sonic_sensor_gateway.ipc",
+  "single_threaded_sequential": true,
+  "snapshot_rejections": {
+    "decoded": 0,
+    "encoded": 0,
+    "reasons": {},
+    "total": 0
+  },
+  "transport_drop_observability": "PUB/HWM transport drops are unobservable without a producer frame identifier",
+  "vla_bytes_per_request": 344048.20544554456,
+  "vla_bytes_per_second": 46330605.28040879,
+  "vla_mbit_per_second": 370.6448422432703,
+  "vla_request_bytes": 2779909500,
+  "vla_request_fps": 134.66312146697692,
+  "vla_requests": 8080
+}

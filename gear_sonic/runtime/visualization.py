@@ -9,6 +9,7 @@ import cv2
 import numpy as np
 import zmq
 
+from gear_sonic.camera.constants import PRODUCTION_JPEG_QUALITY
 
 VISUALIZATION_SCHEMA = "sonic.visualization_frame"
 VISUALIZATION_STREAMS = (
@@ -21,7 +22,9 @@ VISUALIZATION_STREAMS = (
 class VisualizationPublisher:
     """Non-blocking JPEG publisher; display transport never stalls control."""
 
-    def __init__(self, endpoint: str, *, jpeg_quality: int = 85) -> None:
+    def __init__(
+        self, endpoint: str, *, jpeg_quality: int = PRODUCTION_JPEG_QUALITY
+    ) -> None:
         if not 1 <= int(jpeg_quality) <= 100:
             raise ValueError("jpeg_quality must be in [1, 100]")
         self.endpoint = endpoint

@@ -10,7 +10,7 @@ import zmq
 from gear_sonic.runtime.sensor_gateway import SensorGatewayCore, VisualizationZmqIngress
 from gear_sonic.runtime.shared_memory import read_shared_memory_frame
 from gear_sonic.runtime.snapshot import SnapshotRequest
-from gear_sonic.runtime.visualization import VISUALIZATION_SCHEMA
+from gear_sonic.runtime.visualization import VISUALIZATION_SCHEMA, VisualizationPublisher
 
 
 def test_visualization_ingress_stores_jpeg_in_sensor_gateway_shared_memory() -> None:
@@ -53,3 +53,23 @@ def test_visualization_ingress_stores_jpeg_in_sensor_gateway_shared_memory() -> 
     ingress.close()
     core.close()
     context.term()
+
+
+def test_visualization_default_passes_quality_95_to_jpeg_encoder(monkeypatch) -> None:
+    """Catch visualization output using a lower default JPEG quality."""
+    imencode_calls = []
+
+    def capture_imencode(extension, image, parameters):
+        imencode_calls.append((extension, parameters))
+        return True, np.array([0], dtype=np.uint8)
+
+    monkeypatch.setattr(cv2, "imencode", capture_imencode)
+    publisher = VisualizationPublisher("inproc://visualization-quality-test")
+    try:
+        publisher.publish(
+            "visualization/navdp_navigation", np.zeros((8, 8, 3), dtype=np.uint8)
+        )
+    finally:
+        publisher.close()
+
+    assert imencode_calls == [(".jpg", [cv2.IMWRITE_JPEG_QUALITY, 95])]

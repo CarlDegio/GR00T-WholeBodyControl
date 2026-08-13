@@ -362,9 +362,34 @@ class CameraZmqIngress:
             expected_hz=self.expected_hz,
             received_ns=received_ns,
         )
-        schema = ImageMessageSchema.deserialize(payload)
         encoded_schema = ImageMessageSchema.deserialize(payload, decode_images=False)
         count = 0
+        for name, encoded in encoded_schema.images.items():
+            if name.endswith("_depth") or not isinstance(encoded, bytes | bytearray | str):
+                continue
+            if isinstance(encoded, str):
+                encoded_array = np.frombuffer(encoded.encode("utf-8"), dtype=np.uint8).copy()
+                wire_encoding = "base64_jpeg"
+            else:
+                encoded_array = np.frombuffer(encoded, dtype=np.uint8).copy()
+                wire_encoding = "jpeg_bytes"
+            timestamp_s = float(encoded_schema.timestamps.get(name, 0.0))
+            self.core.publish_array(
+                f"camera_encoded/{name}",
+                encoded_array,
+                received_ns=received_ns,
+                source_timestamp_ns=max(0, int(timestamp_s * 1_000_000_000)),
+                source_clock="camera_unix" if timestamp_s > 0.0 else "unknown",
+                expected_hz=self.expected_hz,
+                attributes={
+                    "encoding": wire_encoding,
+                    "decoded_color_order": "RGB",
+                    "image_shape": list(encoded_schema.image_shapes.get(name, ())),
+                    "camera_info": dict(encoded_schema.camera_info.get(name, {})),
+                },
+            )
+
+        schema = ImageMessageSchema.deserialize(payload)
         for name, image in schema.images.items():
             if not isinstance(image, np.ndarray):
                 continue
@@ -386,29 +411,6 @@ class CameraZmqIngress:
                 attributes=attributes,
             )
             count += 1
-
-            encoded = encoded_schema.images.get(name)
-            if name.endswith("_depth") or not isinstance(encoded, bytes | bytearray | str):
-                continue
-            if isinstance(encoded, str):
-                encoded_array = np.frombuffer(encoded.encode("utf-8"), dtype=np.uint8).copy()
-                wire_encoding = "base64_jpeg"
-            else:
-                encoded_array = np.frombuffer(encoded, dtype=np.uint8).copy()
-                wire_encoding = "jpeg_bytes"
-            self.core.publish_array(
-                f"camera_encoded/{name}",
-                encoded_array,
-                received_ns=received_ns,
-                source_timestamp_ns=max(0, int(timestamp_s * 1_000_000_000)),
-                source_clock="camera_unix" if timestamp_s > 0.0 else "unknown",
-                expected_hz=self.expected_hz,
-                attributes={
-                    "encoding": wire_encoding,
-                    "decoded_color_order": "RGB",
-                    "camera_info": dict(schema.camera_info.get(base_name, {})),
-                },
-            )
         return count
 
     def close(self) -> None:
@@ -641,9 +643,9 @@ class Ros2SensorIngress:
     ) -> None:
         # Keep ROS imports out of module import time so non-ROS gateway tests and
         # configuration tools continue to work in ordinary Python environments.
-        import rclpy
         from livox_ros_driver2.msg import CustomMsg
         from nav_msgs.msg import Odometry
+        import rclpy
         from rclpy.executors import MultiThreadedExecutor
         from sensor_msgs.msg import Imu, PointCloud2
         from sensor_msgs_py import point_cloud2

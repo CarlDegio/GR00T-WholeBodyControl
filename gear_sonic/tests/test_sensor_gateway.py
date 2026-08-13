@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 from types import SimpleNamespace
 import threading
 import time
@@ -220,7 +221,7 @@ def test_large_ring_write_does_not_hold_the_global_metadata_lock() -> None:
         core.close()
 
 
-def test_camera_and_cpp_ingress_are_read_only_copies_of_current_wires() -> None:
+def test_camera_and_cpp_ingress_are_read_only_copies_of_current_wires(monkeypatch) -> None:
     context = zmq.Context()
     core = SensorGatewayCore(slot_count=2, history_size=4)
     camera_server = FakeCameraServer(context, "inproc://gateway-camera")
@@ -233,14 +234,34 @@ def test_camera_and_cpp_ingress_are_read_only_copies_of_current_wires() -> None:
     )
     camera_ingress = CameraZmqIngress(context, "inproc://gateway-camera", core)
     state_ingress = CppStateZmqIngress(context, "inproc://gateway-cpp-state", core)
+    rgb_names = ("ego_view", "chest_view", "left_wrist", "right_wrist")
+    depth_names = ("ego_view_depth", "chest_view_depth")
     camera_schema = ImageMessageSchema(
-        timestamps={"ego_view": 100.0, "ego_view_depth": 100.0},
+        timestamps={name: 100.0 for name in (*rgb_names, *depth_names)},
         images={
-            "ego_view": np.full((2, 3, 3), 7, dtype=np.uint8),
-            "ego_view_depth": np.full((2, 3), 1200, dtype=np.uint16),
+            **{
+                name: np.full((2, 3, 3), index, dtype=np.uint8)
+                for index, name in enumerate(rgb_names, start=1)
+            },
+            **{
+                name: np.full((2, 3), 1200, dtype=np.uint16)
+                for name in depth_names
+            },
         },
-        camera_info={"ego_view": {"depth_scale_m": 0.001, "fx": 500.0}},
+        camera_info={
+            "ego_view": {"depth_scale_m": 0.001, "fx": 500.0},
+            "chest_view": {"depth_scale_m": 0.001, "fx": 510.0},
+        },
     )
+    camera_wire = camera_schema.serialize()
+    publish_order = []
+    original_publish_array = core.publish_array
+
+    def record_publish_order(stream, array, **kwargs):
+        publish_order.append(stream)
+        return original_publish_array(stream, array, **kwargs)
+
+    monkeypatch.setattr(core, "publish_array", record_publish_order)
     state = {
         "control_loop_type": "cpp",
         "index": 42,
@@ -254,9 +275,18 @@ def test_camera_and_cpp_ingress_are_read_only_copies_of_current_wires() -> None:
     }
     try:
         assert _publish_until_ingested(
-            lambda: camera_server.publish(camera_schema.serialize()),
+            lambda: camera_server.publish(camera_wire),
             camera_ingress.poll_once,
-        ) == 2
+        ) == 6
+        encoded_positions = [
+            publish_order.index(f"camera_encoded/{name}") for name in rgb_names
+        ]
+        decoded_positions = [
+            index
+            for index, stream in enumerate(publish_order)
+            if stream.startswith("camera/")
+        ]
+        assert max(encoded_positions) < min(decoded_positions)
         assert _publish_until_ingested(
             lambda: cpp_service.publish_state(state),
             state_ingress.poll_once,
@@ -285,9 +315,10 @@ def test_camera_and_cpp_ingress_are_read_only_copies_of_current_wires() -> None:
             camera_schema.images["ego_view"],
         )
         encoded_frame = snapshot.frames["camera_encoded/ego_view"]
-        assert encoded_frame.attributes["encoding"] == "base64_jpeg"
-        encoded_rgb = read_shared_memory_frame(encoded_frame).tobytes().decode("utf-8")
-        assert encoded_rgb == camera_schema.serialize()["images"]["ego_view"]
+        assert encoded_frame.attributes["encoding"] == "jpeg_bytes"
+        assert encoded_frame.attributes["image_shape"] == [2, 3, 3]
+        encoded_rgb = read_shared_memory_frame(encoded_frame).tobytes()
+        assert encoded_rgb == camera_wire["images"]["ego_view"]
         assert snapshot.frames["camera/ego_view_depth"].attributes["camera_info"]["fx"] == 500.0
         raw_state = read_shared_memory_frame(snapshot.frames["cpp/state_msgpack"]).tobytes()
         assert msgpack.unpackb(raw_state, raw=False) == state
@@ -296,6 +327,31 @@ def test_camera_and_cpp_ingress_are_read_only_copies_of_current_wires() -> None:
         ).tobytes()
         assert msgpack.unpackb(raw_config, raw=False) == robot_config
         assert cpp_service.receive_command(timeout_ms=0) is None
+
+        legacy_wire = {
+            **camera_wire,
+            "images": {
+                "ego_view": base64.b64encode(
+                    camera_wire["images"]["ego_view"]
+                ).decode("ascii")
+            },
+            "timestamps": {"ego_view": 100.0},
+            "image_shapes": {"ego_view": [2, 3, 3]},
+        }
+        assert _publish_until_ingested(
+            lambda: camera_server.publish(legacy_wire),
+            camera_ingress.poll_once,
+        ) == 1
+        legacy_snapshot = core.select(
+            SnapshotRequest(
+                streams=("camera_encoded/ego_view",),
+                max_age_ms=1000.0,
+                max_skew_ms=100.0,
+            )
+        )
+        legacy_frame = legacy_snapshot.frames["camera_encoded/ego_view"]
+        assert legacy_frame.attributes["encoding"] == "base64_jpeg"
+        assert legacy_frame.attributes["image_shape"] == [2, 3, 3]
     finally:
         state_ingress.close()
         camera_ingress.close()

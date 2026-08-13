@@ -31,7 +31,8 @@ import math
 import queue
 import threading
 import time
-import cv2
+from typing import Any
+
 import msgpack_numpy as mnp
 import numpy as np
 import tyro
@@ -334,7 +335,6 @@ class _MsgpackNumpyPolicyClient:
 
 
 JPEG_VIDEO_MARKER = "__opencv_jpeg_rgb__"
-JPEG_VIDEO_QUALITY = 95
 # Hold completed chunks so latency compensation selects points farther into the trajectory.
 SIMULATED_INFERENCE_DELAY_SECONDS = 0.0
 
@@ -355,36 +355,15 @@ class _TimedAction(dict):
         self.timing_ms = timing_ms
 
 
-def encode_rgb_video_frame_as_jpeg(image: np.ndarray) -> dict:
-    """Encode a single RGB video frame as JPEG while preserving original shape metadata."""
-    array = np.asarray(image)
-    if array.dtype != np.uint8:
-        raise ValueError(f"JPEG video encoding expects uint8 images, got {array.dtype}")
-
-    if array.ndim == 5 and array.shape[0] == 1 and array.shape[1] == 1:
-        frame = array[0, 0]
-    elif array.ndim == 3:
-        frame = array
-    else:
-        raise ValueError(f"JPEG video encoding expects HWC or [1, 1, H, W, C], got {array.shape}")
-
-    if frame.ndim != 3 or frame.shape[-1] != 3:
-        raise ValueError(f"JPEG video encoding expects RGB HWC images, got {frame.shape}")
-
-    frame_bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR) 
-    ok, encoded = cv2.imencode(
-        ".jpg",
-        frame_bgr,
-        [int(cv2.IMWRITE_JPEG_QUALITY), JPEG_VIDEO_QUALITY],
-    )
-    if not ok:
-        raise RuntimeError("cv2.imencode failed for video frame")
-
+def wrap_camera_jpeg_for_video(
+    encoded: bytes | bytearray | memoryview,
+    image_shape: tuple[int, int, int],
+) -> dict[str, Any]:
     return {
         JPEG_VIDEO_MARKER: True,
-        "shape": array.shape,
-        "dtype": str(array.dtype),
-        "data": encoded.tobytes(),
+        "shape": (1, 1, *image_shape),
+        "dtype": "uint8",
+        "data": bytes(encoded),
     }
 
 
@@ -511,12 +490,12 @@ def prepare_observation_from_sensors(
 
     started = time.perf_counter()
     video = {
-        name: encode_rgb_video_frame_as_jpeg(
-            camera_msg["images"][name][np.newaxis, np.newaxis]
+        name: wrap_camera_jpeg_for_video(
+            camera_msg["images"][name], camera_msg["image_shapes"][name]
         )
         for name in required_image_keys
     }
-    timing_ms["jpeg_encode"] = (time.perf_counter() - started) * 1000.0
+    timing_ms["jpeg_prepare"] = (time.perf_counter() - started) * 1000.0
 
     observation = {
         "video": video,

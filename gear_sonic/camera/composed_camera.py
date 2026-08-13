@@ -29,6 +29,7 @@ from typing import Any
 import cv2  # noqa: F401 — imported early to avoid TSL segfault with camera SDKs
 import numpy as np
 
+from gear_sonic.camera.constants import PRODUCTION_JPEG_QUALITY
 from gear_sonic.camera.sensor import Sensor
 from gear_sonic.camera.sensor_server import (
     CameraMountPosition,
@@ -114,10 +115,15 @@ class ComposedCameraConfig:
     use_mjpeg: bool = False
     """Use on-device MJPEG encoding on OAK cameras to reduce USB bandwidth."""
 
-    mjpeg_quality: int = 80
+    mjpeg_quality: int = PRODUCTION_JPEG_QUALITY
     """MJPEG quality 1-100 (only when use_mjpeg=True)."""
 
+    jpeg_quality: int = PRODUCTION_JPEG_QUALITY
+    """Software JPEG quality 1-100 for RGB frames encoded on the host."""
+
     def __post_init__(self):
+        if not 1 <= self.jpeg_quality <= 100:
+            raise ValueError("jpeg_quality must be between 1 and 100")
         self.run_as_server = self.server
 
 
@@ -543,17 +549,21 @@ class ComposedCameraSensor(Sensor, SensorServer):
         all_timestamps = {}
         all_images = {}
         all_camera_info = {}
+        all_image_shapes = {}
         for _mount, camera_data in message.items():
             all_timestamps.update(camera_data.get("timestamps", {}))
             all_images.update(camera_data.get("images", {}))
             all_camera_info.update(camera_data.get("camera_info", {}))
+            all_image_shapes.update(camera_data.get("image_shapes", {}))
         img_schema = ImageMessageSchema(
             timestamps=all_timestamps,
             images=all_images,
             camera_info=all_camera_info,
+            image_shapes=all_image_shapes,
         )
         return img_schema.serialize(
-            executor=getattr(self, "_image_encoder_pool", None)
+            executor=getattr(self, "_image_encoder_pool", None),
+            jpeg_quality=self.config.jpeg_quality,
         )
 
     def run_server(self):

@@ -1,8 +1,8 @@
 from __future__ import annotations
 
-from types import MappingProxyType
 import threading
 import time
+from types import MappingProxyType
 
 import msgpack
 import msgpack_numpy as mnp
@@ -25,12 +25,17 @@ from gear_sonic.runtime.vla_sensor_gateway import (
 
 
 def _materialized_camera(
-    images: dict[str, np.ndarray],
+    jpeg_payloads: dict[str, bytes],
     *,
     received_ns: int,
     source_ns: int,
+    encoding: str = "jpeg_bytes",
+    image_shape: tuple[int, int, int] = (3, 4, 3),
 ) -> MaterializedSnapshot:
-    arrays = {f"camera/{name}": image for name, image in images.items()}
+    arrays = {
+        f"camera_encoded/{name}": np.frombuffer(payload, np.uint8).copy()
+        for name, payload in jpeg_payloads.items()
+    }
     frames = {
         stream: SharedMemoryFrame(
             metadata=MessageMetadata(
@@ -47,7 +52,11 @@ def _materialized_camera(
             size_bytes=image.nbytes,
             source_timestamp_ns=source_ns + index,
             source_clock="camera_unix",
-            attributes={"camera_info": {"name": stream}},
+            attributes={
+                "encoding": encoding,
+                "image_shape": image_shape,
+                "camera_info": {"name": stream},
+            },
         )
         for index, (stream, image) in enumerate(arrays.items())
     }
@@ -66,26 +75,49 @@ def _materialized_camera(
     )
 
 
-def test_gateway_recreates_vla_four_camera_message_without_value_changes() -> None:
-    images = {
-        name: np.full((3, 4, 3), index, dtype=np.uint8)
+def test_gateway_recreates_vla_four_camera_message_from_jpeg_bytes() -> None:
+    jpeg_payloads = {
+        name: b"\xff\xd8" + bytes([index, index + 1]) + b"\xff\xd9"
         for index, name in enumerate(VLA_CAMERA_NAMES)
     }
     message = camera_message_from_snapshot(
         _materialized_camera(
-            images,
+            jpeg_payloads,
             received_ns=time.monotonic_ns(),
             source_ns=123_000_000_000,
         )
     )
 
+    assert VLA_CAMERA_STREAMS == tuple(
+        f"camera_encoded/{name}" for name in VLA_CAMERA_NAMES
+    )
     assert tuple(message["images"]) == VLA_CAMERA_NAMES
     for index, name in enumerate(VLA_CAMERA_NAMES):
-        np.testing.assert_array_equal(message["images"][name], images[name])
+        assert message["images"][name] == jpeg_payloads[name]
+        assert message["image_shapes"][name] == (3, 4, 3)
         assert message["timestamps"][name] == pytest.approx(
             (123_000_000_000 + index) * 1.0e-9
         )
-        assert message["camera_info"][name] == {"name": f"camera/{name}"}
+        assert message["camera_info"][name] == {
+            "name": f"camera_encoded/{name}"
+        }
+
+
+def test_gateway_rejects_base64_camera_payload_for_vla() -> None:
+    jpeg_payloads = {
+        name: b"\xff\xd8" + bytes([index + 10]) + b"\xff\xd9"
+        for index, name in enumerate(VLA_CAMERA_NAMES)
+    }
+
+    with pytest.raises(ValueError, match="unsupported encoding 'base64_jpeg'"):
+        camera_message_from_snapshot(
+            _materialized_camera(
+                jpeg_payloads,
+                received_ns=time.monotonic_ns(),
+                source_ns=123_000_000_000,
+                encoding="base64_jpeg",
+            )
+        )
 
 
 def test_gateway_decodes_cpp_state_like_the_legacy_subscriber() -> None:
@@ -164,8 +196,8 @@ def test_gateway_ingress_materializes_every_vla_input_and_clear_semantics() -> N
     server.start()
     received_ns = time.monotonic_ns()
     source_ns = 123_000_000_000
-    images = {
-        name: np.full((3, 4, 3), index, dtype=np.uint8)
+    jpeg_payloads = {
+        name: b"\xff\xd8" + bytes([index, index + 1]) + b"\xff\xd9"
         for index, name in enumerate(VLA_CAMERA_NAMES)
     }
     state = {
@@ -178,11 +210,15 @@ def test_gateway_ingress_materializes_every_vla_input_and_clear_semantics() -> N
     for stream, name in zip(VLA_CAMERA_STREAMS, VLA_CAMERA_NAMES, strict=True):
         core.publish_array(
             stream,
-            images[name],
+            np.frombuffer(jpeg_payloads[name], dtype=np.uint8).copy(),
             received_ns=received_ns,
             source_timestamp_ns=source_ns,
             source_clock="camera_unix",
-            attributes={"camera_info": {"camera": name}},
+            attributes={
+                "encoding": "jpeg_bytes",
+                "image_shape": (3, 4, 3),
+                "camera_info": {"camera": name},
+            },
         )
     payload = msgpack.packb(state, default=mnp.encode, use_bin_type=True)
     core.publish_array(
@@ -217,7 +253,8 @@ def test_gateway_ingress_materializes_every_vla_input_and_clear_semantics() -> N
         assert camera is not None
         assert cpp_state is not None
         for name in VLA_CAMERA_NAMES:
-            np.testing.assert_array_equal(camera["images"][name], images[name])
+            assert camera["images"][name] == jpeg_payloads[name]
+            assert camera["image_shapes"][name] == (3, 4, 3)
         np.testing.assert_array_equal(cpp_state["body_q"], state["body_q"])
         assert ingress.read_state(clear=True) is not None
         assert ingress.read_state(clear=False) is None

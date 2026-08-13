@@ -1,0 +1,150 @@
+{
+  "decode_ms": {
+    "max": 18.853343004593626,
+    "mean": 10.482927365509715,
+    "min": 8.486163991619833,
+    "p50": 9.992638995754533,
+    "p95": 13.439861999358982
+  },
+  "elapsed_seconds": 60.02619392599445,
+  "endpoint": "tcp://192.168.123.164:5555",
+  "expected_streams": [
+    "ego_view",
+    "ego_view_depth",
+    "chest_view",
+    "chest_view_depth",
+    "left_wrist",
+    "right_wrist"
+  ],
+  "image_dtypes": {
+    "chest_view": "uint8",
+    "chest_view_depth": "uint16",
+    "ego_view": "uint8",
+    "ego_view_depth": "uint16",
+    "left_wrist": "uint8",
+    "right_wrist": "uint8"
+  },
+  "image_shapes": {
+    "chest_view": [
+      480,
+      640,
+      3
+    ],
+    "chest_view_depth": [
+      480,
+      640
+    ],
+    "ego_view": [
+      480,
+      640,
+      3
+    ],
+    "ego_view_depth": [
+      480,
+      640
+    ],
+    "left_wrist": [
+      480,
+      640,
+      3
+    ],
+    "right_wrist": [
+      480,
+      640,
+      3
+    ]
+  },
+  "images": 10806,
+  "images_per_second": 180.02140887564158,
+  "label": "jpeg-quality-95",
+  "latency_ms": {
+    "max": 84.12551879882812,
+    "mean": 45.516528488419,
+    "min": 21.415233612060547,
+    "p50": 43.44892501831055,
+    "p95": 61.12170219421387
+  },
+  "mean_message_bytes": 802459.7834536369,
+  "message_fps": 30.003568145940264,
+  "messages": 1801,
+  "requested_duration_seconds": 60.0,
+  "streams": {
+    "chest_view": {
+      "latency_ms": {
+        "max": 66.26391410827637,
+        "mean": 45.982445299062775,
+        "min": 21.415233612060547,
+        "p50": 45.664310455322266,
+        "p95": 59.38005447387695
+      },
+      "samples": 1801,
+      "unique_fps": 29.870292995930534,
+      "unique_frames": 1793
+    },
+    "chest_view_depth": {
+      "latency_ms": {
+        "max": 66.26391410827637,
+        "mean": 45.982445299062775,
+        "min": 21.415233612060547,
+        "p50": 45.664310455322266,
+        "p95": 59.38005447387695
+      },
+      "samples": 1801,
+      "unique_fps": 29.870292995930534,
+      "unique_frames": 1793
+    },
+    "ego_view": {
+      "latency_ms": {
+        "max": 84.12551879882812,
+        "mean": 43.28874546180229,
+        "min": 24.39141273498535,
+        "p50": 42.21963882446289,
+        "p95": 49.22318458557129
+      },
+      "samples": 1801,
+      "unique_fps": 29.20391724588189,
+      "unique_frames": 1753
+    },
+    "ego_view_depth": {
+      "latency_ms": {
+        "max": 84.12551879882812,
+        "mean": 43.28874546180229,
+        "min": 24.39141273498535,
+        "p50": 42.21963882446289,
+        "p95": 49.22318458557129
+      },
+      "samples": 1801,
+      "unique_fps": 29.20391724588189,
+      "unique_frames": 1753
+    },
+    "left_wrist": {
+      "latency_ms": {
+        "max": 64.97550010681152,
+        "mean": 45.11951235252774,
+        "min": 27.32229232788086,
+        "p50": 43.41578483581543,
+        "p95": 58.86125564575195
+      },
+      "samples": 1801,
+      "unique_fps": 29.98690875218905,
+      "unique_frames": 1800
+    },
+    "right_wrist": {
+      "latency_ms": {
+        "max": 71.9749927520752,
+        "mean": 49.437277056256114,
+        "min": 24.602413177490234,
+        "p50": 54.215431213378906,
+        "p95": 63.75837326049805
+      },
+      "samples": 1801,
+      "unique_fps": 29.53710512090621,
+      "unique_frames": 1773
+    }
+  },
+  "warmup_seconds": 5.0,
+  "wire_bytes": 1445230070,
+  "wire_bytes_per_second": 24076656.797227662,
+  "wire_mbit_per_second": 192.6132543778213,
+  "wire_mib_per_second": 22.961289212443983
+}
