@@ -1,4 +1,6 @@
 import importlib
+import base64
+import socket
 import sys
 import threading
 import types
@@ -7,9 +9,11 @@ from pathlib import Path
 
 import numpy as np
 import pytest
+import zmq
+import cv2
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-from gear_sonic.camera.sensor_server import ImageMessageSchema, ImageUtils
+from gear_sonic.camera.sensor_server import ImageMessageSchema, ImageUtils, SensorServer
 
 
 class _FakeFrame:
@@ -107,33 +111,65 @@ def _fake_realsense_module():
     return fake_rs, raw_frames, FakeAlign
 
 
-def test_rgbd_schema_round_trip_preserves_uint16_and_camera_info():
-    depth = np.array([[0, 1000], [2345, 65535]], dtype=np.uint16)
+def test_schema_emits_binary_rgb_depth_and_preserves_rgb_order():
+    rgb = np.zeros((48, 64, 3), np.uint8)
+    rgb[..., 0] = 240
+    depth = np.arange(48 * 64, dtype=np.uint16).reshape(48, 64)
     schema = ImageMessageSchema(
-        timestamps={"chest_view": 1.0, "chest_view_depth": 1.0},
+        timestamps={"ego_view": 1.0, "ego_view_depth": 1.0},
         images={
-            "chest_view": np.zeros((2, 2, 3), np.uint8),
-            "chest_view_depth": depth,
-        },
-        camera_info={
-            "chest_view": {
-                "fx": 500.0,
-                "fy": 501.0,
-                "cx": 1.0,
-                "cy": 1.0,
-                "width": 2,
-                "height": 2,
-                "depth_scale_m": 0.001,
-                "depth_aligned_to": "chest_view",
-            }
+            "ego_view": rgb,
+            "ego_view_depth": depth,
         },
     )
+
     wire = schema.serialize()
+
+    assert isinstance(wire["images"]["ego_view"], bytes)
+    assert isinstance(wire["images"]["ego_view_depth"], bytes)
+    assert wire["image_shapes"] == {
+        "ego_view": [48, 64, 3],
+        "ego_view_depth": [48, 64],
+    }
     decoded = ImageMessageSchema.deserialize(wire)
-    np.testing.assert_array_equal(decoded.images["chest_view_depth"], depth)
-    assert decoded.images["chest_view_depth"].dtype == np.uint16
-    assert decoded.camera_info == schema.camera_info
-    assert wire["schema_version"] == 2
+    assert decoded.images["ego_view"][..., 0].mean() > decoded.images["ego_view"][..., 2].mean()
+    np.testing.assert_array_equal(decoded.images["ego_view_depth"], depth)
+    assert decoded.image_shapes == wire["image_shapes"]
+
+
+def test_schema_deserializes_legacy_base64_rgb_and_depth():
+    rgb = np.zeros((32, 48, 3), dtype=np.uint8)
+    rgb[..., 0] = 220
+    depth = np.arange(32 * 48, dtype=np.uint16).reshape(32, 48)
+    _, rgb_encoded = cv2.imencode(".jpg", rgb)
+    _, depth_encoded = cv2.imencode(".png", depth)
+    legacy_wire = {
+        "timestamps": {"ego_view": 1.0, "ego_view_depth": 1.0},
+        "image_shapes": {"ego_view": [32, 48, 3], "ego_view_depth": [32, 48]},
+        "images": {
+            "ego_view": base64.b64encode(rgb_encoded).decode("ascii"),
+            "ego_view_depth": base64.b64encode(depth_encoded).decode("ascii"),
+        },
+    }
+
+    decoded = ImageMessageSchema.deserialize(legacy_wire)
+
+    assert decoded.images["ego_view"].shape == rgb.shape
+    assert decoded.images["ego_view"][..., 0].mean() > decoded.images["ego_view"][..., 2].mean()
+    np.testing.assert_array_equal(decoded.images["ego_view_depth"], depth)
+    assert decoded.image_shapes == legacy_wire["image_shapes"]
+
+
+def test_camera_server_configures_latest_first_send_hwm():
+    with socket.socket() as probe:
+        probe.bind(("127.0.0.1", 0))
+        port = probe.getsockname()[1]
+    server = SensorServer()
+    try:
+        server.start_server(port)
+        assert server.socket.getsockopt(zmq.SNDHWM) == 1
+    finally:
+        server.stop_server()
 
 
 def test_schema_parallel_serialization_preserves_order_and_payload(monkeypatch):
@@ -184,30 +220,6 @@ def test_schema_parallel_serialization_preserves_order_and_payload(monkeypatch):
     np.testing.assert_array_equal(decoded.images["ego_view_depth"], depth_a)
     np.testing.assert_array_equal(decoded.images["chest_view_depth"], depth_b)
     assert decoded.camera_info == schema.camera_info
-
-
-def test_legacy_base64_jpeg_does_not_claim_policy_channel_compatibility() -> None:
-    image = np.zeros((32, 48, 3), dtype=np.uint8)
-    image[:, :16] = (240, 20, 10)
-    image[:, 16:32] = (15, 230, 25)
-    image[:, 32:] = (5, 30, 220)
-
-    wire = ImageMessageSchema(
-        timestamps={"ego_view": 1.0},
-        images={"ego_view": image},
-    ).serialize()
-    legacy_rgb = ImageMessageSchema.deserialize(wire).images["ego_view"]
-    jpeg_bytes = __import__("base64").b64decode(wire["images"]["ego_view"])
-    direct_bgr = __import__("cv2").imdecode(
-        np.frombuffer(jpeg_bytes, dtype=np.uint8),
-        __import__("cv2").IMREAD_COLOR,
-    )
-    direct_rgb = __import__("cv2").cvtColor(
-        direct_bgr,
-        __import__("cv2").COLOR_BGR2RGB,
-    )
-
-    assert not np.array_equal(direct_rgb, legacy_rgb)
 
 
 def test_depth_encoder_rejects_wrong_dtype_and_shape():
@@ -301,6 +313,33 @@ def test_composed_camera_enables_depth_only_for_chest_and_merges_camera_info(mon
         )
     ).asdict()
     assert result["camera_info"] == {"chest_view": {"fx": 500.0}}
+
+
+def test_composed_camera_merges_producer_image_shapes():
+    """Catch raw-camera shape metadata being dropped during composition."""
+    from gear_sonic.camera.composed_camera import ComposedCameraConfig, ComposedCameraSensor
+
+    composed = object.__new__(ComposedCameraSensor)
+    composed.config = ComposedCameraConfig(server=False)
+    wire = composed.serialize_message(
+        {
+            "ego_view": {
+                "timestamps": {"ego_view": 1.0},
+                "images": {"ego_view": b"raw-oak-mjpeg"},
+                "image_shapes": {"ego_view": [480, 640, 3]},
+            },
+            "left_wrist": {
+                "timestamps": {"left_wrist": 1.0},
+                "images": {"left_wrist": np.zeros((24, 32, 3), dtype=np.uint8)},
+            },
+        }
+    )
+
+    assert wire["images"]["ego_view"] == b"raw-oak-mjpeg"
+    assert wire["image_shapes"] == {
+        "ego_view": [480, 640, 3],
+        "left_wrist": [24, 32, 3],
+    }
 
 
 def test_composed_camera_serializes_images_with_owned_executor(monkeypatch):

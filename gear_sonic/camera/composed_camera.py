@@ -549,14 +549,17 @@ class ComposedCameraSensor(Sensor, SensorServer):
         all_timestamps = {}
         all_images = {}
         all_camera_info = {}
+        all_image_shapes = {}
         for _mount, camera_data in message.items():
             all_timestamps.update(camera_data.get("timestamps", {}))
             all_images.update(camera_data.get("images", {}))
             all_camera_info.update(camera_data.get("camera_info", {}))
+            all_image_shapes.update(camera_data.get("image_shapes", {}))
         img_schema = ImageMessageSchema(
             timestamps=all_timestamps,
             images=all_images,
             camera_info=all_camera_info,
+            image_shapes=all_image_shapes,
         )
         return img_schema.serialize(
             executor=getattr(self, "_image_encoder_pool", None),

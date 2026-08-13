@@ -14,6 +14,8 @@ import zmq
 
 from gear_sonic.camera.constants import PRODUCTION_JPEG_QUALITY
 
+CAMERA_SEND_HWM = 1
+
 
 # =============================================================================
 # Pose Message Schema
@@ -118,17 +120,18 @@ class ImageMessageSchema:
     timestamps: dict[str, float]
     images: dict[str, Any]
     camera_info: dict[str, Any] = field(default_factory=dict)
+    image_shapes: dict[str, list[int]] = field(default_factory=dict)
 
     @staticmethod
     def _encode_image_value(
         key: str,
         image: Any,
         jpeg_quality: int = PRODUCTION_JPEG_QUALITY,
-    ) -> str | bytes | bytearray:
+    ) -> bytes:
         if key.endswith("_depth"):
             return ImageUtils.encode_depth_image(image)
         if isinstance(image, bytes | bytearray):
-            return image
+            return bytes(image)
         return ImageUtils.encode_image(image, quality=jpeg_quality)
 
     def serialize(
@@ -141,6 +144,14 @@ class ImageMessageSchema:
             "timestamps": self.timestamps,
             "images": {},
             "camera_info": self.camera_info,
+            "image_shapes": {
+                **self.image_shapes,
+                **{
+                    key: list(image.shape)
+                    for key, image in self.images.items()
+                    if isinstance(image, np.ndarray)
+                },
+            },
         }
         if executor is None:
             encoded_images = [
@@ -188,6 +199,7 @@ class ImageMessageSchema:
             timestamps=timestamps,
             images=images,
             camera_info=data.get("camera_info", {}),
+            image_shapes=data.get("image_shapes", {}),
         )
 
     def asdict(self) -> dict[str, Any]:
@@ -195,6 +207,7 @@ class ImageMessageSchema:
             "timestamps": self.timestamps,
             "images": self.images,
             "camera_info": self.camera_info,
+            "image_shapes": self.image_shapes,
         }
 
 
@@ -207,7 +220,7 @@ class SensorServer:
     def start_server(self, port: int):
         self.context = zmq.Context()
         self.socket = self.context.socket(zmq.PUB)
-        self.socket.setsockopt(zmq.SNDHWM, 20)
+        self.socket.setsockopt(zmq.SNDHWM, CAMERA_SEND_HWM)
         self.socket.setsockopt(zmq.LINGER, 0)
         self.socket.bind(f"tcp://*:{port}")
         print(f"Sensor server running at tcp://*:{port}")
@@ -274,20 +287,25 @@ class CameraMountPosition(Enum):
 
 class ImageUtils:
     @staticmethod
-    def encode_image(image: np.ndarray, quality: int = PRODUCTION_JPEG_QUALITY) -> str:
-        _, color_buffer = cv2.imencode(
+    def encode_image(image: np.ndarray, quality: int = PRODUCTION_JPEG_QUALITY) -> bytes:
+        image_bgr = cv2.cvtColor(np.asarray(image), cv2.COLOR_RGB2BGR)
+        ok, color_buffer = cv2.imencode(
             ".jpg",
-            image,
-            [int(cv2.IMWRITE_JPEG_QUALITY), quality],
+            image_bgr,
+            [int(cv2.IMWRITE_JPEG_QUALITY), int(quality)],
         )
-        return base64.b64encode(color_buffer).decode("utf-8")
+        if not ok:
+            raise RuntimeError("failed to encode RGB image as JPEG")
+        return color_buffer.tobytes()
 
     @staticmethod
-    def encode_depth_image(image: np.ndarray) -> str:
+    def encode_depth_image(image: np.ndarray) -> bytes:
         if not isinstance(image, np.ndarray) or image.ndim != 2 or image.dtype != np.uint16:
             raise ValueError("depth image must be a 2D uint16 array")
-        depth_compressed = cv2.imencode(".png", image)[1].tobytes()
-        return base64.b64encode(depth_compressed).decode("utf-8")
+        ok, depth_compressed = cv2.imencode(".png", image)
+        if not ok:
+            raise RuntimeError("failed to encode depth image as PNG")
+        return depth_compressed.tobytes()
 
     @staticmethod
     def decode_image(image: str) -> np.ndarray:

@@ -1,10 +1,13 @@
 import importlib.util
+import socket
 from pathlib import Path
 import sys
 import types
+from datetime import timedelta
 
 import cv2
 import numpy as np
+import zmq
 
 from gear_sonic.camera.composed_camera import ComposedCameraConfig, ComposedCameraSensor
 from gear_sonic.camera.sensor_server import ImageMessageSchema, ImageUtils
@@ -68,6 +71,30 @@ def test_mujoco_encoder_passes_quality_95_to_opencv(monkeypatch):
     mujoco_sensor_server.ImageUtils.encode_image(np.zeros((8, 8, 3), np.uint8))
 
     assert imencode_calls == [(".jpg", [int(cv2.IMWRITE_JPEG_QUALITY), 95])]
+
+
+def test_mujoco_schema_emits_binary_rgb_with_shape_and_latest_first_hwm():
+    rgb = np.zeros((24, 32, 3), dtype=np.uint8)
+    rgb[..., 2] = 230
+
+    wire = mujoco_sensor_server.ImageMessageSchema(
+        timestamps={"ego_view": 1.0}, images={"ego_view": rgb}
+    ).serialize()
+
+    assert isinstance(wire["images"]["ego_view"], bytes)
+    assert wire["image_shapes"] == {"ego_view": [24, 32, 3]}
+    decoded = mujoco_sensor_server.ImageMessageSchema.deserialize(wire)
+    assert decoded.images["ego_view"][..., 2].mean() > decoded.images["ego_view"][..., 0].mean()
+
+    with socket.socket() as probe:
+        probe.bind(("127.0.0.1", 0))
+        port = probe.getsockname()[1]
+    server = mujoco_sensor_server.SensorServer()
+    try:
+        server.start_server(port)
+        assert server.socket.getsockopt(zmq.SNDHWM) == 1
+    finally:
+        server.stop_server()
 
 
 def test_oak_mjpeg_default_reaches_depthai_encoder_as_quality_95(monkeypatch):
@@ -148,6 +175,7 @@ def test_oak_mjpeg_default_reaches_depthai_encoder_as_quality_95(monkeypatch):
             Profile=types.SimpleNamespace(MJPEG="MJPEG")
         ),
         node=types.SimpleNamespace(Camera=object(), VideoEncoder=object()),
+        Clock=types.SimpleNamespace(now=lambda: timedelta(0)),
     )
     monkeypatch.setitem(sys.modules, "depthai", fake_dai)
     module_path = Path(__file__).parents[1] / "camera" / "drivers" / "oak.py"
@@ -160,6 +188,23 @@ def test_oak_mjpeg_default_reaches_depthai_encoder_as_quality_95(monkeypatch):
     config = oak.OAKConfig()
     config.use_mjpeg = True
     config.autofocus = True
-    oak.OAKSensor(config=config)
+    sensor = oak.OAKSensor(config=config)
 
     assert encoder_qualities == [95]
+
+    class FakeMjpegFrame:
+        def getTimestamp(self):
+            return timedelta(0)
+
+        def getData(self):
+            return bytearray(b"raw-oak-mjpeg")
+
+    frames = [FakeMjpegFrame(), None]
+    sensor.output_queues = {
+        "color": types.SimpleNamespace(tryGet=lambda: frames.pop(0))
+    }
+    result = sensor.read()
+
+    assert result is not None
+    assert result["images"] == {"ego_view": b"raw-oak-mjpeg"}
+    assert result["image_shapes"] == {"ego_view": [480, 640, 3]}

@@ -209,6 +209,7 @@ class OAKSensor(Sensor, SensorServer):
 
         timestamps = {}
         images = {}
+        image_shapes = {}
         rgb_frame_time = None
 
         def drain_queue_get_latest(queue):
@@ -235,6 +236,8 @@ class OAKSensor(Sensor, SensorServer):
 
                 if self._use_mjpeg:
                     images[self.mount_position] = bytes(rgb_frame.getData())
+                    width, height = self.config.color_image_dim
+                    image_shapes[self.mount_position] = [height, width, 3]
                 else:
                     images[self.mount_position] = rgb_frame.getCvFrame()[..., ::-1]
                 timestamps[self.mount_position] = capture_time
@@ -256,6 +259,8 @@ class OAKSensor(Sensor, SensorServer):
                 key = f"{self.mount_position}_left_mono"
                 if self._use_mjpeg:
                     images[key] = bytes(mono_left_frame.getData())
+                    width, height = self.config.monochrome_image_dim
+                    image_shapes[key] = [height, width]
                 else:
                     images[key] = mono_left_frame.getCvFrame()
                 timestamps[key] = capture_time
@@ -277,6 +282,8 @@ class OAKSensor(Sensor, SensorServer):
                 key = f"{self.mount_position}_right_mono"
                 if self._use_mjpeg:
                     images[key] = bytes(mono_right_frame.getData())
+                    width, height = self.config.monochrome_image_dim
+                    image_shapes[key] = [height, width]
                 else:
                     images[key] = mono_right_frame.getCvFrame()
                 timestamps[key] = capture_time
@@ -297,10 +304,18 @@ class OAKSensor(Sensor, SensorServer):
                     f"[{self.mount_position}] OAK frame age too large: {frame_age * 1000:.1f}ms"
                 )
 
-        return {"timestamps": timestamps, "images": images}
+        return {
+            "timestamps": timestamps,
+            "images": images,
+            "image_shapes": image_shapes,
+        }
 
     def serialize(self, data: dict[str, Any]) -> dict[str, Any]:
-        serialized_msg = ImageMessageSchema(timestamps=data["timestamps"], images=data["images"])
+        serialized_msg = ImageMessageSchema(
+            timestamps=data["timestamps"],
+            images=data["images"],
+            image_shapes=data.get("image_shapes", {}),
+        )
         return serialized_msg.serialize()
 
     def observation_space(self):
