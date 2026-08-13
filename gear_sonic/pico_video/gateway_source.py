@@ -85,7 +85,13 @@ class SensorGatewayVideoSource:
             raise InvalidGatewayFrameError("encoded frame must be a NumPy array")
         if encoded.dtype != np.dtype(np.uint8) or encoded.ndim != 1:
             raise InvalidGatewayFrameError("encoded frame must be 1-D uint8")
-        if reference.dtype != "uint8" or tuple(reference.shape) != encoded.shape:
+        try:
+            reference_dtype = np.dtype(reference.dtype)
+        except TypeError as exc:
+            raise InvalidGatewayFrameError(
+                "encoded frame shared-memory dtype is invalid"
+            ) from exc
+        if reference_dtype != np.dtype(np.uint8) or tuple(reference.shape) != encoded.shape:
             raise InvalidGatewayFrameError(
                 "encoded frame shared-memory metadata does not match its array"
             )

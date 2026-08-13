@@ -309,3 +309,4 @@ def test_stale_source_streams_a_fresh_red_status_card() -> None:
     frame = factory.instances[0].frames[0]
     assert frame[..., 0].mean() > frame[..., 1].mean() * 1.5
     assert frame[..., 0].mean() > frame[..., 2].mean() * 1.5
+    np.testing.assert_array_equal(frame[:, :640], frame[:, 640:])

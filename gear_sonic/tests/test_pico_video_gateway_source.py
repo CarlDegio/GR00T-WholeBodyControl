@@ -63,7 +63,7 @@ def _materialized(
         stream=stream,
         shared_memory="test-ring",
         shape=array.shape,
-        dtype=str(array.dtype),
+        dtype=array.dtype.str,
         offset_bytes=0,
         size_bytes=array.nbytes,
         source_timestamp_ns=9_900_000_000,

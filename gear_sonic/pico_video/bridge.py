@@ -279,6 +279,18 @@ class PicoVideoBridge:
     def wait_until_ready(self, *, timeout_s: float) -> bool:
         return self._ready.wait(timeout=max(0.0, timeout_s))
 
+    def _status_frame(self, status: str) -> np.ndarray:
+        eye = render_status_card(
+            self.settings.width // 2,
+            self.settings.height,
+            status,
+        )
+        return compose_mono_sbs(
+            eye,
+            eye_width=self.settings.width // 2,
+            height=self.settings.height,
+        )
+
     def _producer_loop(self) -> None:
         period_s = 1.0 / self.settings.fps
         status_period_s = 1.0 / self.settings.stale_fps
@@ -301,38 +313,20 @@ class PicoVideoBridge:
                     self._frames_published += 1
                     next_status_at = started
                 elif status != "READY" and started >= next_status_at:
-                    self._slot.put(
-                        render_status_card(
-                            self.settings.width,
-                            self.settings.height,
-                            status,
-                        )
-                    )
+                    self._slot.put(self._status_frame(status))
                     self._status_cards_published += 1
                     next_status_at = started + status_period_s
             except FrameError as exc:
                 status = "INVALID CAMERA FRAME"
                 if started >= next_status_at:
-                    self._slot.put(
-                        render_status_card(
-                            self.settings.width,
-                            self.settings.height,
-                            status,
-                        )
-                    )
+                    self._slot.put(self._status_frame(status))
                     self._status_cards_published += 1
                     next_status_at = started + status_period_s
                 LOGGER.warning("PICO frame decode failed: %s", exc)
             except Exception as exc:
                 status = "SENSOR SOURCE ERROR"
                 if started >= next_status_at:
-                    self._slot.put(
-                        render_status_card(
-                            self.settings.width,
-                            self.settings.height,
-                            status,
-                        )
-                    )
+                    self._slot.put(self._status_frame(status))
                     self._status_cards_published += 1
                     next_status_at = started + status_period_s
                 LOGGER.exception("PICO source polling failed: %s", exc)
