@@ -10,6 +10,8 @@ import msgpack_numpy as m
 import numpy as np
 import zmq
 
+from gear_sonic.camera.constants import PRODUCTION_JPEG_QUALITY
+
 
 @dataclass
 class ImageMessageSchema:
@@ -73,7 +75,9 @@ class SensorServer:
 class ImageUtils:
     @staticmethod
     def encode_image(image: np.ndarray) -> str:
-        _, color_buffer = cv2.imencode(".jpg", image, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
+        _, color_buffer = cv2.imencode(
+            ".jpg", image, [int(cv2.IMWRITE_JPEG_QUALITY), PRODUCTION_JPEG_QUALITY]
+        )
         return base64.b64encode(color_buffer).decode("utf-8")
 
     @staticmethod

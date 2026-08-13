@@ -5,6 +5,8 @@ from pathlib import Path
 import sys
 from typing import Any
 
+from gear_sonic.camera.constants import PRODUCTION_JPEG_QUALITY
+
 
 ORBBEC_VENDOR_ID = 0x2BC5
 GEMINI_345LG_PRODUCT_ID = 0x0813
@@ -91,6 +93,8 @@ def build_server_argv(serial: str) -> list[str]:
         "--ego-view-device-id",
         serial,
         "--orbbec-enable-depth",
+        "--jpeg-quality",
+        str(PRODUCTION_JPEG_QUALITY),
         "--port",
         "5555",
     ]

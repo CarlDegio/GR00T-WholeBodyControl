@@ -119,7 +119,7 @@ python -m gear_sonic.camera.composed_camera \
     --port 5555
 ```
 
-Run `python -m gear_sonic.camera.composed_camera --help` for all options including `--fps`, `--use-mjpeg`, and `--mjpeg-quality`.
+Run `python -m gear_sonic.camera.composed_camera --help` for all options including `--fps`, `--use-mjpeg`, and `--mjpeg-quality`. Production JPEG and MJPEG encoding defaults to quality 95; pass the corresponding quality option explicitly to override it.
 
 **Manual systemd setup:**
 

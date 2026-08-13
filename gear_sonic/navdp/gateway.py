@@ -12,6 +12,7 @@ from typing import Any, Mapping, Sequence
 
 import numpy as np
 
+from gear_sonic.camera.constants import PRODUCTION_JPEG_QUALITY
 from gear_sonic.navdp.control import LatestMessageWorker
 from gear_sonic.navdp.navigation import Pose2D, update_slam_map
 from gear_sonic.navdp.visualization import filter_livox_points
@@ -74,7 +75,9 @@ def _encode_navdp_frames(rgb_bgr: np.ndarray, depth_m: np.ndarray) -> tuple[byte
 
     depth = np.asarray(depth_m, dtype=np.float32).copy()
     depth[(depth < 0.1) | (depth > 5.0) | ~np.isfinite(depth)] = 0.0
-    ok_rgb, rgb_encoded = cv2.imencode(".jpg", rgb_bgr)
+    ok_rgb, rgb_encoded = cv2.imencode(
+        ".jpg", rgb_bgr, [int(cv2.IMWRITE_JPEG_QUALITY), PRODUCTION_JPEG_QUALITY]
+    )
     ok_depth, depth_png = cv2.imencode(".png", np.rint(depth * 10000.0).astype(np.uint16))
     if not ok_rgb or not ok_depth:
         raise RuntimeError("failed to encode NavDP RGB-D")

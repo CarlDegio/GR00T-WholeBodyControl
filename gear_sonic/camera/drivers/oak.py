@@ -20,6 +20,7 @@ except ImportError:
 
 import depthai as dai
 
+from gear_sonic.camera.constants import PRODUCTION_JPEG_QUALITY
 from gear_sonic.camera.sensor import Sensor
 from gear_sonic.camera.sensor_server import (
     CameraMountPosition,
@@ -40,7 +41,7 @@ class OAKConfig:
     autofocus: bool = False
     manual_focus: int = 130
     use_mjpeg: bool = False
-    mjpeg_quality: int = 80
+    mjpeg_quality: int = PRODUCTION_JPEG_QUALITY
 
 
 class OAKSensor(Sensor, SensorServer):
@@ -364,7 +365,10 @@ if __name__ == "__main__":
     parser.add_argument("--show-image", action="store_true", help="Display images")
     parser.add_argument("--use-mjpeg", action="store_true", help="Use MJPEG encoding on-device")
     parser.add_argument(
-        "--mjpeg-quality", type=int, default=80, help="MJPEG quality 1-100 (default: 80)"
+        "--mjpeg-quality",
+        type=int,
+        default=PRODUCTION_JPEG_QUALITY,
+        help=f"MJPEG quality 1-100 (default: {PRODUCTION_JPEG_QUALITY})",
     )
     args = parser.parse_args()
 

@@ -29,6 +29,7 @@ from typing import Any
 import cv2  # noqa: F401 — imported early to avoid TSL segfault with camera SDKs
 import numpy as np
 
+from gear_sonic.camera.constants import PRODUCTION_JPEG_QUALITY
 from gear_sonic.camera.sensor import Sensor
 from gear_sonic.camera.sensor_server import (
     CameraMountPosition,
@@ -114,10 +115,10 @@ class ComposedCameraConfig:
     use_mjpeg: bool = False
     """Use on-device MJPEG encoding on OAK cameras to reduce USB bandwidth."""
 
-    mjpeg_quality: int = 80
+    mjpeg_quality: int = PRODUCTION_JPEG_QUALITY
     """MJPEG quality 1-100 (only when use_mjpeg=True)."""
 
-    jpeg_quality: int = 80
+    jpeg_quality: int = PRODUCTION_JPEG_QUALITY
     """Software JPEG quality 1-100 for RGB frames encoded on the host."""
 
     def __post_init__(self):

@@ -12,6 +12,8 @@ import msgpack_numpy as m
 import numpy as np
 import zmq
 
+from gear_sonic.camera.constants import PRODUCTION_JPEG_QUALITY
+
 
 # =============================================================================
 # Pose Message Schema
@@ -121,7 +123,7 @@ class ImageMessageSchema:
     def _encode_image_value(
         key: str,
         image: Any,
-        jpeg_quality: int = 80,
+        jpeg_quality: int = PRODUCTION_JPEG_QUALITY,
     ) -> str | bytes | bytearray:
         if key.endswith("_depth"):
             return ImageUtils.encode_depth_image(image)
@@ -132,7 +134,7 @@ class ImageMessageSchema:
     def serialize(
         self,
         executor: Executor | None = None,
-        jpeg_quality: int = 80,
+        jpeg_quality: int = PRODUCTION_JPEG_QUALITY,
     ) -> dict[str, Any]:
         serialized_msg: dict[str, Any] = {
             "schema_version": 2,
@@ -272,7 +274,7 @@ class CameraMountPosition(Enum):
 
 class ImageUtils:
     @staticmethod
-    def encode_image(image: np.ndarray, quality: int = 80) -> str:
+    def encode_image(image: np.ndarray, quality: int = PRODUCTION_JPEG_QUALITY) -> str:
         _, color_buffer = cv2.imencode(
             ".jpg",
             image,
