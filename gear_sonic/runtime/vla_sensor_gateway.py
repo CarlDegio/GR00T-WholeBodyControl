@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import copy
 import threading
 import time
@@ -17,7 +18,7 @@ from gear_sonic.runtime.snapshot import SnapshotRequest
 
 
 VLA_CAMERA_NAMES = ("ego_view", "chest_view", "left_wrist", "right_wrist")
-VLA_CAMERA_STREAMS = tuple(f"camera/{name}" for name in VLA_CAMERA_NAMES)
+VLA_CAMERA_STREAMS = tuple(f"camera_encoded/{name}" for name in VLA_CAMERA_NAMES)
 VLA_STATE_STREAM = "cpp/state_msgpack"
 
 
@@ -40,17 +41,22 @@ def decode_cpp_state_array(values: np.ndarray) -> dict[str, Any]:
 
 def camera_message_from_snapshot(snapshot: MaterializedSnapshot) -> dict[str, Any]:
     """Recreate the subset of ``ImageMessageSchema.asdict`` consumed by VLA."""
-    images: dict[str, np.ndarray] = {}
+    images: dict[str, bytes] = {}
+    image_shapes: dict[str, tuple[int, ...]] = {}
     timestamps: dict[str, float] = {}
     camera_info: dict[str, Mapping[str, Any]] = {}
     for name, stream in zip(VLA_CAMERA_NAMES, VLA_CAMERA_STREAMS, strict=True):
         frame = snapshot.snapshot.frames[stream]
-        image = np.asarray(snapshot.arrays[stream])
-        if image.ndim != 3 or image.shape[-1] != 3 or image.dtype != np.uint8:
+        payload = np.asarray(snapshot.arrays[stream], dtype=np.uint8).reshape(-1).tobytes()
+        encoding = frame.attributes.get("encoding")
+        if encoding == "base64_jpeg":
+            payload = base64.b64decode(payload)
+        elif encoding != "jpeg_bytes":
             raise ValueError(
-                f"VLA camera {name!r} must be HxWx3 uint8, got {image.shape} {image.dtype}"
+                f"VLA camera {name!r} has unsupported encoding {encoding!r}"
             )
-        images[name] = image.copy()
+        images[name] = payload
+        image_shapes[name] = tuple(frame.attributes["image_shape"])
         timestamps[name] = (
             float(frame.source_timestamp_ns) * 1.0e-9
             if frame.source_timestamp_ns > 0
@@ -59,6 +65,7 @@ def camera_message_from_snapshot(snapshot: MaterializedSnapshot) -> dict[str, An
         camera_info[name] = dict(frame.attributes.get("camera_info", {}))
     return {
         "images": images,
+        "image_shapes": image_shapes,
         "timestamps": timestamps,
         "camera_info": camera_info,
     }
