@@ -1,112 +1,189 @@
 {
   "codec_comparison_ms": {
     "new": {
-      "max": 0.017397,
-      "mean": 0.0009104770960577458,
-      "min": 0.000165,
-      "p50": 0.00042,
-      "p95": 0.003032
+      "max": 0.902668,
+      "mean": 0.0011265664908384231,
+      "min": 0.000175,
+      "p50": 0.000487,
+      "p95": 0.003206
     },
-    "new_mean": 0.0009104770960577458,
-    "new_p50": 0.00042,
-    "new_p95": 0.003032,
+    "new_mean": 0.0011265664908384231,
+    "new_p50": 0.000487,
+    "new_p95": 0.003206,
     "old": {
-      "max": 4.155882,
-      "mean": 0.7509305247084952,
-      "min": 0.47299,
-      "p50": 0.724791,
-      "p95": 0.99827
+      "max": 5.014569,
+      "mean": 0.7489827844253192,
+      "min": 0.468995,
+      "p50": 0.720517,
+      "p95": 1.003313
     },
-    "old_mean": 0.7509305247084952,
-    "old_p50": 0.724791,
-    "old_p95": 0.99827,
+    "old_mean": 0.7489827844253192,
+    "old_p50": 0.720517,
+    "old_p95": 1.003313,
     "samples": 7204
   },
-  "decoded_images": 10806,
-  "decoded_images_per_second": 180.0820214123472,
+  "decoded_physical_images": 10276,
+  "decoded_physical_images_per_second": 171.2472203032589,
   "decoded_streams": {
     "chest_view": {
-      "unique_fps": 30.0136702353912,
-      "unique_frames": 1801
+      "gateway_publication_fps": 30.013258443574276,
+      "gateway_publications": 1801,
+      "gateway_sequence_regressions": 0,
+      "observed_gateway_sequence_gaps": 0,
+      "physical_unique_fps": 29.263343601841438,
+      "physical_unique_frames": 1756,
+      "source_timestamp_missing": 0,
+      "source_timestamp_regressions": 0,
+      "source_timestamp_reuses": 45
     },
     "chest_view_depth": {
-      "unique_fps": 30.0136702353912,
-      "unique_frames": 1801
+      "gateway_publication_fps": 30.013258443574276,
+      "gateway_publications": 1801,
+      "gateway_sequence_regressions": 0,
+      "observed_gateway_sequence_gaps": 0,
+      "physical_unique_fps": 29.263343601841438,
+      "physical_unique_frames": 1756,
+      "source_timestamp_missing": 0,
+      "source_timestamp_regressions": 0,
+      "source_timestamp_reuses": 45
     },
     "ego_view": {
-      "unique_fps": 30.0136702353912,
-      "unique_frames": 1801
+      "gateway_publication_fps": 30.013258443574276,
+      "gateway_publications": 1801,
+      "gateway_sequence_regressions": 0,
+      "observed_gateway_sequence_gaps": 0,
+      "physical_unique_fps": 27.16358204498949,
+      "physical_unique_frames": 1630,
+      "source_timestamp_missing": 0,
+      "source_timestamp_regressions": 0,
+      "source_timestamp_reuses": 171
     },
     "ego_view_depth": {
-      "unique_fps": 30.0136702353912,
-      "unique_frames": 1801
+      "gateway_publication_fps": 30.013258443574276,
+      "gateway_publications": 1801,
+      "gateway_sequence_regressions": 0,
+      "observed_gateway_sequence_gaps": 0,
+      "physical_unique_fps": 27.16358204498949,
+      "physical_unique_frames": 1630,
+      "source_timestamp_missing": 0,
+      "source_timestamp_regressions": 0,
+      "source_timestamp_reuses": 171
     },
     "left_wrist": {
-      "unique_fps": 30.0136702353912,
-      "unique_frames": 1801
+      "gateway_publication_fps": 30.013258443574276,
+      "gateway_publications": 1801,
+      "gateway_sequence_regressions": 0,
+      "observed_gateway_sequence_gaps": 0,
+      "physical_unique_fps": 29.596639087056033,
+      "physical_unique_frames": 1776,
+      "source_timestamp_missing": 0,
+      "source_timestamp_regressions": 0,
+      "source_timestamp_reuses": 25
     },
     "right_wrist": {
-      "unique_fps": 30.0136702353912,
-      "unique_frames": 1801
+      "gateway_publication_fps": 30.013258443574276,
+      "gateway_publications": 1801,
+      "gateway_sequence_regressions": 0,
+      "observed_gateway_sequence_gaps": 0,
+      "physical_unique_fps": 28.796729922541004,
+      "physical_unique_frames": 1728,
+      "source_timestamp_missing": 0,
+      "source_timestamp_regressions": 0,
+      "source_timestamp_reuses": 73
     }
   },
-  "elapsed_seconds": 60.005990133,
+  "elapsed_seconds": 60.006813435,
   "encoded_streams": {
     "chest_view": {
-      "unique_fps": 30.0136702353912,
-      "unique_frames": 1801
+      "gateway_publication_fps": 30.013258443574276,
+      "gateway_publications": 1801,
+      "gateway_sequence_regressions": 0,
+      "observed_gateway_sequence_gaps": 0,
+      "physical_unique_fps": 29.263343601841438,
+      "physical_unique_frames": 1756,
+      "source_timestamp_missing": 0,
+      "source_timestamp_regressions": 0,
+      "source_timestamp_reuses": 45
     },
     "ego_view": {
-      "unique_fps": 30.0136702353912,
-      "unique_frames": 1801
+      "gateway_publication_fps": 30.013258443574276,
+      "gateway_publications": 1801,
+      "gateway_sequence_regressions": 0,
+      "observed_gateway_sequence_gaps": 0,
+      "physical_unique_fps": 27.16358204498949,
+      "physical_unique_frames": 1630,
+      "source_timestamp_missing": 0,
+      "source_timestamp_regressions": 0,
+      "source_timestamp_reuses": 171
     },
     "left_wrist": {
-      "unique_fps": 30.0136702353912,
-      "unique_frames": 1801
+      "gateway_publication_fps": 30.013258443574276,
+      "gateway_publications": 1801,
+      "gateway_sequence_regressions": 0,
+      "observed_gateway_sequence_gaps": 0,
+      "physical_unique_fps": 29.596639087056033,
+      "physical_unique_frames": 1776,
+      "source_timestamp_missing": 0,
+      "source_timestamp_regressions": 0,
+      "source_timestamp_reuses": 25
     },
     "right_wrist": {
-      "unique_fps": 30.0136702353912,
-      "unique_frames": 1801
+      "gateway_publication_fps": 30.013258443574276,
+      "gateway_publications": 1801,
+      "gateway_sequence_regressions": 0,
+      "observed_gateway_sequence_gaps": 0,
+      "physical_unique_fps": 28.796729922541004,
+      "physical_unique_frames": 1728,
+      "source_timestamp_missing": 0,
+      "source_timestamp_regressions": 0,
+      "source_timestamp_reuses": 73
     }
   },
   "latency_ms": {
     "gateway_rpc": {
-      "max": 8.802541,
-      "mean": 0.9696855495457127,
-      "min": 0.303853,
-      "p50": 0.670732,
-      "p95": 2.707747
+      "max": 9.682429,
+      "mean": 0.9631239475455821,
+      "min": 0.284395,
+      "p50": 0.658516,
+      "p95": 2.739141
     },
     "jpeg_prepare": {
-      "max": 2.047779,
-      "mean": 0.054116587876206705,
-      "min": 0.02524,
-      "p50": 0.051626,
-      "p95": 0.070414
+      "max": 3.287898,
+      "mean": 0.055850554838709675,
+      "min": 0.026775,
+      "p50": 0.052106,
+      "p95": 0.073321
     },
     "openpi_decode": {
-      "max": 9.640664,
-      "mean": 4.109878644094264,
-      "min": 3.259208,
-      "p50": 3.972928,
-      "p95": 5.29207
+      "max": 10.769146,
+      "mean": 4.0558434795231415,
+      "min": 3.270483,
+      "p50": 3.898902,
+      "p95": 5.354176
     },
     "request_pack": {
-      "max": 2.700606,
-      "mean": 0.0906612481544577,
-      "min": 0.035327,
-      "p50": 0.085125,
-      "p95": 0.120335
+      "max": 2.463767,
+      "mean": 0.08945216311360447,
+      "min": 0.032386,
+      "p50": 0.082018,
+      "p95": 0.120173
     }
   },
   "openpi_decoder": "/home/user/Project/openpi_sonic/scripts/serve_g1_sonic_zmq_policy.py",
   "requested_duration_seconds": 60.0,
   "sensor_gateway_endpoint": "ipc:///tmp/sonic_sensor_gateway.ipc",
   "single_threaded_sequential": true,
-  "vla_bytes_per_request": 344752.45187393524,
-  "vla_bytes_per_second": 40469897.5155231,
-  "vla_mbit_per_second": 323.7591801241848,
-  "vla_request_bytes": 2428436271,
-  "vla_request_fps": 117.38828047645508,
-  "vla_requests": 7044
+  "snapshot_rejections": {
+    "decoded": 0,
+    "encoded": 0,
+    "reasons": {},
+    "total": 0
+  },
+  "transport_drop_observability": "PUB/HWM transport drops are unobservable without a producer frame identifier",
+  "vla_bytes_per_request": 346939.11023842916,
+  "vla_bytes_per_second": 41223249.734457426,
+  "vla_mbit_per_second": 329.7859978756594,
+  "vla_request_bytes": 2473675856,
+  "vla_request_fps": 118.8198404790031,
+  "vla_requests": 7130
 }

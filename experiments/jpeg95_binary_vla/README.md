@@ -2,11 +2,12 @@
 
 ## Result
 
-The 60-second live run passed all eight machine-checked performance thresholds. The
-camera published at 30.007 messages/s, every observed image payload was msgpack
-binary, and binary was 24.980% smaller than the same-message Base64 counterfactual. The
-sequential SensorGateway/OpenPI protocol benchmark observed 30.014 encoded frames/s
-per RGB stream and 180.082 decoded images/s across all six streams.
+The camera transport thresholds passed: 30.007 messages/s, every observed image
+payload was msgpack binary, and binary was 24.980% smaller than the same-message
+Base64 counterfactual. The corrected physical-frame acceptance did **not** pass. A
+fresh sequential SensorGateway/OpenPI run observed 30.013 Gateway publications/s on
+every stream, but physical encoded rates ranged from 27.164 to 29.597 FPS and the
+six-stream physical decoded aggregate was 171.247 images/s, below the required 174.
 
 The benchmark covers camera transport, Gateway snapshot RPC, JPEG wrapping/request
 packing, and the existing OpenPI JPEG decoder. It deliberately excludes policy/model
@@ -49,9 +50,9 @@ The composed publisher may reuse the latest device frame while still publishing 
 | `left_wrist` | 30.002 | 29.987 | 28.790 | 73 |
 | `right_wrist` | 29.802 | 29.537 | 27.974 | 122 |
 
-The acceptance FPS threshold applies to Gateway encoded-frame sequences, measured
-below. The lower physical-camera timestamp rates above are reported separately and
-must not be hidden by the composed-message rate.
+The acceptance FPS threshold applies to distinct positive producer source timestamps,
+not composed-message or Gateway-created sequence rates. The corrected fresh pipeline
+run below therefore fails the physical threshold honestly.
 
 ## SensorGateway and OpenPI protocol
 
@@ -60,31 +61,47 @@ those baseline cells are explicitly unavailable rather than estimated.
 
 | Metric | JPEG 80 Base64 | JPEG 95 Base64 | JPEG 95 binary |
 |---|---:|---:|---:|
-| Encoded FPS, each of four RGB streams | not measured | not measured | 30.014 |
-| Decoded FPS, each of six streams | not measured | not measured | 30.014 |
-| Decoded aggregate (images/s) | not measured | not measured | 180.082 |
-| VLA request throughput (requests/s) | not measured | not measured | 117.388 |
-| VLA request payload (Mbit/s) | not measured | not measured | 323.759 |
-| Gateway RPC P50 / P95 (ms) | not measured | not measured | 0.671 / 2.708 |
-| JPEG prepare P50 / P95 (ms) | not measured | not measured | 0.052 / 0.070 |
-| Request pack P50 / P95 (ms) | not measured | not measured | 0.085 / 0.120 |
-| OpenPI four-JPEG decode P50 / P95 (ms) | not measured | not measured | 3.973 / 5.292 |
-| New JPEG wrapper P50 / P95 (ms) | not measured | not measured | 0.00042 / 0.00303 |
-| Old RGB-to-JPEG codec P50 / P95 (ms) | not measured | not measured | 0.72479 / 0.99827 |
+| Gateway publication FPS, every stream | not measured | not measured | 30.013 |
+| Physical encoded FPS, four RGB range | not measured | not measured | 27.164–29.597 |
+| Physical decoded FPS, six-stream range | not measured | not measured | 27.164–29.597 |
+| Physical decoded aggregate (images/s) | not measured | not measured | 171.247 (fail) |
+| VLA request throughput (requests/s) | not measured | not measured | 118.820 |
+| VLA request payload (Mbit/s) | not measured | not measured | 329.786 |
+| Gateway RPC P50 / P95 (ms) | not measured | not measured | 0.659 / 2.739 |
+| JPEG prepare P50 / P95 (ms) | not measured | not measured | 0.052 / 0.073 |
+| Request pack P50 / P95 (ms) | not measured | not measured | 0.082 / 0.120 |
+| OpenPI four-JPEG decode P50 / P95 (ms) | not measured | not measured | 3.899 / 5.354 |
+| New JPEG wrapper P50 / P95 (ms) | not measured | not measured | 0.00049 / 0.00321 |
+| Old RGB-to-JPEG codec P50 / P95 (ms) | not measured | not measured | 0.72052 / 1.00331 |
 
 The codec comparison contains 7,204 unique stream/frame samples. The benchmark made
-7,044 sequential requests; requests between new camera publications legitimately
+7,130 sequential requests; requests between new camera publications legitimately
 reused the latest Gateway sequence and were excluded from codec unique-frame counts.
+
+| Stream | Gateway publication FPS | Physical unique FPS | Source timestamp reuses |
+|---|---:|---:|---:|
+| `ego_view` | 30.013 | 27.164 | 171 |
+| `ego_view_depth` | 30.013 | 27.164 | 171 |
+| `chest_view` | 30.013 | 29.263 | 45 |
+| `chest_view_depth` | 30.013 | 29.263 | 45 |
+| `left_wrist` | 30.013 | 29.597 | 25 |
+| `right_wrist` | 30.013 | 28.797 | 73 |
 
 ## Drop and stale evidence
 
-- The Sonic producer log reported `message dropped: 0` through the live run.
-- Post-run Gateway health reported zero dropped messages, zero failures, and zero
-  out-of-order messages for the source, all encoded streams, and all decoded streams.
-- The pipeline benchmark aborts on stale/unavailable snapshots; it completed all
-  7,044 requests without such an error. No separate stale counter is emitted.
-- Source timestamp reuse is listed in the per-camera table and is distinct from a
-  transport drop or stale Gateway snapshot.
+- Sonic's `message dropped: 0` counter means the nonblocking `socket.send` call had
+  zero `zmq.Again` failures. It does not observe messages discarded later by PUB/HWM,
+  TCP, SUB conflation, or a receiver.
+- The fresh benchmark observed zero Gateway sequence gaps or regressions. Those are
+  gaps in Gateway-created ring publications as sampled by this benchmark, not proof
+  of zero camera transport drops.
+- Producer source timestamps had zero missing values and zero regressions, but the
+  reuse counts in the table show composed publications frequently reused physical
+  frames.
+- Snapshot rejection accounting was encoded=0, decoded=0, total=0. Rejections would
+  be counted and skipped rather than silently terminating the benchmark.
+- PUB/HWM transport drops are unobservable in this protocol because the producer
+  message has no independent frame identifier. No zero-drop claim is made.
 
 ## Why the protocol path is shorter
 
@@ -99,9 +116,13 @@ sleep, retry, wait, freshness, pairing, or scheduling branch was added. The tele
 label changed from `jpeg_encode` to `jpeg_prepare`, and the observation builder now
 records the wrapping duration under that label.
 
+VLA encoded ingress accepts only `jpeg_bytes`. The ordinary camera schema decoder
+retains historical Base64 decoding for non-VLA consumers, but VLA does not Base64
+decode, infer shapes, fall back to RGB decode/re-encode, or perform color correction.
+
 ## Live topology and deployment
 
-- PC compatibility receiver: this worktree's read-only SensorGateway, bound to
+- PC binary receiver: this worktree's read-only SensorGateway, bound to
   `ipc:///tmp/sonic_sensor_gateway.ipc`, was started before the producer change.
 - Sonic camera: `unitree@192.168.123.164`, port 5555, confirmed command line includes
   `--jpeg-quality 95`.
@@ -127,3 +148,7 @@ Run the checker from the repository root:
 /home/user/Project/GR00T-WholeBodyControl/.venv_teleop/bin/python \
   experiments/jpeg95_binary_vla/check_acceptance.py
 ```
+
+For the committed fresh run this command exits 1 at the physical encoded FPS
+assertion. The JSON is preserved as failure evidence; full performance acceptance is
+not claimed.

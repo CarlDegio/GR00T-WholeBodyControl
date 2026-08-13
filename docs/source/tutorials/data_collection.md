@@ -168,11 +168,16 @@ The camera server publishes a single msgpack-encoded payload per frame cycle con
 ```python
 {
     "timestamps": {"ego_view": 1712345678.123, "left_wrist": 1712345678.125},
-    "images": {"ego_view": "<base64-jpeg>", "left_wrist": "<base64-jpeg>"}
+    "images": {"ego_view": b"<jpeg-bytes>", "left_wrist": b"<jpeg-bytes>"}
 }
 ```
 
-Images are JPEG-compressed (quality 80) and either base64-encoded strings or raw JPEG bytes (when MJPEG on-device encoding is enabled). SensorGateway preserves those encoded values for DataExporter's deferred-video path while also publishing decoded RGB arrays for inference consumers.
+Production RGB images are JPEG-compressed at quality 95 and carried as msgpack
+binary; depth images are lossless PNG binary. SensorGateway preserves encoded RGB
+values for deferred-video consumers while also publishing decoded RGB/depth arrays.
+The generic schema decoder can still read historical Base64 strings for ordinary
+non-VLA consumers, but VLA encoded ingress requires `jpeg_bytes` and provides no
+Base64 rollout fallback.
 
 ---
 

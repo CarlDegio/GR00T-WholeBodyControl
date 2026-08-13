@@ -1,9 +1,8 @@
 from __future__ import annotations
 
-import base64
-from types import MappingProxyType
 import threading
 import time
+from types import MappingProxyType
 
 import msgpack
 import msgpack_numpy as mnp
@@ -104,25 +103,21 @@ def test_gateway_recreates_vla_four_camera_message_from_jpeg_bytes() -> None:
         }
 
 
-def test_gateway_decodes_base64_camera_payload_to_jpeg_bytes() -> None:
+def test_gateway_rejects_base64_camera_payload_for_vla() -> None:
     jpeg_payloads = {
         name: b"\xff\xd8" + bytes([index + 10]) + b"\xff\xd9"
         for index, name in enumerate(VLA_CAMERA_NAMES)
     }
-    base64_payloads = {
-        name: base64.b64encode(payload) for name, payload in jpeg_payloads.items()
-    }
 
-    message = camera_message_from_snapshot(
-        _materialized_camera(
-            base64_payloads,
-            received_ns=time.monotonic_ns(),
-            source_ns=123_000_000_000,
-            encoding="base64_jpeg",
+    with pytest.raises(ValueError, match="unsupported encoding 'base64_jpeg'"):
+        camera_message_from_snapshot(
+            _materialized_camera(
+                jpeg_payloads,
+                received_ns=time.monotonic_ns(),
+                source_ns=123_000_000_000,
+                encoding="base64_jpeg",
+            )
         )
-    )
-
-    assert message["images"] == jpeg_payloads
 
 
 def test_gateway_decodes_cpp_state_like_the_legacy_subscriber() -> None:

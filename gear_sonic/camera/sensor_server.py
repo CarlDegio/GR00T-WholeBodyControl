@@ -111,10 +111,13 @@ class PoseMessageSchema:
 class ImageMessageSchema:
     """Standardized message schema for camera images.
 
-    Handles two encodings on the wire:
+    Production serialization emits msgpack binary values: software-encoded RGB
+    images are JPEG bytes, existing device MJPEG bytes pass through unchanged,
+    and uint16 depth images are lossless PNG bytes.
 
-    * **str** – legacy base64-encoded JPEG.
-    * **bytes** – raw JPEG from on-device MJPEG encoder (e.g. OAK).
+    ``deserialize`` retains ordinary-consumer support for legacy Base64 JPEG/PNG
+    strings. That decoder-only compatibility is not a VLA rollout guarantee; the
+    VLA encoded ingress accepts only the ``jpeg_bytes`` representation.
     """
 
     timestamps: dict[str, float]

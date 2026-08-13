@@ -7,7 +7,7 @@ without changing or reusing the production VLA ingress worker.
 from __future__ import annotations
 
 import argparse
-from collections import defaultdict
+from collections import Counter, defaultdict
 import importlib.util
 import json
 import math
@@ -27,7 +27,10 @@ if str(REPOSITORY_ROOT) not in sys.path:
     sys.path.insert(0, str(REPOSITORY_ROOT))
 
 from gear_sonic.camera.constants import PRODUCTION_JPEG_QUALITY  # noqa: E402
-from gear_sonic.runtime.client import SensorGatewayClient  # noqa: E402
+from gear_sonic.runtime.client import (  # noqa: E402
+    SensorGatewayClient,
+    SnapshotUnavailableError,
+)
 from gear_sonic.runtime.snapshot import SnapshotRequest  # noqa: E402
 from gear_sonic.runtime.vla_sensor_gateway import (  # noqa: E402
     VLA_CAMERA_NAMES,
@@ -80,8 +83,28 @@ class VlaPipelineStats:
     def __init__(self) -> None:
         self.request_count = 0
         self.total_request_bytes = 0
-        self.encoded_sequences: dict[str, set[int]] = defaultdict(set)
-        self.decoded_sequences: dict[str, set[int]] = defaultdict(set)
+        self.gateway_sequences: dict[str, dict[str, set[int]]] = {
+            "encoded": defaultdict(set),
+            "decoded": defaultdict(set),
+        }
+        self.source_timestamps: dict[str, dict[str, set[int]]] = {
+            "encoded": defaultdict(set),
+            "decoded": defaultdict(set),
+        }
+        self.last_gateway_sequence: dict[str, dict[str, int]] = {
+            "encoded": {},
+            "decoded": {},
+        }
+        self.last_source_timestamp: dict[str, dict[str, int]] = {
+            "encoded": {},
+            "decoded": {},
+        }
+        self.stream_counters: dict[str, dict[str, Counter[str]]] = {
+            "encoded": defaultdict(Counter),
+            "decoded": defaultdict(Counter),
+        }
+        self.snapshot_rejections: Counter[str] = Counter()
+        self.snapshot_rejection_reasons: Counter[str] = Counter()
         self.latency_ms: dict[str, list[float]] = {
             "gateway_rpc": [],
             "jpeg_prepare": [],
@@ -95,8 +118,8 @@ class VlaPipelineStats:
     def record(
         self,
         *,
-        encoded_sequences: Mapping[str, int],
-        decoded_sequences: Mapping[str, int],
+        encoded_frames: Mapping[str, tuple[int, int]],
+        decoded_frames: Mapping[str, tuple[int, int]],
         request_bytes: int,
         camera_rpc_ms: float,
         jpeg_prepare_ms: float,
@@ -105,14 +128,54 @@ class VlaPipelineStats:
     ) -> None:
         self.request_count += 1
         self.total_request_bytes += int(request_bytes)
-        for stream, sequence in encoded_sequences.items():
-            self.encoded_sequences[stream].add(int(sequence))
-        for stream, sequence in decoded_sequences.items():
-            self.decoded_sequences[stream].add(int(sequence))
+        self._record_frames("encoded", encoded_frames)
+        self._record_frames("decoded", decoded_frames)
         self.latency_ms["gateway_rpc"].append(float(camera_rpc_ms))
         self.latency_ms["jpeg_prepare"].append(float(jpeg_prepare_ms))
         self.latency_ms["request_pack"].append(float(request_pack_ms))
         self.latency_ms["openpi_decode"].append(float(openpi_decode_ms))
+
+    def _record_frames(
+        self,
+        stage: str,
+        frames: Mapping[str, tuple[int, int]],
+    ) -> None:
+        for stream, (raw_sequence, raw_source_timestamp) in frames.items():
+            sequence = int(raw_sequence)
+            source_timestamp = int(raw_source_timestamp)
+            sequences = self.gateway_sequences[stage][stream]
+            if sequence in sequences:
+                continue
+
+            previous_sequence = self.last_gateway_sequence[stage].get(stream)
+            counters = self.stream_counters[stage][stream]
+            if previous_sequence is not None:
+                if sequence > previous_sequence:
+                    counters["observed_gateway_sequence_gaps"] += max(
+                        0, sequence - previous_sequence - 1
+                    )
+                else:
+                    counters["gateway_sequence_regressions"] += 1
+            sequences.add(sequence)
+            self.last_gateway_sequence[stage][stream] = sequence
+
+            if source_timestamp <= 0:
+                counters["source_timestamp_missing"] += 1
+                continue
+            previous_timestamp = self.last_source_timestamp[stage].get(stream)
+            if previous_timestamp is not None:
+                if source_timestamp == previous_timestamp:
+                    counters["source_timestamp_reuses"] += 1
+                elif source_timestamp < previous_timestamp:
+                    counters["source_timestamp_regressions"] += 1
+            self.source_timestamps[stage][stream].add(source_timestamp)
+            self.last_source_timestamp[stage][stream] = source_timestamp
+
+    def record_snapshot_rejection(self, stage: str, reason: str) -> None:
+        if stage not in self.gateway_sequences:
+            raise ValueError(f"unsupported snapshot stage: {stage!r}")
+        self.snapshot_rejections[stage] += 1
+        self.snapshot_rejection_reasons[str(reason)] += 1
 
     def record_codec(
         self,
@@ -130,24 +193,39 @@ class VlaPipelineStats:
         self.old_codec_ms.append(float(old_codec_ms))
         return True
 
-    @staticmethod
-    def _stream_summary(
-        sequences: Mapping[str, set[int]], elapsed_s: float
-    ) -> dict[str, dict[str, float | int]]:
+    def _stream_summary(self, stage: str, elapsed_s: float) -> dict[str, dict[str, float | int]]:
         return {
             stream: {
-                "unique_frames": len(values),
-                "unique_fps": len(values) / elapsed_s,
+                "gateway_publications": len(sequences),
+                "gateway_publication_fps": len(sequences) / elapsed_s,
+                "physical_unique_frames": len(self.source_timestamps[stage][stream]),
+                "physical_unique_fps": len(self.source_timestamps[stage][stream])
+                / elapsed_s,
+                "source_timestamp_reuses": self.stream_counters[stage][stream][
+                    "source_timestamp_reuses"
+                ],
+                "source_timestamp_regressions": self.stream_counters[stage][stream][
+                    "source_timestamp_regressions"
+                ],
+                "source_timestamp_missing": self.stream_counters[stage][stream][
+                    "source_timestamp_missing"
+                ],
+                "observed_gateway_sequence_gaps": self.stream_counters[stage][stream][
+                    "observed_gateway_sequence_gaps"
+                ],
+                "gateway_sequence_regressions": self.stream_counters[stage][stream][
+                    "gateway_sequence_regressions"
+                ],
             }
-            for stream, values in sorted(sequences.items())
+            for stream, sequences in sorted(self.gateway_sequences[stage].items())
         }
 
     def summary(self, elapsed_s: float) -> dict[str, object]:
         if elapsed_s <= 0.0:
             raise ValueError("elapsed_s must be positive")
 
-        encoded_streams = self._stream_summary(self.encoded_sequences, elapsed_s)
-        decoded_streams = self._stream_summary(self.decoded_sequences, elapsed_s)
+        encoded_streams = self._stream_summary("encoded", elapsed_s)
+        decoded_streams = self._stream_summary("decoded", elapsed_s)
         request_bytes_per_second = self.total_request_bytes / elapsed_s
         new_codec = _distribution(self.new_codec_ms)
         old_codec = _distribution(self.old_codec_ms)
@@ -165,13 +243,22 @@ class VlaPipelineStats:
             "vla_mbit_per_second": request_bytes_per_second * 8.0 / 1_000_000.0,
             "encoded_streams": encoded_streams,
             "decoded_streams": decoded_streams,
-            "decoded_images": sum(
-                stream["unique_frames"] for stream in decoded_streams.values()
+            "decoded_physical_images": sum(
+                stream["physical_unique_frames"] for stream in decoded_streams.values()
             ),
-            "decoded_images_per_second": sum(
-                stream["unique_frames"] for stream in decoded_streams.values()
+            "decoded_physical_images_per_second": sum(
+                stream["physical_unique_frames"] for stream in decoded_streams.values()
             )
             / elapsed_s,
+            "snapshot_rejections": {
+                "total": sum(self.snapshot_rejections.values()),
+                "encoded": self.snapshot_rejections["encoded"],
+                "decoded": self.snapshot_rejections["decoded"],
+                "reasons": dict(sorted(self.snapshot_rejection_reasons.items())),
+            },
+            "transport_drop_observability": (
+                "PUB/HWM transport drops are unobservable without a producer frame identifier"
+            ),
             "latency_ms": {
                 name: _distribution(values) for name, values in self.latency_ms.items()
             },
@@ -251,9 +338,16 @@ def load_openpi_decoder(openpi_repo: Path) -> ModuleType:
     return module
 
 
-def _sequences(snapshot: Any, streams: tuple[str, ...], names: tuple[str, ...]) -> dict[str, int]:
+def _frame_observations(
+    snapshot: Any,
+    streams: tuple[str, ...],
+    names: tuple[str, ...],
+) -> dict[str, tuple[int, int]]:
     return {
-        name: int(snapshot.snapshot.frames[stream].metadata.sequence)
+        name: (
+            int(snapshot.snapshot.frames[stream].metadata.sequence),
+            int(snapshot.snapshot.frames[stream].source_timestamp_ns),
+        )
         for stream, name in zip(streams, names, strict=True)
     }
 
@@ -308,7 +402,11 @@ def run_benchmark(
     try:
         while time.perf_counter_ns() < deadline_ns:
             rpc_started_ns = time.perf_counter_ns()
-            encoded = client.read_snapshot(encoded_request, retries=0)
+            try:
+                encoded = client.read_snapshot(encoded_request, retries=0)
+            except SnapshotUnavailableError as exc:
+                stats.record_snapshot_rejection("encoded", str(exc))
+                continue
             camera_rpc_ms = _elapsed_ms(rpc_started_ns)
 
             prepare_started_ns = time.perf_counter_ns()
@@ -331,10 +429,10 @@ def run_benchmark(
             }
             openpi_decode_ms = _elapsed_ms(decode_started_ns)
 
-            encoded_sequences = _sequences(
+            encoded_frames = _frame_observations(
                 encoded, VLA_CAMERA_STREAMS, VLA_CAMERA_NAMES
             )
-            for name, sequence in encoded_sequences.items():
+            for name, (sequence, _source_timestamp) in encoded_frames.items():
                 if sequence in seen_codec_sequences[name]:
                     continue
                 seen_codec_sequences[name].add(sequence)
@@ -348,13 +446,17 @@ def run_benchmark(
                     old_codec_ms=old_codec_ms,
                 )
 
-            decoded = client.read_snapshot(decoded_request, retries=0)
-            decoded_sequences = _sequences(
+            try:
+                decoded = client.read_snapshot(decoded_request, retries=0)
+            except SnapshotUnavailableError as exc:
+                stats.record_snapshot_rejection("decoded", str(exc))
+                continue
+            decoded_frames = _frame_observations(
                 decoded, DECODED_CAMERA_STREAMS, DECODED_CAMERA_NAMES
             )
             stats.record(
-                encoded_sequences=encoded_sequences,
-                decoded_sequences=decoded_sequences,
+                encoded_frames=encoded_frames,
+                decoded_frames=decoded_frames,
                 request_bytes=len(packed),
                 camera_rpc_ms=camera_rpc_ms,
                 jpeg_prepare_ms=jpeg_prepare_ms,

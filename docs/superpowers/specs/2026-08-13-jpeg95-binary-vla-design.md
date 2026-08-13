@@ -84,16 +84,19 @@ Gateway RPC 已运行在其现有独立服务线程中。因此主 Gateway 线�
 - 消息同时携带每路原始图像 shape；这是编码前已有的数据描述，不做 JPEG
   解析、解码、时序判断或额外等待。
 - `ImageMessageSchema` 已允许 binary 图像字段，因此不强制提升 schema version。
-- 接收端继续接受旧 Base64 字符串，作为滚动升级和回退兼容路径。
+- 普通 `ImageMessageSchema.deserialize` 继续接受历史 Base64 字符串，仅用于非
+  VLA 消费者读取旧数据；这不是 VLA 滚动升级或回退保证。
 - 新软件 JPEG 编码前显式执行 RGB 到 BGR 转换，再调用 OpenCV 编码；binary 解码后显式转换回 RGB，保证颜色语义一致。
 - OAK 设备产生的 MJPEG 字节直接透传。
 
 ### 5.2 Gateway encoded stream
 
-每个 `camera_encoded/*` 样本包含一维 `uint8` JPEG 数据、原始图像 shape 及现有时间戳/序号元数据。编码标记接受：
+每个 `camera_encoded/*` 样本包含一维 `uint8` JPEG 数据、原始图像 shape 及现有时间戳/序号元数据。VLA 编码侧只接受：
 
 - `jpeg_bytes`：新 binary 生产路径；
-- `base64_jpeg`：旧消息兼容路径，由 Gateway/VLA 适配层转换为 JPEG bytes，不执行图像解码。
+
+Gateway 可为普通历史解码消费者标记 `base64_jpeg`，但 VLA ingress 必须拒绝
+该编码，不做 Base64 decode、shape inference、fallback decode/re-encode 或颜色修正。
 
 如果 encoded 流缺失、类型错误、超时或四相机时间偏差超过现有阈值，VLA 沿用当前“快照不可用则跳过本轮推理”的行为，不静默退回 RGB 重编码。
 
@@ -117,8 +120,8 @@ Gateway RPC 已运行在其现有独立服务线程中。因此主 Gateway 线�
 
 实施硬约束：`VlaSensorGatewayIngress._run`、`_request`、`_poll_state`、现有
 age/skew/sequence 检查及轮询顺序保持不变。VLA 热路径不新增时间戳比较、等待
-窗口、重试、sleep、数据配对或调度分支；新增分支只负责区分 binary JPEG 与旧
-Base64 JPEG 的线格式，并立即转换为相同的 JPEG bytes。
+窗口、重试、sleep、数据配对或调度分支；encoded adapter 仅验证
+`encoding == "jpeg_bytes"` 并透传 JPEG bytes。
 
 ## 7. 降低相机传输延迟
 
@@ -151,17 +154,21 @@ Base64 JPEG 的线格式，并立即转换为相同的 JPEG bytes。
 
 - Camera Server 发送消息 FPS；
 - Gateway 接收消息 FPS；
-- 四路 `camera_encoded/*` 的唯一帧 FPS；
-- 六路 `camera/*` 的唯一图像 FPS；
-- 六路合计 images/s；
+- 四路 `camera_encoded/*` 的 Gateway publication FPS 与 producer source timestamp
+  物理唯一帧 FPS；
+- 六路 `camera/*` 的 Gateway publication FPS 与物理唯一图像 FPS；
+- 六路物理唯一图像合计 images/s；
 - 相机 ZMQ payload 的 MiB/s 和 Mbit/s；
 - VLA 请求 FPS、bytes/request 和 Mbit/s；
-- 发送失败、序号跳变、重复帧、陈旧帧和 Gateway 快照拒绝次数。
+- `zmq.Again` 发送 API 失败、Gateway 序号跳变、source timestamp 重用/回退/缺失、
+  陈旧帧和 Gateway 快照拒绝次数。没有独立 producer frame ID 时，PUB/HWM
+  transport drop 不可观测，不以 send API 或 Gateway sequence 推断为零。
 
 计算方式：
 
 ```text
-FPS = unique frame count / elapsed seconds
+physical FPS = unique positive producer source timestamp count / elapsed seconds
+Gateway publication FPS = unique Gateway ring sequence count / elapsed seconds
 MiB/s = total payload bytes / elapsed seconds / 2^20
 Mbit/s = total payload bytes * 8 / elapsed seconds / 10^6
 images/s = sum(unique frames for all image streams) / elapsed seconds
@@ -206,18 +213,22 @@ VLA telemetry 中原 `jpeg_encode` 分段更名为 `jpeg_prepare`，避免把字
 - VLA 只从 Gateway 获取四路 JPEG，不直接订阅相机。
 - VLA 实时路径不调用 `cv2.imencode`。
 - OpenPI 现有协议每幅图只调用一次 JPEG decode，OpenPI 仓库无改动。
-- 旧 Base64 相机包和现有 VLA JPEG 标记仍可读取。
+- 普通 schema decoder 仍可读取历史 Base64 相机包；VLA encoded ingress 只接受
+  `jpeg_bytes`，并继续输出既有 VLA JPEG marker。
 - RGB 色彩测试能识别红/蓝通道，不发生静默 BGR/RGB 互换。
 
 ### 10.2 性能
 
 - 60 秒 Camera Server/Gateway 消息 FPS 不低于 29。
-- 每路 `camera_encoded/*` 唯一帧 FPS 不低于 29。
-- 每路正常工作的 `camera/*` 唯一帧 FPS 不低于 29，六路目标合计不低于 174 images/s。
+- 每路 `camera_encoded/*` producer source timestamp 物理唯一帧 FPS 不低于 29。
+- 每路正常工作的 `camera/*` 物理唯一帧 FPS 不低于 29，六路物理唯一图像
+  合计不低于 174 images/s。Gateway publication FPS 单独报告，不代替物理阈值。
 - 对同一批消息，以实际 binary 大小和“若使用 Base64”的反事实大小比较，相机 ZMQ payload 至少减少 20%；预期约 25%。
 - `jpeg_prepare` P95 小于 1 ms。
 - 在同一 PC 上 OpenPI 四幅顺序 JPEG decode P95 不高于 6 ms。
-- 60 秒内没有因 socket 队列累积产生持续增长的帧龄；允许 latest-first 策略主动丢弃旧帧，但必须记录计数。
+- 60 秒内没有因 socket 队列累积产生持续增长的帧龄；报告 send API failures、
+  source timestamp reuse/discontinuity、observed Gateway sequence gaps 和 snapshot
+  rejections。无 producer ID 时不宣称 PUB/HWM transport drop 为零。
 
 性能阈值用于检测回归。相机到 PC 的绝对延迟受时钟同步和现场网络影响，同时报告原始结果，不以单次均值作为唯一通过条件。
 
@@ -225,7 +236,8 @@ VLA telemetry 中原 `jpeg_encode` 分段更名为 `jpeg_prepare`，避免把字
 
 ### 11.1 单元测试
 
-- schema 对 JPEG/PNG binary 和旧 Base64 的序列化/反序列化；
+- schema 对 JPEG/PNG binary 的生产序列化及普通 decoder 的历史 Base64 解码；
+- VLA encoded ingress 对 `base64_jpeg` 明确报 unsupported encoding；
 - RGB/BGR 色彩语义；
 - Gateway encoded-first 发布顺序；
 - VLA encoded stream 校验、四相机偏差和缺帧行为；
@@ -256,14 +268,13 @@ camera msgpack
 - 保存机器可读 JSON 和简短 Markdown 报告；
 - 与已提交 JPEG 80/95 基线并列比较。
 
-## 12. 部署和回退顺序
+## 12. 部署和回退边界
 
-为避免混合版本中断，按兼容接收端优先部署：
-
-1. PC：部署同时支持 binary/Base64 的 Gateway 和 VLA ingress，并继续输出现有 OpenPI marker。
-2. Sonic：最后切换相机生产端为 binary msgpack，JPEG 95。
-
-回退时反向操作。任意阶段都保留旧输入解码能力，因此无需同步停机升级。
+VLA 不提供 Base64/binary 混合版本兼容窗口。启动 VLA 前必须同时确认 PC
+Gateway 输出四路 `jpeg_bytes` 且 Sonic producer 使用 binary msgpack/JPEG 95；
+现有 OpenPI marker 保持不变。普通 schema decoder 的历史 Base64 能力只服务非
+VLA 旧数据读取，不能作为 VLA 回退路径。若 producer 回退到 Base64，VLA 必须
+停止并报告 unsupported encoding，而不是静默 decode/re-encode。
 
 ## 13. 代码库与分支边界
 

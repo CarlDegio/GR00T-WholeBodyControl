@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import base64
 import copy
 import threading
 import time
@@ -48,9 +47,7 @@ def camera_message_from_snapshot(snapshot: MaterializedSnapshot) -> dict[str, An
         frame = snapshot.snapshot.frames[stream]
         payload = np.asarray(snapshot.arrays[stream], dtype=np.uint8).reshape(-1).tobytes()
         encoding = frame.attributes.get("encoding")
-        if encoding == "base64_jpeg":
-            payload = base64.b64decode(payload)
-        elif encoding != "jpeg_bytes":
+        if encoding != "jpeg_bytes":
             raise ValueError(
                 f"VLA camera {name!r} has unsupported encoding {encoding!r}"
             )

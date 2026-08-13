@@ -11,9 +11,9 @@ from gear_sonic.scripts.run_vla_inference import (
     _drain_queue,
     _inference_worker_loop,
     _pose_policy_is_active,
-    prepare_observation_from_sensors,
     _should_schedule_vla_inference,
     _vla_inference_is_due,
+    prepare_observation_from_sensors,
 )
 from gear_sonic.utils.inference.vla_utils import calculate_latency_compensated_index
 
@@ -22,10 +22,11 @@ class InferenceWorkerDelayTest(unittest.TestCase):
     def test_camera_jpeg_wrapper_keeps_bytes_and_uses_existing_protocol(self):
         payload = b"already-encoded-camera-jpeg"
 
+        self.assertEqual(JPEG_VIDEO_MARKER, "__opencv_jpeg_rgb__")
         self.assertEqual(
             run_vla_inference.wrap_camera_jpeg_for_video(payload, (24, 32, 3)),
             {
-                JPEG_VIDEO_MARKER: True,
+                "__opencv_jpeg_rgb__": True,
                 "shape": (1, 1, 24, 32, 3),
                 "dtype": "uint8",
                 "data": payload,

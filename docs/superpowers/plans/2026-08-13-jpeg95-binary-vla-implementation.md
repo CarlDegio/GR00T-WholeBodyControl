@@ -19,7 +19,8 @@
 - encoded adapter 的线格式分支替换原 HWC shape/dtype 校验，不叠加新的 readiness/freshness check。
 - 不创建 VLA 新线程、解码线程池、新 socket 或新端口。
 - 逐帧详细统计只在 benchmark 中执行，不进入生产热路径。
-- 旧 Base64 相机消息和 __opencv_jpeg_rgb__ marker 继续可读。
+- 普通 ImageMessageSchema decoder 可读历史 Base64；VLA encoded ingress 只接受
+  `jpeg_bytes`。既有 `__opencv_jpeg_rgb__` marker 保持不变。
 - 每个任务先观察测试失败，再做最小实现、通过聚焦测试并提交。
 
 ---
@@ -236,7 +237,8 @@ Expected: 测试全过，quality 95 bytes 大于 quality 80 bytes，RGB 通道�
 - Test: gear_sonic/tests/test_sensor_gateway.py:223-307
 
 **Interfaces:**
-- Produces: camera_encoded/{name} 一维 uint8，encoding 为 jpeg_bytes 或 base64_jpeg，attributes 携带 `image_shape`。
+- Produces: camera_encoded/{name} 一维 uint8；Gateway 可标记 jpeg_bytes 或历史
+  base64_jpeg，但 VLA 只消费 jpeg_bytes；attributes 携带 `image_shape`。
 - Preserves: camera/{name}、return count、时间戳、序号和现有 RPC thread。
 
 - [ ] **Step 1: 写发布顺序失败测试**
@@ -331,14 +333,14 @@ Expected: Gateway 测试全过；production 仍只有已有 ingress thread 和 R
 - Produces: camera_message_from_snapshot 中 images 为 dict[str, bytes]。
 - Preserves: 原 _run/_request/_poll_state/_fresh、age/skew/sequence 和轮询顺序。
 
-- [ ] **Step 1: 把 fixture 改成 encoded arrays 并写 Base64 兼容测试**
+- [ ] **Step 1: 把 fixture 改成 encoded arrays 并写 Base64 拒绝测试**
 
     arrays = {
         f"camera_encoded/{name}": np.frombuffer(payload, np.uint8).copy()
         for name, payload in jpeg_payloads.items()
     }
 
-SharedMemoryFrame attributes 设置 encoding="jpeg_bytes"、`image_shape=(H, W, 3)` 和原 camera_info。断言四个 stream 名、shape 及输出 bytes 完全一致。另一个 fixture 放 Base64 ASCII uint8、encoding="base64_jpeg"，断言输出还原为原 JPEG bytes，而不是 RGB。
+SharedMemoryFrame attributes 设置 encoding="jpeg_bytes"、`image_shape=(H, W, 3)` 和原 camera_info。断言四个 stream 名、shape 及输出 bytes 完全一致。另一个 fixture 设置 encoding="base64_jpeg"，断言 VLA adapter 报 unsupported encoding，不做 Base64 decode 或 RGB fallback。
 
 - [ ] **Step 2: 确认当前 HWC 校验失败**
 
@@ -349,14 +351,11 @@ Expected: 当前请求 camera/* 且要求 HxWx3，测试 FAIL。
 
 - [ ] **Step 3: 只修改 stream 常量和 payload helper**
 
-    import base64
     VLA_CAMERA_STREAMS = tuple(f"camera_encoded/{name}" for name in VLA_CAMERA_NAMES)
 
     payload = np.asarray(snapshot.arrays[stream], dtype=np.uint8).reshape(-1).tobytes()
     encoding = frame.attributes.get("encoding")
-    if encoding == "base64_jpeg":
-        payload = base64.b64decode(payload)
-    elif encoding != "jpeg_bytes":
+    if encoding != "jpeg_bytes":
         raise ValueError(f"VLA camera {name!r} has unsupported encoding {encoding!r}")
     images[name] = payload
     image_shapes[name] = tuple(frame.attributes["image_shape"])
@@ -565,7 +564,8 @@ Expected: pytest/Ruff 通过，benchmark 未修改任何 production 调度代码
 
 **Acceptance:**
 - camera/Gateway message FPS ≥ 29。
-- 每路 encoded FPS ≥ 29；正常六路 decoded 合计 ≥ 174 images/s。
+- 每路 producer source timestamp 物理 encoded FPS ≥ 29；正常六路物理 decoded
+  合计 ≥ 174 images/s；Gateway publication FPS 单独报告且不能代替物理阈值。
 - 同包 binary 相比 Base64 反事实至少减少 20%。
 - jpeg_prepare P95 < 1 ms；四 JPEG 顺序 decode P95 ≤ 6 ms。
 - 新 codec P50/P95 均小于旧二次编码路径。
@@ -597,13 +597,14 @@ Expected: pytest 零失败/错误，Ruff 通过，diff check 无输出。
 
 Expected: vla_sensor_gateway diff 不含 _run、_request、_poll_state、_fresh hunk，也没有新 thread、sleep、重试、时间比较、等待或配对。
 
-- [ ] **Step 3: 按兼容顺序部署协议**
+- [ ] **Step 3: 验证 binary-only VLA 部署边界**
 
 1. 用 GR00T worktree 启动 PC SensorGateway 和协议 benchmark，确认请求使用 OpenPI 现有 marker。
 2. 在 Sonic 的 /home/unitree/GR00T-WholeBodyControl 做文件级日期备份、SHA-256 校验和原子替换。
 3. 只停止命令行为 gear_sonic.camera.composed_camera 的已确认 PID，再用 start_camera_server.zsh 启动，确认命令行含 --jpeg-quality 95。
 
-Expected: Sonic 切 binary 前所有接收端已经兼容 binary/Base64。
+Expected: 启动 VLA benchmark 前 Gateway 四路 encoded stream 均为 jpeg_bytes；
+普通 schema 的历史 Base64 decoder 不作为 VLA rollout 或回退保证。
 
 - [ ] **Step 4: 运行相机 60 秒测试**
 
@@ -626,7 +627,10 @@ Expected: 六路存在、message FPS ≥ 29、所有图像为 binary、反事实
       --duration-seconds 60 \
       --output-json experiments/jpeg95_binary_vla/vla_pipeline_60s.json
 
-Expected: encoded/decoded FPS、请求吞吐和各段 P50/P95 完整；不包含模型推理时间。
+Expected: encoded/decoded 的 physical unique FPS 与 Gateway publication FPS、source
+timestamp reuse/regression/missing、observed Gateway sequence gaps、snapshot
+rejections、请求吞吐和各段 P50/P95 完整；明确 transport drops 无 producer ID 时
+不可观测；不包含模型推理时间。
 
 - [ ] **Step 6: 机器检查验收阈值**
 
@@ -638,8 +642,8 @@ Expected: encoded/decoded FPS、请求吞吐和各段 P50/P95 完整；不包含
     vla = json.loads((root / "vla_pipeline_60s.json").read_text())
     assert camera["message_fps"] >= 29.0
     assert camera["binary_wire_savings_percent"] >= 20.0
-    assert min(x["unique_fps"] for x in vla["encoded_streams"].values()) >= 29.0
-    assert vla["decoded_images_per_second"] >= 174.0
+    assert min(x["physical_unique_fps"] for x in vla["encoded_streams"].values()) >= 29.0
+    assert vla["decoded_physical_images_per_second"] >= 174.0
     assert vla["latency_ms"]["jpeg_prepare"]["p95"] < 1.0
     assert vla["latency_ms"]["openpi_decode"]["p95"] <= 6.0
     assert vla["codec_comparison_ms"]["new_p50"] < vla["codec_comparison_ms"]["old_p50"]
@@ -654,7 +658,13 @@ Expected: exit code 0。该 check_acceptance.py 使用上面的完整代码并�
 
 - [ ] **Step 7: 写报告并提交结果**
 
-README 必须并列 JPEG 80、JPEG 95 Base64、JPEG 95 binary 的 FPS/Mbit/s/latency，列出 encoded/decoded FPS、images/s、drop/stale、old/new codec 和 OpenPI decode P50/P95；明确延迟下降来自删除 Base64、encoded-first、删除 VLA imencode 和 SNDHWM=1；明确 VLA 时序函数未修改。
+README 必须并列 JPEG 80、JPEG 95 Base64、JPEG 95 binary 的
+FPS/Mbit/s/latency，分别列出 physical encoded/decoded FPS、Gateway publication
+FPS、physical images/s、send API failure/source timestamp reuse 或 discontinuity/
+sequence gap/snapshot rejection 可观测证据、old/new codec 和 OpenPI decode
+P50/P95；不得把 send API 或 Gateway sequence 说成 PUB/HWM zero drops。明确延迟
+下降来自删除 Base64、encoded-first、删除 VLA imencode 和 SNDHWM=1；明确 VLA
+时序函数未修改。
 
     git add docs/superpowers/specs/2026-08-13-jpeg95-binary-vla-design.md \
       docs/superpowers/plans/2026-08-13-jpeg95-binary-vla-implementation.md \

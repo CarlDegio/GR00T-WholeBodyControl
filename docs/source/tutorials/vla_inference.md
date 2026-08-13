@@ -70,6 +70,12 @@ inference dependencies.
 The camera server should be running as a systemd service on the robot.
 See [Data Collection](data_collection.md) for camera server setup.
 
+The production VLA path reads four `camera_encoded/*` streams from SensorGateway.
+Those streams must carry `jpeg_bytes`; legacy Base64 strings are supported only by
+the ordinary camera schema decoder and are rejected by VLA ingress. VLA wraps the
+existing JPEG bytes in OpenPI's `__opencv_jpeg_rgb__` marker without shape inference,
+fallback decode/re-encode, or color correction.
+
 ### 4. C++ Deploy
 
 The `gear_sonic_deploy` binary must be built. See the main README.
