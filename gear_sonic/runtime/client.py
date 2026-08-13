@@ -3,9 +3,9 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from types import MappingProxyType
 import threading
 import time
+from types import MappingProxyType
 from typing import Any, Callable, Mapping
 
 import numpy as np

@@ -16,7 +16,6 @@ from gear_sonic.runtime.client import MaterializedSnapshot, SensorGatewayClient
 from gear_sonic.runtime.contracts import SharedMemoryFrame
 from gear_sonic.runtime.snapshot import SnapshotRequest
 
-
 VLA_CAMERA_NAMES = ("ego_view", "chest_view", "left_wrist", "right_wrist")
 VLA_CAMERA_STREAMS = tuple(f"camera_encoded/{name}" for name in VLA_CAMERA_NAMES)
 VLA_STATE_STREAM = "cpp/state_msgpack"

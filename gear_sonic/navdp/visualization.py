@@ -54,13 +54,41 @@ def _reasan_base_panel(title: str, subtitle: str) -> np.ndarray:
     panel = np.full((_VIZ_SIZE, _VIZ_SIZE, 3), 20, dtype=np.uint8)
     for fraction in (0.25, 0.5, 0.75, 1.0):
         cv2.circle(panel, _VIZ_CENTER, int(_VIZ_RADIUS * fraction), (65, 65, 65), 1, cv2.LINE_AA)
-    cv2.line(panel, (_VIZ_CENTER[0], _VIZ_CENTER[1] - _VIZ_RADIUS), (_VIZ_CENTER[0], _VIZ_CENTER[1] + _VIZ_RADIUS), (50, 50, 50), 1)
-    cv2.line(panel, (_VIZ_CENTER[0] - _VIZ_RADIUS, _VIZ_CENTER[1]), (_VIZ_CENTER[0] + _VIZ_RADIUS, _VIZ_CENTER[1]), (50, 50, 50), 1)
+    cv2.line(
+        panel,
+        (_VIZ_CENTER[0], _VIZ_CENTER[1] - _VIZ_RADIUS),
+        (_VIZ_CENTER[0], _VIZ_CENTER[1] + _VIZ_RADIUS),
+        (50, 50, 50),
+        1,
+    )
+    cv2.line(
+        panel,
+        (_VIZ_CENTER[0] - _VIZ_RADIUS, _VIZ_CENTER[1]),
+        (_VIZ_CENTER[0] + _VIZ_RADIUS, _VIZ_CENTER[1]),
+        (50, 50, 50),
+        1,
+    )
     cv2.putText(panel, title, (14, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.62, (240, 240, 240), 2, cv2.LINE_AA)
     cv2.putText(panel, subtitle, (14, 51), cv2.FONT_HERSHEY_SIMPLEX, 0.48, (170, 170, 170), 1, cv2.LINE_AA)
     cv2.circle(panel, _VIZ_CENTER, 7, (255, 210, 80), -1, cv2.LINE_AA)
-    cv2.arrowedLine(panel, _VIZ_CENTER, (_VIZ_CENTER[0], _VIZ_CENTER[1] - 30), (255, 210, 80), 2, cv2.LINE_AA, tipLength=0.3)
-    cv2.putText(panel, "+X", (_VIZ_CENTER[0] + 8, _VIZ_CENTER[1] - 28), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 210, 80), 1)
+    cv2.arrowedLine(
+        panel,
+        _VIZ_CENTER,
+        (_VIZ_CENTER[0], _VIZ_CENTER[1] - 30),
+        (255, 210, 80),
+        2,
+        cv2.LINE_AA,
+        tipLength=0.3,
+    )
+    cv2.putText(
+        panel,
+        "+X",
+        (_VIZ_CENTER[0] + 8, _VIZ_CENTER[1] - 28),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.4,
+        (255, 210, 80),
+        1,
+    )
     return panel
 
 
@@ -221,8 +249,26 @@ def render_actor_ray_panel(
             2,
             cv2.LINE_AA,
         )
-    cv2.putText(panel, f"min={normalized.min():.3f}  mean={normalized.mean():.3f}  max={normalized.max():.3f}", (14, _VIZ_SIZE - 36), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (210, 210, 210), 1, cv2.LINE_AA)
-    cv2.putText(panel, "red: occupied | yellow: NavDP | cyan arrow: sent velocity", (14, _VIZ_SIZE - 16), cv2.FONT_HERSHEY_SIMPLEX, 0.39, (210, 210, 210), 1, cv2.LINE_AA)
+    cv2.putText(
+        panel,
+        f"min={normalized.min():.3f}  mean={normalized.mean():.3f}  max={normalized.max():.3f}",
+        (14, _VIZ_SIZE - 36),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.45,
+        (210, 210, 210),
+        1,
+        cv2.LINE_AA,
+    )
+    cv2.putText(
+        panel,
+        "red: occupied | yellow: NavDP | cyan arrow: sent velocity",
+        (14, _VIZ_SIZE - 16),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.39,
+        (210, 210, 210),
+        1,
+        cv2.LINE_AA,
+    )
     return panel
 
 
@@ -358,7 +404,16 @@ def compose_reasan_navigation_view(
     path = np.asarray(trajectory, dtype=np.float32).reshape(-1, 2)
     envelope_px = round(_VIZ_RADIUS * 0.3 / max_range_m)
     cv2.circle(physical, _VIZ_CENTER, envelope_px, (255, 220, 80), 2, cv2.LINE_AA)
-    cv2.putText(physical, "orange: MID-360 | blue circle: 0.3 m envelope", (14, _VIZ_SIZE - 16), cv2.FONT_HERSHEY_SIMPLEX, 0.41, (0, 200, 255), 1, cv2.LINE_AA)
+    cv2.putText(
+        physical,
+        "orange: MID-360 | blue circle: 0.3 m envelope",
+        (14, _VIZ_SIZE - 16),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.41,
+        (0, 200, 255),
+        1,
+        cv2.LINE_AA,
+    )
     world = render_slam_world_panel(
         np.empty((0, 2), dtype=np.float32) if slam_map_xy is None else slam_map_xy,
         pose=pose,
@@ -420,10 +475,18 @@ def render_slam_world_panel(
         valid = (pix[:, 0] >= 0) & (pix[:, 0] < _VIZ_SIZE) & (pix[:, 1] >= 0) & (pix[:, 1] < _VIZ_SIZE)
         panel[pix[valid, 1], pix[valid, 0]] = (105, 105, 105)
 
-    history = np.empty((0, 2), dtype=np.float32) if robot_history is None else np.asarray(robot_history, dtype=np.float32).reshape(-1, 2)
+    history = (
+        np.empty((0, 2), dtype=np.float32)
+        if robot_history is None
+        else np.asarray(robot_history, dtype=np.float32).reshape(-1, 2)
+    )
     if len(history) >= 2:
         cv2.polylines(panel, [pixels(history)], False, (245, 245, 245), 2, cv2.LINE_AA)
-    predicted = np.empty((0, 2), dtype=np.float32) if trajectory_world is None else np.asarray(trajectory_world, dtype=np.float32).reshape(-1, 2)
+    predicted = (
+        np.empty((0, 2), dtype=np.float32)
+        if trajectory_world is None
+        else np.asarray(trajectory_world, dtype=np.float32).reshape(-1, 2)
+    )
     if len(predicted) >= 2:
         cv2.polylines(panel, [pixels(predicted)], False, (0, 255, 255), 3, cv2.LINE_AA)
 
@@ -439,9 +502,36 @@ def render_slam_world_panel(
         cv2.circle(panel, tuple(tip[0]), 7, (255, 255, 0), -1, cv2.LINE_AA)
         cv2.arrowedLine(panel, tuple(tip[0]), tuple(tip[1]), (255, 255, 0), 3, cv2.LINE_AA, tipLength=0.3)
 
-    cv2.putText(panel, "FAST-LIO world map (north-up)", (14, 27), cv2.FONT_HERSHEY_SIMPLEX, 0.62, (240, 240, 240), 2, cv2.LINE_AA)
-    cv2.putText(panel, f"center odom=({center[0]:.2f}, {center[1]:.2f}) m", (14, 49), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (170, 170, 170), 1, cv2.LINE_AA)
-    cv2.putText(panel, "gray map | cyan robot | green goal | white movement history", (14, _VIZ_SIZE - 16), cv2.FONT_HERSHEY_SIMPLEX, 0.39, (200, 200, 200), 1, cv2.LINE_AA)
+    cv2.putText(
+        panel,
+        "FAST-LIO world map (north-up)",
+        (14, 27),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.62,
+        (240, 240, 240),
+        2,
+        cv2.LINE_AA,
+    )
+    cv2.putText(
+        panel,
+        f"center odom=({center[0]:.2f}, {center[1]:.2f}) m",
+        (14, 49),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.45,
+        (170, 170, 170),
+        1,
+        cv2.LINE_AA,
+    )
+    cv2.putText(
+        panel,
+        "gray map | cyan robot | green goal | white movement history",
+        (14, _VIZ_SIZE - 16),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.39,
+        (200, 200, 200),
+        1,
+        cv2.LINE_AA,
+    )
     return panel
 
 

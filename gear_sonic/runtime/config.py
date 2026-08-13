@@ -12,7 +12,6 @@ import yaml
 
 from gear_sonic.runtime.endpoints import ENDPOINTS, Transport
 
-
 PROFILE_SCHEMA = "sonic.runtime_profile"
 PROFILE_VERSION = 1
 _TOP_LEVEL_KEYS = {

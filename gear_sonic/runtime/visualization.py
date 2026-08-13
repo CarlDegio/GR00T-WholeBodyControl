@@ -11,7 +11,6 @@ import zmq
 
 from gear_sonic.camera.constants import PRODUCTION_JPEG_QUALITY
 
-
 VISUALIZATION_SCHEMA = "sonic.visualization_frame"
 VISUALIZATION_STREAMS = (
     "visualization/navdp_navigation",

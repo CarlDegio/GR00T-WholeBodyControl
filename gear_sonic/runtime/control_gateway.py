@@ -7,7 +7,6 @@ from typing import Callable, Mapping
 
 from gear_sonic.runtime.contracts import MessageMetadata, OperatorCommand
 
-
 CONSOLE_COMMAND_NAMES = {
     "c": "start_recording",
     "e": "stop_recording_success",

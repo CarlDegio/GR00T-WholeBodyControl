@@ -4,7 +4,7 @@
 
 The 60-second live run passed all eight machine-checked performance thresholds. The
 camera published at 30.007 messages/s, every observed image payload was msgpack
-binary, and the same-message Base64 counterfactual was 24.980% larger. The
+binary, and binary was 24.980% smaller than the same-message Base64 counterfactual. The
 sequential SensorGateway/OpenPI protocol benchmark observed 30.014 encoded frames/s
 per RGB stream and 180.082 decoded images/s across all six streams.
 

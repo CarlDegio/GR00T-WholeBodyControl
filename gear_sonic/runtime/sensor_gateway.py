@@ -643,9 +643,9 @@ class Ros2SensorIngress:
     ) -> None:
         # Keep ROS imports out of module import time so non-ROS gateway tests and
         # configuration tools continue to work in ordinary Python environments.
-        import rclpy
         from livox_ros_driver2.msg import CustomMsg
         from nav_msgs.msg import Odometry
+        import rclpy
         from rclpy.executors import MultiThreadedExecutor
         from sensor_msgs.msg import Imu, PointCloud2
         from sensor_msgs_py import point_cloud2

@@ -308,7 +308,10 @@ class InternNavMpcController:
             ([0.0], np.cumsum(np.linalg.norm(np.diff(remaining, axis=0), axis=1)))
         )
         spacing = self.desired_velocity * self.reference_gap * self.dt
-        indices = [int(np.searchsorted(arc, spacing * index, side="left")) for index in range(self.reference_count)]
+        indices = [
+            int(np.searchsorted(arc, spacing * index, side="left"))
+            for index in range(self.reference_count)
+        ]
         indices = np.clip(indices, 0, len(remaining) - 1)
         xy = remaining[indices]
         return np.column_stack((xy, np.zeros(self.reference_count)))

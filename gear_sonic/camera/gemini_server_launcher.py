@@ -7,7 +7,6 @@ from typing import Any
 
 from gear_sonic.camera.constants import PRODUCTION_JPEG_QUALITY
 
-
 ORBBEC_VENDOR_ID = 0x2BC5
 GEMINI_345LG_PRODUCT_ID = 0x0813
 MINIMUM_USB3_SPEED_MBPS = 5000
