@@ -158,10 +158,10 @@ class DataCollectionLaunchConfig:
     """Start the camera viewer pane."""
 
     camera_host: str = "localhost"
-    """Camera server host used by SensorGateway and the direct viewer."""
+    """Camera server host used by SensorGateway."""
 
     camera_port: int = 5555
-    """Camera server port used by SensorGateway and the direct viewer."""
+    """Camera server port used by SensorGateway and the simulator publisher."""
 
 
 SESSION_NAME = "sonic_data_collection"
@@ -282,6 +282,19 @@ def _check_pane_alive(pane_index: int) -> bool:
         text=True,
     )
     return result.stdout.strip() != "1"
+
+
+def build_camera_viewer_command(
+    config: DataCollectionLaunchConfig,
+    repo_root: Path,
+) -> str:
+    """Build the Gateway-only camera viewer command for its tmux pane."""
+    return (
+        f"cd {shlex.quote(str(repo_root))} && "
+        "source .venv_data_collection/bin/activate && "
+        "python gear_sonic/scripts/run_camera_viewer.py "
+        f"--profile {shlex.quote(config.runtime_profile)}"
+    )
 
 
 def main(config: DataCollectionLaunchConfig):
@@ -439,13 +452,7 @@ def main(config: DataCollectionLaunchConfig):
 
     # --- Pane 3 (bottom-right): Camera Viewer ---
     if config.camera_viewer:
-        viewer_cmd = (
-            f"cd {repo_root} && "
-            f"source .venv_data_collection/bin/activate && "
-            f"python gear_sonic/scripts/run_camera_viewer.py "
-            f"--camera-host {config.camera_host} "
-            f"--camera-port {config.camera_port}"
-        )
+        viewer_cmd = build_camera_viewer_command(config, repo_root)
         print("Starting camera viewer (pane 3)...")
         _send_to_pane(3, viewer_cmd, wait=2.0)
 

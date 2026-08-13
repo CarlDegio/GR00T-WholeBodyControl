@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import sys
 import types
+from pathlib import Path
 from types import MappingProxyType, SimpleNamespace
 
 import numpy as np
@@ -17,6 +18,10 @@ from gear_sonic.scripts.run_camera_viewer import (
     GatewayCameraClient,
     _gateway_rgb_streams,
     _rgb_camera_names,
+)
+from gear_sonic.scripts.launch_data_collection import (
+    DataCollectionLaunchConfig,
+    build_camera_viewer_command,
 )
 from gear_sonic.scripts.run_depth_camera_viewer import colorize_depth
 
@@ -121,6 +126,20 @@ def test_gateway_camera_client_treats_gateway_errors_as_missing_frames() -> None
 
     assert health_failure.read() is None
     assert snapshot_failure.read() is None
+
+
+def test_data_collection_launcher_viewer_uses_profile_without_direct_camera() -> None:
+    command = build_camera_viewer_command(
+        DataCollectionLaunchConfig(runtime_profile="/tmp/runtime profile.yaml"),
+        Path("/workspace/sonic"),
+    )
+
+    assert command == (
+        "cd /workspace/sonic && "
+        "source .venv_data_collection/bin/activate && "
+        "python gear_sonic/scripts/run_camera_viewer.py "
+        "--profile '/tmp/runtime profile.yaml'"
+    )
 
 
 def test_rgb_viewer_ignores_depth_from_schema_v2_message() -> None:
