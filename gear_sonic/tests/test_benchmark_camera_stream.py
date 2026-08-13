@@ -48,3 +48,26 @@ def test_stream_stats_rejects_nonpositive_elapsed_time():
 
     with pytest.raises(ValueError, match="elapsed_s must be positive"):
         stats.summary(elapsed_s=0.0)
+
+
+def test_binary_stats_report_same_message_base64_counterfactual():
+    message = {
+        "timestamps": {"ego_view": 10.0},
+        "images": {
+            "ego_view": b"123456",
+            "ego_view_depth": b"abcdefghi",
+        },
+    }
+    packed = msgpack.packb(message, use_bin_type=True)
+    assert len(packed) == 82
+
+    stats = CameraStreamStats()
+    stats.add_message(packed, received_at=10.1, decode_ms=1.0)
+
+    summary = stats.summary(1.0)
+
+    assert summary["wire_bytes"] == 82
+    assert summary["binary_images"] == 2
+    assert summary["base64_counterfactual_wire_bytes"] == 85
+    assert summary["binary_wire_savings_bytes"] == 3
+    assert summary["binary_wire_savings_percent"] == pytest.approx(3 / 85 * 100.0)

@@ -17,7 +17,6 @@ import msgpack
 import numpy as np
 import zmq
 
-
 DEFAULT_EXPECTED_STREAMS = (
     "ego_view",
     "ego_view_depth",
@@ -48,12 +47,26 @@ def _distribution(values: list[float]) -> dict[str, float]:
     }
 
 
+def _base64_counterfactual_size(message: dict[str, Any]) -> int:
+    """Pack the same message after replacing binary image values with Base64."""
+    counterfactual = dict(message)
+    counterfactual["images"] = {
+        name: base64.b64encode(data).decode("ascii")
+        if isinstance(data, bytes | bytearray)
+        else data
+        for name, data in message.get("images", {}).items()
+    }
+    return len(msgpack.packb(counterfactual, use_bin_type=True))
+
+
 class CameraStreamStats:
     """Accumulate receiver-side camera stream statistics."""
 
     def __init__(self) -> None:
         self.message_count = 0
         self.total_wire_bytes = 0
+        self.total_base64_counterfactual_wire_bytes = 0
+        self.binary_image_count = 0
         self.image_count = 0
         self.latency_ms: list[float] = []
         self.decode_ms: list[float] = []
@@ -70,6 +83,12 @@ class CameraStreamStats:
 
         self.message_count += 1
         self.total_wire_bytes += len(packed)
+        self.total_base64_counterfactual_wire_bytes += _base64_counterfactual_size(
+            message
+        )
+        self.binary_image_count += sum(
+            isinstance(encoded, bytes | bytearray) for encoded in images.values()
+        )
         self.image_count += len(images)
         self.decode_ms.append(decode_ms)
 
@@ -100,18 +119,35 @@ class CameraStreamStats:
             }
 
         wire_bytes_per_second = self.total_wire_bytes / elapsed_s
+        counterfactual_bytes = self.total_base64_counterfactual_wire_bytes
+        savings_bytes = counterfactual_bytes - self.total_wire_bytes
         return {
             "elapsed_seconds": elapsed_s,
             "messages": self.message_count,
             "message_fps": self.message_count / elapsed_s,
             "images": self.image_count,
+            "binary_images": self.binary_image_count,
             "images_per_second": self.image_count / elapsed_s,
             "wire_bytes": self.total_wire_bytes,
+            "actual_wire_bytes": self.total_wire_bytes,
             "wire_bytes_per_second": wire_bytes_per_second,
             "wire_mib_per_second": wire_bytes_per_second / (1024.0**2),
             "wire_mbit_per_second": wire_bytes_per_second * 8.0 / 1_000_000.0,
             "mean_message_bytes": (
                 self.total_wire_bytes / self.message_count if self.message_count else 0.0
+            ),
+            "base64_counterfactual_wire_bytes": counterfactual_bytes,
+            "base64_counterfactual_wire_bytes_per_second": (
+                counterfactual_bytes / elapsed_s
+            ),
+            "base64_counterfactual_wire_mbit_per_second": (
+                counterfactual_bytes / elapsed_s * 8.0 / 1_000_000.0
+            ),
+            "binary_wire_savings_bytes": savings_bytes,
+            "binary_wire_savings_percent": (
+                savings_bytes / counterfactual_bytes * 100.0
+                if counterfactual_bytes
+                else 0.0
             ),
             "latency_ms": _distribution(self.latency_ms),
             "decode_ms": _distribution(self.decode_ms),
