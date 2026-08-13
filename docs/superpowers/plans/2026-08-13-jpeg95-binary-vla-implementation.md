@@ -137,25 +137,30 @@ Expected: 两个测试和 Ruff 通过。
 - Produces: PRODUCTION_JPEG_QUALITY: Final[int] = 95。
 - Consumes: 各生产默认配置/encoder；显式相机 CLI 参数仍可覆盖。
 
-- [ ] **Step 1: 写生产默认值失败测试**
+- [ ] **Step 1: 写生产质量行为失败测试**
 
-    import inspect
-    from gear_sonic.camera.composed_camera import ComposedCameraConfig
-    from gear_sonic.camera.constants import PRODUCTION_JPEG_QUALITY
-    from gear_sonic.camera.sensor_server import ImageMessageSchema, ImageUtils
-    from gear_sonic.runtime.visualization import VisualizationPublisher
+    from gear_sonic.camera.composed_camera import ComposedCameraConfig, ComposedCameraSensor
+    from gear_sonic.camera.sensor_server import ImageUtils
 
-    def test_production_jpeg_defaults_are_95():
-        assert PRODUCTION_JPEG_QUALITY == 95
-        assert ComposedCameraConfig().jpeg_quality == 95
-        assert ComposedCameraConfig().mjpeg_quality == 95
-        assert inspect.signature(ImageMessageSchema.serialize).parameters["jpeg_quality"].default == 95
-        assert inspect.signature(ImageUtils.encode_image).parameters["quality"].default == 95
-        publisher = VisualizationPublisher("inproc://jpeg-quality-default")
-        try:
-            assert publisher.jpeg_quality == 95
-        finally:
-            publisher.close()
+    def test_composed_camera_default_reaches_jpeg_encoder_as_quality_95(monkeypatch):
+        qualities = []
+
+        def capture_quality(image, quality):
+            qualities.append(quality)
+            return b"jpeg"
+
+        monkeypatch.setattr(ImageUtils, "encode_image", capture_quality)
+        composed = object.__new__(ComposedCameraSensor)
+        composed.config = ComposedCameraConfig(server=False)
+        composed._image_encoder_pool = None
+        composed.serialize_message({
+            "ego_view": {
+                "timestamps": {"ego_view": 1.0},
+                "images": {"ego_view": np.zeros((8, 8, 3), np.uint8)},
+                "camera_info": {},
+            }
+        })
+        assert qualities == [95]
 
 Gemini argv 预期加入 "--jpeg-quality", "95"；NavDP 用 monkeypatch 断言 JPEG imencode 参数为 [cv2.IMWRITE_JPEG_QUALITY, 95]。
 
@@ -168,7 +173,7 @@ Gemini argv 预期加入 "--jpeg-quality", "95"；NavDP 用 monkeypatch 断言 J
       gear_sonic/tests/test_runtime_visualization.py \
       gear_sonic/tests/test_navdp_sensor_gateway.py -v
 
-Expected: 常量缺失或 80/85 默认值导致 FAIL。
+Expected: 实际 encoder 收到 80/85 而不是 95，测试 FAIL。
 
 - [ ] **Step 3: 添加常量并替换生产默认值**
 
@@ -228,7 +233,20 @@ Expected: 聚焦测试全过；benchmark 中显式 80/95 对照值没有被统�
         assert decoded.images["ego_view"][..., 0].mean() > decoded.images["ego_view"][..., 2].mean()
         np.testing.assert_array_equal(decoded.images["ego_view_depth"], depth)
 
-另一个测试将这两个 bytes 转成 Base64 ASCII string 后 deserialize，断言旧 RGB/深度仍可解码；同时断言 CAMERA_SEND_HWM == 1。
+另一个测试将这两个 bytes 转成 Base64 ASCII string 后 deserialize，断言旧 RGB/深度仍可解码。发送队列使用真实 ZMQ socket 验证：
+
+    import socket
+
+    def test_camera_server_configures_latest_first_send_hwm():
+        with socket.socket() as probe:
+            probe.bind(("127.0.0.1", 0))
+            port = probe.getsockname()[1]
+        server = SensorServer()
+        try:
+            server.start_server(port)
+            assert server.socket.getsockopt(zmq.SNDHWM) == 1
+        finally:
+            server.stop_server()
 
 - [ ] **Step 2: 确认当前 producer 类型/HWM 测试失败**
 
@@ -236,7 +254,7 @@ Expected: 聚焦测试全过；benchmark 中显式 80/95 对照值没有被统�
       gear_sonic/tests/test_camera_rgbd_protocol.py \
       gear_sonic/tests/test_jpeg95_production_defaults.py -v
 
-Expected: binary 类型或 HWM 断言 FAIL。
+Expected: binary 类型或真实 socket 的 HWM 行为断言 FAIL。
 
 - [ ] **Step 3: 实现 bytes encoder 与 RGB/BGR 边界**
 
