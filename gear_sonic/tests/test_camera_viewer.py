@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import sys
 import types
+from types import MappingProxyType, SimpleNamespace
 
 import numpy as np
 
@@ -11,8 +12,115 @@ import numpy as np
 sys.modules.setdefault("tyro", types.ModuleType("tyro"))
 
 from gear_sonic.camera.sensor_server import ImageMessageSchema
-from gear_sonic.scripts.run_camera_viewer import _rgb_camera_names
+from gear_sonic.runtime.client import SensorGatewayClientError
+from gear_sonic.scripts.run_camera_viewer import (
+    GatewayCameraClient,
+    _gateway_rgb_streams,
+    _rgb_camera_names,
+)
 from gear_sonic.scripts.run_depth_camera_viewer import colorize_depth
+
+
+def _gateway_health(*streams: str) -> dict:
+    return {
+        "type": "sonic.sensor_gateway_health",
+        "version": 1,
+        "timestamp_ns": 123,
+        "streams": {stream: {"state": "healthy"} for stream in streams},
+        "shared_memory": {},
+        "retired_ring_count": 0,
+    }
+
+
+class _FakeGatewayClient:
+    def __init__(
+        self,
+        *,
+        health: dict | None = None,
+        arrays: dict[str, np.ndarray] | None = None,
+        health_error: Exception | None = None,
+        snapshot_error: Exception | None = None,
+    ) -> None:
+        self.health_payload = health or _gateway_health()
+        self.arrays = arrays or {}
+        self.health_error = health_error
+        self.snapshot_error = snapshot_error
+        self.requests = []
+        self.closed = False
+
+    def health(self) -> dict:
+        if self.health_error is not None:
+            raise self.health_error
+        return self.health_payload
+
+    def read_snapshot(self, request, *, retries: int = 2):
+        self.requests.append((request, retries))
+        if self.snapshot_error is not None:
+            raise self.snapshot_error
+        return SimpleNamespace(arrays=MappingProxyType(self.arrays))
+
+    def close(self) -> None:
+        self.closed = True
+
+
+def test_gateway_rgb_streams_are_sorted_and_exclude_depth_and_non_camera() -> None:
+    health = _gateway_health(
+        "camera/right_wrist",
+        "camera/ego_view_depth",
+        "source/camera_server",
+        "camera/ego_view",
+        "cpp/state_msgpack",
+    )
+
+    assert _gateway_rgb_streams(health) == (
+        "camera/ego_view",
+        "camera/right_wrist",
+    )
+
+
+def test_gateway_camera_client_materializes_only_rgb_images_by_camera_name() -> None:
+    ego_rgb = np.arange(18, dtype=np.uint8).reshape(2, 3, 3)
+    fake = _FakeGatewayClient(
+        health=_gateway_health(
+            "camera/right_wrist",
+            "camera/ego_view",
+        ),
+        arrays={
+            "camera/ego_view": ego_rgb,
+            "camera/right_wrist": np.zeros((2, 3, 3), dtype=np.float32),
+        },
+    )
+    camera = GatewayCameraClient("inproc://unused", client=fake)
+
+    message = camera.read()
+
+    assert message is not None
+    assert tuple(message["images"]) == ("ego_view",)
+    np.testing.assert_array_equal(message["images"]["ego_view"], ego_rgb)
+    request, retries = fake.requests[0]
+    assert request.streams == ("camera/ego_view", "camera/right_wrist")
+    assert request.max_age_ms == 1500.0
+    assert request.max_skew_ms == 5.0
+    assert retries == 0
+
+
+def test_gateway_camera_client_treats_gateway_errors_as_missing_frames() -> None:
+    health_failure = GatewayCameraClient(
+        "inproc://unused",
+        client=_FakeGatewayClient(
+            health_error=SensorGatewayClientError("health unavailable")
+        ),
+    )
+    snapshot_failure = GatewayCameraClient(
+        "inproc://unused",
+        client=_FakeGatewayClient(
+            health=_gateway_health("camera/ego_view"),
+            snapshot_error=SensorGatewayClientError("snapshot unavailable"),
+        ),
+    )
+
+    assert health_failure.read() is None
+    assert snapshot_failure.read() is None
 
 
 def test_rgb_viewer_ignores_depth_from_schema_v2_message() -> None:

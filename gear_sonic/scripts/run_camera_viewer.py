@@ -1,15 +1,15 @@
-"""
-ROS-free camera viewer with optional recording.
+"""SensorGateway camera viewer with optional recording.
 
-Connects to a ZMQ camera server (MuJoCo sim SensorServer or real robot camera)
-and displays live camera feeds using OpenCV. Supports recording to MP4.
+Reads decoded RGB camera frames from the local SensorGateway shared-memory
+Snapshot API and displays them using OpenCV. Supports recording to MP4.
 
 Virtual environment setup (run from repo root):
     bash install_scripts/install_data_collection.sh
     source .venv_data_collection/bin/activate
 
 Usage:
-    python gear_sonic/scripts/run_camera_viewer.py --camera-host localhost --camera-port 5555
+    python gear_sonic/scripts/run_camera_viewer.py \
+        --profile gear_sonic/config/launch_inference.yaml
 
 Controls (OpenCV window must be focused):
     R - Start/stop recording
@@ -31,18 +31,17 @@ import cv2
 import numpy as np
 import tyro
 
-from gear_sonic.camera.composed_camera import ComposedCameraClientSensor
+from gear_sonic.runtime.client import SensorGatewayClient, SensorGatewayClientError
+from gear_sonic.runtime.config import default_runtime_profile_path, load_runtime_profile
+from gear_sonic.runtime.snapshot import SnapshotRequest
 
 
 @dataclass
 class CameraViewerConfig:
     """CLI config for the ROS-free camera viewer."""
 
-    camera_host: str = "localhost"
-    """Camera server hostname."""
-
-    camera_port: int = 5555
-    """Camera server port."""
+    profile: str = str(default_runtime_profile_path())
+    """Runtime profile containing the local SensorGateway endpoint."""
 
     fps: int = 30
     """Target display refresh rate (Hz)."""
@@ -70,10 +69,73 @@ def _rgb_camera_names(images: Mapping[str, Any]) -> list[str]:
     return sorted(name for name, image in images.items() if _is_rgb_image(image))
 
 
-def main(config: CameraViewerConfig):
-    client = ComposedCameraClientSensor(server_ip=config.camera_host, port=config.camera_port)
+def _gateway_rgb_streams(health: Mapping[str, Any]) -> tuple[str, ...]:
+    """Return sorted decoded RGB camera stream names advertised by Gateway."""
+    streams = health.get("streams", {})
+    if not isinstance(streams, Mapping):
+        return ()
+    return tuple(
+        sorted(
+            name
+            for name in streams
+            if isinstance(name, str)
+            and name.startswith("camera/")
+            and not name.endswith("_depth")
+        )
+    )
 
-    print("Waiting for first camera frame...")
+
+class GatewayCameraClient:
+    """Expose SensorGateway RGB snapshots in the viewer's camera-message shape."""
+
+    def __init__(
+        self,
+        endpoint: str,
+        *,
+        max_age_ms: float = 1500.0,
+        max_skew_ms: float = 5.0,
+        client: SensorGatewayClient | None = None,
+    ) -> None:
+        self.client = client or SensorGatewayClient(endpoint, request_timeout_ms=100)
+        self.max_age_ms = float(max_age_ms)
+        self.max_skew_ms = float(max_skew_ms)
+        self._streams: tuple[str, ...] = ()
+
+    def read(self, blocking: bool = False) -> dict[str, dict[str, np.ndarray]] | None:
+        del blocking
+        try:
+            if not self._streams:
+                self._streams = _gateway_rgb_streams(self.client.health())
+                if not self._streams:
+                    return None
+            snapshot = self.client.read_snapshot(
+                SnapshotRequest(
+                    streams=self._streams,
+                    max_age_ms=self.max_age_ms,
+                    max_skew_ms=self.max_skew_ms,
+                ),
+                retries=0,
+            )
+        except SensorGatewayClientError:
+            return None
+
+        images = {
+            stream.removeprefix("camera/"): image
+            for stream, image in snapshot.arrays.items()
+            if _is_rgb_image(image) and image.dtype == np.uint8
+        }
+        return {"images": images} if images else None
+
+    def close(self) -> None:
+        self.client.close()
+
+
+def main(config: CameraViewerConfig):
+    profile = load_runtime_profile(config.profile or None)
+    endpoint = profile.endpoint_uri("sensor_gateway_metadata")
+    client = GatewayCameraClient(endpoint)
+
+    print(f"Waiting for first camera frame from SensorGateway {endpoint}...")
     sample = None
     for _ in range(100):
         sample = client.read(blocking=False)
@@ -82,7 +144,8 @@ def main(config: CameraViewerConfig):
         time.sleep(0.1)
 
     if sample is None or not sample.get("images"):
-        print("ERROR: No camera frames received after 10s. Check the camera server.")
+        print("ERROR: No camera frames received from SensorGateway after 10s.")
+        client.close()
         return
 
     camera_names = _rgb_camera_names(sample["images"])
