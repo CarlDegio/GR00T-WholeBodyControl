@@ -5,6 +5,16 @@ import pytest
 from gear_sonic.runtime.vla_timing import VlaTimingWindow
 
 
+def test_timing_uses_jpeg_prepare() -> None:
+    window = VlaTimingWindow(window_size=2)
+    window.record({"jpeg_prepare": 0.05, "worker_total": 1.0})
+
+    snapshot = window.snapshot()
+
+    assert snapshot["segments_ms"]["jpeg_prepare"]["last"] == 0.05
+    assert "jpeg_encode" not in snapshot["segments_ms"]
+
+
 def test_vla_timing_window_reports_fixed_rolling_statistics() -> None:
     window = VlaTimingWindow(window_size=3)
     window.record({"camera_read": 1.0, "worker_total": 10.0}, received_ns=1_000_000)

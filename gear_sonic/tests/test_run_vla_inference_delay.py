@@ -2,12 +2,16 @@ import queue
 import threading
 import time
 import unittest
+from unittest.mock import patch
 
+import gear_sonic.scripts.run_vla_inference as run_vla_inference
 from gear_sonic.scripts.run_vla_inference import (
+    JPEG_VIDEO_MARKER,
     SIMULATED_INFERENCE_DELAY_SECONDS,
     _drain_queue,
     _inference_worker_loop,
     _pose_policy_is_active,
+    prepare_observation_from_sensors,
     _should_schedule_vla_inference,
     _vla_inference_is_due,
 )
@@ -15,6 +19,74 @@ from gear_sonic.utils.inference.vla_utils import calculate_latency_compensated_i
 
 
 class InferenceWorkerDelayTest(unittest.TestCase):
+    def test_camera_jpeg_wrapper_keeps_bytes_and_uses_existing_protocol(self):
+        payload = b"already-encoded-camera-jpeg"
+
+        self.assertEqual(
+            run_vla_inference.wrap_camera_jpeg_for_video(payload, (24, 32, 3)),
+            {
+                JPEG_VIDEO_MARKER: True,
+                "shape": (1, 1, 24, 32, 3),
+                "dtype": "uint8",
+                "data": payload,
+            },
+        )
+
+    def test_prepare_observation_wraps_undecodable_camera_jpegs_without_codec(self):
+        image_names = ("ego_view", "chest_view", "left_wrist", "right_wrist")
+        payloads = {
+            name: f"not-a-jpeg-{name}".encode() for name in image_names
+        }
+        image_shapes = {
+            "ego_view": (24, 32, 3),
+            "chest_view": (25, 33, 3),
+            "left_wrist": (26, 34, 3),
+            "right_wrist": (27, 35, 3),
+        }
+
+        class FakeGateway:
+            def read_camera(self):
+                return {
+                    "images": payloads,
+                    "image_shapes": image_shapes,
+                    "timestamps": {name: [0.0] for name in image_names},
+                }
+
+            def read_state(self):
+                return {
+                    "body_q": [],
+                    "left_hand_q": [],
+                    "right_hand_q": [],
+                    "base_quat": [1.0, 0.0, 0.0, 0.0],
+                }
+
+        class FakeRobotModel:
+            def get_configuration_from_actuated_joints(self, **_kwargs):
+                return [0.0]
+
+        with patch.object(
+            run_vla_inference,
+            "prepare_observation_for_eval",
+            side_effect=lambda _robot_model, observation: observation,
+        ):
+            observation = prepare_observation_from_sensors(
+                FakeGateway(), FakeRobotModel(), "test prompt"
+            )
+
+        self.assertEqual(list(observation["video"]), list(image_names))
+        for name in image_names:
+            self.assertEqual(
+                observation["video"][name],
+                {
+                    JPEG_VIDEO_MARKER: True,
+                    "shape": (1, 1, *image_shapes[name]),
+                    "dtype": "uint8",
+                    "data": payloads[name],
+                },
+            )
+        self.assertIn("jpeg_prepare", observation.timing_ms)
+        self.assertNotIn("jpeg_encode", observation.timing_ms)
+
     def test_worker_emits_best_effort_timing_without_changing_result_contract(self):
         inference_queue = queue.Queue(maxsize=1)
         result_queue = queue.Queue(maxsize=1)

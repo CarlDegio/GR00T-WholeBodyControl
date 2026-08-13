@@ -16,7 +16,7 @@ VLA_TIMING_SEGMENTS = (
     "frame_age",
     "camera_read",
     "state_read",
-    "jpeg_encode",
+    "jpeg_prepare",
     "observation_build",
     "request_pack",
     "policy_roundtrip",
