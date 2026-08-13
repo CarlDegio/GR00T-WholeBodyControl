@@ -4,14 +4,14 @@
 
 **Goal:** 将所有生产 JPEG/MJPEG 质量统一为 95，用 msgpack binary 传输相机 JPEG/PNG，并让 VLA 经 Gateway 复用相机 JPEG，使 OpenPI 只解码一次且不改变现有 VLA 时序。
 
-**Architecture:** 相机保持单个 msgpack 消息，图像从 Base64 string 改为 raw bytes；Gateway 先发布 camera_encoded/*，再同步解码并发布原 camera/*。VLA 现有单 worker 仍按 camera→state 顺序轮询，只切换相机 stream 和 payload 表示；OpenPI 兼容新旧 marker。
+**Architecture:** 相机保持单个 msgpack 消息，图像从 Base64 string 改为 raw bytes；Gateway 先发布 camera_encoded/*，再同步解码并发布原 camera/*。VLA 现有单 worker 仍按 camera→state 顺序轮询，只切换相机 stream 和 payload 表示；请求继续使用 OpenPI 已支持的 marker，OpenPI 代码不变。
 
 **Tech Stack:** Python 3.11、NumPy、OpenCV、msgpack/msgpack-numpy、pyzmq、pytest、Ruff、zsh、SensorGateway shared memory。
 
 ## Global Constraints
 
 - GR00T 只在 /home/user/Project/GR00T-WholeBodyControl/.worktrees/jpeg-quality-95 的 experiment/jpeg-quality-95 分支改动。
-- OpenPI 使用 /home/user/Project/openpi_sonic/.worktrees/jpeg95-direct-camera-jpeg 和 experiment/jpeg95-direct-camera-jpeg；主工作区 replay_data/ 不移动、不删除。
+- OpenPI 仓库保持 origin/main 内容不变，不创建功能分支或提交；主工作区 replay_data/ 不移动、不删除。
 - 所有生产 JPEG/MJPEG 质量为 95；PNG 深度继续无损编码。
 - VLA 只访问 Gateway，不直接订阅相机 ZMQ。
 - VlaSensorGatewayIngress._run、_request、_poll_state、_fresh 和 camera→state 顺序不得修改。
@@ -24,95 +24,29 @@
 
 ---
 
-### Task 1: OpenPI 向后兼容地支持相机原始 JPEG
+### Task 1: 取消 OpenPI 改动并锁定现有协议
 
 **Files:**
-- Create: /home/user/Project/openpi_sonic/.worktrees/jpeg95-direct-camera-jpeg/scripts/serve_g1_sonic_zmq_policy_test.py
-- Modify: /home/user/Project/openpi_sonic/.worktrees/jpeg95-direct-camera-jpeg/scripts/serve_g1_sonic_zmq_policy.py:127-163
+- Verify only: `/home/user/Project/openpi_sonic/scripts/serve_g1_sonic_zmq_policy.py`
 
 **Interfaces:**
-- Consumes: {"__camera_jpeg_rgb__": True, "data": bytes} 和旧 marker dict。
-- Produces: _decode_jpeg_rgb_video(value: Any, *, name: str) -> Any；新 marker 返回 [1, 1, H, W, 3] RGB uint8。
+- Consumes unchanged: `{"__opencv_jpeg_rgb__": True, "shape": tuple, "dtype": str, "data": bytes}`。
+- Produces unchanged: OpenPI 现有 decoder 每幅 JPEG 解码一次。
 
-- [ ] **Step 1: 创建 OpenPI worktree**
+- [x] **Step 1: 删除实验 worktree/分支并恢复 OpenPI 主工作区**
 
-    cd /home/user/Project/openpi_sonic
-    git worktree add .worktrees/jpeg95-direct-camera-jpeg -b experiment/jpeg95-direct-camera-jpeg main
-    git -C .worktrees/jpeg95-direct-camera-jpeg status --short --branch
+OpenPI 功能分支和 worktree 已删除；为 worktree 添加的 `.gitignore` 改动也已恢复。
 
-Expected: 新 worktree/分支存在，原工作区仍只有未跟踪 replay_data/。
+- [x] **Step 2: 验证 OpenPI 没有内容或历史偏移**
 
-- [ ] **Step 2: 写新旧 marker 和 decode 次数测试**
+    git -C /home/user/Project/openpi_sonic status --short --branch
+    git -C /home/user/Project/openpi_sonic log -1 --oneline
 
-    import cv2
-    import numpy as np
-    from scripts import serve_g1_sonic_zmq_policy as server
+Expected: `main...origin/main`，HEAD 为 `347b6ae`，仅显示用户原有未跟踪 `replay_data/`。
 
-    def _jpeg(image_rgb):
-        ok, encoded = cv2.imencode(".jpg", cv2.cvtColor(image_rgb, cv2.COLOR_RGB2BGR))
-        assert ok
-        return encoded.tobytes()
+- [x] **Step 3: 后续只复用现有 marker**
 
-    def test_camera_marker_decodes_once_to_bt_rgb(monkeypatch):
-        image = np.zeros((24, 32, 3), np.uint8)
-        image[..., 0] = 240
-        real = cv2.imdecode
-        calls = []
-        def counted(*args, **kwargs):
-            calls.append(1)
-            return real(*args, **kwargs)
-        monkeypatch.setattr(server.cv2, "imdecode", counted)
-        result = server._decode_jpeg_rgb_video(
-            {server.CAMERA_JPEG_VIDEO_MARKER: True, "data": _jpeg(image)},
-            name="video.ego_view",
-        )
-        assert result.shape == (1, 1, 24, 32, 3)
-        assert result[0, 0, ..., 0].mean() > result[0, 0, ..., 2].mean()
-        assert len(calls) == 1
-
-    def test_legacy_marker_still_decodes():
-        image = np.zeros((12, 16, 3), np.uint8)
-        result = server._decode_jpeg_rgb_video(
-            {server.JPEG_VIDEO_MARKER: True, "shape": (1, 1, 12, 16, 3),
-             "dtype": "uint8", "data": _jpeg(image)},
-            name="video.chest_view",
-        )
-        assert result.shape == (1, 1, 12, 16, 3)
-
-- [ ] **Step 3: 确认新 marker 测试失败**
-
-    cd /home/user/Project/openpi_sonic/.worktrees/jpeg95-direct-camera-jpeg
-    /home/user/Project/openpi_sonic/.venv/bin/pytest scripts/serve_g1_sonic_zmq_policy_test.py -v
-
-Expected: CAMERA_JPEG_VIDEO_MARKER 未定义导致 FAIL；legacy 用例通过。
-
-- [ ] **Step 4: 实现共享 decode 和双 marker 分派**
-
-    JPEG_VIDEO_MARKER = "__opencv_jpeg_rgb__"
-    CAMERA_JPEG_VIDEO_MARKER = "__camera_jpeg_rgb__"
-
-    def _decode_jpeg_bytes(encoded: bytes | bytearray, *, name: str) -> np.ndarray:
-        image_bgr = cv2.imdecode(np.frombuffer(encoded, np.uint8), cv2.IMREAD_COLOR)
-        if image_bgr is None:
-            raise ValueError(f"cv2.imdecode failed for {name}")
-        return cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
-
-新 marker 分支验证 data 为 bytes，调用一次 _decode_jpeg_bytes 后增加 [1, 1] 维。旧 marker 的 shape/dtype 分支改为调用同一 helper；gr00t_observation_to_openpi 的四个调用点不改。
-
-    if isinstance(value, dict) and value.get(CAMERA_JPEG_VIDEO_MARKER):
-        encoded = value.get("data")
-        if not isinstance(encoded, bytes | bytearray):
-            raise ValueError(f"{name} JPEG payload must contain bytes in 'data'")
-        return _decode_jpeg_bytes(encoded, name=name)[np.newaxis, np.newaxis]
-
-- [ ] **Step 5: 验证并提交**
-
-    /home/user/Project/openpi_sonic/.venv/bin/pytest scripts/serve_g1_sonic_zmq_policy_test.py -v
-    /home/user/Project/openpi_sonic/.venv/bin/ruff check scripts/serve_g1_sonic_zmq_policy.py scripts/serve_g1_sonic_zmq_policy_test.py
-    git add scripts/serve_g1_sonic_zmq_policy.py scripts/serve_g1_sonic_zmq_policy_test.py
-    git commit -m "feat: accept direct camera JPEG observations"
-
-Expected: 两个测试和 Ruff 通过。
+VLA 在 GR00T 内提供现有协议要求的 shape/dtype/data；不修改、测试提交或部署 OpenPI 文件。
 
 ---
 
@@ -208,12 +142,14 @@ Expected: 聚焦测试全过；benchmark 中显式 80/95 对照值没有被统�
 
 **Files:**
 - Modify: gear_sonic/camera/sensor_server.py:107-180,205-229,273-300
+- Modify: gear_sonic/camera/composed_camera.py:543-565
+- Modify: gear_sonic/camera/drivers/oak.py:250-310
 - Modify: gear_sonic/utils/mujoco_sim/sensor_server.py:15-80
 - Test: gear_sonic/tests/test_camera_rgbd_protocol.py
 - Test: gear_sonic/tests/test_jpeg95_production_defaults.py
 
 **Interfaces:**
-- Produces: ImageUtils.encode_image(...) -> bytes、encode_depth_image(...) -> bytes、CAMERA_SEND_HWM = 1。
+- Produces: ImageUtils.encode_image(...) -> bytes、encode_depth_image(...) -> bytes、CAMERA_SEND_HWM = 1，以及每路编码前原始 `image_shapes` metadata。
 - Preserves: ImageMessageSchema.deserialize 接受 bytes 和旧 Base64 string。
 
 - [ ] **Step 1: 写 binary、颜色和兼容失败测试**
@@ -229,6 +165,10 @@ Expected: 聚焦测试全过；benchmark 中显式 80/95 对照值没有被统�
         wire = schema.serialize()
         assert isinstance(wire["images"]["ego_view"], bytes)
         assert isinstance(wire["images"]["ego_view_depth"], bytes)
+        assert wire["image_shapes"] == {
+            "ego_view": [48, 64, 3],
+            "ego_view_depth": [48, 64],
+        }
         decoded = ImageMessageSchema.deserialize(wire)
         assert decoded.images["ego_view"][..., 0].mean() > decoded.images["ego_view"][..., 2].mean()
         np.testing.assert_array_equal(decoded.images["ego_view_depth"], depth)
@@ -270,7 +210,7 @@ Expected: binary 类型或真实 socket 的 HWM 行为断言 FAIL。
             raise RuntimeError("failed to encode RGB image as JPEG")
         return encoded.tobytes()
 
-深度 PNG 成功后直接返回 bytes；旧 decode_image/decode_depth_image 保留。主相机与 MuJoCo sender 使用 SNDHWM=1。
+深度 PNG 成功后直接返回 bytes；旧 decode_image/decode_depth_image 保留。`ImageMessageSchema` 在编码前从 NumPy 数组记录 `image_shapes`，OAK raw MJPEG 从设备配置填写 shape，组合相机合并并透传该 metadata。主相机与 MuJoCo sender 使用 SNDHWM=1。shape 只是数据描述，不解析 JPEG、不新增检查或时序逻辑。
 
 - [ ] **Step 4: 验证并提交**
 
@@ -280,7 +220,8 @@ Expected: binary 类型或真实 socket 的 HWM 行为断言 FAIL。
       gear_sonic/tests/test_runtime_fake_services.py \
       gear_sonic/tests/test_orbbec_driver.py \
       gear_sonic/tests/test_jpeg95_production_defaults.py -v
-    git add gear_sonic/camera/sensor_server.py gear_sonic/utils/mujoco_sim/sensor_server.py \
+    git add gear_sonic/camera/sensor_server.py gear_sonic/camera/composed_camera.py \
+      gear_sonic/camera/drivers/oak.py gear_sonic/utils/mujoco_sim/sensor_server.py \
       gear_sonic/tests/test_camera_rgbd_protocol.py gear_sonic/tests/test_jpeg95_production_defaults.py
     git commit -m "perf: send camera images as msgpack binary"
 
@@ -295,7 +236,7 @@ Expected: 测试全过，quality 95 bytes 大于 quality 80 bytes，RGB 通道�
 - Test: gear_sonic/tests/test_sensor_gateway.py:223-307
 
 **Interfaces:**
-- Produces: camera_encoded/{name} 一维 uint8，encoding 为 jpeg_bytes 或 base64_jpeg。
+- Produces: camera_encoded/{name} 一维 uint8，encoding 为 jpeg_bytes 或 base64_jpeg，attributes 携带 `image_shape`。
 - Preserves: camera/{name}、return count、时间戳、序号和现有 RPC thread。
 
 - [ ] **Step 1: 写发布顺序失败测试**
@@ -340,6 +281,7 @@ Expected: 当前先 decode、后 encoded，顺序断言 FAIL。
             source_clock="camera_unix" if encoded_schema.timestamps.get(name, 0.0) else "unknown",
             expected_hz=self.expected_hz,
             attributes={"encoding": wire_encoding, "decoded_color_order": "RGB",
+                        "image_shape": list(encoded_schema.image_shapes.get(name, ())),
                         "camera_info": dict(encoded_schema.camera_info.get(name, {}))},
         )
 
@@ -396,7 +338,7 @@ Expected: Gateway 测试全过；production 仍只有已有 ingress thread 和 R
         for name, payload in jpeg_payloads.items()
     }
 
-SharedMemoryFrame attributes 设置 encoding="jpeg_bytes" 和原 camera_info。断言四个 stream 名及输出 bytes 完全一致。另一个 fixture 放 Base64 ASCII uint8、encoding="base64_jpeg"，断言输出还原为原 JPEG bytes，而不是 RGB。
+SharedMemoryFrame attributes 设置 encoding="jpeg_bytes"、`image_shape=(H, W, 3)` 和原 camera_info。断言四个 stream 名、shape 及输出 bytes 完全一致。另一个 fixture 放 Base64 ASCII uint8、encoding="base64_jpeg"，断言输出还原为原 JPEG bytes，而不是 RGB。
 
 - [ ] **Step 2: 确认当前 HWC 校验失败**
 
@@ -417,8 +359,9 @@ Expected: 当前请求 camera/* 且要求 HxWx3，测试 FAIL。
     elif encoding != "jpeg_bytes":
         raise ValueError(f"VLA camera {name!r} has unsupported encoding {encoding!r}")
     images[name] = payload
+    image_shapes[name] = tuple(frame.attributes["image_shape"])
 
-encoding 分支替换原 HWC shape/dtype 判断，只做线格式归一，不做时间判断。timestamp/camera_info 复制代码保持原样。
+返回值增加 `"image_shapes": image_shapes`。encoding 分支替换原 HWC shape/dtype 判断，只做线格式归一，不做时间判断。shape 是 producer 透传的描述信息；timestamp/camera_info 复制代码保持原样。
 
 - [ ] **Step 4: 验证、审计限定 diff 并提交**
 
@@ -441,16 +384,18 @@ Expected: 测试通过；diff 没有 _run、_request、_poll_state、_fresh hunk
 - Test: gear_sonic/tests/test_vla_timing.py
 
 **Interfaces:**
-- Produces: CAMERA_JPEG_VIDEO_MARKER = "__camera_jpeg_rgb__"。
-- Produces: wrap_camera_jpeg_for_video(encoded) -> marker/data dict。
+- Reuses unchanged: `JPEG_VIDEO_MARKER = "__opencv_jpeg_rgb__"`。
+- Produces: `wrap_camera_jpeg_for_video(encoded, image_shape) -> existing marker/shape/dtype/data dict`。
 - Produces: timing 名 jpeg_prepare；移除生产 jpeg_encode timing。
 
 - [ ] **Step 1: 写零 codec 封装和 timing 失败测试**
 
-    def test_camera_jpeg_wrapper_keeps_bytes_without_codec():
+    def test_camera_jpeg_wrapper_keeps_bytes_and_uses_existing_protocol():
         payload = b"already-encoded-camera-jpeg"
-        assert wrap_camera_jpeg_for_video(payload) == {
-            CAMERA_JPEG_VIDEO_MARKER: True,
+        assert wrap_camera_jpeg_for_video(payload, (24, 32, 3)) == {
+            JPEG_VIDEO_MARKER: True,
+            "shape": (1, 1, 24, 32, 3),
+            "dtype": "uint8",
             "data": payload,
         }
 
@@ -461,7 +406,7 @@ Expected: 测试通过；diff 没有 _run、_request、_poll_state、_fresh hunk
         assert snapshot["segments_ms"]["jpeg_prepare"]["last"] == 0.05
         assert "jpeg_encode" not in snapshot["segments_ms"]
 
-prepare_observation 测试让 fake Gateway 返回四个故意不可解码的 byte strings，并 monkeypatch prepare_observation_for_eval 为 identity；成功构建 observation 即证明本端没有 decode/re-encode。
+prepare_observation 测试让 fake Gateway 返回四个故意不可解码的 byte strings 和对应 `image_shapes`，并 monkeypatch prepare_observation_for_eval 为 identity；成功构建 observation 即证明本端没有 decode/re-encode，同时请求仍符合 OpenPI 现有 marker。
 
 - [ ] **Step 2: 确认 helper/timing 缺失而失败**
 
@@ -473,12 +418,18 @@ Expected: wrapper 和 jpeg_prepare 尚不存在，测试 FAIL。
 
 - [ ] **Step 3: 删除二次编码并封装 bytes**
 
-    CAMERA_JPEG_VIDEO_MARKER = "__camera_jpeg_rgb__"
+    def wrap_camera_jpeg_for_video(
+        encoded: bytes | bytearray | memoryview,
+        image_shape: tuple[int, int, int],
+    ) -> dict[str, Any]:
+        return {
+            JPEG_VIDEO_MARKER: True,
+            "shape": (1, 1, *image_shape),
+            "dtype": "uint8",
+            "data": bytes(encoded),
+        }
 
-    def wrap_camera_jpeg_for_video(encoded: bytes | bytearray | memoryview) -> dict[str, Any]:
-        return {CAMERA_JPEG_VIDEO_MARKER: True, "data": bytes(encoded)}
-
-video comprehension 直接调用该 helper，timing key 改为 jpeg_prepare。删除 JPEG_VIDEO_QUALITY、旧 encode helper 和只供它使用的 cv2 import；VLA_TIMING_SEGMENTS 同步更名。
+video comprehension 直接用 images 与 image_shapes 调用该 helper，timing key 改为 jpeg_prepare。删除 JPEG_VIDEO_QUALITY、旧 encode helper 和只供它使用的 cv2 import；VLA_TIMING_SEGMENTS 同步更名。不得修改 OpenPI 文件。
 
 - [ ] **Step 4: 验证、静态检查并提交**
 
@@ -506,7 +457,7 @@ Expected: pytest 通过；rg 无输出。
 **Interfaces:**
 - Produces: camera JSON 的 actual wire、同包 Base64 counterfactual、binary savings。
 - Produces: VLA JSON 的 encoded/decoded unique FPS、images/s、bytes/request、Mbit/s、Gateway RPC、prepare、pack、OpenPI 顺序 decode 的 mean/P50/P95。
-- Consumes: SensorGateway IPC 和 OpenPI worktree path。
+- Consumes: SensorGateway IPC；可只读加载 `/home/user/Project/openpi_sonic` 的现有 decoder 做协议计时，不修改该仓库。
 
 - [ ] **Step 1: 写 stats 失败测试**
 
@@ -581,7 +532,7 @@ CameraStreamStats 对同一个 unpacked message 累计 actual 和 counterfactual
         for name in VLA_CAMERA_NAMES
     ]
 
-随后同线程读取六路 camera/* 只统计 sequence/FPS。所有阶段用 perf_counter_ns，重复 encoded sequence 不重复计 codec；同时对同一 JPEG 运行旧 RGB re-encode 微基准，输出 old/new codec P50/P95。
+`openpi_module` 从当前 `/home/user/Project/openpi_sonic/scripts/serve_g1_sonic_zmq_policy.py` 只读加载。随后同线程读取六路 camera/* 只统计 sequence/FPS。所有阶段用 perf_counter_ns，重复 encoded sequence 不重复计 codec；同时对同一 JPEG 运行旧 RGB re-encode 微基准，输出 old/new codec P50/P95。
 
 - [ ] **Step 5: 验证并提交 benchmark**
 
@@ -610,7 +561,7 @@ Expected: pytest/Ruff 通过，benchmark 未修改任何 production 调度代码
 - Create: experiments/jpeg95_binary_vla/vla_pipeline_60s.json
 - Create: experiments/jpeg95_binary_vla/check_acceptance.py
 - Create: experiments/jpeg95_binary_vla/README.md
-- Verify: 两个仓库的改动文件。
+- Verify: GR00T 改动文件以及 OpenPI 仓库内容保持 `origin/main`。
 
 **Acceptance:**
 - camera/Gateway message FPS ≥ 29。
@@ -620,7 +571,7 @@ Expected: pytest/Ruff 通过，benchmark 未修改任何 production 调度代码
 - 新 codec P50/P95 均小于旧二次编码路径。
 - VLA 时序函数无修改。
 
-- [ ] **Step 1: 运行两仓测试、Ruff 和 diff 检查**
+- [ ] **Step 1: 运行 GR00T 测试/Ruff，并验证 OpenPI 未改动**
 
     cd /home/user/Project/GR00T-WholeBodyControl/.worktrees/jpeg-quality-95
     /home/user/Project/GR00T-WholeBodyControl/.venv_teleop/bin/python -m pytest gear_sonic/tests -q
@@ -630,10 +581,8 @@ Expected: pytest/Ruff 通过，benchmark 未修改任何 production 调度代码
       gear_sonic/scripts/benchmark_vla_jpeg_pipeline.py
     git diff --check c90d208..HEAD
 
-    cd /home/user/Project/openpi_sonic/.worktrees/jpeg95-direct-camera-jpeg
-    /home/user/Project/openpi_sonic/.venv/bin/pytest scripts/serve_g1_sonic_zmq_policy_test.py -q
-    /home/user/Project/openpi_sonic/.venv/bin/ruff check scripts/serve_g1_sonic_zmq_policy.py scripts/serve_g1_sonic_zmq_policy_test.py
-    git diff --check main..HEAD
+    git -C /home/user/Project/openpi_sonic diff --exit-code origin/main
+    git -C /home/user/Project/openpi_sonic status --short --branch
 
 Expected: pytest 零失败/错误，Ruff 通过，diff check 无输出。
 
@@ -641,7 +590,7 @@ Expected: pytest 零失败/错误，Ruff 通过，diff check 无输出。
 
     cd /home/user/Project/GR00T-WholeBodyControl/.worktrees/jpeg-quality-95
     git diff c90d208..HEAD -- gear_sonic/runtime/vla_sensor_gateway.py
-    rg -n "camera_encoded|jpeg_prepare|__camera_jpeg_rgb__" \
+    rg -n "camera_encoded|jpeg_prepare|__opencv_jpeg_rgb__" \
       gear_sonic/runtime/vla_sensor_gateway.py \
       gear_sonic/scripts/run_vla_inference.py \
       gear_sonic/runtime/vla_timing.py
@@ -650,10 +599,9 @@ Expected: vla_sensor_gateway diff 不含 _run、_request、_poll_state、_fresh 
 
 - [ ] **Step 3: 按兼容顺序部署协议**
 
-1. 先在 OpenPI worktree 运行新旧 marker 协议测试，不加载模型。
-2. 再用 GR00T worktree 启动 PC SensorGateway 和协议 benchmark。
-3. 最后在 Sonic 的 /home/unitree/GR00T-WholeBodyControl 做文件级日期备份、SHA-256 校验和原子替换。
-4. 只停止命令行为 gear_sonic.camera.composed_camera 的已确认 PID，再用 start_camera_server.zsh 启动，确认命令行含 --jpeg-quality 95。
+1. 用 GR00T worktree 启动 PC SensorGateway 和协议 benchmark，确认请求使用 OpenPI 现有 marker。
+2. 在 Sonic 的 /home/unitree/GR00T-WholeBodyControl 做文件级日期备份、SHA-256 校验和原子替换。
+3. 只停止命令行为 gear_sonic.camera.composed_camera 的已确认 PID，再用 start_camera_server.zsh 启动，确认命令行含 --jpeg-quality 95。
 
 Expected: Sonic 切 binary 前所有接收端已经兼容 binary/Base64。
 
@@ -674,7 +622,7 @@ Expected: 六路存在、message FPS ≥ 29、所有图像为 binary、反事实
     /home/user/Project/GR00T-WholeBodyControl/.venv_teleop/bin/python \
       gear_sonic/scripts/benchmark_vla_jpeg_pipeline.py \
       --sensor-gateway-endpoint ipc:///tmp/sonic_sensor_gateway.ipc \
-      --openpi-repo /home/user/Project/openpi_sonic/.worktrees/jpeg95-direct-camera-jpeg \
+      --openpi-repo /home/user/Project/openpi_sonic \
       --duration-seconds 60 \
       --output-json experiments/jpeg95_binary_vla/vla_pipeline_60s.json
 

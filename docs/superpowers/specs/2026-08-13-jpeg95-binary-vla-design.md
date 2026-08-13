@@ -81,6 +81,8 @@ Gateway RPC 已运行在其现有独立服务线程中。因此主 Gateway 线�
 
 - 保持单个 msgpack 消息和现有字段结构。
 - 新生产端把 RGB JPEG 和深度 PNG 写为 msgpack binary (`bytes`)。
+- 消息同时携带每路原始图像 shape；这是编码前已有的数据描述，不做 JPEG
+  解析、解码、时序判断或额外等待。
 - `ImageMessageSchema` 已允许 binary 图像字段，因此不强制提升 schema version。
 - 接收端继续接受旧 Base64 字符串，作为滚动升级和回退兼容路径。
 - 新软件 JPEG 编码前显式执行 RGB 到 BGR 转换，再调用 OpenCV 编码；binary 解码后显式转换回 RGB，保证颜色语义一致。
@@ -88,7 +90,7 @@ Gateway RPC 已运行在其现有独立服务线程中。因此主 Gateway 线�
 
 ### 5.2 Gateway encoded stream
 
-每个 `camera_encoded/*` 样本包含一维 `uint8` JPEG 数据及现有时间戳/序号元数据。编码标记接受：
+每个 `camera_encoded/*` 样本包含一维 `uint8` JPEG 数据、原始图像 shape 及现有时间戳/序号元数据。编码标记接受：
 
 - `jpeg_bytes`：新 binary 生产路径；
 - `base64_jpeg`：旧消息兼容路径，由 Gateway/VLA 适配层转换为 JPEG bytes，不执行图像解码。
@@ -97,9 +99,9 @@ Gateway RPC 已运行在其现有独立服务线程中。因此主 Gateway 线�
 
 ### 5.3 VLA 请求
 
-- 新标记：`__camera_jpeg_rgb__`，负载为相机原始 JPEG bytes。
-- OpenPI 收到新标记后解码一次并形成现有 `[B, T, H, W, C]` RGB 输入。
-- 旧标记 `__opencv_jpeg_rgb__` 和其解码器继续保留，支持旧 PC 端客户端。
+- 继续使用 OpenPI 已支持的 `__opencv_jpeg_rgb__` 标记，不修改 OpenPI 代码。
+- VLA 把相机原始 JPEG bytes 与 Gateway `camera_info` 中的 width/height 封装为
+  现有 shape/dtype/data 格式；OpenPI 的现有解码器仍只解码一次。
 - `run_vla_inference` 删除实时链路中的 `cv2.imencode`，仅封装 bytes 并执行 msgpack 打包。
 
 ## 6. 调度和时序
@@ -203,8 +205,8 @@ VLA telemetry 中原 `jpeg_encode` 分段更名为 `jpeg_prepare`，避免把字
 - `camera_encoded/*` 在对应 `camera/*` 解码发布之前可用。
 - VLA 只从 Gateway 获取四路 JPEG，不直接订阅相机。
 - VLA 实时路径不调用 `cv2.imencode`。
-- OpenPI 新协议每幅图只调用一次 JPEG decode。
-- 旧 Base64 相机包和旧 VLA JPEG 标记仍可读取。
+- OpenPI 现有协议每幅图只调用一次 JPEG decode，OpenPI 仓库无改动。
+- 旧 Base64 相机包和现有 VLA JPEG 标记仍可读取。
 - RGB 色彩测试能识别红/蓝通道，不发生静默 BGR/RGB 互换。
 
 ### 10.2 性能
@@ -228,7 +230,7 @@ VLA telemetry 中原 `jpeg_encode` 分段更名为 `jpeg_prepare`，避免把字
 - Gateway encoded-first 发布顺序；
 - VLA encoded stream 校验、四相机偏差和缺帧行为；
 - `run_vla_inference` 直接封装 JPEG，使用 monkeypatch 证明未调用 `cv2.imencode`；
-- OpenPI 同时解码新、旧 VLA 标记。
+- VLA 用相机原始 JPEG 构造 OpenPI 现有 marker 的 shape/dtype/data 字段。
 
 ### 11.2 协议集成测试
 
@@ -258,14 +260,13 @@ camera msgpack
 
 为避免混合版本中断，按兼容接收端优先部署：
 
-1. OpenPI：先支持新 `__camera_jpeg_rgb__`，保留旧标记。
-2. PC：部署同时支持 binary/Base64 的 Gateway 和 VLA ingress。
-3. Sonic：最后切换相机生产端为 binary msgpack，JPEG 95。
+1. PC：部署同时支持 binary/Base64 的 Gateway 和 VLA ingress，并继续输出现有 OpenPI marker。
+2. Sonic：最后切换相机生产端为 binary msgpack，JPEG 95。
 
 回退时反向操作。任意阶段都保留旧输入解码能力，因此无需同步停机升级。
 
 ## 13. 代码库与分支边界
 
 - `GR00T-WholeBodyControl` 的改动继续位于独立分支 `experiment/jpeg-quality-95`。
-- `openpi_sonic` 的 OpenPI 解码兼容改动将在其独立 worktree/分支完成，不触碰主工作区中现有未跟踪的 `replay_data/`。
-- 两个仓库分别运行测试和提交，现场启动/停止操作单独记录。
+- `openpi_sonic` 保持 `origin/main` 内容不变，不创建功能提交，不触碰主工作区中现有未跟踪的 `replay_data/`。
+- 现场启动/停止操作单独记录。
