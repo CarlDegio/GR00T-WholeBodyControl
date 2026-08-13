@@ -76,6 +76,19 @@ class _VideoReceiver:
         length = struct.unpack(">I", _read_exact(self.connection, 4))[0]
         return _read_exact(self.connection, length)
 
+    def wait_for_disconnect(self, *, timeout_s: float) -> bool:
+        if self.connection is None:
+            return False
+        deadline = time.monotonic() + timeout_s
+        while time.monotonic() < deadline:
+            self.connection.settimeout(max(0.01, deadline - time.monotonic()))
+            try:
+                if self.connection.recv(64 * 1024) == b"":
+                    return True
+            except socket.timeout:
+                return False
+        return False
+
     def close(self) -> None:
         if self.connection is not None:
             self.connection.close()
@@ -160,15 +173,19 @@ def test_mock_camera_to_sensor_gateway_to_fake_pico_loop(
         bridge_started = True
         assert bridge.wait_until_ready(timeout_s=2.0)
         control = socket.create_connection(bridge.control_address, timeout=2.0)
-        control.sendall(_open_camera_packet(port=receiver.port))
-        for _ in range(5):
+        open_packet = _open_camera_packet(port=receiver.port)
+        control.sendall(open_packet[:3])
+        control.sendall(open_packet[3:])
+        for _ in range(10):
             access_units.append(receiver.receive())
 
         mock.stop()
         mock_thread.join(timeout=2.0)
         assert not mock_thread.is_alive()
-        for _ in range(3):
+        for _ in range(30):
             access_units.append(receiver.receive(timeout_s=3.0))
+        control.sendall(_control_packet(b"CLOSE_CAMERA", b""))
+        assert receiver.wait_for_disconnect(timeout_s=3.0)
     finally:
         if control is not None:
             control.close()
@@ -236,7 +253,7 @@ def test_mock_camera_to_sensor_gateway_to_fake_pico_loop(
     frame_bytes = 1280 * 480 * 3
     assert len(raw) % frame_bytes == 0
     frames = np.frombuffer(raw, dtype=np.uint8).reshape(-1, 480, 1280, 3)
-    assert len(frames) >= 8
+    assert len(frames) >= 40
     eye_difference = np.abs(
         frames.astype(np.int16)[:, :, :640] - frames.astype(np.int16)[:, :, 640:]
     ).mean(axis=(1, 2, 3))
@@ -245,5 +262,10 @@ def test_mock_camera_to_sensor_gateway_to_fake_pico_loop(
         (frames[..., 0].mean(axis=(1, 2)) > frames[..., 1].mean(axis=(1, 2)) * 1.5)
         & (frames[..., 0].mean(axis=(1, 2)) > frames[..., 2].mean(axis=(1, 2)) * 1.5)
     )
-    assert np.any(~red_dominant[:5])
+    assert np.any(~red_dominant[:10])
+    live_frames = frames[:10]
+    assert any(
+        not np.array_equal(live_frames[0], candidate)
+        for candidate in live_frames[1:]
+    )
     assert red_dominant[-1]

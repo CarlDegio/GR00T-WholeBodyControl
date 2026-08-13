@@ -10,6 +10,7 @@ import numpy as np
 from gear_sonic.runtime.client import (
     SensorGatewayClient,
     SensorGatewayClientError,
+    SensorGatewayTimeoutError,
     SnapshotUnavailableError,
 )
 from gear_sonic.runtime.snapshot import SnapshotRequest
@@ -128,8 +129,19 @@ class SensorGatewayVideoSource:
         try:
             materialized = self._client.read_snapshot(self._request, retries=0)
             return self._materialize_frame(materialized)
-        except SnapshotUnavailableError:
-            self.status = "SENSOR FRAME STALE"
+        except SnapshotUnavailableError as exc:
+            cause: BaseException | None = exc
+            seen: set[int] = set()
+            while cause is not None and not isinstance(
+                cause, SensorGatewayTimeoutError
+            ) and id(cause) not in seen:
+                seen.add(id(cause))
+                cause = cause.__cause__ or cause.__context__
+            self.status = (
+                "SENSORGATEWAY OFFLINE"
+                if isinstance(cause, SensorGatewayTimeoutError)
+                else "SENSOR FRAME STALE"
+            )
         except SensorGatewayClientError:
             self.status = "SENSORGATEWAY OFFLINE"
         except InvalidGatewayFrameError:

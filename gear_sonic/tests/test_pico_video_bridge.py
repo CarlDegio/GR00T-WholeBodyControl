@@ -104,11 +104,17 @@ def _control_packet(command: bytes, data: bytes) -> bytes:
     return struct.pack(">I", len(body)) + body
 
 
-def _open_camera_packet(*, ip: str, port: int, width: int = 1280) -> bytes:
+def _open_camera_packet(
+    *,
+    ip: str,
+    port: int,
+    width: int = 1280,
+    bitrate: int = 4_000_000,
+) -> bytes:
     camera = b"ZED"
     encoded_ip = ip.encode("utf-8")
     payload = b"\xca\xfe\x01" + struct.pack(
-        "<7i", width, 480, 30, 4_000_000, 0, 0, port
+        "<7i", width, 480, 30, bitrate, 0, 0, port
     )
     payload += bytes((len(camera),)) + camera
     payload += bytes((len(encoded_ip),)) + encoded_ip
@@ -130,10 +136,10 @@ def _read_exact(connection: socket.socket, size: int) -> bytes:
 
 
 class FakePicoVideoReceiver:
-    def __init__(self) -> None:
+    def __init__(self, *, bind_host: str = "127.0.0.1") -> None:
         self._listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self._listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        self._listener.bind(("127.0.0.1", 0))
+        self._listener.bind((bind_host, 0))
         self._listener.listen(1)
         self._listener.settimeout(3.0)
         self.port = self._listener.getsockname()[1]
@@ -254,6 +260,52 @@ def test_invalid_open_is_isolated_and_next_valid_open_still_streams() -> None:
     assert len(factory.instances) == 1
 
 
+def test_open_camera_rejects_bitrate_outside_the_local_profile() -> None:
+    factory = RecordingEncoderFactory()
+    with FakePicoVideoReceiver() as rejected, FakePicoVideoReceiver() as accepted, running_bridge(
+        source=RepeatingSource(_jpeg()), encoder_factory=factory
+    ) as bridge:
+        with socket.create_connection(bridge.control_address, timeout=1.0) as control:
+            control.sendall(
+                _open_camera_packet(
+                    ip="127.0.0.1",
+                    port=rejected.port,
+                    bitrate=5_000_000,
+                )
+            )
+            time.sleep(0.1)
+            assert factory.instances == []
+            control.sendall(
+                _open_camera_packet(ip="127.0.0.1", port=accepted.port)
+            )
+            assert accepted.receive_access_unit() == TEST_ACCESS_UNIT
+
+    assert len(factory.instances) == 1
+
+
+def test_open_camera_rejects_video_ip_that_differs_from_control_peer() -> None:
+    factory = RecordingEncoderFactory()
+    with (
+        FakePicoVideoReceiver(bind_host="0.0.0.0") as redirected,
+        FakePicoVideoReceiver() as accepted,
+        running_bridge(
+            source=RepeatingSource(_jpeg()), encoder_factory=factory
+        ) as bridge,
+    ):
+        with socket.create_connection(bridge.control_address, timeout=1.0) as control:
+            control.sendall(
+                _open_camera_packet(ip="127.0.0.2", port=redirected.port)
+            )
+            time.sleep(0.1)
+            assert factory.instances == []
+            control.sendall(
+                _open_camera_packet(ip="127.0.0.1", port=accepted.port)
+            )
+            assert accepted.receive_access_unit() == TEST_ACCESS_UNIT
+
+    assert len(factory.instances) == 1
+
+
 def test_unreachable_video_endpoint_and_unknown_command_do_not_kill_control() -> None:
     unavailable = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     unavailable.bind(("127.0.0.1", 0))
@@ -310,3 +362,20 @@ def test_stale_source_streams_a_fresh_red_status_card() -> None:
     assert frame[..., 0].mean() > frame[..., 1].mean() * 1.5
     assert frame[..., 0].mean() > frame[..., 2].mean() * 1.5
     np.testing.assert_array_equal(frame[:, :640], frame[:, 640:])
+
+
+def test_session_reuses_latest_frame_at_the_negotiated_output_cadence() -> None:
+    factory = RecordingEncoderFactory()
+    with FakePicoVideoReceiver() as pico, running_bridge(
+        source=StaleSource(), encoder_factory=factory
+    ) as bridge:
+        with socket.create_connection(bridge.control_address, timeout=1.0) as control:
+            control.sendall(_open_camera_packet(ip="127.0.0.1", port=pico.port))
+            pico.receive_access_unit()
+            deadline = time.monotonic() + 0.35
+            while len(factory.instances[0].frames) < 5 and time.monotonic() < deadline:
+                time.sleep(0.01)
+            assert len(factory.instances[0].frames) >= 5
+
+    for frame in factory.instances[0].frames[1:]:
+        np.testing.assert_array_equal(frame, factory.instances[0].frames[0])

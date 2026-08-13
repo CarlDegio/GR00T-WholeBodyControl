@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 from io import BytesIO
+import os
 import threading
+import time
 
 import numpy as np
 import pytest
@@ -132,6 +134,13 @@ class _FakeProcess:
         self.returncode = -9
 
 
+class _BlockedPipeProcess(_FakeProcess):
+    def __init__(self) -> None:
+        super().__init__(returncode=None)
+        self.reader_fd, writer_fd = os.pipe()
+        self.stdin = os.fdopen(writer_fd, "wb", buffering=0)
+
+
 def test_encoder_rejects_wrong_frame_contract_before_writing() -> None:
     process = _FakeProcess(returncode=None)
     encoder = FfmpegH264Encoder(
@@ -161,3 +170,35 @@ def test_encoder_reports_early_ffmpeg_exit_with_stderr() -> None:
     finally:
         encoder.close()
     assert stderr_read.is_set()
+
+
+def test_encoder_close_cancels_a_frame_write_blocked_by_backpressure() -> None:
+    process = _BlockedPipeProcess()
+    encoder = FfmpegH264Encoder(
+        EncoderSettings(width=1280, height=480, fps=30, bitrate=4_000_000),
+        process_factory=lambda *args, **kwargs: process,
+    )
+    writer_errors: list[BaseException] = []
+
+    def write_frame() -> None:
+        try:
+            encoder.write_frame(np.zeros((480, 1280, 3), dtype=np.uint8))
+        except BaseException as exc:
+            writer_errors.append(exc)
+
+    writer = threading.Thread(target=write_frame, name="blocked-ffmpeg-writer")
+    closer = threading.Thread(target=encoder.close, name="blocked-ffmpeg-closer")
+    writer.start()
+    time.sleep(0.1)
+    closer.start()
+    try:
+        closer.join(timeout=0.5)
+        assert not closer.is_alive(), "encoder close deadlocked behind blocked stdin"
+    finally:
+        os.close(process.reader_fd)
+        writer.join(timeout=1.0)
+        closer.join(timeout=1.0)
+
+    assert not writer.is_alive()
+    assert len(writer_errors) == 1
+    assert isinstance(writer_errors[0], EncoderError)

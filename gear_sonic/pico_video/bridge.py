@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import ipaddress
 import logging
 import socket
 import threading
@@ -196,10 +197,27 @@ class VideoSession:
             )
             sender.start()
             version = 0
+            current_frame: np.ndarray | None = None
+            period_s = 1.0 / self.request.fps
+            next_frame_at = time.monotonic()
             while not self._stop.is_set():
-                version, frame = self._slot.get_after(version, timeout_s=0.2)
-                if frame is not None:
-                    encoder.write_frame(frame)
+                now = time.monotonic()
+                wait_s = max(0.0, min(0.2, next_frame_at - now))
+                version, replacement = self._slot.get_after(
+                    version,
+                    timeout_s=wait_s,
+                )
+                if replacement is not None:
+                    if current_frame is None:
+                        next_frame_at = time.monotonic()
+                    current_frame = replacement
+                now = time.monotonic()
+                if current_frame is None or now < next_frame_at:
+                    continue
+                encoder.write_frame(current_frame)
+                next_frame_at += period_s
+                if next_frame_at <= now:
+                    next_frame_at = now + period_s
         except (OSError, RuntimeError) as exc:
             if not self._stop.is_set():
                 self.error = str(exc)
@@ -341,7 +359,12 @@ class PicoVideoBridge:
                 next_stats_at = started + self.settings.stats_interval_s
             self._stop.wait(max(0.0, period_s - (time.monotonic() - started)))
 
-    def _validate_profile(self, request: CameraRequest) -> None:
+    def _validate_profile(
+        self,
+        request: CameraRequest,
+        *,
+        control_peer_ip: str,
+    ) -> None:
         if (
             request.width != self.settings.width
             or request.height != self.settings.height
@@ -350,8 +373,14 @@ class PicoVideoBridge:
             raise ProtocolError(
                 "OPEN_CAMERA does not match SONIC_HEAD 1280x480@30 profile"
             )
-        if request.bitrate > 100_000_000:
-            raise ProtocolError("OPEN_CAMERA bitrate exceeds the safety limit")
+        if request.bitrate != self.settings.bitrate:
+            raise ProtocolError(
+                f"OPEN_CAMERA bitrate must match local profile: {self.settings.bitrate}"
+            )
+        if ipaddress.ip_address(request.ip) != ipaddress.ip_address(control_peer_ip):
+            raise ProtocolError(
+                "OPEN_CAMERA video IP must match the control connection peer"
+            )
 
     def _stop_session(self) -> None:
         with self._session_lock:
@@ -374,6 +403,7 @@ class PicoVideoBridge:
     def _handle_control(self, connection: socket.socket) -> None:
         decoder = ControlFrameDecoder()
         connection.settimeout(0.2)
+        control_peer_ip = str(connection.getpeername()[0])
         try:
             while not self._stop.is_set():
                 try:
@@ -395,7 +425,10 @@ class PicoVideoBridge:
                     if command == "OPEN_CAMERA":
                         try:
                             request = parse_camera_request(payload)
-                            self._validate_profile(request)
+                            self._validate_profile(
+                                request,
+                                control_peer_ip=control_peer_ip,
+                            )
                         except ProtocolError as exc:
                             LOGGER.warning("Ignoring invalid OPEN_CAMERA: %s", exc)
                             continue

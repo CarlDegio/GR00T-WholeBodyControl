@@ -78,7 +78,9 @@ python gear_sonic/scripts/run_pico_video_bridge.py \
 
 The bridge listens for XRoboToolkit control on TCP 13579. It does not connect
 to a video receiver until an `OPEN_CAMERA` request arrives. While there is no
-PICO, this idle state is expected.
+PICO, this idle state is expected. The H.264 session runs at the negotiated
+30 FPS; a stale/error card is redrawn at 2 FPS and the current card is repeated
+between redraws so the decoder cadence stays stable.
 
 The full robot-free loopback check is:
 
@@ -154,6 +156,9 @@ adb shell rm /sdcard/Android/data/com.xrobotoolkit.client/files/video_source.yml
 - Allow inbound TCP 13579 on the workstation for Remote Vision control.
 - The PICO listens on TCP 12345; the workstation opens the outbound video
   connection to the IP and port supplied by the headset.
+- The bridge rejects a video target IP that differs from the control
+  connection's PICO peer IP, preventing control clients from redirecting the
+  workstation to another LAN host.
 - With UFW enabled, the workstation rule is `sudo ufw allow 13579/tcp`.
 
 In XRoboToolkit Remote Vision, select **SONIC_HEAD**, enter the workstation's
@@ -198,7 +203,8 @@ for this video check.
 | FFmpeg exits immediately | Run the encoder listing command above; use `--encoder libx264` to distinguish NVENC/driver problems from pipeline problems. |
 | PICO cannot connect | Verify the app uses the workstation LAN IP, TCP 13579 is reachable, and another bridge is not already bound to the port. |
 | Bridge cannot connect to PICO video | Keep the Remote Vision window listening, verify the PICO IP in `OPEN_CAMERA`, and confirm both devices are on the same network. |
-| Image is stretched or double | Select `SONIC_HEAD`; the bridge intentionally accepts only 1280x480@30 and duplicates one 640x480 eye image. |
+| `OPEN_CAMERA` is rejected | Select `SONIC_HEAD`; the bridge intentionally accepts only 1280x480@30 at the configured 4 Mbps, with a video IP matching the control peer. |
+| Image is stretched or double | The bridge duplicates one 640x480 eye image; verify the `SONIC_HEAD` display properties were copied exactly. |
 
 Stop in reverse order: close Remote Vision, stop the bridge, stop
 SensorGateway, then stop the camera publisher. Video failures are isolated

@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from collections import deque
 from dataclasses import dataclass
+import os
+import select
 import subprocess
 import threading
 from typing import Any, Callable, Iterator
@@ -201,8 +203,14 @@ class FfmpegH264Encoder:
         ):
             raise EncoderError("FFmpeg process did not expose all required pipes")
         self._write_lock = threading.Lock()
+        self._write_cancel = threading.Event()
         self._input_closed = False
         self._closing = False
+        try:
+            self._stdin_fd: int | None = self._process.stdin.fileno()
+            os.set_blocking(self._stdin_fd, False)
+        except (AttributeError, OSError, ValueError):
+            self._stdin_fd = None
         self._stderr_chunks: deque[bytes] = deque(maxlen=32)
         self._stderr_thread = threading.Thread(
             target=self._drain_stderr,
@@ -252,7 +260,24 @@ class FfmpegH264Encoder:
                 raise EncoderError("FFmpeg input is closed")
             try:
                 while remaining:
-                    written = self._process.stdin.write(remaining)
+                    if self._write_cancel.is_set():
+                        raise EncoderError("FFmpeg frame write was cancelled")
+                    if self._stdin_fd is None:
+                        written = self._process.stdin.write(remaining)
+                    else:
+                        _, writable, _ = select.select(
+                            [],
+                            [self._stdin_fd],
+                            [],
+                            0.05,
+                        )
+                        if not writable:
+                            self._raise_if_exited()
+                            continue
+                        try:
+                            written = os.write(self._stdin_fd, remaining)
+                        except BlockingIOError:
+                            continue
                     if written is None or written <= 0:
                         raise BrokenPipeError("FFmpeg stdin accepted no data")
                     remaining = remaining[written:]
@@ -263,6 +288,7 @@ class FfmpegH264Encoder:
     def finish_input(self) -> None:
         """Close FFmpeg stdin so a finite stream can drain and exit normally."""
 
+        self._write_cancel.set()
         with self._write_lock:
             if self._input_closed:
                 return
@@ -302,6 +328,7 @@ class FfmpegH264Encoder:
         if self._closing:
             return
         self._closing = True
+        self._write_cancel.set()
         self.finish_input()
         try:
             self._process.wait(timeout=1.0)

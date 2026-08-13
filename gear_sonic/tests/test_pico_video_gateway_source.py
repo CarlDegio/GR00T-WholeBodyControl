@@ -11,6 +11,7 @@ from gear_sonic.pico_video.gateway_source import GatewayFrame, SensorGatewayVide
 from gear_sonic.runtime.client import (
     MaterializedSnapshot,
     SensorGatewayClientError,
+    SensorGatewayTimeoutError,
     SnapshotUnavailableError,
 )
 from gear_sonic.runtime.contracts import MessageMetadata, SharedMemoryFrame
@@ -194,6 +195,18 @@ def test_source_reports_stale_and_gateway_failures_as_distinct_statuses() -> Non
 
     assert source.poll() is None
     assert source.status == "SENSOR FRAME STALE"
+    assert source.poll() is None
+    assert source.status == "SENSORGATEWAY OFFLINE"
+
+
+def test_source_preserves_gateway_timeout_status_through_snapshot_wrapper() -> None:
+    wrapped = SnapshotUnavailableError("snapshot unavailable after one attempt")
+    wrapped.__cause__ = SensorGatewayTimeoutError("RPC timed out")
+    source = SensorGatewayVideoSource(
+        SequenceClient([wrapped]),
+        max_age_ms=250.0,
+    )
+
     assert source.poll() is None
     assert source.status == "SENSORGATEWAY OFFLINE"
 
