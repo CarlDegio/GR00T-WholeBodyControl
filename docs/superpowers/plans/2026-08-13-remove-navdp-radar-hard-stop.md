@@ -163,7 +163,8 @@ Run:
 /home/user/Project/GR00T-WholeBodyControl/.venv_teleop/bin/python -m pytest -q \
   gear_sonic/tests/test_runtime_config.py \
   gear_sonic/tests/test_launch_tmux_panes.py \
-  gear_sonic/tests/test_navdp_planner.py -k 'radar_timeout or depth_stop or near_radar_point'
+  gear_sonic/tests/test_navdp_planner.py \
+  -k 'radar_timeout or depth_stop or near_radar_point or navdp_stack_commands'
 ```
 
 Expected: all selected tests pass.

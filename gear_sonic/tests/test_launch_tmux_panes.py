@@ -192,6 +192,7 @@ def test_navdp_stack_commands_use_ros_topics_and_official_xnavdp_server() -> Non
     assert "--control-hz 20.0" in planner
     assert "--mpc-hz 10.0" in planner
     assert "--goal-tolerance-m 0.5" in planner
+    assert "--radar-timeout-s 0.75" in planner
     assert "--output-endpoint 'tcp://*:5563'" in planner
     assert "source /opt/ros/humble/setup.bash" in planner
     assert config.navdp_root == "/home/user/Project/NavDP/baselines/x-navdp"
