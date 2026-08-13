@@ -17,6 +17,7 @@
 - Keep at most one pending decoded frame and one active PICO video session. Prefer current frames over preserving old ones.
 - Never silently freeze the last camera frame. Missing, invalid, or stale input renders a conspicuous status card at 2 FPS.
 - Do not run a test command until the user has received the requested pre-test reminder. PICO and robot/hardware tests require a separate explicit confirmation.
+- In every command below, `python` means `/home/user/Project/GR00T-WholeBodyControl/.venv_teleop/bin/python`; the isolated worktree intentionally does not contain a second virtual environment.
 - Preserve the original checkout's modified `gear_sonic/scripts/run_data_exporter.py` and untracked `Log/`; all work stays on `feature/pico-sensorgateway-video` in `.worktrees/pico-sensorgateway-video`.
 
 ---
