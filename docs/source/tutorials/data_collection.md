@@ -138,12 +138,19 @@ Once the systemd service is running, the camera server starts automatically when
 
 ### Connecting from the workstation
 
-On your workstation, SensorGateway and the camera viewer connect to the robot's camera server over the network. DataExporter reads the local SensorGateway cache. Pass the robot's IP address (the G1 robot's default IP is `192.168.123.164`) to the launcher:
+On your workstation, SensorGateway connects to the robot's camera server over the network. DataExporter and the camera viewer read the local SensorGateway cache. To verify the standalone viewer against the G1 robot's default IP (`192.168.123.164`), start SensorGateway first:
 
 ```sh
-# Camera viewer (to verify the feed)
+# Start SensorGateway before running the standalone viewer
+source .venv_teleop/bin/activate
+python gear_sonic/scripts/run_sensor_gateway.py \
+    --camera-host 192.168.123.164 --camera-port 5555 \
+    --no-enable-lingbot-depth --no-enable-ros \
+    --no-enable-visualization --no-enable-vla-timing
+
+source .venv_data_collection/bin/activate
 python gear_sonic/scripts/run_camera_viewer.py \
-    --camera-host 192.168.123.164 --camera-port 5555
+    --profile gear_sonic/config/launch_inference.yaml
 ```
 
 The tmux launcher also accepts `--camera-host`:
@@ -391,10 +398,11 @@ A standalone camera viewer is available for monitoring camera feeds and recordin
 
 ```bash
 source .venv_data_collection/bin/activate
-python gear_sonic/scripts/run_camera_viewer.py --camera-host localhost --camera-port 5555
+python gear_sonic/scripts/run_camera_viewer.py \
+    --profile gear_sonic/config/launch_inference.yaml
 ```
 
-The viewer connects directly to the same camera server ingested by SensorGateway and displays all detected camera streams in a tiled OpenCV window.
+SensorGateway must already be running. The viewer reads decoded RGB camera snapshots from the local Gateway and displays all detected camera streams in a tiled OpenCV window; it never connects directly to the camera server.
 
 **Controls** (OpenCV window must be focused):
 

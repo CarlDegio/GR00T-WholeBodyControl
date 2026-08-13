@@ -18,6 +18,7 @@ from gear_sonic.scripts.run_camera_viewer import (
     GatewayCameraClient,
     _gateway_rgb_streams,
     _rgb_camera_names,
+    _wait_for_first_camera_frame,
 )
 from gear_sonic.scripts.launch_data_collection import (
     DataCollectionLaunchConfig,
@@ -66,6 +67,47 @@ class _FakeGatewayClient:
 
     def close(self) -> None:
         self.closed = True
+
+
+class _FakeClock:
+    def __init__(self) -> None:
+        self.now = 0.0
+
+    def monotonic(self) -> float:
+        return self.now
+
+    def sleep(self, duration: float) -> None:
+        self.now += duration
+
+
+class _SlowUnavailableCamera:
+    def __init__(self, clock: _FakeClock, rpc_duration_s: float) -> None:
+        self.clock = clock
+        self.rpc_duration_s = rpc_duration_s
+        self.read_count = 0
+
+    def read(self, blocking: bool = False):
+        assert blocking is False
+        self.read_count += 1
+        self.clock.now += self.rpc_duration_s
+        return None
+
+
+def test_first_frame_wait_uses_wall_clock_deadline_including_rpc_time() -> None:
+    clock = _FakeClock()
+    camera = _SlowUnavailableCamera(clock, rpc_duration_s=0.1)
+
+    sample = _wait_for_first_camera_frame(
+        camera,
+        timeout_s=10.0,
+        poll_interval_s=0.1,
+        monotonic=clock.monotonic,
+        sleep=clock.sleep,
+    )
+
+    assert sample is None
+    assert abs(clock.now - 10.0) <= 1.0e-9
+    assert camera.read_count == 50
 
 
 def test_gateway_rgb_streams_are_sorted_and_exclude_depth_and_non_camera() -> None:

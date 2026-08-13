@@ -25,7 +25,7 @@ Output structure:
 from dataclasses import dataclass
 from pathlib import Path
 import time
-from typing import Any, Mapping, Optional
+from typing import Any, Callable, Mapping, Optional
 
 import cv2
 import numpy as np
@@ -130,22 +130,40 @@ class GatewayCameraClient:
         self.client.close()
 
 
-def main(config: CameraViewerConfig):
-    profile = load_runtime_profile(config.profile or None)
-    endpoint = profile.endpoint_uri("sensor_gateway_metadata")
-    client = GatewayCameraClient(endpoint)
-
-    print(f"Waiting for first camera frame from SensorGateway {endpoint}...")
-    sample = None
-    for _ in range(100):
+def _wait_for_first_camera_frame(
+    client: GatewayCameraClient,
+    *,
+    timeout_s: float = 10.0,
+    poll_interval_s: float = 0.1,
+    monotonic: Callable[[], float] = time.monotonic,
+    sleep: Callable[[float], None] = time.sleep,
+) -> dict[str, dict[str, np.ndarray]] | None:
+    """Wait up to a wall-clock deadline, including time spent inside RPCs."""
+    deadline = monotonic() + timeout_s
+    while True:
+        if deadline - monotonic() <= 1.0e-9:
+            break
         sample = client.read(blocking=False)
         if sample and sample.get("images"):
+            return sample
+        remaining = deadline - monotonic()
+        if remaining <= 0.0:
             break
-        time.sleep(0.1)
+        sleep(min(poll_interval_s, remaining))
+    return None
+
+
+def _run_viewer(
+    config: CameraViewerConfig,
+    client: GatewayCameraClient,
+    endpoint: str,
+) -> None:
+
+    print(f"Waiting for first camera frame from SensorGateway {endpoint}...")
+    sample = _wait_for_first_camera_frame(client)
 
     if sample is None or not sample.get("images"):
         print("ERROR: No camera frames received from SensorGateway after 10s.")
-        client.close()
         return
 
     camera_names = _rgb_camera_names(sample["images"])
@@ -279,8 +297,17 @@ def main(config: CameraViewerConfig):
                 duration = time.time() - recording_start_time
                 print(f"Final recording: {duration:.1f}s, {frame_count} frames")
 
-        client.close()
         cv2.destroyAllWindows()
+
+
+def main(config: CameraViewerConfig) -> None:
+    profile = load_runtime_profile(config.profile or None)
+    endpoint = profile.endpoint_uri("sensor_gateway_metadata")
+    client = GatewayCameraClient(endpoint)
+    try:
+        _run_viewer(config, client, endpoint)
+    finally:
+        client.close()
 
 
 if __name__ == "__main__":
