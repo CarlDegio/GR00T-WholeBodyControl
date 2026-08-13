@@ -1,3 +1,8 @@
+import importlib.util
+from pathlib import Path
+import sys
+import types
+
 import cv2
 import numpy as np
 
@@ -63,3 +68,98 @@ def test_mujoco_encoder_passes_quality_95_to_opencv(monkeypatch):
     mujoco_sensor_server.ImageUtils.encode_image(np.zeros((8, 8, 3), np.uint8))
 
     assert imencode_calls == [(".jpg", [int(cv2.IMWRITE_JPEG_QUALITY), 95])]
+
+
+def test_oak_mjpeg_default_reaches_depthai_encoder_as_quality_95(monkeypatch):
+    """Catch OAK MJPEG defaults that never reach the DepthAI encoder."""
+    encoder_qualities = []
+
+    class FakeOutput:
+        def link(self, target):
+            return None
+
+        def createOutputQueue(self, **kwargs):
+            return types.SimpleNamespace(tryGet=lambda: None)
+
+    class FakeCamera:
+        def build(self, socket):
+            return self
+
+        def requestOutput(self, *args, **kwargs):
+            return FakeOutput()
+
+    class FakeEncoder:
+        input = object()
+        out = FakeOutput()
+
+        def setDefaultProfilePreset(self, fps, profile):
+            return None
+
+        def setQuality(self, quality):
+            encoder_qualities.append(quality)
+
+    class FakePipeline:
+        def __init__(self, device):
+            self.running = False
+
+        def create(self, node):
+            if node is fake_dai.node.Camera:
+                return FakeCamera()
+            return FakeEncoder()
+
+        def start(self):
+            self.running = True
+
+        def isRunning(self):
+            return self.running
+
+        def stop(self):
+            self.running = False
+
+    class FakeDevice:
+        @staticmethod
+        def getAllAvailableDevices():
+            return [object()]
+
+        def __init__(self, *args, **kwargs):
+            return None
+
+        def getDeviceName(self):
+            return "fake-oak"
+
+        def getDeviceId(self):
+            return "fake-id"
+
+        def getConnectedCameras(self):
+            return [fake_dai.CameraBoardSocket.CAM_A]
+
+        def isPipelineRunning(self):
+            return True
+
+        def close(self):
+            return None
+
+    fake_dai = types.SimpleNamespace(
+        Device=FakeDevice,
+        Pipeline=FakePipeline,
+        CameraBoardSocket=types.SimpleNamespace(CAM_A="CAM_A"),
+        ImgFrame=types.SimpleNamespace(Type=types.SimpleNamespace(NV12="NV12")),
+        VideoEncoderProperties=types.SimpleNamespace(
+            Profile=types.SimpleNamespace(MJPEG="MJPEG")
+        ),
+        node=types.SimpleNamespace(Camera=object(), VideoEncoder=object()),
+    )
+    monkeypatch.setitem(sys.modules, "depthai", fake_dai)
+    module_path = Path(__file__).parents[1] / "camera" / "drivers" / "oak.py"
+    spec = importlib.util.spec_from_file_location("test_oak_driver", module_path)
+    assert spec is not None and spec.loader is not None
+    oak = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(oak)
+    monkeypatch.setattr(oak.time, "sleep", lambda _: None)
+
+    config = oak.OAKConfig()
+    config.use_mjpeg = True
+    config.autofocus = True
+    oak.OAKSensor(config=config)
+
+    assert encoder_qualities == [95]
