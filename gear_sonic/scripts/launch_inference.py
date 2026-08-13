@@ -92,6 +92,9 @@ class InferenceLaunchConfig:
     deploy_zmq_host: str = "localhost"
     """ZMQ host for the C++ deploy to listen on."""
 
+    deploy_policy_variant: Literal["default", "low_latency", "sonic_v1_1"] = "default"
+    """Bundled deploy checkpoint and observation-config preset."""
+
     deploy_checkpoint: str = ""
     """Checkpoint path for deploy.sh. Leave empty for default."""
 
@@ -320,7 +323,9 @@ def load_inference_launch_config(path: str | Path | None = None) -> InferenceLau
     raw_values = payload.get("launch_inference")
     if not isinstance(raw_values, dict):
         raise ValueError("launch YAML must contain a launch_inference object")
-    values = _validated_launch_values(dict(raw_values))
+    migrated_values = dict(raw_values)
+    migrated_values.setdefault("deploy_policy_variant", "default")
+    values = _validated_launch_values(migrated_values)
     return InferenceLaunchConfig(config=str(config_path), **values)
 
 
@@ -344,6 +349,97 @@ LINGBOT_READY_FILE = Path("/tmp/sonic_lingbot_ready")
 
 def _runtime_profile(config: InferenceLaunchConfig):
     return load_runtime_profile(config.config)
+
+
+DEPLOY_POLICY_PRESETS = {
+    "default": (
+        "policy/release/model",
+        "policy/release/observation_config.yaml",
+        "python download_from_hf.py",
+    ),
+    "low_latency": (
+        "policy/low_latency/model",
+        "policy/low_latency/observation_config.yaml",
+        "python download_from_hf.py --low-latency",
+    ),
+    "sonic_v1_1": (
+        "policy/sonic_v1_1/model",
+        "policy/sonic_v1_1/observation_config.yaml",
+        "python download_from_hf.py --sonic-v1-1",
+    ),
+}
+
+
+def _deploy_asset_path(deploy_dir: Path, value: str) -> Path:
+    path = Path(value).expanduser()
+    return path if path.is_absolute() else deploy_dir / path
+
+
+def _normalized_deploy_argument(value: str) -> str:
+    path = Path(value).expanduser()
+    return str(path) if path.is_absolute() else value
+
+
+def resolve_deploy_policy(
+    config: InferenceLaunchConfig,
+    deploy_dir: Path,
+) -> tuple[str, str]:
+    """Resolve and validate a paired deploy checkpoint and observation config."""
+    has_checkpoint = bool(config.deploy_checkpoint.strip())
+    has_obs_config = bool(config.deploy_obs_config.strip())
+    if has_checkpoint != has_obs_config:
+        raise ValueError(
+            "deploy_checkpoint and deploy_obs_config must be set together"
+        )
+
+    if has_checkpoint:
+        checkpoint = _normalized_deploy_argument(config.deploy_checkpoint.strip())
+        obs_config = _normalized_deploy_argument(config.deploy_obs_config.strip())
+        download_hint = "provide the matching custom deployment files"
+    else:
+        checkpoint, obs_config, download_hint = DEPLOY_POLICY_PRESETS[
+            config.deploy_policy_variant
+        ]
+
+    required = (
+        _deploy_asset_path(deploy_dir, f"{checkpoint}_encoder.onnx"),
+        _deploy_asset_path(deploy_dir, f"{checkpoint}_decoder.onnx"),
+        _deploy_asset_path(deploy_dir, obs_config),
+    )
+    missing = [path for path in required if not path.is_file()]
+    if missing:
+        formatted = "\n".join(f"  - {path}" for path in missing)
+        raise FileNotFoundError(
+            "deploy policy files are missing:\n"
+            f"{formatted}\n"
+            f"Download them with: {download_hint}"
+        )
+    return checkpoint, obs_config
+
+
+def build_deploy_command(config: InferenceLaunchConfig, repo_root: Path) -> str:
+    """Build the C++ deploy command from a validated policy selection."""
+    deploy_dir = repo_root / "gear_sonic_deploy"
+    checkpoint, obs_config = resolve_deploy_policy(config, deploy_dir)
+    deploy_mode = "sim" if config.sim else "real"
+    command = (
+        f"cd {shlex.quote(str(deploy_dir))} && "
+        f"./deploy.sh "
+        f"--input-type {shlex.quote(config.deploy_input_type)} "
+        f"--zmq-host {shlex.quote(config.deploy_zmq_host)} "
+        f"--hand-type dex1 "
+        f"--dex1-kp 1.0 "
+        f"--dex1-kd 0.05 "
+        f"--cp {shlex.quote(checkpoint)} "
+        f"--obs-config {shlex.quote(obs_config)} "
+    )
+    if config.deploy_planner:
+        command += f"--planner {shlex.quote(config.deploy_planner)} "
+    if config.deploy_motion_data:
+        command += f"--motion-data {shlex.quote(config.deploy_motion_data)} "
+    if config.deploy_output_type:
+        command += f"--output-type {shlex.quote(config.deploy_output_type)} "
+    return command + deploy_mode
 
 
 def build_vla_inference_command(
@@ -798,6 +894,11 @@ def _check_prerequisites(config: InferenceLaunchConfig):
             f"gear_sonic_deploy/deploy.sh not found at {deploy_dir}. "
             "Ensure the deploy directory is set up."
         )
+    else:
+        try:
+            resolve_deploy_policy(config, deploy_dir)
+        except (ValueError, FileNotFoundError) as exc:
+            errors.append(str(exc))
 
     if config.data_exporter:
         if not (repo_root / ".venv_data_collection" / "bin" / "activate").exists():
@@ -993,27 +1094,7 @@ def main(config: InferenceLaunchConfig):
         )
 
     # --- Pane 0 (top-left): C++ Deploy ---
-    deploy_mode = "sim" if config.sim else "real"
-    deploy_cmd = (
-        f"cd {repo_root / 'gear_sonic_deploy'} && "
-        f"./deploy.sh "
-        f"--input-type {config.deploy_input_type} "
-        f"--zmq-host {config.deploy_zmq_host} "
-        f"--hand-type dex1 "
-        f"--dex1-kp 1.0 "
-        f"--dex1-kd 0.05 "
-    )
-    if config.deploy_checkpoint:
-        deploy_cmd += f"--cp {config.deploy_checkpoint} "
-    if config.deploy_obs_config:
-        deploy_cmd += f"--obs-config {config.deploy_obs_config} "
-    if config.deploy_planner:
-        deploy_cmd += f"--planner {config.deploy_planner} "
-    if config.deploy_motion_data:
-        deploy_cmd += f"--motion-data {config.deploy_motion_data} "
-    if config.deploy_output_type:
-        deploy_cmd += f"--output-type {config.deploy_output_type} "
-    deploy_cmd += deploy_mode
+    deploy_cmd = build_deploy_command(config, repo_root)
 
     print("Starting C++ deploy (pane 0)...")
     _send_to_pane(pane_ids[0], deploy_cmd, wait=3.0)

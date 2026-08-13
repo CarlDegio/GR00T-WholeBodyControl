@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import shlex
 import sys
 import types
 from pathlib import Path
@@ -20,6 +21,7 @@ from gear_sonic.scripts.launch_inference import (
     build_slam_debug_command,
     build_control_gateway_command,
     build_data_exporter_command,
+    build_deploy_command,
     build_operator_console_command,
     build_operator_interface_command,
     build_livox_command,
@@ -29,9 +31,141 @@ from gear_sonic.scripts.launch_inference import (
     build_navdp_server_command,
     build_sensor_gateway_command,
     build_vla_inference_command,
+    default_launch_config_path,
     load_inference_launch_config,
+    resolve_deploy_policy,
     run_readiness_gate,
 )
+
+
+def _write_deploy_policy_files(
+    deploy_dir: Path,
+    checkpoint: str,
+    obs_config: str,
+) -> None:
+    prefix = deploy_dir / checkpoint
+    prefix.parent.mkdir(parents=True, exist_ok=True)
+    prefix.with_name(prefix.name + "_encoder.onnx").write_bytes(b"encoder")
+    prefix.with_name(prefix.name + "_decoder.onnx").write_bytes(b"decoder")
+    config_path = deploy_dir / obs_config
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    config_path.write_text("observations: []\n", encoding="utf-8")
+
+
+@pytest.mark.parametrize(
+    ("variant", "checkpoint", "obs_config"),
+    [
+        ("default", "policy/release/model", "policy/release/observation_config.yaml"),
+        (
+            "low_latency",
+            "policy/low_latency/model",
+            "policy/low_latency/observation_config.yaml",
+        ),
+        (
+            "sonic_v1_1",
+            "policy/sonic_v1_1/model",
+            "policy/sonic_v1_1/observation_config.yaml",
+        ),
+    ],
+)
+def test_deploy_policy_presets_keep_checkpoint_and_observation_config_paired(
+    tmp_path: Path,
+    variant: str,
+    checkpoint: str,
+    obs_config: str,
+) -> None:
+    _write_deploy_policy_files(tmp_path, checkpoint, obs_config)
+
+    resolved = resolve_deploy_policy(
+        InferenceLaunchConfig(deploy_policy_variant=variant),
+        tmp_path,
+    )
+
+    assert resolved == (checkpoint, obs_config)
+
+
+def test_deploy_policy_allows_paired_custom_override(tmp_path: Path) -> None:
+    checkpoint = "policy/custom/controller"
+    obs_config = "policy/custom/observations.yaml"
+    _write_deploy_policy_files(tmp_path, checkpoint, obs_config)
+
+    resolved = resolve_deploy_policy(
+        InferenceLaunchConfig(
+            deploy_policy_variant="sonic_v1_1",
+            deploy_checkpoint=checkpoint,
+            deploy_obs_config=obs_config,
+        ),
+        tmp_path,
+    )
+
+    assert resolved == (checkpoint, obs_config)
+
+
+def test_deploy_policy_expands_custom_tilde_paths_for_the_launch_command(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home = tmp_path / "home with spaces"
+    checkpoint = home / "policy" / "custom" / "controller"
+    obs_config = home / "policy" / "custom" / "observations.yaml"
+    monkeypatch.setenv("HOME", str(home))
+    _write_deploy_policy_files(
+        tmp_path,
+        str(checkpoint),
+        str(obs_config),
+    )
+
+    command = build_deploy_command(
+        InferenceLaunchConfig(
+            deploy_checkpoint="~/policy/custom/controller",
+            deploy_obs_config="~/policy/custom/observations.yaml",
+        ),
+        tmp_path,
+    )
+
+    assert f"--cp {shlex.quote(str(checkpoint))}" in command
+    assert f"--obs-config {shlex.quote(str(obs_config))}" in command
+
+
+def test_deploy_policy_rejects_partial_custom_override(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="must be set together"):
+        resolve_deploy_policy(
+            InferenceLaunchConfig(deploy_checkpoint="policy/custom/model"),
+            tmp_path,
+        )
+
+
+def test_deploy_policy_reports_missing_v1_1_files_and_download_command(
+    tmp_path: Path,
+) -> None:
+    with pytest.raises(FileNotFoundError) as exc_info:
+        resolve_deploy_policy(
+            InferenceLaunchConfig(deploy_policy_variant="sonic_v1_1"),
+            tmp_path,
+        )
+
+    message = str(exc_info.value)
+    assert "model_encoder.onnx" in message
+    assert "model_decoder.onnx" in message
+    assert "observation_config.yaml" in message
+    assert "python download_from_hf.py --sonic-v1-1" in message
+
+
+def test_build_deploy_command_uses_resolved_v1_1_policy(tmp_path: Path) -> None:
+    deploy_dir = tmp_path / "gear_sonic_deploy"
+    checkpoint = "policy/sonic_v1_1/model"
+    obs_config = "policy/sonic_v1_1/observation_config.yaml"
+    _write_deploy_policy_files(deploy_dir, checkpoint, obs_config)
+
+    command = build_deploy_command(
+        InferenceLaunchConfig(deploy_policy_variant="sonic_v1_1", sim=True),
+        tmp_path,
+    )
+
+    assert f"cd {deploy_dir}" in command
+    assert "--cp policy/sonic_v1_1/model" in command
+    assert "--obs-config policy/sonic_v1_1/observation_config.yaml" in command
+    assert command.endswith("sim")
 
 
 def test_dotenv_key_check_does_not_require_loading_secret(tmp_path: Path) -> None:
@@ -80,11 +214,29 @@ def test_gateways_are_mandatory_launcher_components() -> None:
 def test_yaml_contains_every_launch_parameter() -> None:
     loaded = load_inference_launch_config()
 
+    assert loaded.deploy_policy_variant == "default"
     assert loaded.prompt.startswith("Approach the tabletop")
     assert loaded.lavira_mission == "blue basket"
     assert loaded.lavira_global_target == "blue basket"
     assert loaded.lavira_vision_backend == "qwenvl"
     assert loaded.slam_debug is False
+
+
+def test_schema_v1_yaml_without_policy_variant_uses_default(
+    tmp_path: Path,
+) -> None:
+    current_text = default_launch_config_path().read_text(encoding="utf-8")
+    legacy_text = "\n".join(
+        line
+        for line in current_text.splitlines()
+        if not line.lstrip().startswith("deploy_policy_variant:")
+    )
+    legacy_path = tmp_path / "legacy_launch_inference.yaml"
+    legacy_path.write_text(legacy_text + "\n", encoding="utf-8")
+
+    loaded = load_inference_launch_config(legacy_path)
+
+    assert loaded.deploy_policy_variant == "default"
 
 
 def test_launcher_defaults_match_current_endpoint_inventory() -> None:
