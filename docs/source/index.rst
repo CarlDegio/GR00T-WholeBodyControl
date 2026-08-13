@@ -91,6 +91,7 @@ Documentation
    tutorials/zmq
    tutorials/manager
    tutorials/vr_wholebody_teleop
+   tutorials/pico_remote_vision
    tutorials/data_collection
    tutorials/vla_workflow
    tutorials/vla_inference

@@ -36,6 +36,7 @@ teleop = [
     "casadi==3.7.0",
     "pyzmq",
     "msgpack",
+    "opencv-python",
     "pin",
     "pyvista; platform_machine != 'aarch64'",
 ]
