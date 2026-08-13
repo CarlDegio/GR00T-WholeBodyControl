@@ -18,7 +18,6 @@ from gear_sonic.navdp.navigation import (
 from gear_sonic.runtime.config import load_runtime_profile
 from gear_sonic.utils.teleop.zmq.zmq_planner_sender import build_planner_message
 
-
 XNAVDP_G1_MPC_DEFAULTS = dict(
     load_runtime_profile().component("xnavdp_mpc")
 )
