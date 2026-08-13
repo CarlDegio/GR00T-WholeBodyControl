@@ -2,12 +2,12 @@
 
 ## Result
 
-The camera transport thresholds passed: 30.007 messages/s, every observed image
+The camera transport thresholds passed: 30.001 messages/s, every observed image
 payload was msgpack binary, and binary was 24.980% smaller than the same-message
-Base64 counterfactual. The corrected physical-frame acceptance did **not** pass. A
-fresh sequential SensorGateway/OpenPI run observed 30.013 Gateway publications/s on
-every stream, but physical encoded rates ranged from 27.164 to 29.597 FPS and the
-six-stream physical decoded aggregate was 171.247 images/s, below the required 174.
+Base64 counterfactual. The corrected physical-frame acceptance also passed. A fresh
+sequential SensorGateway/OpenPI run observed 30.016 Gateway publications/s on every
+stream, physical encoded rates of 29.666--30.016 FPS, and a six-stream physical
+decoded aggregate of 179.012 images/s.
 
 The benchmark covers camera transport, Gateway snapshot RPC, JPEG wrapping/request
 packing, and the existing OpenPI JPEG decoder. It deliberately excludes policy/model
@@ -22,18 +22,18 @@ binary/Base64 wire comparison.
 
 | Metric | JPEG 80 Base64 | JPEG 95 Base64 | JPEG 95 binary |
 |---|---:|---:|---:|
-| Message FPS | 30.002 | 30.004 | 30.007 |
-| Six-image throughput (images/s) | 180.013 | 180.021 | 180.040 |
-| Wire payload (Mbit/s) | 131.965 | 192.613 | 145.403 |
-| Same-packet Base64 counterfactual (Mbit/s) | not recorded | not recorded | 193.819 |
+| Message FPS | 30.002 | 30.004 | 30.001 |
+| Six-image throughput (images/s) | 180.013 | 180.021 | 180.005 |
+| Wire payload (Mbit/s) | 131.965 | 192.613 | 144.702 |
+| Same-packet Base64 counterfactual (Mbit/s) | not recorded | not recorded | 192.885 |
 | Binary saving vs same-packet Base64 | not applicable | not applicable | 24.980% |
-| End-to-end latency P50 / P95 (ms) | 41.265 / 63.047 | 43.449 / 61.122 | 54.737 / 80.124 |
-| Six-image PC decode P50 / P95 (ms) | 8.926 / 12.710 | 9.993 / 13.440 | 9.082 / 12.073 |
+| End-to-end latency P50 / P95 (ms) | 41.265 / 63.047 | 43.449 / 61.122 | 40.653 / 55.233 |
+| Six-image PC decode P50 / P95 (ms) | 8.926 / 12.710 | 9.993 / 13.440 | 9.282 / 12.356 |
 
 Absolute end-to-end latency is sensitive to separate-run camera timing and host clock
 conditions; this run does not claim an absolute latency improvement over the older
-runs. Its direct transport evidence is the 145.403 Mbit/s actual payload versus the
-193.819 Mbit/s same-message Base64 counterfactual.
+runs. Its direct transport evidence is the 144.702 Mbit/s actual payload versus the
+192.885 Mbit/s same-message Base64 counterfactual.
 
 ### Per-camera source timestamp rate
 
@@ -43,16 +43,39 @@ The composed publisher may reuse the latest device frame while still publishing 
 
 | Stream | JPEG 80 Base64 | JPEG 95 Base64 | JPEG 95 binary | Binary reused timestamps |
 |---|---:|---:|---:|---:|
-| `ego_view` | 28.236 | 29.204 | 27.224 | 167 |
-| `ego_view_depth` | 28.236 | 29.204 | 27.224 | 167 |
-| `chest_view` | 29.919 | 29.870 | 28.141 | 112 |
-| `chest_view_depth` | 29.919 | 29.870 | 28.141 | 112 |
-| `left_wrist` | 30.002 | 29.987 | 28.790 | 73 |
-| `right_wrist` | 29.802 | 29.537 | 27.974 | 122 |
+| `ego_view` | 28.236 | 29.204 | 29.818 | 11 |
+| `ego_view_depth` | 28.236 | 29.204 | 29.818 | 11 |
+| `chest_view` | 29.919 | 29.870 | 29.834 | 10 |
+| `chest_view_depth` | 29.919 | 29.870 | 29.834 | 10 |
+| `left_wrist` | 30.002 | 29.987 | 29.801 | 12 |
+| `right_wrist` | 29.802 | 29.537 | 29.984 | 1 |
 
 The acceptance FPS threshold applies to distinct positive producer source timestamps,
-not composed-message or Gateway-created sequence rates. The corrected fresh pipeline
-run below therefore fails the physical threshold honestly.
+not composed-message or Gateway-created sequence rates. The controlled NI=0 camera
+and fresh pipeline runs below pass those physical thresholds.
+
+### Controlled scheduler A/B
+
+The initial Task 8 launcher used `nohup ./start_camera_server.zsh ... &` from Zsh.
+Zsh's default `BG_NICE` option automatically assigned that background job nice +5;
+the camera child inherited it. The start script itself contains no `nice` command.
+A controlled A/B restarted only the owned camera with `unsetopt BG_NICE`, keeping the
+same deployed files, JPEG quality 95, device IDs, depth settings, port, and command
+line. The launcher/camera moved from PID 5187/5190 at NI=5 to PID 218685/218687 at
+NI=0.
+
+| Physical source | NI=5 pipeline FPS | NI=0 camera A/B FPS |
+|---|---:|---:|
+| Ego | 27.164 | 29.818 |
+| Chest | 29.263 | 29.834 |
+| Left wrist | 29.597 | 29.801 |
+| Right wrist | 28.797 | 29.984 |
+
+The directly comparable raw-camera artifact improved from 54.737/80.124 ms P50/P95
+at NI=5 to 40.653/55.233 ms at NI=0 while composed-message rate remained about
+30 FPS. This isolates the earlier physical-frame reuse and latency regression to the
+background launch scheduling condition. It is not evidence that JPEG 95 or binary
+transport caused the loss.
 
 ## SensorGateway and OpenPI protocol
 
@@ -61,31 +84,31 @@ those baseline cells are explicitly unavailable rather than estimated.
 
 | Metric | JPEG 80 Base64 | JPEG 95 Base64 | JPEG 95 binary |
 |---|---:|---:|---:|
-| Gateway publication FPS, every stream | not measured | not measured | 30.013 |
-| Physical encoded FPS, four RGB range | not measured | not measured | 27.164–29.597 |
-| Physical decoded FPS, six-stream range | not measured | not measured | 27.164–29.597 |
-| Physical decoded aggregate (images/s) | not measured | not measured | 171.247 (fail) |
-| VLA request throughput (requests/s) | not measured | not measured | 118.820 |
-| VLA request payload (Mbit/s) | not measured | not measured | 329.786 |
-| Gateway RPC P50 / P95 (ms) | not measured | not measured | 0.659 / 2.739 |
-| JPEG prepare P50 / P95 (ms) | not measured | not measured | 0.052 / 0.073 |
-| Request pack P50 / P95 (ms) | not measured | not measured | 0.082 / 0.120 |
-| OpenPI four-JPEG decode P50 / P95 (ms) | not measured | not measured | 3.899 / 5.354 |
-| New JPEG wrapper P50 / P95 (ms) | not measured | not measured | 0.00049 / 0.00321 |
-| Old RGB-to-JPEG codec P50 / P95 (ms) | not measured | not measured | 0.72052 / 1.00331 |
+| Gateway publication FPS, every stream | not measured | not measured | 30.016 |
+| Physical encoded FPS, four RGB range | not measured | not measured | 29.666–30.016 |
+| Physical decoded FPS, six-stream range | not measured | not measured | 29.666–30.016 |
+| Physical decoded aggregate (images/s) | not measured | not measured | 179.012 (pass) |
+| VLA request throughput (requests/s) | not measured | not measured | 134.663 |
+| VLA request payload (Mbit/s) | not measured | not measured | 370.645 |
+| Gateway RPC P50 / P95 (ms) | not measured | not measured | 0.513 / 2.234 |
+| JPEG prepare P50 / P95 (ms) | not measured | not measured | 0.045 / 0.067 |
+| Request pack P50 / P95 (ms) | not measured | not measured | 0.072 / 0.111 |
+| OpenPI four-JPEG decode P50 / P95 (ms) | not measured | not measured | 3.717 / 4.806 |
+| New JPEG wrapper P50 / P95 (ms) | not measured | not measured | 0.00047 / 0.00287 |
+| Old RGB-to-JPEG codec P50 / P95 (ms) | not measured | not measured | 0.71260 / 0.94543 |
 
 The codec comparison contains 7,204 unique stream/frame samples. The benchmark made
-7,130 sequential requests; requests between new camera publications legitimately
+8,080 sequential requests; requests between new camera publications legitimately
 reused the latest Gateway sequence and were excluded from codec unique-frame counts.
 
 | Stream | Gateway publication FPS | Physical unique FPS | Source timestamp reuses |
 |---|---:|---:|---:|
-| `ego_view` | 30.013 | 27.164 | 171 |
-| `ego_view_depth` | 30.013 | 27.164 | 171 |
-| `chest_view` | 30.013 | 29.263 | 45 |
-| `chest_view_depth` | 30.013 | 29.263 | 45 |
-| `left_wrist` | 30.013 | 29.597 | 25 |
-| `right_wrist` | 30.013 | 28.797 | 73 |
+| `ego_view` | 30.016 | 29.666 | 21 |
+| `ego_view_depth` | 30.016 | 29.666 | 21 |
+| `chest_view` | 30.016 | 29.916 | 6 |
+| `chest_view_depth` | 30.016 | 29.916 | 6 |
+| `left_wrist` | 30.016 | 29.833 | 11 |
+| `right_wrist` | 30.016 | 30.016 | 0 |
 
 ## Drop and stale evidence
 
@@ -125,7 +148,8 @@ decode, infer shapes, fall back to RGB decode/re-encode, or perform color correc
 - PC binary receiver: this worktree's read-only SensorGateway, bound to
   `ipc:///tmp/sonic_sensor_gateway.ipc`, was started before the producer change.
 - Sonic camera: `unitree@192.168.123.164`, port 5555, confirmed command line includes
-  `--jpeg-quality 95`.
+  `--jpeg-quality 95`. The final evidence uses launcher PID 218685 and camera PID
+  218687 at NI=0; no production source/config file was changed for the scheduler A/B.
 - Only `gear_sonic/camera/constants.py`, `composed_camera.py`, and `sensor_server.py`
   were deployed. Exact overwritten files were backed up at
   `/home/unitree/GR00T-WholeBodyControl/.task8-backups/20260813T154131+0800` before
@@ -149,6 +173,6 @@ Run the checker from the repository root:
   experiments/jpeg95_binary_vla/check_acceptance.py
 ```
 
-For the committed fresh run this command exits 1 at the physical encoded FPS
-assertion. The JSON is preserved as failure evidence; full performance acceptance is
-not claimed.
+For the committed fresh NI=0 run this command exits 0: all specified camera,
+physical-rate, aggregate-throughput, JPEG preparation, OpenPI decode, and codec
+comparison thresholds pass.
