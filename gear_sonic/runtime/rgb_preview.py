@@ -183,7 +183,7 @@ class RgbPreviewWorker:
                 if images is not None and self._gui.waitKey(1) & 0xFF == ord("q"):
                     self._stop.set()
         except Exception as exc:
-            print(f"[DataExporter] RGB preview disabled: {exc}", flush=True)
+            print(f"[SensorGateway] RGB preview disabled: {exc}", flush=True)
             self._stop.set()
         finally:
             if self._display_available:

@@ -16,6 +16,7 @@ import zmq
 
 from gear_sonic.camera.sensor_server import ImageMessageSchema
 from gear_sonic.runtime.diagnostics import EndpointHealthMonitor
+from gear_sonic.runtime.rgb_preview import RgbPreviewWorker
 from gear_sonic.runtime.shared_memory import SharedMemoryRing
 from gear_sonic.runtime.snapshot import SensorSnapshotStore, SnapshotRequest
 from gear_sonic.runtime.visualization import VISUALIZATION_SCHEMA, VISUALIZATION_STREAMS
@@ -339,6 +340,8 @@ class CameraZmqIngress:
         core: SensorGatewayCore,
         *,
         expected_hz: float = 30.0,
+        preview_rgb: bool = False,
+        preview_worker: RgbPreviewWorker | None = None,
     ) -> None:
         self.core = core
         self.expected_hz = float(expected_hz)
@@ -351,6 +354,11 @@ class CameraZmqIngress:
             "source/camera_server",
             expected_hz=self.expected_hz,
         )
+        self._preview = preview_worker if preview_worker is not None else (
+            RgbPreviewWorker(encoded=True) if preview_rgb else None
+        )
+        if self._preview is not None:
+            self._preview.start()
 
     def poll_once(self, timeout_ms: int = 0) -> int:
         if not self.socket.poll(timeout_ms, zmq.POLLIN):
@@ -364,9 +372,11 @@ class CameraZmqIngress:
         )
         encoded_schema = ImageMessageSchema.deserialize(payload, decode_images=False)
         count = 0
+        preview_images: dict[str, bytes | str] = {}
         for name, encoded in encoded_schema.images.items():
             if name.endswith("_depth") or not isinstance(encoded, bytes | bytearray | str):
                 continue
+            preview_images[name] = bytes(encoded) if isinstance(encoded, bytearray) else encoded
             if isinstance(encoded, str):
                 encoded_array = np.frombuffer(encoded.encode("utf-8"), dtype=np.uint8).copy()
                 wire_encoding = "base64_jpeg"
@@ -388,6 +398,8 @@ class CameraZmqIngress:
                     "camera_info": dict(encoded_schema.camera_info.get(name, {})),
                 },
             )
+        if self._preview is not None and preview_images:
+            self._preview.publish(preview_images)
 
         schema = ImageMessageSchema.deserialize(payload)
         for name, image in schema.images.items():
@@ -414,6 +426,8 @@ class CameraZmqIngress:
         return count
 
     def close(self) -> None:
+        if self._preview is not None:
+            self._preview.close()
         self.socket.close(linger=0)
 
 

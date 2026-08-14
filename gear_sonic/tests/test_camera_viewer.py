@@ -25,6 +25,7 @@ from gear_sonic.scripts.launch_data_collection import (
     DataCollectionLaunchConfig,
     build_camera_viewer_command,
     build_pico_video_command,
+    build_sensor_gateway_command,
 )
 from gear_sonic.scripts.run_depth_camera_viewer import colorize_depth
 
@@ -183,6 +184,28 @@ def test_data_collection_launcher_viewer_uses_profile_without_direct_camera() ->
         "source .venv_data_collection/bin/activate && "
         "python gear_sonic/scripts/run_camera_viewer.py "
         "--profile '/tmp/runtime profile.yaml'"
+    )
+
+
+def test_data_collection_launcher_enables_sensor_gateway_rgb_preview() -> None:
+    command = build_sensor_gateway_command(
+        DataCollectionLaunchConfig(
+            runtime_profile="/tmp/runtime profile.yaml",
+            camera_host="192.168.123.164",
+            camera_port=5555,
+        ),
+        Path("/workspace/sonic"),
+    )
+
+    assert command == (
+        "cd /workspace/sonic && "
+        "source .venv_teleop/bin/activate && "
+        "python gear_sonic/scripts/run_sensor_gateway.py "
+        "--profile '/tmp/runtime profile.yaml' "
+        "--camera-host 192.168.123.164 --camera-port 5555 "
+        "--enable-rgb-preview "
+        "--no-enable-lingbot-depth --no-enable-ros "
+        "--no-enable-visualization --no-enable-vla-timing"
     )
 
 

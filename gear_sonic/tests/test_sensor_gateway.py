@@ -42,6 +42,61 @@ def _publish_until_ingested(publish, poll, *, timeout_s: float = 1.0) -> int:
     raise TimeoutError("SensorGateway ingress did not receive the fake message")
 
 
+class _RecordingPreview:
+    def __init__(self) -> None:
+        self.start_count = 0
+        self.frames = []
+        self.close_count = 0
+
+    def start(self) -> None:
+        self.start_count += 1
+
+    def publish(self, images) -> None:
+        self.frames.append(dict(images))
+
+    def close(self) -> None:
+        self.close_count += 1
+
+
+def test_camera_ingress_owns_rgb_preview_lifecycle_and_forwards_rgb_only() -> None:
+    context = zmq.Context()
+    core = SensorGatewayCore(slot_count=2, history_size=4)
+    camera_server = FakeCameraServer(context, "inproc://gateway-rgb-preview")
+    preview = _RecordingPreview()
+    ingress = CameraZmqIngress(
+        context,
+        "inproc://gateway-rgb-preview",
+        core,
+        preview_rgb=True,
+        preview_worker=preview,
+    )
+    schema = ImageMessageSchema(
+        timestamps={"ego_view": 100.0, "chest_view": 100.0, "ego_view_depth": 100.0},
+        images={
+            "ego_view": np.full((2, 3, 3), 10, dtype=np.uint8),
+            "chest_view": np.full((2, 3, 3), 20, dtype=np.uint8),
+            "ego_view_depth": np.full((2, 3), 1200, dtype=np.uint16),
+        },
+        camera_info={},
+    )
+
+    try:
+        assert _publish_until_ingested(
+            lambda: camera_server.publish(schema.serialize()),
+            ingress.poll_once,
+        ) == 3
+        assert preview.start_count == 1
+        assert len(preview.frames) == 1
+        assert tuple(preview.frames[0]) == ("ego_view", "chest_view")
+    finally:
+        ingress.close()
+        camera_server.close()
+        core.close()
+        context.term()
+
+    assert preview.close_count == 1
+
+
 def test_gateway_core_resizes_ring_without_resetting_sequence() -> None:
     core = SensorGatewayCore(slot_count=2, history_size=4, retired_ring_ttl_s=10.0)
     try:

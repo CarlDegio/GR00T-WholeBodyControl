@@ -27,6 +27,7 @@ def test_script_imports_without_ros2_and_resolves_json_defaults() -> None:
     assert settings.loop_hz == 200.0
     assert settings.expected_hz["odometry"] == 10.0
     assert not settings.enable_ros
+    assert not settings.enable_rgb_preview
 
 
 def test_cli_overrides_are_the_final_configuration_layer() -> None:
@@ -45,6 +46,7 @@ def test_cli_overrides_are_the_final_configuration_layer() -> None:
             "6003",
             "--no-enable-camera",
             "--no-enable-cpp-state",
+            "--enable-rgb-preview",
         ]
     )
 
@@ -55,6 +57,7 @@ def test_cli_overrides_are_the_final_configuration_layer() -> None:
     assert settings.rpc_bind_endpoint == "tcp://*:6003"
     assert not settings.enable_camera
     assert not settings.enable_cpp_state
+    assert settings.enable_rgb_preview
 
 
 def test_sensor_gateway_script_has_no_control_endpoint_or_output_path() -> None:

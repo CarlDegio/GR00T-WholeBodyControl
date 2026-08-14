@@ -13,7 +13,6 @@ import numpy as np
 
 from gear_sonic.runtime.client import MaterializedSnapshot, SensorGatewayClient
 from gear_sonic.runtime.contracts import SharedMemoryFrame
-from gear_sonic.runtime.rgb_preview import RgbPreviewWorker
 from gear_sonic.runtime.snapshot import SnapshotRequest
 from gear_sonic.runtime.vla_sensor_gateway import decode_cpp_state_array
 
@@ -104,8 +103,6 @@ class DataExporterSensorGatewayIngress:
         request_timeout_ms: int = 100,
         max_age_ms: float = 1000.0,
         max_skew_ms: float = 5.0,
-        preview_rgb: bool = False,
-        preview_worker: RgbPreviewWorker | None = None,
         client: SensorGatewayClient | None = None,
     ) -> None:
         if not camera_names or len(set(camera_names)) != len(camera_names):
@@ -126,11 +123,6 @@ class DataExporterSensorGatewayIngress:
         self.poll_hz = float(poll_hz)
         self.max_age_ms = float(max_age_ms)
         self.max_skew_ms = float(max_skew_ms)
-        self._preview = preview_worker or (
-            RgbPreviewWorker(encoded=self.defer_video_encoding)
-            if preview_rgb
-            else None
-        )
         self.client = client or SensorGatewayClient(
             endpoint,
             request_timeout_ms=request_timeout_ms,
@@ -187,8 +179,6 @@ class DataExporterSensorGatewayIngress:
             self._camera_received_ns = max(
                 frame.metadata.timestamp_ns for frame in frames
             )
-        if self._preview is not None:
-            self._preview.publish(message["images"])
 
     def _poll_state(self) -> None:
         snapshot = self._request((DATA_EXPORTER_STATE_STREAM,), max_skew_ms=0.0)
@@ -239,8 +229,6 @@ class DataExporterSensorGatewayIngress:
         if self._started:
             return
         self._started = True
-        if self._preview is not None:
-            self._preview.start()
         self._thread.start()
 
     def _fresh(self, received_ns: int) -> bool:
@@ -293,7 +281,5 @@ class DataExporterSensorGatewayIngress:
             self._thread.join(timeout=max(1.0, 2.0 / self.poll_hz))
             if self._thread.is_alive():
                 raise RuntimeError("DataExporter SensorGateway worker did not stop")
-        if self._preview is not None:
-            self._preview.close()
         if self._owns_client:
             self.client.close()

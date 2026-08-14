@@ -306,6 +306,24 @@ def build_camera_viewer_command(
     )
 
 
+def build_sensor_gateway_command(
+    config: DataCollectionLaunchConfig,
+    repo_root: Path,
+) -> str:
+    """Build the data-collection SensorGateway command with local RGB preview."""
+    return (
+        f"cd {shlex.quote(str(repo_root))} && "
+        "source .venv_teleop/bin/activate && "
+        "python gear_sonic/scripts/run_sensor_gateway.py "
+        f"--profile {shlex.quote(config.runtime_profile)} "
+        f"--camera-host {shlex.quote(config.camera_host)} "
+        f"--camera-port {config.camera_port} "
+        "--enable-rgb-preview "
+        "--no-enable-lingbot-depth --no-enable-ros "
+        "--no-enable-visualization --no-enable-vla-timing"
+    )
+
+
 def build_pico_video_command(
     config: DataCollectionLaunchConfig,
     repo_root: Path,
@@ -373,16 +391,7 @@ def main(config: DataCollectionLaunchConfig):
             check=True,
         )
     profile_arg = shlex.quote(config.runtime_profile)
-    sensor_gateway_cmd = (
-        f"cd {shlex.quote(str(repo_root))} && "
-        "source .venv_teleop/bin/activate && "
-        "python gear_sonic/scripts/run_sensor_gateway.py "
-        f"--profile {profile_arg} "
-        f"--camera-host {shlex.quote(config.camera_host)} "
-        f"--camera-port {config.camera_port} "
-        "--no-enable-lingbot-depth --no-enable-ros "
-        "--no-enable-visualization --no-enable-vla-timing"
-    )
+    sensor_gateway_cmd = build_sensor_gateway_command(config, repo_root)
     control_gateway_cmd = (
         f"cd {shlex.quote(str(repo_root))} && "
         "source .venv_teleop/bin/activate && "

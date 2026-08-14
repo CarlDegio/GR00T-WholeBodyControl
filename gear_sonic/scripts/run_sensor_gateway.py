@@ -56,6 +56,7 @@ class SensorGatewaySettings:
     enable_ros: bool
     enable_visualization: bool
     enable_vla_timing: bool
+    enable_rgb_preview: bool
     vla_timing_window_size: int
 
 
@@ -165,6 +166,7 @@ def resolve_sensor_gateway_settings(args: argparse.Namespace) -> SensorGatewaySe
         enable_ros=bool(args.enable_ros),
         enable_visualization=bool(args.enable_visualization),
         enable_vla_timing=bool(args.enable_vla_timing),
+        enable_rgb_preview=bool(args.enable_rgb_preview),
         vla_timing_window_size=int(component["vla_timing_window_size"]),
     )
 
@@ -220,6 +222,11 @@ def build_argument_parser() -> argparse.ArgumentParser:
         "--enable-vla-timing",
         action=argparse.BooleanOptionalAction,
         default=True,
+    )
+    parser.add_argument(
+        "--enable-rgb-preview",
+        action=argparse.BooleanOptionalAction,
+        default=False,
     )
     return parser
 
@@ -398,6 +405,7 @@ def run_sensor_gateway(settings: SensorGatewaySettings) -> None:
                 settings.camera_endpoint,
                 core,
                 expected_hz=settings.expected_hz["camera"],
+                preview_rgb=settings.enable_rgb_preview,
             )
         if settings.enable_lingbot_depth:
             lingbot_depth = LingBotDepthZmqIngress(

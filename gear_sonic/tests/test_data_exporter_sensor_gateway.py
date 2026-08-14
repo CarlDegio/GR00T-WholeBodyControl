@@ -23,22 +23,6 @@ from gear_sonic.runtime.sensor_gateway import SensorGatewayCore, SensorGatewayRp
 from gear_sonic.runtime.snapshot import SensorSnapshot, TimestampBasis
 
 
-class _RecordingPreview:
-    def __init__(self) -> None:
-        self.start_count = 0
-        self.published: list[dict[str, object]] = []
-        self.close_count = 0
-
-    def start(self) -> None:
-        self.start_count += 1
-
-    def publish(self, images: dict[str, object]) -> None:
-        self.published.append(dict(images))
-
-    def close(self) -> None:
-        self.close_count += 1
-
-
 def _materialized_encoded_camera(
     payloads: dict[str, bytes],
     encodings: dict[str, str],
@@ -280,51 +264,3 @@ def test_data_exporter_gateway_cache_materializes_all_migrated_inputs() -> None:
         server.close()
         core.close()
         context.term()
-
-
-def test_ingress_starts_updates_and_idempotently_closes_rgb_preview() -> None:
-    context = zmq.Context()
-    core = SensorGatewayCore(slot_count=4, history_size=8)
-    server = _RpcThread(context, "inproc://data-exporter-preview", core)
-    server.start()
-    jpeg = b"\xff\xd8preview-jpeg\xff\xd9"
-    core.publish_array(
-        "camera_encoded/ego_view",
-        np.frombuffer(jpeg, dtype=np.uint8).copy(),
-        received_ns=time.monotonic_ns(),
-        source_timestamp_ns=123_000_000_000,
-        source_clock="camera_unix",
-        attributes={"encoding": "jpeg_bytes", "camera_info": {}},
-    )
-    client = SensorGatewayClient(
-        "inproc://data-exporter-preview",
-        context=context,
-        request_timeout_ms=100,
-    )
-    preview = _RecordingPreview()
-    ingress = DataExporterSensorGatewayIngress(
-        "inproc://data-exporter-preview",
-        camera_names=("ego_view",),
-        defer_video_encoding=True,
-        preview_rgb=True,
-        preview_worker=preview,
-        client=client,
-        poll_hz=100.0,
-    )
-    try:
-        ingress.start()
-        deadline = time.monotonic() + 1.0
-        while not preview.published and time.monotonic() < deadline:
-            time.sleep(0.01)
-
-        assert preview.start_count == 1
-        assert preview.published == [{"ego_view": jpeg}]
-    finally:
-        ingress.close()
-        ingress.close()
-        client.close()
-        server.close()
-        core.close()
-        context.term()
-
-    assert preview.close_count == 1
