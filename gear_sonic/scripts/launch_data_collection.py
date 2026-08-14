@@ -41,7 +41,8 @@ Usage (from repo root — no venv activation needed):
     python gear_sonic/scripts/launch_data_collection.py --no-pico-video  # skip PICO video
 """
 
-from dataclasses import dataclass
+import argparse
+from dataclasses import dataclass, fields
 from pathlib import Path
 import os
 import shlex
@@ -51,6 +52,7 @@ import socket
 import subprocess
 import sys
 import time
+from typing import Any, get_type_hints
 
 
 def _bootstrap_venv():
@@ -77,6 +79,11 @@ def _bootstrap_venv():
 _bootstrap_venv()
 
 import tyro
+import yaml
+
+
+def default_data_collection_config_path() -> Path:
+    return Path(__file__).resolve().parents[1] / "config" / "launch_data_collection.yaml"
 
 
 def _get_local_ip() -> str:
@@ -168,6 +175,84 @@ class DataCollectionLaunchConfig:
 
     camera_port: int = 5555
     """Camera server port used by SensorGateway and the simulator publisher."""
+
+    config: str = str(default_data_collection_config_path())
+    """YAML file containing the data collection launcher configuration."""
+
+
+def _validated_data_collection_values(raw_values: dict[str, Any]) -> dict[str, Any]:
+    config_fields = {
+        item.name: item
+        for item in fields(DataCollectionLaunchConfig)
+        if item.name != "config"
+    }
+    unknown = set(raw_values) - set(config_fields)
+    missing = set(config_fields) - set(raw_values)
+    if unknown:
+        raise ValueError(
+            "unknown launch_data_collection YAML fields: "
+            + ", ".join(sorted(unknown))
+        )
+    if missing:
+        raise ValueError(
+            "missing launch_data_collection YAML fields: "
+            + ", ".join(sorted(missing))
+        )
+
+    annotations = get_type_hints(DataCollectionLaunchConfig)
+    values: dict[str, Any] = {}
+    for name, value in raw_values.items():
+        annotation = annotations[name]
+        if annotation is bool:
+            if not isinstance(value, bool):
+                raise ValueError(f"launch_data_collection.{name} must be a boolean")
+            values[name] = value
+        elif annotation is int:
+            if isinstance(value, bool) or not isinstance(value, int):
+                raise ValueError(f"launch_data_collection.{name} must be an integer")
+            values[name] = value
+        elif annotation is float:
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                raise ValueError(f"launch_data_collection.{name} must be a number")
+            values[name] = float(value)
+        elif annotation is str:
+            if not isinstance(value, str):
+                raise ValueError(f"launch_data_collection.{name} must be a string")
+            values[name] = value
+        else:
+            raise TypeError(
+                f"unsupported data collection launch type for {name}: {annotation}"
+            )
+    return values
+
+
+def load_data_collection_launch_config(
+    path: str | Path | None = None,
+) -> DataCollectionLaunchConfig:
+    config_path = (
+        default_data_collection_config_path()
+        if path is None
+        else Path(path).expanduser()
+    )
+    try:
+        with config_path.open("r", encoding="utf-8") as stream:
+            payload = yaml.safe_load(stream)
+    except yaml.YAMLError as exc:
+        raise ValueError(f"invalid launch YAML {config_path}: {exc}") from exc
+    if not isinstance(payload, dict):
+        raise ValueError(f"launch YAML must contain an object: {config_path}")
+    if (
+        payload.get("schema") != "sonic.data_collection_launch"
+        or payload.get("version") != 1
+    ):
+        raise ValueError(
+            "launch YAML must use sonic.data_collection_launch version 1"
+        )
+    raw_values = payload.get("launch_data_collection")
+    if not isinstance(raw_values, dict):
+        raise ValueError("launch YAML must contain a launch_data_collection object")
+    values = _validated_data_collection_values(raw_values)
+    return DataCollectionLaunchConfig(config=str(config_path), **values)
 
 
 SESSION_NAME = "sonic_data_collection"
