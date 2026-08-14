@@ -195,7 +195,7 @@ def test_data_collection_launcher_keeps_pico_video_running_by_default() -> None:
     assert command == (
         "cd /workspace/sonic && "
         "source .venv_teleop/bin/activate && "
-        "python gear_sonic/scripts/run_pico_video_bridge.py "
+        "python -m gear_sonic.scripts.run_pico_video_bridge "
         "--profile '/tmp/runtime profile.yaml' "
         "--encoder h264_nvenc --stay-alive"
     )

@@ -314,7 +314,7 @@ def build_pico_video_command(
     return (
         f"cd {shlex.quote(str(repo_root))} && "
         "source .venv_teleop/bin/activate && "
-        "python gear_sonic/scripts/run_pico_video_bridge.py "
+        "python -m gear_sonic.scripts.run_pico_video_bridge "
         f"--profile {shlex.quote(config.runtime_profile)} "
         "--encoder h264_nvenc --stay-alive"
     )
