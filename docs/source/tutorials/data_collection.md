@@ -226,6 +226,27 @@ The launcher starts the existing four data-collection panes plus a `gateways` wi
 Requires `tmux` to be installed (`sudo apt install tmux`).
 ```
 
+The launcher reads all startup defaults from
+`gear_sonic/config/launch_data_collection.yaml`:
+
+```bash
+python gear_sonic/scripts/launch_data_collection.py
+```
+
+Use `--config` to select another complete collection profile. Explicit CLI
+flags override the selected YAML, which is useful for one-off task prompts or
+camera changes:
+
+```bash
+python gear_sonic/scripts/launch_data_collection.py \
+    --config /path/to/my_collection.yaml \
+    --task-prompt "pick up the cup"
+```
+
+The collection YAML owns launcher settings only. Its `runtime_profile` field
+continues to reference `gear_sonic/config/launch_inference.yaml`, which remains
+the single source of truth for Gateway endpoints and component timing.
+
 **For simulation** (the launcher starts `run_sim_loop.py` in a separate tmux window automatically):
 
 ```bash
@@ -259,6 +280,7 @@ Common options:
 
 | Flag | Default | Description |
 |---|---|---|
+| `--config` | `gear_sonic/config/launch_data_collection.yaml` | Complete data-collection launcher defaults |
 | `--task-prompt` | `"demo"` | Language task description (e.g., `"pick up the cup"`) |
 | `--dataset-name` | *(auto: timestamp)* | Dataset name; omit to auto-generate |
 | `--sim / --no-sim` | `False` | Run deploy.sh in sim mode (also starts the sim loop) |
@@ -272,6 +294,9 @@ Common options:
 | `--deploy-motion-data` | *(default)* | Custom motion data path for deploy.sh |
 | `--record-wrist-cameras` | `False` | Record left/right wrist camera streams in the dataset |
 | `--no-text-to-speech` | *(on)* | Disable voice feedback via espeak |
+
+Values shown above come from the default YAML. Passing a flag on the command
+line overrides only that value for the current launch.
 
 Run `python gear_sonic/scripts/launch_data_collection.py --help` for all options.
 

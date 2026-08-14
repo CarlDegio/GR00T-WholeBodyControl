@@ -1,0 +1,26 @@
+schema: sonic.data_collection_launch
+version: 1
+profile: agent_full_data_collection
+launch_data_collection:
+  sim: false
+  deploy_input_type: zmq_manager
+  deploy_zmq_host: localhost
+  deploy_checkpoint: ''
+  deploy_obs_config: ''
+  deploy_planner: ''
+  deploy_motion_data: ''
+  deploy_output_type: ''
+  pico_manager: true
+  pico_vis_vr3pt: false
+  pico_vis_smpl: false
+  pico_waist_tracking: false
+  pico_video: true
+  task_prompt: demo
+  dataset_name: ''
+  runtime_profile: gear_sonic/config/launch_inference.yaml
+  record_wrist_cameras: false
+  record_chest_camera: false
+  text_to_speech: true
+  camera_viewer: true
+  camera_host: localhost
+  camera_port: 5555
