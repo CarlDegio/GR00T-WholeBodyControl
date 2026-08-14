@@ -96,6 +96,9 @@ class SonicDataExporterConfig:
     defer_video_encoding: bool = True
     """Keep encoded camera frames in memory and encode videos when saving the episode."""
 
+    preview_rgb: bool = True
+    """Show all enabled RGB camera streams in one OpenCV window."""
+
     video_encoder_threads: int = 8
     """Maximum encoder threads used while saving each deferred video."""
 
@@ -997,6 +1000,7 @@ def main(config: SonicDataExporterConfig):
         ),
         max_age_ms=float(exporter_settings["sensor_gateway_max_age_ms"]),
         max_skew_ms=float(exporter_settings["sensor_gateway_max_skew_ms"]),
+        preview_rgb=config.preview_rgb,
     )
     gateway_ingress.start()
     print(
