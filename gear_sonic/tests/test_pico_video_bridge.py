@@ -10,17 +10,28 @@ from typing import Iterator
 
 import cv2
 import numpy as np
+import pytest
 
 from gear_sonic.pico_video.bridge import (
     BridgeSettings,
     LatestFrameSlot,
     PicoVideoBridge,
+    open_video_connection,
 )
 from gear_sonic.pico_video.encoder import EncoderSettings
 from gear_sonic.pico_video.gateway_source import GatewayFrame
+from gear_sonic.pico_video.protocol import CameraRequest, ProtocolError
+from gear_sonic.pico_video.usb_network import PicoUsbNetwork
 
 
 TEST_ACCESS_UNIT = b"\x00\x00\x00\x01\x09\xf0\x00\x00\x01\x65\xaa"
+PICO_USB = PicoUsbNetwork(
+    interface="enx4662be5cb0cb",
+    workstation_ip="192.168.123.61",
+    pico_ip="192.168.123.242",
+    prefix_length=24,
+    serial="PA9410MGL1090624G",
+)
 
 
 def _jpeg() -> bytes:
@@ -304,6 +315,72 @@ def test_open_camera_rejects_video_ip_that_differs_from_control_peer() -> None:
             assert accepted.receive_access_unit() == TEST_ACCESS_UNIT
 
     assert len(factory.instances) == 1
+
+
+def test_usb_only_rejects_a_control_peer_outside_the_discovered_pico_link() -> None:
+    bridge = PicoVideoBridge(
+        BridgeSettings(
+            gateway_endpoint="inproc://unused",
+            control_host=PICO_USB.workstation_ip,
+            control_port=0,
+            encoder="libx264",
+            pico_usb=PICO_USB,
+        ),
+        source=StaleSource(),
+        encoder_factory=RecordingEncoderFactory(),
+    )
+    request = CameraRequest(
+        width=1280,
+        height=480,
+        fps=30,
+        bitrate=4_000_000,
+        enable_mv_hevc=False,
+        render_mode=0,
+        port=12345,
+        camera="ZED",
+        ip="192.168.123.100",
+    )
+
+    with pytest.raises(ProtocolError, match="discovered PICO USB peer"):
+        bridge._validate_profile(request, control_peer_ip=request.ip)
+
+
+def test_video_socket_binds_the_discovered_usb_source_address(monkeypatch) -> None:
+    calls: list[tuple[tuple[str, int], float, tuple[str, int] | None]] = []
+    sentinel = object()
+
+    def fake_create_connection(
+        address: tuple[str, int],
+        timeout: float,
+        source_address: tuple[str, int] | None = None,
+    ) -> object:
+        calls.append((address, timeout, source_address))
+        return sentinel
+
+    monkeypatch.setattr(socket, "create_connection", fake_create_connection)
+    request = CameraRequest(
+        width=1280,
+        height=480,
+        fps=30,
+        bitrate=4_000_000,
+        enable_mv_hevc=False,
+        render_mode=0,
+        port=12345,
+        camera="ZED",
+        ip=PICO_USB.pico_ip,
+    )
+    settings = BridgeSettings(
+        gateway_endpoint="inproc://unused",
+        control_host=PICO_USB.workstation_ip,
+        pico_usb=PICO_USB,
+    )
+
+    result = open_video_connection(request, settings)
+
+    assert result is sentinel
+    assert calls == [
+        ((PICO_USB.pico_ip, 12345), 2.0, (PICO_USB.workstation_ip, 0))
+    ]
 
 
 def test_unreachable_video_endpoint_and_unknown_command_do_not_kill_control() -> None:

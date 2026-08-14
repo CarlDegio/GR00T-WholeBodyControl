@@ -65,7 +65,7 @@ For the first CPU-only workstation check:
 ```bash
 python gear_sonic/scripts/run_pico_video_bridge.py \
   --gateway-endpoint tcp://127.0.0.1:5560 \
-  --encoder libx264 --verbose
+  --network-mode local-test --encoder libx264 --verbose
 ```
 
 For normal use on the RTX workstation:
@@ -73,7 +73,7 @@ For normal use on the RTX workstation:
 ```bash
 python gear_sonic/scripts/run_pico_video_bridge.py \
   --gateway-endpoint tcp://127.0.0.1:5560 \
-  --encoder h264_nvenc
+  --network-mode local-test --encoder h264_nvenc
 ```
 
 The bridge listens for XRoboToolkit control on TCP 13579. It does not connect
@@ -150,19 +150,49 @@ If the profile must be reset, remove the device copy and restart the app:
 adb shell rm /sdcard/Android/data/com.xrobotoolkit.client/files/video_source.yml
 ```
 
-### Network setup
+### Native USBOnly network
 
-- PICO and workstation must be on the same low-latency LAN/Wi-Fi.
-- Allow inbound TCP 13579 on the workstation for Remote Vision control.
-- The PICO listens on TCP 12345; the workstation opens the outbound video
-  connection to the IP and port supplied by the headset.
-- The bridge rejects a video target IP that differs from the control
-  connection's PICO peer IP, preventing control clients from redirecting the
-  workstation to another LAN host.
-- With UFW enabled, the workstation rule is `sudo ufw allow 13579/tcp`.
+Connect the PICO over USB and select **USBOnly** in XRoboToolkit. Leave the
+network under the ownership of the PICO OS and NetworkManager:
 
-In XRoboToolkit Remote Vision, select **SONIC_HEAD**, enter the workstation's
-LAN IPv4 address, and press **Listen**. Expected results are:
+- do not create a static `pico0` connection or rename the RNDIS interface;
+- do not change the headset USB gadget functions;
+- do not add ADB forward/reverse tunnels;
+- do not add interface-name firewall rules for XRoboToolkit.
+
+The PICO provides DHCP over its native RNDIS link. Both the subnet and the
+workstation address may change after reconnecting, so neither belongs in a
+checked-in profile. The production bridge discovers the active PICO RNDIS
+interface, workstation address, and PICO gateway every time it starts. It
+binds TCP 13579 only to that workstation USB address and binds the outbound
+H.264 socket to the same source address. Startup fails closed when USBOnly is
+absent, ambiguous, or routed through another interface.
+
+With SensorGateway running, start the production bridge without a network
+override:
+
+```bash
+python gear_sonic/scripts/run_pico_video_bridge.py \
+  --gateway-endpoint tcp://127.0.0.1:5560 \
+  --encoder h264_nvenc
+```
+
+If multiple PICO headsets are attached, select the intended native interface
+explicitly:
+
+```bash
+python gear_sonic/scripts/run_pico_video_bridge.py \
+  --gateway-endpoint tcp://127.0.0.1:5560 \
+  --pico-usb-interface enx0123456789ab
+```
+
+The PICO listens on TCP 12345 and advertises that endpoint in `OPEN_CAMERA`.
+The bridge accepts it only when both the control peer and video target match
+the discovered PICO USB peer. Wi-Fi and ordinary Ethernet clients cannot open
+a video session.
+
+In XRoboToolkit Remote Vision, select **SONIC_HEAD** and press **Listen**.
+Expected results are:
 
 - the animated frame counter and timestamp keep changing;
 - `LEFT`, `RIGHT`, `TOP`, and `BOTTOM` have the correct orientation;
@@ -201,8 +231,9 @@ for this video check.
 | `SENSOR FRAME STALE` | The camera publisher stopped, the stream name is missing, or the newest Gateway frame is older than `--max-age-ms` (default 250 ms). |
 | `INVALID CAMERA FRAME` | `camera_encoded/ego_view` must be a 1-D uint8 shared-memory array with `encoding=jpeg_bytes` and `image_shape=[H,W,3]`. |
 | FFmpeg exits immediately | Run the encoder listing command above; use `--encoder libx264` to distinguish NVENC/driver problems from pipeline problems. |
-| PICO cannot connect | Verify the app uses the workstation LAN IP, TCP 13579 is reachable, and another bridge is not already bound to the port. |
-| Bridge cannot connect to PICO video | Keep the Remote Vision window listening, verify the PICO IP in `OPEN_CAMERA`, and confirm both devices are on the same network. |
+| `PICO USBOnly RNDIS network not found` | Confirm USB is attached, select USBOnly, and wait for NetworkManager DHCP. Do not create a static replacement profile. |
+| PICO cannot connect | Confirm XRoboToolkit control is connected through USBOnly, the bridge reports the current USB workstation address, and another bridge is not already bound to TCP 13579. |
+| Bridge cannot connect to PICO video | Keep Remote Vision listening and verify that the discovered PICO USB peer is reachable on TCP 12345. The bridge intentionally does not fall back to Wi-Fi. |
 | `OPEN_CAMERA` is rejected | Select `SONIC_HEAD`; the bridge intentionally accepts only 1280x480@30 at the configured 4 Mbps, with a video IP matching the control peer. |
 | Image is stretched or double | The bridge duplicates one 640x480 eye image; verify the `SONIC_HEAD` display properties were copied exactly. |
 

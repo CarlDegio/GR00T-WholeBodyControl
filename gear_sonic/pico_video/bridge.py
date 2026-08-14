@@ -27,6 +27,7 @@ from gear_sonic.pico_video.protocol import (
     frame_video_access_unit,
     parse_camera_request,
 )
+from gear_sonic.pico_video.usb_network import PicoUsbNetwork
 
 
 LOGGER = logging.getLogger(__name__)
@@ -64,6 +65,7 @@ class BridgeSettings:
     stale_fps: float = 2.0
     encoder: str = "h264_nvenc"
     stats_interval_s: float = 5.0
+    pico_usb: PicoUsbNetwork | None = None
 
     def __post_init__(self) -> None:
         if not self.gateway_endpoint:
@@ -90,6 +92,30 @@ class BridgeSettings:
             raise ValueError(f"unsupported encoder: {self.encoder}")
         if self.stats_interval_s < 0.0:
             raise ValueError("stats interval cannot be negative")
+        if self.pico_usb is not None and self.control_host != self.pico_usb.workstation_ip:
+            raise ValueError(
+                "USBOnly control host must match the discovered workstation USB address"
+            )
+
+
+def open_video_connection(
+    request: CameraRequest,
+    settings: BridgeSettings,
+) -> socket.socket:
+    """Open the PICO video socket, binding its source to USBOnly when enabled."""
+
+    source_address: tuple[str, int] | None = None
+    if settings.pico_usb is not None:
+        if ipaddress.ip_address(request.ip) != ipaddress.ip_address(
+            settings.pico_usb.pico_ip
+        ):
+            raise OSError("video target is not the discovered PICO USB peer")
+        source_address = (settings.pico_usb.workstation_ip, 0)
+    return socket.create_connection(
+        (request.ip, request.port),
+        timeout=2.0,
+        source_address=source_address,
+    )
 
 
 class LatestFrameSlot:
@@ -173,9 +199,7 @@ class VideoSession:
         sender: threading.Thread | None = None
         connection: socket.socket | None = None
         try:
-            connection = socket.create_connection(
-                (self.request.ip, self.request.port), timeout=2.0
-            )
+            connection = open_video_connection(self.request, self._settings)
             connection.settimeout(2.0)
             with self._socket_lock:
                 self._video_socket = connection
@@ -381,6 +405,12 @@ class PicoVideoBridge:
             raise ProtocolError(
                 "OPEN_CAMERA video IP must match the control connection peer"
             )
+        if self.settings.pico_usb is not None and ipaddress.ip_address(
+            control_peer_ip
+        ) != ipaddress.ip_address(self.settings.pico_usb.pico_ip):
+            raise ProtocolError(
+                "OPEN_CAMERA control peer is not the discovered PICO USB peer"
+            )
 
     def _stop_session(self) -> None:
         with self._session_lock:
@@ -463,6 +493,14 @@ class PicoVideoBridge:
         self._producer.start()
         self._ready.set()
         LOGGER.info("PICO control server listening on %s:%d", *self.control_address)
+        if self.settings.pico_usb is not None:
+            LOGGER.info(
+                "PICO USBOnly interface=%s workstation=%s pico=%s serial=%s",
+                self.settings.pico_usb.interface,
+                self.settings.pico_usb.workstation_ip,
+                self.settings.pico_usb.pico_ip,
+                self.settings.pico_usb.serial or "unknown",
+            )
         try:
             while not self._stop.is_set():
                 try:
