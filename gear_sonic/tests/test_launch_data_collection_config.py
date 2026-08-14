@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import json
+import subprocess
 import sys
 import types
 from pathlib import Path
 
 import pytest
+import tomli
 import yaml
 
 
@@ -36,7 +39,7 @@ def _write_config(
     tmp_path: Path,
     values: dict[str, object],
     *,
-    version: int = 1,
+    version: object = 1,
 ) -> Path:
     path = tmp_path / "launch_data_collection.yaml"
     path.write_text(
@@ -44,6 +47,7 @@ def _write_config(
             {
                 "schema": "sonic.data_collection_launch",
                 "version": version,
+                "profile": "test_data_collection",
                 "launch_data_collection": values,
             },
             sort_keys=False,
@@ -107,11 +111,78 @@ def test_loader_rejects_wrong_scalar_types(
         _load(_write_config(tmp_path, values))
 
 
-def test_loader_rejects_wrong_schema_version(tmp_path: Path) -> None:
-    path = _write_config(tmp_path, _default_values(), version=2)
+@pytest.mark.parametrize("version", [True, 1.0, 2])
+def test_loader_rejects_non_integer_or_unsupported_schema_version(
+    tmp_path: Path,
+    version: object,
+) -> None:
+    path = _write_config(tmp_path, _default_values(), version=version)
 
     with pytest.raises(ValueError, match="sonic.data_collection_launch version 1"):
         _load(path)
+
+
+def test_loader_rejects_unknown_top_level_field(tmp_path: Path) -> None:
+    path = _write_config(tmp_path, _default_values())
+    payload = yaml.safe_load(path.read_text(encoding="utf-8"))
+    payload["endpoints"] = {"camera_server": {"port": 5555}}
+    path.write_text(yaml.safe_dump(payload), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="unknown data collection YAML root fields"):
+        _load(path)
+
+
+@pytest.mark.parametrize("profile", [None, "", 123])
+def test_loader_requires_nonempty_string_profile(
+    tmp_path: Path,
+    profile: object,
+) -> None:
+    path = _write_config(tmp_path, _default_values())
+    payload = yaml.safe_load(path.read_text(encoding="utf-8"))
+    if profile is None:
+        payload.pop("profile")
+    else:
+        payload["profile"] = profile
+    path.write_text(yaml.safe_dump(payload), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="profile must be a non-empty string"):
+        _load(path)
+
+
+def test_loader_reports_unreadable_config_path(tmp_path: Path) -> None:
+    missing = tmp_path / "missing.yaml"
+
+    with pytest.raises(ValueError, match=r"cannot read launch YAML .*missing\.yaml"):
+        _load(missing)
+
+
+def test_bootstrap_dependency_probe_requires_tyro_and_yaml() -> None:
+    probe = getattr(
+        data_collection_launcher,
+        "_launcher_dependencies_available",
+        None,
+    )
+    assert probe is not None, "launcher dependency probe is missing"
+    imported: list[str] = []
+
+    def missing_yaml(module_name: str) -> object:
+        imported.append(module_name)
+        if module_name == "yaml":
+            raise ImportError("PyYAML is unavailable")
+        return object()
+
+    assert probe(missing_yaml) is False
+    assert imported == ["tyro", "yaml"]
+    assert probe(lambda _module_name: object()) is True
+
+
+def test_data_collection_extra_declares_pyyaml_directly() -> None:
+    pyproject_path = Path(__file__).resolve().parents[1] / "pyproject.toml"
+    pyproject = tomli.loads(pyproject_path.read_text(encoding="utf-8"))
+
+    dependencies = pyproject["project"]["optional-dependencies"]["data_collection"]
+
+    assert "pyyaml" in dependencies
 
 
 def test_parse_uses_selected_yaml_as_defaults_and_keeps_cli_overrides(
@@ -167,3 +238,40 @@ def test_parse_uses_selected_yaml_as_defaults_and_keeps_cli_overrides(
     assert parsed.task_prompt == "CLI prompt"
     assert parsed.camera_port == 6000
     assert parsed.pico_video is False
+
+
+def test_real_tyro_applies_cli_overrides_over_selected_yaml(tmp_path: Path) -> None:
+    values = _default_values()
+    values.update(task_prompt="yaml prompt", camera_port=6000, pico_video=True)
+    path = _write_config(tmp_path, values)
+    repo_root = Path(__file__).resolve().parents[2]
+    program = """
+import json
+import sys
+from gear_sonic.scripts.launch_data_collection import parse_data_collection_launch_config
+
+config = parse_data_collection_launch_config([
+    "--config", sys.argv[1],
+    "--task-prompt", "CLI prompt",
+    "--no-pico-video",
+])
+print(json.dumps({
+    "task_prompt": config.task_prompt,
+    "camera_port": config.camera_port,
+    "pico_video": config.pico_video,
+}))
+"""
+
+    completed = subprocess.run(
+        [sys.executable, "-c", program, str(path)],
+        cwd=repo_root,
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+
+    assert json.loads(completed.stdout) == {
+        "task_prompt": "CLI prompt",
+        "camera_port": 6000,
+        "pico_video": False,
+    }

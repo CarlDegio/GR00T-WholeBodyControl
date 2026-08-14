@@ -43,6 +43,7 @@ Usage (from repo root — no venv activation needed):
 
 import argparse
 from dataclasses import dataclass, fields
+import importlib
 from pathlib import Path
 import os
 import shlex
@@ -55,19 +56,25 @@ import time
 from typing import Any, get_type_hints
 
 
-def _bootstrap_venv():
-    """Re-exec with the .venv_data_collection Python if tyro is not available."""
+def _launcher_dependencies_available(import_module=importlib.import_module) -> bool:
     try:
-        import tyro  # noqa: F401
-        return
+        import_module("tyro")
+        import_module("yaml")
     except ImportError:
-        pass
+        return False
+    return True
+
+
+def _bootstrap_venv():
+    """Re-exec with the data-collection Python if launcher deps are unavailable."""
+    if _launcher_dependencies_available():
+        return
 
     repo_root = Path(__file__).resolve().parent.parent.parent
     venv_python = repo_root / ".venv_data_collection" / "bin" / "python"
     if not venv_python.exists():
         print(
-            "ERROR: tyro is not installed and .venv_data_collection not found.\n"
+            "ERROR: tyro/PyYAML unavailable and .venv_data_collection not found.\n"
             "  Run: bash install_scripts/install_data_collection.sh"
         )
         sys.exit(1)
@@ -237,17 +244,30 @@ def load_data_collection_launch_config(
     try:
         with config_path.open("r", encoding="utf-8") as stream:
             payload = yaml.safe_load(stream)
+    except OSError as exc:
+        raise ValueError(f"cannot read launch YAML {config_path}: {exc}") from exc
     except yaml.YAMLError as exc:
         raise ValueError(f"invalid launch YAML {config_path}: {exc}") from exc
     if not isinstance(payload, dict):
         raise ValueError(f"launch YAML must contain an object: {config_path}")
+    root_fields = {"schema", "version", "profile", "launch_data_collection"}
+    unknown_root_fields = set(payload) - root_fields
+    if unknown_root_fields:
+        raise ValueError(
+            "unknown data collection YAML root fields: "
+            + ", ".join(sorted(unknown_root_fields))
+        )
     if (
         payload.get("schema") != "sonic.data_collection_launch"
+        or type(payload.get("version")) is not int
         or payload.get("version") != 1
     ):
         raise ValueError(
             "launch YAML must use sonic.data_collection_launch version 1"
         )
+    profile = payload.get("profile")
+    if not isinstance(profile, str) or not profile.strip():
+        raise ValueError("launch YAML profile must be a non-empty string")
     raw_values = payload.get("launch_data_collection")
     if not isinstance(raw_values, dict):
         raise ValueError("launch YAML must contain a launch_data_collection object")
