@@ -255,6 +255,20 @@ def load_data_collection_launch_config(
     return DataCollectionLaunchConfig(config=str(config_path), **values)
 
 
+def parse_data_collection_launch_config(
+    args: list[str] | None = None,
+) -> DataCollectionLaunchConfig:
+    argv = list(sys.argv[1:] if args is None else args)
+    bootstrap = argparse.ArgumentParser(add_help=False)
+    bootstrap.add_argument(
+        "--config",
+        default=str(default_data_collection_config_path()),
+    )
+    bootstrap_args, _ = bootstrap.parse_known_args(argv)
+    yaml_defaults = load_data_collection_launch_config(bootstrap_args.config)
+    return tyro.cli(DataCollectionLaunchConfig, args=argv, default=yaml_defaults)
+
+
 SESSION_NAME = "sonic_data_collection"
 
 
@@ -692,5 +706,5 @@ def _signal_handler(sig, frame):
 
 if __name__ == "__main__":
     signal.signal(signal.SIGINT, _signal_handler)
-    config = tyro.cli(DataCollectionLaunchConfig)
+    config = parse_data_collection_launch_config()
     main(config)

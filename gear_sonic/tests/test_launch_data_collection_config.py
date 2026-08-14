@@ -112,3 +112,58 @@ def test_loader_rejects_wrong_schema_version(tmp_path: Path) -> None:
 
     with pytest.raises(ValueError, match="sonic.data_collection_launch version 1"):
         _load(path)
+
+
+def test_parse_uses_selected_yaml_as_defaults_and_keeps_cli_overrides(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    values = _default_values()
+    values.update(task_prompt="yaml prompt", camera_port=6000, pico_video=True)
+    path = _write_config(tmp_path, values)
+    captured: dict[str, object] = {}
+
+    def fake_cli(config_type, *, args, default):
+        captured.update(config_type=config_type, args=args, default=default)
+        parsed_values = vars(default).copy()
+        parsed_values.update(task_prompt="CLI prompt", pico_video=False)
+        return DataCollectionLaunchConfig(**parsed_values)
+
+    monkeypatch.setattr(
+        data_collection_launcher.tyro,
+        "cli",
+        fake_cli,
+        raising=False,
+    )
+    parser = getattr(
+        data_collection_launcher,
+        "parse_data_collection_launch_config",
+        None,
+    )
+    assert parser is not None, "two-stage data collection parser is missing"
+
+    parsed = parser(
+        [
+            "--config",
+            str(path),
+            "--task-prompt",
+            "CLI prompt",
+            "--no-pico-video",
+        ]
+    )
+
+    assert captured["config_type"] is DataCollectionLaunchConfig
+    assert captured["args"] == [
+        "--config",
+        str(path),
+        "--task-prompt",
+        "CLI prompt",
+        "--no-pico-video",
+    ]
+    yaml_defaults = captured["default"]
+    assert isinstance(yaml_defaults, DataCollectionLaunchConfig)
+    assert yaml_defaults.task_prompt == "yaml prompt"
+    assert yaml_defaults.camera_port == 6000
+    assert parsed.task_prompt == "CLI prompt"
+    assert parsed.camera_port == 6000
+    assert parsed.pico_video is False
