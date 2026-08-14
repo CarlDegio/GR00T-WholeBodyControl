@@ -275,3 +275,20 @@ print(json.dumps({
         "camera_port": 6000,
         "pico_video": False,
     }
+
+
+def test_cli_reports_config_error_without_traceback(tmp_path: Path) -> None:
+    repo_root = Path(__file__).resolve().parents[2]
+    script = repo_root / "gear_sonic" / "scripts" / "launch_data_collection.py"
+    missing = tmp_path / "missing.yaml"
+
+    completed = subprocess.run(
+        [sys.executable, str(script), "--config", str(missing)],
+        cwd=repo_root,
+        capture_output=True,
+        text=True,
+    )
+
+    assert completed.returncode == 2
+    assert f"ERROR: cannot read launch YAML {missing}" in completed.stderr
+    assert "Traceback" not in completed.stderr

@@ -726,5 +726,9 @@ def _signal_handler(sig, frame):
 
 if __name__ == "__main__":
     signal.signal(signal.SIGINT, _signal_handler)
-    config = parse_data_collection_launch_config()
+    try:
+        config = parse_data_collection_launch_config()
+    except ValueError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        sys.exit(2)
     main(config)
