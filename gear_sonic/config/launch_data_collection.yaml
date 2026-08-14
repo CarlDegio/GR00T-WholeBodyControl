@@ -5,8 +5,8 @@ launch_data_collection:
   sim: false
   deploy_input_type: zmq_manager
   deploy_zmq_host: localhost
-  deploy_checkpoint: ''
-  deploy_obs_config: ''
+  deploy_checkpoint: policy/sonic_v1_1/model
+  deploy_obs_config: policy/sonic_v1_1/observation_config.yaml
   deploy_planner: ''
   deploy_motion_data: ''
   deploy_output_type: ''

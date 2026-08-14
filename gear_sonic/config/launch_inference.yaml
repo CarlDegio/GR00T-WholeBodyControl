@@ -132,7 +132,7 @@ launch_inference:
   sim: false
   deploy_input_type: zmq_manager
   deploy_zmq_host: localhost
-  deploy_policy_variant: default  # default | low_latency | sonic_v1_1
+  deploy_policy_variant: sonic_v1_1  # default | low_latency | sonic_v1_1
   deploy_checkpoint: ''
   deploy_obs_config: ''
   deploy_planner: ''

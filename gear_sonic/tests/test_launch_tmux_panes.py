@@ -214,7 +214,7 @@ def test_gateways_are_mandatory_launcher_components() -> None:
 def test_yaml_contains_every_launch_parameter() -> None:
     loaded = load_inference_launch_config()
 
-    assert loaded.deploy_policy_variant == "default"
+    assert loaded.deploy_policy_variant == "sonic_v1_1"
     assert loaded.prompt.startswith("Approach the tabletop")
     assert loaded.lavira_mission == "blue basket"
     assert loaded.lavira_global_target == "blue basket"
