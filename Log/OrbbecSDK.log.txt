@@ -1,0 +1,810 @@
+[08/12 17:25:53.408840][info][26013][HostTimestampProvider.cpp:36] Update clock type to: realtime(0)
+[08/12 17:25:53.465884][info][26013][LinuxUsbPal.cpp:334] Create PollingDeviceWatcher!
+[08/12 17:25:53.465898][info][26013][DeviceManager.cpp:25] Current found device(s): (1)
+[08/12 17:25:53.465899][info][26013][DeviceManager.cpp:34] 	- Name: Gemini 345Lg, PID: 0x0813, SN/ID: CPMD464001G, Connection: USB3.2
+[08/12 17:25:53.465902][info][26013][DeviceManager.cpp:463] Enable net device enumeration: true
+[08/12 17:25:54.479643][info][26013][DeviceManager.cpp:25] Current device(s) list: (1)
+[08/12 17:25:54.479660][info][26013][DeviceManager.cpp:34] 	- Name: Gemini 345Lg, PID: 0x0813, SN/ID: CPMD464001G, Connection: USB3.2
+[08/12 17:25:54.479783][warning][26013][PropertyServer.cpp:120] [CPMD464001G] Not added to property map, property not found in OBPropertyBaseInfoMap, id=4037
+[08/12 17:25:54.479807][warning][26013][PropertyServer.cpp:120] [CPMD464001G] Not added to property map, property not found in OBPropertyBaseInfoMap, id=4059
+[08/12 17:25:54.479808][warning][26013][PropertyServer.cpp:120] [CPMD464001G] Not added to property map, property not found in OBPropertyBaseInfoMap, id=193
+[08/12 17:25:54.479809][warning][26013][PropertyServer.cpp:120] [CPMD464001G] Not added to property map, property not found in OBPropertyBaseInfoMap, id=194
+[08/12 17:25:54.479810][warning][26013][PropertyServer.cpp:120] [CPMD464001G] Not added to property map, property not found in OBPropertyBaseInfoMap, id=195
+[08/12 17:25:54.479818][warning][26013][PropertyServer.cpp:120] [CPMD464001G] Not added to property map, property not found in OBPropertyBaseInfoMap, id=4046
+[08/12 17:25:54.479819][warning][26013][PropertyServer.cpp:120] [CPMD464001G] Not added to property map, property not found in OBPropertyBaseInfoMap, id=2040
+[08/12 17:25:54.482609][info][26013][DeviceBase.cpp:742] key: AppSlot,value:2
+[08/12 17:25:54.482612][info][26013][DeviceBase.cpp:742] key: GxVer,value:V1.2.1
+[08/12 17:25:54.482612][info][26013][DeviceBase.cpp:742] key: HwVer,value:V1.1
+[08/12 17:25:54.482613][info][26013][DeviceBase.cpp:742] key: IspFwVer,value:2.1.17
+[08/12 17:25:54.482613][info][26013][DeviceBase.cpp:742] key: PresetVer,value:0.0.4
+[08/12 17:25:54.482613][info][26013][DeviceBase.cpp:742] key: cfg,value:0
+[08/12 17:25:54.482614][info][26013][DeviceBase.cpp:742] key: dtree,value:0
+[08/12 17:25:54.482614][info][26013][DeviceBase.cpp:742] key: postfliter,value:0
+[08/12 17:25:54.645127][info][26013][DeviceManager.cpp:200] Device created successfully! Name: Gemini 345Lg, PID: 0x0813, SN/ID: CPMD464001G FW: 1.9.03
+[08/12 17:25:54.651954][info][26013][ObLibuvcDevicePort.cpp:87] uvc_close done.
+[08/12 17:25:54.651959][info][26013][ObLibuvcDevicePort.cpp:88] ~ObLibuvcDevicePort done
+[08/12 17:25:54.677110][info][26013][ObLibuvcDevicePort.cpp:87] uvc_close done.
+[08/12 17:25:54.677117][info][26013][ObLibuvcDevicePort.cpp:88] ~ObLibuvcDevicePort done
+[08/12 17:26:10.783859][info][26173][HostTimestampProvider.cpp:36] Update clock type to: realtime(0)
+[08/12 17:26:10.841204][info][26173][LinuxUsbPal.cpp:334] Create PollingDeviceWatcher!
+[08/12 17:26:10.841213][info][26173][DeviceManager.cpp:25] Current found device(s): (1)
+[08/12 17:26:10.841214][info][26173][DeviceManager.cpp:34] 	- Name: Gemini 345Lg, PID: 0x0813, SN/ID: CPMD464001G, Connection: USB3.2
+[08/12 17:26:10.841216][info][26173][DeviceManager.cpp:463] Enable net device enumeration: true
+[08/12 17:26:11.847588][info][26173][DeviceManager.cpp:25] Current device(s) list: (1)
+[08/12 17:26:11.847603][info][26173][DeviceManager.cpp:34] 	- Name: Gemini 345Lg, PID: 0x0813, SN/ID: CPMD464001G, Connection: USB3.2
+[08/12 17:26:11.847741][warning][26173][PropertyServer.cpp:120] [CPMD464001G] Not added to property map, property not found in OBPropertyBaseInfoMap, id=4037
+[08/12 17:26:11.847764][warning][26173][PropertyServer.cpp:120] [CPMD464001G] Not added to property map, property not found in OBPropertyBaseInfoMap, id=4059
+[08/12 17:26:11.847766][warning][26173][PropertyServer.cpp:120] [CPMD464001G] Not added to property map, property not found in OBPropertyBaseInfoMap, id=193
+[08/12 17:26:11.847779][warning][26173][PropertyServer.cpp:120] [CPMD464001G] Not added to property map, property not found in OBPropertyBaseInfoMap, id=194
+[08/12 17:26:11.847781][warning][26173][PropertyServer.cpp:120] [CPMD464001G] Not added to property map, property not found in OBPropertyBaseInfoMap, id=195
+[08/12 17:26:11.847789][warning][26173][PropertyServer.cpp:120] [CPMD464001G] Not added to property map, property not found in OBPropertyBaseInfoMap, id=4046
+[08/12 17:26:11.847791][warning][26173][PropertyServer.cpp:120] [CPMD464001G] Not added to property map, property not found in OBPropertyBaseInfoMap, id=2040
+[08/12 17:26:11.850093][info][26173][DeviceBase.cpp:742] key: AppSlot,value:2
+[08/12 17:26:11.850095][info][26173][DeviceBase.cpp:742] key: GxVer,value:V1.2.1
+[08/12 17:26:11.850095][info][26173][DeviceBase.cpp:742] key: HwVer,value:V1.1
+[08/12 17:26:11.850096][info][26173][DeviceBase.cpp:742] key: IspFwVer,value:2.1.17
+[08/12 17:26:11.850096][info][26173][DeviceBase.cpp:742] key: PresetVer,value:0.0.4
+[08/12 17:26:11.850096][info][26173][DeviceBase.cpp:742] key: cfg,value:0
+[08/12 17:26:11.850097][info][26173][DeviceBase.cpp:742] key: dtree,value:0
+[08/12 17:26:11.850097][info][26173][DeviceBase.cpp:742] key: postfliter,value:0
+[08/12 17:26:12.011863][info][26173][DeviceManager.cpp:200] Device created successfully! Name: Gemini 345Lg, PID: 0x0813, SN/ID: CPMD464001G FW: 1.9.03
+[08/12 17:26:12.011938][info][26173][Pipeline.cpp:54] [CPMD464001G] Pipeline created with device: {name: Gemini 345Lg, sn: CPMD464001G}, @0x5AA9C24656C0
+[08/12 17:26:12.014638][info][26173][Pipeline.cpp:228] [CPMD464001G] Check and set config done!
+[08/12 17:26:12.014767][info][26173][Pipeline.cpp:266] [CPMD464001G] Try to start streams!
+[08/12 17:26:12.014770][info][26173][VideoSensor.cpp:61] [CPMD464001G] Try to start stream: {type: Color, format: RGB, width: 640, height: 480, fps: 30}
+[08/12 17:26:12.014772][info][26173][SensorBase.cpp:216] [CPMD464001G] Stream state changed from STOPPED to STARTING@Color
+[08/12 17:26:12.014775][info][26173][VideoSensor.cpp:130] [CPMD464001G] Start backend stream: {type: Color, format: YUYV, width: 640, height: 480, fps: 30}
+[08/12 17:26:12.118789][info][26173][VideoSensor.cpp:61] [CPMD464001G] Try to start stream: {type: Depth, format: Y16, width: 640, height: 480, fps: 30}
+[08/12 17:26:12.118801][info][26173][SensorBase.cpp:216] [CPMD464001G] Stream state changed from STOPPED to STARTING@Depth
+[08/12 17:26:12.118806][info][26173][VideoSensor.cpp:130] [CPMD464001G] Start backend stream: {type: Depth, format: Z16, width: 640, height: 480, fps: 30}
+[08/12 17:26:12.121938][info][26173][Pipeline.cpp:293] [CPMD464001G] Start streams done!
+[08/12 17:26:12.121941][info][26173][Pipeline.cpp:250] [CPMD464001G] Pipeline start done!
+[08/12 17:26:12.220644][info][26243][SensorBase.cpp:216] [CPMD464001G] Stream state changed from STARTING to STREAMING@Depth
+[08/12 17:26:12.916653][info][26239][SensorBase.cpp:216] [CPMD464001G] Stream state changed from STARTING to STREAMING@Color
+[08/12 17:26:12.929659][info][26173][Pipeline.cpp:367] [CPMD464001G] Try to stop pipeline!
+[08/12 17:26:12.929666][info][26173][Pipeline.cpp:343] [CPMD464001G] Try to stop streams!
+[08/12 17:26:12.929687][info][26173][SensorBase.cpp:216] [CPMD464001G] Stream state changed from STREAMING to STOPPING@Depth
+[08/12 17:26:12.986064][info][26173][SensorBase.cpp:216] [CPMD464001G] Stream state changed from STOPPING to STOPPED@Depth
+[08/12 17:26:12.986332][info][26173][Pipeline.cpp:357] [CPMD464001G] Sensor stream stopped, sensorType=Depth
+[08/12 17:26:12.986338][info][26173][SensorBase.cpp:216] [CPMD464001G] Stream state changed from STREAMING to STOPPING@Color
+[08/12 17:26:13.031614][info][26173][SensorBase.cpp:216] [CPMD464001G] Stream state changed from STOPPING to STOPPED@Color
+[08/12 17:26:13.032307][info][26173][Pipeline.cpp:357] [CPMD464001G] Sensor stream stopped, sensorType=Color
+[08/12 17:26:13.032309][info][26173][Pipeline.cpp:363] [CPMD464001G] Stop streams done!
+[08/12 17:26:13.032592][info][26173][Pipeline.cpp:393] [CPMD464001G] Stop pipeline done!
+[08/12 17:26:13.039046][info][26173][Pipeline.cpp:65] [CPMD464001G] Pipeline destroyed! @0x5AA9C24656C0
+[08/12 17:26:13.039147][info][26173][SensorBase.cpp:53] [CPMD464001G] SensorBase is destroyed
+[08/12 17:26:13.039954][info][26173][ObLibuvcDevicePort.cpp:87] uvc_close done.
+[08/12 17:26:13.039955][info][26173][ObLibuvcDevicePort.cpp:88] ~ObLibuvcDevicePort done
+[08/12 17:26:13.039968][info][26173][SensorBase.cpp:53] [CPMD464001G] SensorBase is destroyed
+[08/12 17:26:13.090439][info][26173][ObLibuvcDevicePort.cpp:87] uvc_close done.
+[08/12 17:26:13.090445][info][26173][ObLibuvcDevicePort.cpp:88] ~ObLibuvcDevicePort done
+[08/12 17:26:45.207188][info][26451][HostTimestampProvider.cpp:36] Update clock type to: realtime(0)
+[08/12 17:26:45.263516][info][26451][LinuxUsbPal.cpp:334] Create PollingDeviceWatcher!
+[08/12 17:26:45.263525][info][26451][DeviceManager.cpp:25] Current found device(s): (1)
+[08/12 17:26:45.263526][info][26451][DeviceManager.cpp:34] 	- Name: Gemini 345Lg, PID: 0x0813, SN/ID: CPMD464001G, Connection: USB3.2
+[08/12 17:26:45.263528][info][26451][DeviceManager.cpp:463] Enable net device enumeration: true
+[08/12 17:26:46.272299][info][26451][DeviceManager.cpp:25] Current device(s) list: (1)
+[08/12 17:26:46.272314][info][26451][DeviceManager.cpp:34] 	- Name: Gemini 345Lg, PID: 0x0813, SN/ID: CPMD464001G, Connection: USB3.2
+[08/12 17:26:46.272463][warning][26451][PropertyServer.cpp:120] [CPMD464001G] Not added to property map, property not found in OBPropertyBaseInfoMap, id=4037
+[08/12 17:26:46.272483][warning][26451][PropertyServer.cpp:120] [CPMD464001G] Not added to property map, property not found in OBPropertyBaseInfoMap, id=4059
+[08/12 17:26:46.272485][warning][26451][PropertyServer.cpp:120] [CPMD464001G] Not added to property map, property not found in OBPropertyBaseInfoMap, id=193
+[08/12 17:26:46.272487][warning][26451][PropertyServer.cpp:120] [CPMD464001G] Not added to property map, property not found in OBPropertyBaseInfoMap, id=194
+[08/12 17:26:46.272488][warning][26451][PropertyServer.cpp:120] [CPMD464001G] Not added to property map, property not found in OBPropertyBaseInfoMap, id=195
+[08/12 17:26:46.272497][warning][26451][PropertyServer.cpp:120] [CPMD464001G] Not added to property map, property not found in OBPropertyBaseInfoMap, id=4046
+[08/12 17:26:46.272498][warning][26451][PropertyServer.cpp:120] [CPMD464001G] Not added to property map, property not found in OBPropertyBaseInfoMap, id=2040
+[08/12 17:26:46.278100][info][26451][DeviceBase.cpp:742] key: AppSlot,value:2
+[08/12 17:26:46.278103][info][26451][DeviceBase.cpp:742] key: GxVer,value:V1.2.1
+[08/12 17:26:46.278104][info][26451][DeviceBase.cpp:742] key: HwVer,value:V1.1
+[08/12 17:26:46.278104][info][26451][DeviceBase.cpp:742] key: IspFwVer,value:2.1.17
+[08/12 17:26:46.278105][info][26451][DeviceBase.cpp:742] key: PresetVer,value:0.0.4
+[08/12 17:26:46.278105][info][26451][DeviceBase.cpp:742] key: cfg,value:0
+[08/12 17:26:46.278105][info][26451][DeviceBase.cpp:742] key: dtree,value:0
+[08/12 17:26:46.278106][info][26451][DeviceBase.cpp:742] key: postfliter,value:0
+[08/12 17:26:46.441712][info][26451][DeviceManager.cpp:200] Device created successfully! Name: Gemini 345Lg, PID: 0x0813, SN/ID: CPMD464001G FW: 1.9.03
+[08/12 17:26:46.441782][info][26451][Pipeline.cpp:54] [CPMD464001G] Pipeline created with device: {name: Gemini 345Lg, sn: CPMD464001G}, @0x73EA3C3F3BA0
+[08/12 17:26:46.444502][info][26451][Pipeline.cpp:228] [CPMD464001G] Check and set config done!
+[08/12 17:26:46.444642][info][26451][Pipeline.cpp:266] [CPMD464001G] Try to start streams!
+[08/12 17:26:46.444645][info][26451][VideoSensor.cpp:61] [CPMD464001G] Try to start stream: {type: Color, format: RGB, width: 640, height: 480, fps: 30}
+[08/12 17:26:46.444648][info][26451][SensorBase.cpp:216] [CPMD464001G] Stream state changed from STOPPED to STARTING@Color
+[08/12 17:26:46.444650][info][26451][VideoSensor.cpp:130] [CPMD464001G] Start backend stream: {type: Color, format: YUYV, width: 640, height: 480, fps: 30}
+[08/12 17:26:46.447140][info][26451][VideoSensor.cpp:61] [CPMD464001G] Try to start stream: {type: Depth, format: Y16, width: 640, height: 480, fps: 30}
+[08/12 17:26:46.447147][info][26451][SensorBase.cpp:216] [CPMD464001G] Stream state changed from STOPPED to STARTING@Depth
+[08/12 17:26:46.447152][info][26451][VideoSensor.cpp:130] [CPMD464001G] Start backend stream: {type: Depth, format: Z16, width: 640, height: 480, fps: 30}
+[08/12 17:26:46.450105][info][26451][Pipeline.cpp:293] [CPMD464001G] Start streams done!
+[08/12 17:26:46.450106][info][26451][Pipeline.cpp:250] [CPMD464001G] Pipeline start done!
+[08/12 17:26:46.545248][info][26486][SensorBase.cpp:216] [CPMD464001G] Stream state changed from STARTING to STREAMING@Depth
+[08/12 17:26:47.246511][info][26484][SensorBase.cpp:216] [CPMD464001G] Stream state changed from STARTING to STREAMING@Color
+[08/12 17:26:49.815475][info][26451][Pipeline.cpp:367] [CPMD464001G] Try to stop pipeline!
+[08/12 17:26:49.815489][info][26451][Pipeline.cpp:343] [CPMD464001G] Try to stop streams!
+[08/12 17:26:49.815499][info][26451][SensorBase.cpp:216] [CPMD464001G] Stream state changed from STREAMING to STOPPING@Depth
+[08/12 17:26:49.871512][info][26451][SensorBase.cpp:216] [CPMD464001G] Stream state changed from STOPPING to STOPPED@Depth
+[08/12 17:26:49.873268][info][26451][Pipeline.cpp:357] [CPMD464001G] Sensor stream stopped, sensorType=Depth
+[08/12 17:26:49.873285][info][26451][SensorBase.cpp:216] [CPMD464001G] Stream state changed from STREAMING to STOPPING@Color
+[08/12 17:26:49.915464][info][26451][SensorBase.cpp:216] [CPMD464001G] Stream state changed from STOPPING to STOPPED@Color
+[08/12 17:26:49.915704][info][26451][Pipeline.cpp:357] [CPMD464001G] Sensor stream stopped, sensorType=Color
+[08/12 17:26:49.915706][info][26451][Pipeline.cpp:363] [CPMD464001G] Stop streams done!
+[08/12 17:26:49.916006][info][26451][Pipeline.cpp:393] [CPMD464001G] Stop pipeline done!
+[08/12 17:26:49.916032][info][26451][Pipeline.cpp:65] [CPMD464001G] Pipeline destroyed! @0x73EA3C3F3BA0
+[08/12 17:26:49.916095][info][26451][SensorBase.cpp:53] [CPMD464001G] SensorBase is destroyed
+[08/12 17:26:49.918209][info][26451][ObLibuvcDevicePort.cpp:87] uvc_close done.
+[08/12 17:26:49.918212][info][26451][ObLibuvcDevicePort.cpp:88] ~ObLibuvcDevicePort done
+[08/12 17:26:49.918238][info][26451][SensorBase.cpp:53] [CPMD464001G] SensorBase is destroyed
+[08/12 17:26:49.925386][info][26451][ObLibuvcDevicePort.cpp:87] uvc_close done.
+[08/12 17:26:49.925393][info][26451][ObLibuvcDevicePort.cpp:88] ~ObLibuvcDevicePort done
+[08/12 17:26:59.161929][info][26725][HostTimestampProvider.cpp:36] Update clock type to: realtime(0)
+[08/12 17:26:59.219527][info][26725][LinuxUsbPal.cpp:334] Create PollingDeviceWatcher!
+[08/12 17:26:59.219539][info][26725][DeviceManager.cpp:25] Current found device(s): (1)
+[08/12 17:26:59.219541][info][26725][DeviceManager.cpp:34] 	- Name: Gemini 345Lg, PID: 0x0813, SN/ID: CPMD464001G, Connection: USB3.2
+[08/12 17:26:59.219543][info][26725][DeviceManager.cpp:463] Enable net device enumeration: true
+[08/12 17:27:00.241629][info][26725][DeviceManager.cpp:25] Current device(s) list: (1)
+[08/12 17:27:00.241650][info][26725][DeviceManager.cpp:34] 	- Name: Gemini 345Lg, PID: 0x0813, SN/ID: CPMD464001G, Connection: USB3.2
+[08/12 17:27:00.241785][warning][26725][PropertyServer.cpp:120] [CPMD464001G] Not added to property map, property not found in OBPropertyBaseInfoMap, id=4037
+[08/12 17:27:00.241812][warning][26725][PropertyServer.cpp:120] [CPMD464001G] Not added to property map, property not found in OBPropertyBaseInfoMap, id=4059
+[08/12 17:27:00.241814][warning][26725][PropertyServer.cpp:120] [CPMD464001G] Not added to property map, property not found in OBPropertyBaseInfoMap, id=193
+[08/12 17:27:00.241816][warning][26725][PropertyServer.cpp:120] [CPMD464001G] Not added to property map, property not found in OBPropertyBaseInfoMap, id=194
+[08/12 17:27:00.241817][warning][26725][PropertyServer.cpp:120] [CPMD464001G] Not added to property map, property not found in OBPropertyBaseInfoMap, id=195
+[08/12 17:27:00.241830][warning][26725][PropertyServer.cpp:120] [CPMD464001G] Not added to property map, property not found in OBPropertyBaseInfoMap, id=4046
+[08/12 17:27:00.241843][warning][26725][PropertyServer.cpp:120] [CPMD464001G] Not added to property map, property not found in OBPropertyBaseInfoMap, id=2040
+[08/12 17:27:00.243846][info][26725][DeviceBase.cpp:742] key: AppSlot,value:2
+[08/12 17:27:00.243848][info][26725][DeviceBase.cpp:742] key: GxVer,value:V1.2.1
+[08/12 17:27:00.243849][info][26725][DeviceBase.cpp:742] key: HwVer,value:V1.1
+[08/12 17:27:00.243849][info][26725][DeviceBase.cpp:742] key: IspFwVer,value:2.1.17
+[08/12 17:27:00.243850][info][26725][DeviceBase.cpp:742] key: PresetVer,value:0.0.4
+[08/12 17:27:00.243850][info][26725][DeviceBase.cpp:742] key: cfg,value:0
+[08/12 17:27:00.243850][info][26725][DeviceBase.cpp:742] key: dtree,value:0
+[08/12 17:27:00.243851][info][26725][DeviceBase.cpp:742] key: postfliter,value:0
+[08/12 17:27:00.409028][info][26725][DeviceManager.cpp:200] Device created successfully! Name: Gemini 345Lg, PID: 0x0813, SN/ID: CPMD464001G FW: 1.9.03
+[08/12 17:27:00.411519][info][26725][ObLibuvcDevicePort.cpp:87] uvc_close done.
+[08/12 17:27:00.411520][info][26725][ObLibuvcDevicePort.cpp:88] ~ObLibuvcDevicePort done
+[08/12 17:27:00.438499][info][26725][ObLibuvcDevicePort.cpp:87] uvc_close done.
+[08/12 17:27:00.438506][info][26725][ObLibuvcDevicePort.cpp:88] ~ObLibuvcDevicePort done
+[08/12 17:27:01.376454][info][26834][HostTimestampProvider.cpp:36] Update clock type to: realtime(0)
+[08/12 17:27:01.377219][info][26834][LinuxUsbPal.cpp:334] Create PollingDeviceWatcher!
+[08/12 17:27:01.377227][info][26834][DeviceManager.cpp:25] Current found device(s): (1)
+[08/12 17:27:01.377228][info][26834][DeviceManager.cpp:34] 	- Name: Gemini 345Lg, PID: 0x0813, SN/ID: CPMD464001G, Connection: USB3.2
+[08/12 17:27:01.377230][info][26834][DeviceManager.cpp:463] Enable net device enumeration: true
+[08/12 17:27:02.381789][info][26834][DeviceManager.cpp:25] Current device(s) list: (1)
+[08/12 17:27:02.381806][info][26834][DeviceManager.cpp:34] 	- Name: Gemini 345Lg, PID: 0x0813, SN/ID: CPMD464001G, Connection: USB3.2
+[08/12 17:27:02.381929][warning][26834][PropertyServer.cpp:120] [CPMD464001G] Not added to property map, property not found in OBPropertyBaseInfoMap, id=4037
+[08/12 17:27:02.381946][warning][26834][PropertyServer.cpp:120] [CPMD464001G] Not added to property map, property not found in OBPropertyBaseInfoMap, id=4059
+[08/12 17:27:02.381953][warning][26834][PropertyServer.cpp:120] [CPMD464001G] Not added to property map, property not found in OBPropertyBaseInfoMap, id=193
+[08/12 17:27:02.381954][warning][26834][PropertyServer.cpp:120] [CPMD464001G] Not added to property map, property not found in OBPropertyBaseInfoMap, id=194
+[08/12 17:27:02.381954][warning][26834][PropertyServer.cpp:120] [CPMD464001G] Not added to property map, property not found in OBPropertyBaseInfoMap, id=195
+[08/12 17:27:02.381962][warning][26834][PropertyServer.cpp:120] [CPMD464001G] Not added to property map, property not found in OBPropertyBaseInfoMap, id=4046
+[08/12 17:27:02.381963][warning][26834][PropertyServer.cpp:120] [CPMD464001G] Not added to property map, property not found in OBPropertyBaseInfoMap, id=2040
+[08/12 17:27:02.386556][info][26834][DeviceBase.cpp:742] key: AppSlot,value:2
+[08/12 17:27:02.386561][info][26834][DeviceBase.cpp:742] key: GxVer,value:V1.2.1
+[08/12 17:27:02.386561][info][26834][DeviceBase.cpp:742] key: HwVer,value:V1.1
+[08/12 17:27:02.386561][info][26834][DeviceBase.cpp:742] key: IspFwVer,value:2.1.17
+[08/12 17:27:02.386562][info][26834][DeviceBase.cpp:742] key: PresetVer,value:0.0.4
+[08/12 17:27:02.386562][info][26834][DeviceBase.cpp:742] key: cfg,value:0
+[08/12 17:27:02.386562][info][26834][DeviceBase.cpp:742] key: dtree,value:0
+[08/12 17:27:02.386563][info][26834][DeviceBase.cpp:742] key: postfliter,value:0
+[08/12 17:27:02.548369][info][26834][DeviceManager.cpp:200] Device created successfully! Name: Gemini 345Lg, PID: 0x0813, SN/ID: CPMD464001G FW: 1.9.03
+[08/12 17:27:02.548462][info][26834][Pipeline.cpp:54] [CPMD464001G] Pipeline created with device: {name: Gemini 345Lg, sn: CPMD464001G}, @0x7A48B8377000
+[08/12 17:27:02.551217][info][26834][Pipeline.cpp:228] [CPMD464001G] Check and set config done!
+[08/12 17:27:02.551357][info][26834][Pipeline.cpp:266] [CPMD464001G] Try to start streams!
+[08/12 17:27:02.551359][info][26834][VideoSensor.cpp:61] [CPMD464001G] Try to start stream: {type: Color, format: RGB, width: 640, height: 480, fps: 30}
+[08/12 17:27:02.551362][info][26834][SensorBase.cpp:216] [CPMD464001G] Stream state changed from STOPPED to STARTING@Color
+[08/12 17:27:02.551363][info][26834][VideoSensor.cpp:130] [CPMD464001G] Start backend stream: {type: Color, format: YUYV, width: 640, height: 480, fps: 30}
+[08/12 17:27:02.553643][info][26834][VideoSensor.cpp:61] [CPMD464001G] Try to start stream: {type: Depth, format: Y16, width: 640, height: 480, fps: 30}
+[08/12 17:27:02.553647][info][26834][SensorBase.cpp:216] [CPMD464001G] Stream state changed from STOPPED to STARTING@Depth
+[08/12 17:27:02.553651][info][26834][VideoSensor.cpp:130] [CPMD464001G] Start backend stream: {type: Depth, format: Z16, width: 640, height: 480, fps: 30}
+[08/12 17:27:02.557428][info][26834][Pipeline.cpp:293] [CPMD464001G] Start streams done!
+[08/12 17:27:02.557431][info][26834][Pipeline.cpp:250] [CPMD464001G] Pipeline start done!
+[08/12 17:27:02.651901][info][26866][SensorBase.cpp:216] [CPMD464001G] Stream state changed from STARTING to STREAMING@Depth
+[08/12 17:27:03.353396][info][26864][SensorBase.cpp:216] [CPMD464001G] Stream state changed from STARTING to STREAMING@Color
+[08/12 17:27:07.681974][info][26866][VideoSensor.cpp:180] [CPMD464001G] Depth backend frame callback, frameRate=30.218687fps
+[08/12 17:27:07.682792][info][26870][SensorBase.cpp:405] [CPMD464001G] Depth Streaming... frameRate=30.230709fps
+[08/12 17:27:08.387889][info][26864][VideoSensor.cpp:180] [CPMD464001G] Color backend frame callback, frameRate=30.188681fps
+[08/12 17:27:08.388532][info][26885][SensorBase.cpp:405] [CPMD464001G] Color Streaming... frameRate=30.194677fps
+[08/12 17:27:12.712240][info][26866][VideoSensor.cpp:180] [CPMD464001G] Depth backend frame callback, frameRate=30.019880fps
+[08/12 17:27:12.713027][info][26870][SensorBase.cpp:405] [CPMD464001G] Depth Streaming... frameRate=30.019880fps
+[08/12 17:27:13.419237][info][26864][VideoSensor.cpp:180] [CPMD464001G] Color backend frame callback, frameRate=30.013912fps
+[08/12 17:27:13.419502][info][26885][SensorBase.cpp:405] [CPMD464001G] Color Streaming... frameRate=30.013912fps
+[08/12 17:27:17.742748][info][26866][VideoSensor.cpp:180] [CPMD464001G] Depth backend frame callback, frameRate=30.013912fps
+[08/12 17:27:17.743417][info][26870][SensorBase.cpp:405] [CPMD464001G] Depth Streaming... frameRate=30.019880fps
+[08/12 17:27:18.452541][info][26864][VideoSensor.cpp:180] [CPMD464001G] Color backend frame callback, frameRate=30.001987fps
+[08/12 17:27:18.452773][info][26885][SensorBase.cpp:405] [CPMD464001G] Color Streaming... frameRate=29.996027fps
+[08/12 17:27:22.773299][info][26866][VideoSensor.cpp:180] [CPMD464001G] Depth backend frame callback, frameRate=30.019880fps
+[08/12 17:27:22.774107][info][26870][SensorBase.cpp:405] [CPMD464001G] Depth Streaming... frameRate=30.013912fps
+[08/12 17:27:23.453089][info][26864][VideoSensor.cpp:180] [CPMD464001G] Color backend frame callback, frameRate=29.994001fps
+[08/12 17:27:23.486194][info][26885][SensorBase.cpp:405] [CPMD464001G] Color Streaming... frameRate=30.001987fps
+[08/12 17:27:27.803640][info][26866][VideoSensor.cpp:180] [CPMD464001G] Depth backend frame callback, frameRate=30.019880fps
+[08/12 17:27:27.804380][info][26870][SensorBase.cpp:405] [CPMD464001G] Depth Streaming... frameRate=30.019880fps
+[08/12 17:27:28.486120][info][26864][VideoSensor.cpp:180] [CPMD464001G] Color backend frame callback, frameRate=30.001987fps
+[08/12 17:27:28.519869][info][26885][SensorBase.cpp:405] [CPMD464001G] Color Streaming... frameRate=29.996027fps
+[08/12 17:27:32.834304][info][26866][VideoSensor.cpp:180] [CPMD464001G] Depth backend frame callback, frameRate=30.013912fps
+[08/12 17:27:32.835060][info][26870][SensorBase.cpp:405] [CPMD464001G] Depth Streaming... frameRate=30.013912fps
+[08/12 17:27:33.519517][info][26864][VideoSensor.cpp:180] [CPMD464001G] Color backend frame callback, frameRate=30.001987fps
+[08/12 17:27:33.553315][info][26885][SensorBase.cpp:405] [CPMD464001G] Color Streaming... frameRate=30.001987fps
+[08/12 17:27:37.864879][info][26866][VideoSensor.cpp:180] [CPMD464001G] Depth backend frame callback, frameRate=30.013912fps
+[08/12 17:27:37.865594][info][26870][SensorBase.cpp:405] [CPMD464001G] Depth Streaming... frameRate=30.019880fps
+[08/12 17:27:38.552771][info][26864][VideoSensor.cpp:180] [CPMD464001G] Color backend frame callback, frameRate=29.996027fps
+[08/12 17:27:38.586280][info][26885][SensorBase.cpp:405] [CPMD464001G] Color Streaming... frameRate=30.001987fps
+[08/12 17:27:42.895038][info][26866][VideoSensor.cpp:180] [CPMD464001G] Depth backend frame callback, frameRate=30.019880fps
+[08/12 17:27:42.895990][info][26870][SensorBase.cpp:405] [CPMD464001G] Depth Streaming... frameRate=30.013912fps
+[08/12 17:27:43.585904][info][26864][VideoSensor.cpp:180] [CPMD464001G] Color backend frame callback, frameRate=30.001987fps
+[08/12 17:27:43.619468][info][26885][SensorBase.cpp:405] [CPMD464001G] Color Streaming... frameRate=30.001987fps
+[08/12 17:27:47.925641][info][26866][VideoSensor.cpp:180] [CPMD464001G] Depth backend frame callback, frameRate=30.019880fps
+[08/12 17:27:47.926477][info][26870][SensorBase.cpp:405] [CPMD464001G] Depth Streaming... frameRate=30.019880fps
+[08/12 17:27:48.620673][info][26864][VideoSensor.cpp:180] [CPMD464001G] Color backend frame callback, frameRate=29.996027fps
+[08/12 17:27:48.621055][info][26885][SensorBase.cpp:405] [CPMD464001G] Color Streaming... frameRate=29.988007fps
+[08/12 17:27:52.956150][info][26866][VideoSensor.cpp:180] [CPMD464001G] Depth backend frame callback, frameRate=30.013912fps
+[08/12 17:27:52.956976][info][26870][SensorBase.cpp:405] [CPMD464001G] Depth Streaming... frameRate=30.013912fps
+[08/12 17:27:53.652664][info][26864][VideoSensor.cpp:180] [CPMD464001G] Color backend frame callback, frameRate=30.007948fps
+[08/12 17:27:53.653041][info][26885][SensorBase.cpp:405] [CPMD464001G] Color Streaming... frameRate=30.007948fps
+[08/12 17:27:57.986589][info][26866][VideoSensor.cpp:180] [CPMD464001G] Depth backend frame callback, frameRate=30.019880fps
+[08/12 17:27:57.987502][info][26870][SensorBase.cpp:405] [CPMD464001G] Depth Streaming... frameRate=30.019880fps
+[08/12 17:27:58.686036][info][26864][VideoSensor.cpp:180] [CPMD464001G] Color backend frame callback, frameRate=29.996027fps
+[08/12 17:27:58.686594][info][26885][SensorBase.cpp:405] [CPMD464001G] Color Streaming... frameRate=30.001987fps
+[08/12 17:28:03.017004][info][26866][VideoSensor.cpp:180] [CPMD464001G] Depth backend frame callback, frameRate=30.013912fps
+[08/12 17:28:03.017923][info][26870][SensorBase.cpp:405] [CPMD464001G] Depth Streaming... frameRate=30.013912fps
+[08/12 17:28:03.719232][info][26864][VideoSensor.cpp:180] [CPMD464001G] Color backend frame callback, frameRate=30.001987fps
+[08/12 17:28:03.719678][info][26885][SensorBase.cpp:405] [CPMD464001G] Color Streaming... frameRate=30.001987fps
+[08/12 17:28:03.542151][info][30896][HostTimestampProvider.cpp:36] Update clock type to: realtime(0)
+[08/12 17:28:03.542883][info][30896][LinuxUsbPal.cpp:334] Create PollingDeviceWatcher!
+[08/12 17:28:03.542888][info][30896][DeviceManager.cpp:25] Current found device(s): (1)
+[08/12 17:28:03.542889][info][30896][DeviceManager.cpp:34] 	- Name: Gemini 345Lg, PID: 0x0813, SN/ID: CPMD464001G, Connection: USB3.2
+[08/12 17:28:03.542890][info][30896][DeviceManager.cpp:463] Enable net device enumeration: true
+[08/12 17:28:04.554794][info][30896][DeviceManager.cpp:25] Current device(s) list: (1)
+[08/12 17:28:04.554812][info][30896][DeviceManager.cpp:34] 	- Name: Gemini 345Lg, PID: 0x0813, SN/ID: CPMD464001G, Connection: USB3.2
+[08/12 17:28:04.554948][warning][30896][PropertyServer.cpp:120] [CPMD464001G] Not added to property map, property not found in OBPropertyBaseInfoMap, id=4037
+[08/12 17:28:04.554975][warning][30896][PropertyServer.cpp:120] [CPMD464001G] Not added to property map, property not found in OBPropertyBaseInfoMap, id=4059
+[08/12 17:28:04.555000][warning][30896][PropertyServer.cpp:120] [CPMD464001G] Not added to property map, property not found in OBPropertyBaseInfoMap, id=193
+[08/12 17:28:04.555001][warning][30896][PropertyServer.cpp:120] [CPMD464001G] Not added to property map, property not found in OBPropertyBaseInfoMap, id=194
+[08/12 17:28:04.555002][warning][30896][PropertyServer.cpp:120] [CPMD464001G] Not added to property map, property not found in OBPropertyBaseInfoMap, id=195
+[08/12 17:28:04.555012][warning][30896][PropertyServer.cpp:120] [CPMD464001G] Not added to property map, property not found in OBPropertyBaseInfoMap, id=4046
+[08/12 17:28:04.555014][warning][30896][PropertyServer.cpp:120] [CPMD464001G] Not added to property map, property not found in OBPropertyBaseInfoMap, id=2040
+[08/12 17:28:04.556842][warning][30896][ObLibuvcDevicePort.cpp:71] uvc_open failed: [Path: 4-4-7.0, Return Code: -6]
+[08/12 17:28:04.556879][warning][30896][ObException.cpp:32] A unrecoverable_exception has occurred!
+ - where: ObLibuvcDevicePort.cpp(72)
+ - msg: uvc_open failed: [Path: 4-4-7.0, Return Code: -6]
+ - type: IO
+ - status: 115
+[08/12 17:28:04.556926][warning][30896][DeviceBase.cpp:374] Execute failure! A libobsensor_exception has occurred!
+ - where: DeviceBase.cpp(374):getComponent
+ - msg: uvc_open failed: [Path: 4-4-7.0, Return Code: -6]
+ - type: N11libobsensor23unrecoverable_exceptionE
+ - status: 115
+[08/12 17:28:04.557240][warning][30896][ObLibuvcDevicePort.cpp:71] uvc_open failed: [Path: 4-4-7.0, Return Code: -6]
+[08/12 17:28:04.557241][warning][30896][ObException.cpp:32] A unrecoverable_exception has occurred!
+ - where: ObLibuvcDevicePort.cpp(72)
+ - msg: uvc_open failed: [Path: 4-4-7.0, Return Code: -6]
+ - type: IO
+ - status: 115
+[08/12 17:28:04.557257][warning][30896][DeviceBase.cpp:374] Execute failure! A libobsensor_exception has occurred!
+ - where: DeviceBase.cpp(374):getComponent
+ - msg: uvc_open failed: [Path: 4-4-7.0, Return Code: -6]
+ - type: N11libobsensor23unrecoverable_exceptionE
+ - status: 115
+[08/12 17:28:08.047612][info][26866][VideoSensor.cpp:180] [CPMD464001G] Depth backend frame callback, frameRate=30.019880fps
+[08/12 17:28:08.048295][info][26870][SensorBase.cpp:405] [CPMD464001G] Depth Streaming... frameRate=30.019880fps
+[08/12 17:28:08.752446][info][26864][VideoSensor.cpp:180] [CPMD464001G] Color backend frame callback, frameRate=30.001987fps
+[08/12 17:28:08.752899][info][26885][SensorBase.cpp:405] [CPMD464001G] Color Streaming... frameRate=29.996027fps
+[08/12 17:28:13.078169][info][26866][VideoSensor.cpp:180] [CPMD464001G] Depth backend frame callback, frameRate=30.013912fps
+[08/12 17:28:13.079184][info][26870][SensorBase.cpp:405] [CPMD464001G] Depth Streaming... frameRate=30.013912fps
+[08/12 17:28:13.785815][info][26864][VideoSensor.cpp:180] [CPMD464001G] Color backend frame callback, frameRate=29.996027fps
+[08/12 17:28:13.786077][info][26885][SensorBase.cpp:405] [CPMD464001G] Color Streaming... frameRate=30.001987fps
+[08/12 17:28:18.108507][info][26866][VideoSensor.cpp:180] [CPMD464001G] Depth backend frame callback, frameRate=30.019880fps
+[08/12 17:28:18.109629][info][26870][SensorBase.cpp:405] [CPMD464001G] Depth Streaming... frameRate=30.019880fps
+[08/12 17:28:18.818975][info][26864][VideoSensor.cpp:180] [CPMD464001G] Color backend frame callback, frameRate=30.001987fps
+[08/12 17:28:18.819177][info][26885][SensorBase.cpp:405] [CPMD464001G] Color Streaming... frameRate=30.001987fps
+[08/12 17:28:23.139019][info][26866][VideoSensor.cpp:180] [CPMD464001G] Depth backend frame callback, frameRate=30.013912fps
+[08/12 17:28:23.139973][info][26870][SensorBase.cpp:405] [CPMD464001G] Depth Streaming... frameRate=30.013912fps
+[08/12 17:28:23.853055][info][26864][VideoSensor.cpp:180] [CPMD464001G] Color backend frame callback, frameRate=29.996027fps
+[08/12 17:28:23.853314][info][26885][SensorBase.cpp:405] [CPMD464001G] Color Streaming... frameRate=29.996027fps
+[08/12 17:28:28.169858][info][26866][VideoSensor.cpp:180] [CPMD464001G] Depth backend frame callback, frameRate=30.013912fps
+[08/12 17:28:28.170882][info][26870][SensorBase.cpp:405] [CPMD464001G] Depth Streaming... frameRate=30.013912fps
+[08/12 17:28:28.885534][info][26864][VideoSensor.cpp:180] [CPMD464001G] Color backend frame callback, frameRate=30.007948fps
+[08/12 17:28:28.885898][info][26885][SensorBase.cpp:405] [CPMD464001G] Color Streaming... frameRate=30.001987fps
+[08/12 17:28:33.200027][info][26866][VideoSensor.cpp:180] [CPMD464001G] Depth backend frame callback, frameRate=30.019880fps
+[08/12 17:28:33.201031][info][26870][SensorBase.cpp:405] [CPMD464001G] Depth Streaming... frameRate=30.019880fps
+[08/12 17:28:33.918891][info][26864][VideoSensor.cpp:180] [CPMD464001G] Color backend frame callback, frameRate=29.996027fps
+[08/12 17:28:33.919222][info][26885][SensorBase.cpp:405] [CPMD464001G] Color Streaming... frameRate=30.001987fps
+[08/12 17:28:38.230486][info][26866][VideoSensor.cpp:180] [CPMD464001G] Depth backend frame callback, frameRate=30.019880fps
+[08/12 17:28:38.231259][info][26870][SensorBase.cpp:405] [CPMD464001G] Depth Streaming... frameRate=30.019880fps
+[08/12 17:28:38.952252][info][26864][VideoSensor.cpp:180] [CPMD464001G] Color backend frame callback, frameRate=30.001987fps
+[08/12 17:28:38.952807][info][26885][SensorBase.cpp:405] [CPMD464001G] Color Streaming... frameRate=29.996027fps
+[08/12 17:29:18.426225][info][33878][HostTimestampProvider.cpp:36] Update clock type to: realtime(0)
+[08/12 17:29:18.482438][info][33878][LinuxUsbPal.cpp:334] Create PollingDeviceWatcher!
+[08/12 17:29:18.482449][info][33878][DeviceManager.cpp:25] Current found device(s): (1)
+[08/12 17:29:18.482450][info][33878][DeviceManager.cpp:34] 	- Name: Gemini 345Lg, PID: 0x0813, SN/ID: CPMD464001G, Connection: USB3.2
+[08/12 17:29:18.482452][info][33878][DeviceManager.cpp:463] Enable net device enumeration: true
+[08/12 17:29:19.483938][info][33878][DeviceManager.cpp:25] Current device(s) list: (1)
+[08/12 17:29:19.483952][info][33878][DeviceManager.cpp:34] 	- Name: Gemini 345Lg, PID: 0x0813, SN/ID: CPMD464001G, Connection: USB3.2
+[08/12 17:29:19.484053][warning][33878][PropertyServer.cpp:120] [CPMD464001G] Not added to property map, property not found in OBPropertyBaseInfoMap, id=4037
+[08/12 17:29:19.484073][warning][33878][PropertyServer.cpp:120] [CPMD464001G] Not added to property map, property not found in OBPropertyBaseInfoMap, id=4059
+[08/12 17:29:19.484075][warning][33878][PropertyServer.cpp:120] [CPMD464001G] Not added to property map, property not found in OBPropertyBaseInfoMap, id=193
+[08/12 17:29:19.484076][warning][33878][PropertyServer.cpp:120] [CPMD464001G] Not added to property map, property not found in OBPropertyBaseInfoMap, id=194
+[08/12 17:29:19.484077][warning][33878][PropertyServer.cpp:120] [CPMD464001G] Not added to property map, property not found in OBPropertyBaseInfoMap, id=195
+[08/12 17:29:19.484086][warning][33878][PropertyServer.cpp:120] [CPMD464001G] Not added to property map, property not found in OBPropertyBaseInfoMap, id=4046
+[08/12 17:29:19.484088][warning][33878][PropertyServer.cpp:120] [CPMD464001G] Not added to property map, property not found in OBPropertyBaseInfoMap, id=2040
+[08/12 17:29:19.489875][info][33878][DeviceBase.cpp:742] key: AppSlot,value:2
+[08/12 17:29:19.489880][info][33878][DeviceBase.cpp:742] key: GxVer,value:V1.2.1
+[08/12 17:29:19.489880][info][33878][DeviceBase.cpp:742] key: HwVer,value:V1.1
+[08/12 17:29:19.489880][info][33878][DeviceBase.cpp:742] key: IspFwVer,value:2.1.17
+[08/12 17:29:19.489881][info][33878][DeviceBase.cpp:742] key: PresetVer,value:0.0.4
+[08/12 17:29:19.489881][info][33878][DeviceBase.cpp:742] key: cfg,value:0
+[08/12 17:29:19.489882][info][33878][DeviceBase.cpp:742] key: dtree,value:0
+[08/12 17:29:19.489882][info][33878][DeviceBase.cpp:742] key: postfliter,value:0
+[08/12 17:29:19.651573][info][33878][DeviceManager.cpp:200] Device created successfully! Name: Gemini 345Lg, PID: 0x0813, SN/ID: CPMD464001G FW: 1.9.03
+[08/12 17:29:19.651661][info][33878][Pipeline.cpp:54] [CPMD464001G] Pipeline created with device: {name: Gemini 345Lg, sn: CPMD464001G}, @0x5C11A1E2EFA0
+[08/12 17:29:19.655335][info][33878][Pipeline.cpp:228] [CPMD464001G] Check and set config done!
+[08/12 17:29:19.655487][info][33878][Pipeline.cpp:266] [CPMD464001G] Try to start streams!
+[08/12 17:29:19.655490][info][33878][VideoSensor.cpp:61] [CPMD464001G] Try to start stream: {type: Color, format: RGB, width: 640, height: 480, fps: 30}
+[08/12 17:29:19.655493][info][33878][SensorBase.cpp:216] [CPMD464001G] Stream state changed from STOPPED to STARTING@Color
+[08/12 17:29:19.655495][info][33878][VideoSensor.cpp:130] [CPMD464001G] Start backend stream: {type: Color, format: YUYV, width: 640, height: 480, fps: 30}
+[08/12 17:29:19.659119][info][33878][VideoSensor.cpp:61] [CPMD464001G] Try to start stream: {type: Depth, format: Y16, width: 640, height: 480, fps: 30}
+[08/12 17:29:19.659128][info][33878][SensorBase.cpp:216] [CPMD464001G] Stream state changed from STOPPED to STARTING@Depth
+[08/12 17:29:19.659131][info][33878][VideoSensor.cpp:130] [CPMD464001G] Start backend stream: {type: Depth, format: Z16, width: 640, height: 480, fps: 30}
+[08/12 17:29:19.663033][info][33878][Pipeline.cpp:293] [CPMD464001G] Start streams done!
+[08/12 17:29:19.663036][info][33878][Pipeline.cpp:250] [CPMD464001G] Pipeline start done!
+[08/12 17:29:19.761602][info][33959][SensorBase.cpp:216] [CPMD464001G] Stream state changed from STARTING to STREAMING@Depth
+[08/12 17:29:20.460060][info][33955][SensorBase.cpp:216] [CPMD464001G] Stream state changed from STARTING to STREAMING@Color
+[08/12 17:29:20.491791][info][33878][Pipeline.cpp:367] [CPMD464001G] Try to stop pipeline!
+[08/12 17:29:20.491797][info][33878][Pipeline.cpp:343] [CPMD464001G] Try to stop streams!
+[08/12 17:29:20.491811][info][33878][SensorBase.cpp:216] [CPMD464001G] Stream state changed from STREAMING to STOPPING@Depth
+[08/12 17:29:20.546142][warning][33955][VideoSensor.cpp:226] [CPMD464001G] This frame will be dropped because the data size does not match the expectation! size=327407, expected=614400 @Color
+[08/12 17:29:20.546230][info][33878][SensorBase.cpp:216] [CPMD464001G] Stream state changed from STOPPING to STOPPED@Depth
+[08/12 17:29:20.546386][info][33878][Pipeline.cpp:357] [CPMD464001G] Sensor stream stopped, sensorType=Depth
+[08/12 17:29:20.546391][info][33878][SensorBase.cpp:216] [CPMD464001G] Stream state changed from STREAMING to STOPPING@Color
+[08/12 17:29:20.592090][info][33878][SensorBase.cpp:216] [CPMD464001G] Stream state changed from STOPPING to STOPPED@Color
+[08/12 17:29:20.592695][info][33878][Pipeline.cpp:357] [CPMD464001G] Sensor stream stopped, sensorType=Color
+[08/12 17:29:20.592697][info][33878][Pipeline.cpp:363] [CPMD464001G] Stop streams done!
+[08/12 17:29:20.592862][info][33878][Pipeline.cpp:393] [CPMD464001G] Stop pipeline done!
+[08/12 17:29:20.597599][info][33878][Pipeline.cpp:65] [CPMD464001G] Pipeline destroyed! @0x5C11A1E2EFA0
+[08/12 17:29:20.597661][info][33878][SensorBase.cpp:53] [CPMD464001G] SensorBase is destroyed
+[08/12 17:29:20.598559][info][33878][ObLibuvcDevicePort.cpp:87] uvc_close done.
+[08/12 17:29:20.598560][info][33878][ObLibuvcDevicePort.cpp:88] ~ObLibuvcDevicePort done
+[08/12 17:29:20.598573][info][33878][SensorBase.cpp:53] [CPMD464001G] SensorBase is destroyed
+[08/12 17:29:20.606930][info][33878][ObLibuvcDevicePort.cpp:87] uvc_close done.
+[08/12 17:29:20.606938][info][33878][ObLibuvcDevicePort.cpp:88] ~ObLibuvcDevicePort done
+[08/12 17:29:40.343988][info][34134][HostTimestampProvider.cpp:36] Update clock type to: realtime(0)
+[08/12 17:29:40.405022][info][34134][LinuxUsbPal.cpp:334] Create PollingDeviceWatcher!
+[08/12 17:29:40.405040][info][34134][DeviceManager.cpp:25] Current found device(s): (1)
+[08/12 17:29:40.405041][info][34134][DeviceManager.cpp:34] 	- Name: Gemini 345Lg, PID: 0x0813, SN/ID: CPMD464001G, Connection: USB3.2
+[08/12 17:29:40.405044][info][34134][DeviceManager.cpp:463] Enable net device enumeration: true
+[08/12 17:29:41.427027][info][34134][DeviceManager.cpp:25] Current device(s) list: (1)
+[08/12 17:29:41.427042][info][34134][DeviceManager.cpp:34] 	- Name: Gemini 345Lg, PID: 0x0813, SN/ID: CPMD464001G, Connection: USB3.2
+[08/12 17:29:41.427136][warning][34134][PropertyServer.cpp:120] [CPMD464001G] Not added to property map, property not found in OBPropertyBaseInfoMap, id=4037
+[08/12 17:29:41.427171][warning][34134][PropertyServer.cpp:120] [CPMD464001G] Not added to property map, property not found in OBPropertyBaseInfoMap, id=4059
+[08/12 17:29:41.427173][warning][34134][PropertyServer.cpp:120] [CPMD464001G] Not added to property map, property not found in OBPropertyBaseInfoMap, id=193
+[08/12 17:29:41.427174][warning][34134][PropertyServer.cpp:120] [CPMD464001G] Not added to property map, property not found in OBPropertyBaseInfoMap, id=194
+[08/12 17:29:41.427175][warning][34134][PropertyServer.cpp:120] [CPMD464001G] Not added to property map, property not found in OBPropertyBaseInfoMap, id=195
+[08/12 17:29:41.427183][warning][34134][PropertyServer.cpp:120] [CPMD464001G] Not added to property map, property not found in OBPropertyBaseInfoMap, id=4046
+[08/12 17:29:41.427184][warning][34134][PropertyServer.cpp:120] [CPMD464001G] Not added to property map, property not found in OBPropertyBaseInfoMap, id=2040
+[08/12 17:29:41.429665][info][34134][DeviceBase.cpp:742] key: AppSlot,value:2
+[08/12 17:29:41.429667][info][34134][DeviceBase.cpp:742] key: GxVer,value:V1.2.1
+[08/12 17:29:41.429667][info][34134][DeviceBase.cpp:742] key: HwVer,value:V1.1
+[08/12 17:29:41.429668][info][34134][DeviceBase.cpp:742] key: IspFwVer,value:2.1.17
+[08/12 17:29:41.429668][info][34134][DeviceBase.cpp:742] key: PresetVer,value:0.0.4
+[08/12 17:29:41.429668][info][34134][DeviceBase.cpp:742] key: cfg,value:0
+[08/12 17:29:41.429668][info][34134][DeviceBase.cpp:742] key: dtree,value:0
+[08/12 17:29:41.429669][info][34134][DeviceBase.cpp:742] key: postfliter,value:0
+[08/12 17:29:41.591996][info][34134][DeviceManager.cpp:200] Device created successfully! Name: Gemini 345Lg, PID: 0x0813, SN/ID: CPMD464001G FW: 1.9.03
+[08/12 17:29:41.594831][info][34134][ObLibuvcDevicePort.cpp:87] uvc_close done.
+[08/12 17:29:41.594833][info][34134][ObLibuvcDevicePort.cpp:88] ~ObLibuvcDevicePort done
+[08/12 17:29:41.620373][info][34134][ObLibuvcDevicePort.cpp:87] uvc_close done.
+[08/12 17:29:41.620384][info][34134][ObLibuvcDevicePort.cpp:88] ~ObLibuvcDevicePort done
+[08/12 17:29:42.560130][info][34234][HostTimestampProvider.cpp:36] Update clock type to: realtime(0)
+[08/12 17:29:42.560819][info][34234][LinuxUsbPal.cpp:334] Create PollingDeviceWatcher!
+[08/12 17:29:42.560825][info][34234][DeviceManager.cpp:25] Current found device(s): (1)
+[08/12 17:29:42.560826][info][34234][DeviceManager.cpp:34] 	- Name: Gemini 345Lg, PID: 0x0813, SN/ID: CPMD464001G, Connection: USB3.2
+[08/12 17:29:42.560828][info][34234][DeviceManager.cpp:463] Enable net device enumeration: true
+[08/12 17:29:43.572133][info][34234][DeviceManager.cpp:25] Current device(s) list: (1)
+[08/12 17:29:43.572159][info][34234][DeviceManager.cpp:34] 	- Name: Gemini 345Lg, PID: 0x0813, SN/ID: CPMD464001G, Connection: USB3.2
+[08/12 17:29:43.572441][warning][34234][PropertyServer.cpp:120] [CPMD464001G] Not added to property map, property not found in OBPropertyBaseInfoMap, id=4037
+[08/12 17:29:43.572475][warning][34234][PropertyServer.cpp:120] [CPMD464001G] Not added to property map, property not found in OBPropertyBaseInfoMap, id=4059
+[08/12 17:29:43.572481][warning][34234][PropertyServer.cpp:120] [CPMD464001G] Not added to property map, property not found in OBPropertyBaseInfoMap, id=193
+[08/12 17:29:43.572482][warning][34234][PropertyServer.cpp:120] [CPMD464001G] Not added to property map, property not found in OBPropertyBaseInfoMap, id=194
+[08/12 17:29:43.572483][warning][34234][PropertyServer.cpp:120] [CPMD464001G] Not added to property map, property not found in OBPropertyBaseInfoMap, id=195
+[08/12 17:29:43.572491][warning][34234][PropertyServer.cpp:120] [CPMD464001G] Not added to property map, property not found in OBPropertyBaseInfoMap, id=4046
+[08/12 17:29:43.572492][warning][34234][PropertyServer.cpp:120] [CPMD464001G] Not added to property map, property not found in OBPropertyBaseInfoMap, id=2040
+[08/12 17:29:43.576943][info][34234][DeviceBase.cpp:742] key: AppSlot,value:2
+[08/12 17:29:43.576948][info][34234][DeviceBase.cpp:742] key: GxVer,value:V1.2.1
+[08/12 17:29:43.576948][info][34234][DeviceBase.cpp:742] key: HwVer,value:V1.1
+[08/12 17:29:43.576948][info][34234][DeviceBase.cpp:742] key: IspFwVer,value:2.1.17
+[08/12 17:29:43.576949][info][34234][DeviceBase.cpp:742] key: PresetVer,value:0.0.4
+[08/12 17:29:43.576949][info][34234][DeviceBase.cpp:742] key: cfg,value:0
+[08/12 17:29:43.576949][info][34234][DeviceBase.cpp:742] key: dtree,value:0
+[08/12 17:29:43.576950][info][34234][DeviceBase.cpp:742] key: postfliter,value:0
+[08/12 17:29:43.737597][info][34234][DeviceManager.cpp:200] Device created successfully! Name: Gemini 345Lg, PID: 0x0813, SN/ID: CPMD464001G FW: 1.9.03
+[08/12 17:29:43.737774][info][34234][Pipeline.cpp:54] [CPMD464001G] Pipeline created with device: {name: Gemini 345Lg, sn: CPMD464001G}, @0x7A3548377000
+[08/12 17:29:43.740744][info][34234][Pipeline.cpp:228] [CPMD464001G] Check and set config done!
+[08/12 17:29:43.740900][info][34234][Pipeline.cpp:266] [CPMD464001G] Try to start streams!
+[08/12 17:29:43.740904][info][34234][VideoSensor.cpp:61] [CPMD464001G] Try to start stream: {type: Color, format: RGB, width: 640, height: 480, fps: 30}
+[08/12 17:29:43.740908][info][34234][SensorBase.cpp:216] [CPMD464001G] Stream state changed from STOPPED to STARTING@Color
+[08/12 17:29:43.740911][info][34234][VideoSensor.cpp:130] [CPMD464001G] Start backend stream: {type: Color, format: YUYV, width: 640, height: 480, fps: 30}
+[08/12 17:29:43.743559][info][34234][VideoSensor.cpp:61] [CPMD464001G] Try to start stream: {type: Depth, format: Y16, width: 640, height: 480, fps: 30}
+[08/12 17:29:43.743571][info][34234][SensorBase.cpp:216] [CPMD464001G] Stream state changed from STOPPED to STARTING@Depth
+[08/12 17:29:43.743575][info][34234][VideoSensor.cpp:130] [CPMD464001G] Start backend stream: {type: Depth, format: Z16, width: 640, height: 480, fps: 30}
+[08/12 17:29:43.746590][info][34234][Pipeline.cpp:293] [CPMD464001G] Start streams done!
+[08/12 17:29:43.746593][info][34234][Pipeline.cpp:250] [CPMD464001G] Pipeline start done!
+[08/12 17:29:43.839391][info][34280][SensorBase.cpp:216] [CPMD464001G] Stream state changed from STARTING to STREAMING@Depth
+[08/12 17:29:44.543106][info][34277][SensorBase.cpp:216] [CPMD464001G] Stream state changed from STARTING to STREAMING@Color
+[08/12 17:29:48.869369][info][34280][VideoSensor.cpp:180] [CPMD464001G] Depth backend frame callback, frameRate=30.218687fps
+[08/12 17:29:48.870153][info][34283][SensorBase.cpp:405] [CPMD464001G] Depth Streaming... frameRate=30.230709fps
+[08/12 17:29:49.574266][info][34277][VideoSensor.cpp:180] [CPMD464001G] Color backend frame callback, frameRate=30.212681fps
+[08/12 17:29:49.574461][info][34295][SensorBase.cpp:405] [CPMD464001G] Color Streaming... frameRate=30.218687fps
+[08/12 17:29:52.910892][info][34234][Pipeline.cpp:367] [CPMD464001G] Try to stop pipeline!
+[08/12 17:29:52.910906][info][34234][Pipeline.cpp:343] [CPMD464001G] Try to stop streams!
+[08/12 17:29:52.910919][info][34234][SensorBase.cpp:216] [CPMD464001G] Stream state changed from STREAMING to STOPPING@Depth
+[08/12 17:29:52.962309][info][34234][SensorBase.cpp:216] [CPMD464001G] Stream state changed from STOPPING to STOPPED@Depth
+[08/12 17:29:52.962384][info][34234][Pipeline.cpp:357] [CPMD464001G] Sensor stream stopped, sensorType=Depth
+[08/12 17:29:52.962390][info][34234][SensorBase.cpp:216] [CPMD464001G] Stream state changed from STREAMING to STOPPING@Color
+[08/12 17:29:53.004293][info][34234][SensorBase.cpp:216] [CPMD464001G] Stream state changed from STOPPING to STOPPED@Color
+[08/12 17:29:53.004571][info][34234][Pipeline.cpp:357] [CPMD464001G] Sensor stream stopped, sensorType=Color
+[08/12 17:29:53.004573][info][34234][Pipeline.cpp:363] [CPMD464001G] Stop streams done!
+[08/12 17:29:53.004742][info][34234][Pipeline.cpp:393] [CPMD464001G] Stop pipeline done!
+[08/12 17:29:53.004779][info][34234][Pipeline.cpp:65] [CPMD464001G] Pipeline destroyed! @0x7A3548377000
+[08/12 17:29:53.004868][info][34234][SensorBase.cpp:53] [CPMD464001G] SensorBase is destroyed
+[08/12 17:29:53.006275][info][34234][ObLibuvcDevicePort.cpp:87] uvc_close done.
+[08/12 17:29:53.006279][info][34234][ObLibuvcDevicePort.cpp:88] ~ObLibuvcDevicePort done
+[08/12 17:29:53.006306][info][34234][SensorBase.cpp:53] [CPMD464001G] SensorBase is destroyed
+[08/12 17:29:53.014024][info][34234][ObLibuvcDevicePort.cpp:87] uvc_close done.
+[08/12 17:29:53.014028][info][34234][ObLibuvcDevicePort.cpp:88] ~ObLibuvcDevicePort done
+[08/12 17:35:39.181565][info][36472][HostTimestampProvider.cpp:36] Update clock type to: realtime(0)
+[08/12 17:35:39.238374][info][36472][LinuxUsbPal.cpp:334] Create PollingDeviceWatcher!
+[08/12 17:35:39.238385][info][36472][DeviceManager.cpp:25] Current found device(s): (1)
+[08/12 17:35:39.238386][info][36472][DeviceManager.cpp:34] 	- Name: Gemini 345Lg, PID: 0x0813, SN/ID: CPMD464001G, Connection: USB3.2
+[08/12 17:35:39.238387][info][36472][DeviceManager.cpp:463] Enable net device enumeration: true
+[08/12 17:35:40.247530][info][36472][DeviceManager.cpp:25] Current device(s) list: (1)
+[08/12 17:35:40.247553][info][36472][DeviceManager.cpp:34] 	- Name: Gemini 345Lg, PID: 0x0813, SN/ID: CPMD464001G, Connection: USB3.2
+[08/12 17:35:40.247708][warning][36472][PropertyServer.cpp:120] [CPMD464001G] Not added to property map, property not found in OBPropertyBaseInfoMap, id=4037
+[08/12 17:35:40.247738][warning][36472][PropertyServer.cpp:120] [CPMD464001G] Not added to property map, property not found in OBPropertyBaseInfoMap, id=4059
+[08/12 17:35:40.247741][warning][36472][PropertyServer.cpp:120] [CPMD464001G] Not added to property map, property not found in OBPropertyBaseInfoMap, id=193
+[08/12 17:35:40.247742][warning][36472][PropertyServer.cpp:120] [CPMD464001G] Not added to property map, property not found in OBPropertyBaseInfoMap, id=194
+[08/12 17:35:40.247743][warning][36472][PropertyServer.cpp:120] [CPMD464001G] Not added to property map, property not found in OBPropertyBaseInfoMap, id=195
+[08/12 17:35:40.247755][warning][36472][PropertyServer.cpp:120] [CPMD464001G] Not added to property map, property not found in OBPropertyBaseInfoMap, id=4046
+[08/12 17:35:40.247757][warning][36472][PropertyServer.cpp:120] [CPMD464001G] Not added to property map, property not found in OBPropertyBaseInfoMap, id=2040
+[08/12 17:35:40.252388][info][36472][DeviceBase.cpp:742] key: AppSlot,value:2
+[08/12 17:35:40.252393][info][36472][DeviceBase.cpp:742] key: GxVer,value:V1.2.1
+[08/12 17:35:40.252394][info][36472][DeviceBase.cpp:742] key: HwVer,value:V1.1
+[08/12 17:35:40.252395][info][36472][DeviceBase.cpp:742] key: IspFwVer,value:2.1.17
+[08/12 17:35:40.252395][info][36472][DeviceBase.cpp:742] key: PresetVer,value:0.0.4
+[08/12 17:35:40.252395][info][36472][DeviceBase.cpp:742] key: cfg,value:0
+[08/12 17:35:40.252396][info][36472][DeviceBase.cpp:742] key: dtree,value:0
+[08/12 17:35:40.252396][info][36472][DeviceBase.cpp:742] key: postfliter,value:0
+[08/12 17:35:40.412986][info][36472][DeviceManager.cpp:200] Device created successfully! Name: Gemini 345Lg, PID: 0x0813, SN/ID: CPMD464001G FW: 1.9.03
+[08/12 17:35:40.415747][info][36472][ObLibuvcDevicePort.cpp:87] uvc_close done.
+[08/12 17:35:40.415752][info][36472][ObLibuvcDevicePort.cpp:88] ~ObLibuvcDevicePort done
+[08/12 17:35:40.444482][info][36472][ObLibuvcDevicePort.cpp:87] uvc_close done.
+[08/12 17:35:40.444488][info][36472][ObLibuvcDevicePort.cpp:88] ~ObLibuvcDevicePort done
+[08/12 17:35:41.377870][info][36605][HostTimestampProvider.cpp:36] Update clock type to: realtime(0)
+[08/12 17:35:41.378720][info][36605][LinuxUsbPal.cpp:334] Create PollingDeviceWatcher!
+[08/12 17:35:41.378726][info][36605][DeviceManager.cpp:25] Current found device(s): (1)
+[08/12 17:35:41.378727][info][36605][DeviceManager.cpp:34] 	- Name: Gemini 345Lg, PID: 0x0813, SN/ID: CPMD464001G, Connection: USB3.2
+[08/12 17:35:41.378728][info][36605][DeviceManager.cpp:463] Enable net device enumeration: true
+[08/12 17:35:42.399986][info][36605][DeviceManager.cpp:25] Current device(s) list: (1)
+[08/12 17:35:42.400004][info][36605][DeviceManager.cpp:34] 	- Name: Gemini 345Lg, PID: 0x0813, SN/ID: CPMD464001G, Connection: USB3.2
+[08/12 17:35:42.400243][warning][36605][PropertyServer.cpp:120] [CPMD464001G] Not added to property map, property not found in OBPropertyBaseInfoMap, id=4037
+[08/12 17:35:42.400274][warning][36605][PropertyServer.cpp:120] [CPMD464001G] Not added to property map, property not found in OBPropertyBaseInfoMap, id=4059
+[08/12 17:35:42.400275][warning][36605][PropertyServer.cpp:120] [CPMD464001G] Not added to property map, property not found in OBPropertyBaseInfoMap, id=193
+[08/12 17:35:42.400276][warning][36605][PropertyServer.cpp:120] [CPMD464001G] Not added to property map, property not found in OBPropertyBaseInfoMap, id=194
+[08/12 17:35:42.400277][warning][36605][PropertyServer.cpp:120] [CPMD464001G] Not added to property map, property not found in OBPropertyBaseInfoMap, id=195
+[08/12 17:35:42.400285][warning][36605][PropertyServer.cpp:120] [CPMD464001G] Not added to property map, property not found in OBPropertyBaseInfoMap, id=4046
+[08/12 17:35:42.400287][warning][36605][PropertyServer.cpp:120] [CPMD464001G] Not added to property map, property not found in OBPropertyBaseInfoMap, id=2040
+[08/12 17:35:42.404302][info][36605][DeviceBase.cpp:742] key: AppSlot,value:2
+[08/12 17:35:42.404304][info][36605][DeviceBase.cpp:742] key: GxVer,value:V1.2.1
+[08/12 17:35:42.404304][info][36605][DeviceBase.cpp:742] key: HwVer,value:V1.1
+[08/12 17:35:42.404305][info][36605][DeviceBase.cpp:742] key: IspFwVer,value:2.1.17
+[08/12 17:35:42.404305][info][36605][DeviceBase.cpp:742] key: PresetVer,value:0.0.4
+[08/12 17:35:42.404306][info][36605][DeviceBase.cpp:742] key: cfg,value:0
+[08/12 17:35:42.404306][info][36605][DeviceBase.cpp:742] key: dtree,value:0
+[08/12 17:35:42.404306][info][36605][DeviceBase.cpp:742] key: postfliter,value:0
+[08/12 17:35:42.566072][info][36605][DeviceManager.cpp:200] Device created successfully! Name: Gemini 345Lg, PID: 0x0813, SN/ID: CPMD464001G FW: 1.9.03
+[08/12 17:35:42.566140][info][36605][Pipeline.cpp:54] [CPMD464001G] Pipeline created with device: {name: Gemini 345Lg, sn: CPMD464001G}, @0x773B9C377C00
+[08/12 17:35:42.568986][info][36605][Pipeline.cpp:228] [CPMD464001G] Check and set config done!
+[08/12 17:35:42.569120][info][36605][Pipeline.cpp:266] [CPMD464001G] Try to start streams!
+[08/12 17:35:42.569123][info][36605][VideoSensor.cpp:61] [CPMD464001G] Try to start stream: {type: Color, format: RGB, width: 640, height: 480, fps: 30}
+[08/12 17:35:42.569126][info][36605][SensorBase.cpp:216] [CPMD464001G] Stream state changed from STOPPED to STARTING@Color
+[08/12 17:35:42.569127][info][36605][VideoSensor.cpp:130] [CPMD464001G] Start backend stream: {type: Color, format: YUYV, width: 640, height: 480, fps: 30}
+[08/12 17:35:42.572301][info][36605][VideoSensor.cpp:61] [CPMD464001G] Try to start stream: {type: Depth, format: Y16, width: 640, height: 480, fps: 30}
+[08/12 17:35:42.572304][info][36605][SensorBase.cpp:216] [CPMD464001G] Stream state changed from STOPPED to STARTING@Depth
+[08/12 17:35:42.572306][info][36605][VideoSensor.cpp:130] [CPMD464001G] Start backend stream: {type: Depth, format: Z16, width: 640, height: 480, fps: 30}
+[08/12 17:35:42.575244][info][36605][Pipeline.cpp:293] [CPMD464001G] Start streams done!
+[08/12 17:35:42.575246][info][36605][Pipeline.cpp:250] [CPMD464001G] Pipeline start done!
+[08/12 17:35:42.668032][info][36648][SensorBase.cpp:216] [CPMD464001G] Stream state changed from STARTING to STREAMING@Depth
+[08/12 17:35:43.372070][info][36645][SensorBase.cpp:216] [CPMD464001G] Stream state changed from STARTING to STREAMING@Color
+[08/12 17:35:47.698122][info][36648][VideoSensor.cpp:180] [CPMD464001G] Depth backend frame callback, frameRate=30.218687fps
+[08/12 17:35:47.698997][info][36654][SensorBase.cpp:405] [CPMD464001G] Depth Streaming... frameRate=30.230709fps
+[08/12 17:35:48.372391][info][36645][VideoSensor.cpp:180] [CPMD464001G] Color backend frame callback, frameRate=30.193962fps
+[08/12 17:35:48.405292][info][36663][SensorBase.cpp:405] [CPMD464001G] Color Streaming... frameRate=30.206676fps
+[08/12 17:35:52.728574][info][36648][VideoSensor.cpp:180] [CPMD464001G] Depth backend frame callback, frameRate=30.013912fps
+[08/12 17:35:52.729336][info][36654][SensorBase.cpp:405] [CPMD464001G] Depth Streaming... frameRate=30.013912fps
+[08/12 17:35:53.404699][info][36645][VideoSensor.cpp:180] [CPMD464001G] Color backend frame callback, frameRate=30.007948fps
+[08/12 17:35:53.438416][info][36663][SensorBase.cpp:405] [CPMD464001G] Color Streaming... frameRate=29.996027fps
+[08/12 17:35:57.759029][info][36648][VideoSensor.cpp:180] [CPMD464001G] Depth backend frame callback, frameRate=30.019880fps
+[08/12 17:35:57.759906][info][36654][SensorBase.cpp:405] [CPMD464001G] Depth Streaming... frameRate=30.019880fps
+[08/12 17:35:58.438170][info][36645][VideoSensor.cpp:180] [CPMD464001G] Color backend frame callback, frameRate=30.001987fps
+[08/12 17:35:58.471791][info][36663][SensorBase.cpp:405] [CPMD464001G] Color Streaming... frameRate=30.001987fps
+[08/12 17:36:02.789473][info][36648][VideoSensor.cpp:180] [CPMD464001G] Depth backend frame callback, frameRate=30.013912fps
+[08/12 17:36:02.790301][info][36654][SensorBase.cpp:405] [CPMD464001G] Depth Streaming... frameRate=30.019880fps
+[08/12 17:36:03.471308][info][36645][VideoSensor.cpp:180] [CPMD464001G] Color backend frame callback, frameRate=30.001987fps
+[08/12 17:36:03.504872][info][36663][SensorBase.cpp:405] [CPMD464001G] Color Streaming... frameRate=30.001987fps
+[08/12 17:36:07.820064][info][36648][VideoSensor.cpp:180] [CPMD464001G] Depth backend frame callback, frameRate=30.019880fps
+[08/12 17:36:07.820772][info][36654][SensorBase.cpp:405] [CPMD464001G] Depth Streaming... frameRate=30.013912fps
+[08/12 17:36:08.504618][info][36645][VideoSensor.cpp:180] [CPMD464001G] Color backend frame callback, frameRate=29.996027fps
+[08/12 17:36:08.538415][info][36663][SensorBase.cpp:405] [CPMD464001G] Color Streaming... frameRate=29.996027fps
+[08/12 17:36:12.850459][info][36648][VideoSensor.cpp:180] [CPMD464001G] Depth backend frame callback, frameRate=30.013912fps
+[08/12 17:36:12.851246][info][36654][SensorBase.cpp:405] [CPMD464001G] Depth Streaming... frameRate=30.019880fps
+[08/12 17:36:13.537988][info][36645][VideoSensor.cpp:180] [CPMD464001G] Color backend frame callback, frameRate=30.001987fps
+[08/12 17:36:13.540252][info][36663][SensorBase.cpp:405] [CPMD464001G] Color Streaming... frameRate=29.994001fps
+[08/12 17:36:17.880981][info][36648][VideoSensor.cpp:180] [CPMD464001G] Depth backend frame callback, frameRate=30.019880fps
+[08/12 17:36:17.881972][info][36654][SensorBase.cpp:405] [CPMD464001G] Depth Streaming... frameRate=30.013912fps
+[08/12 17:36:18.571491][info][36645][VideoSensor.cpp:180] [CPMD464001G] Color backend frame callback, frameRate=29.996027fps
+[08/12 17:36:18.572036][info][36663][SensorBase.cpp:405] [CPMD464001G] Color Streaming... frameRate=30.007948fps
+[08/12 17:36:22.911422][info][36648][VideoSensor.cpp:180] [CPMD464001G] Depth backend frame callback, frameRate=30.013912fps
+[08/12 17:36:22.912207][info][36654][SensorBase.cpp:405] [CPMD464001G] Depth Streaming... frameRate=30.019880fps
+[08/12 17:36:23.604566][info][36645][VideoSensor.cpp:180] [CPMD464001G] Color backend frame callback, frameRate=30.001987fps
+[08/12 17:36:23.605072][info][36663][SensorBase.cpp:405] [CPMD464001G] Color Streaming... frameRate=30.001987fps
+[08/12 17:36:27.941838][info][36648][VideoSensor.cpp:180] [CPMD464001G] Depth backend frame callback, frameRate=30.019880fps
+[08/12 17:36:27.942577][info][36654][SensorBase.cpp:405] [CPMD464001G] Depth Streaming... frameRate=30.013912fps
+[08/12 17:36:28.637871][info][36645][VideoSensor.cpp:180] [CPMD464001G] Color backend frame callback, frameRate=30.001987fps
+[08/12 17:36:28.638292][info][36663][SensorBase.cpp:405] [CPMD464001G] Color Streaming... frameRate=30.001987fps
+[08/12 17:36:32.972468][info][36648][VideoSensor.cpp:180] [CPMD464001G] Depth backend frame callback, frameRate=30.013912fps
+[08/12 17:36:32.973083][info][36654][SensorBase.cpp:405] [CPMD464001G] Depth Streaming... frameRate=30.019880fps
+[08/12 17:36:33.638640][info][36663][SensorBase.cpp:405] [CPMD464001G] Color Streaming... frameRate=29.994001fps
+[08/12 17:36:33.671384][info][36645][VideoSensor.cpp:180] [CPMD464001G] Color backend frame callback, frameRate=30.001987fps
+[08/12 17:36:38.003075][info][36648][VideoSensor.cpp:180] [CPMD464001G] Depth backend frame callback, frameRate=30.019880fps
+[08/12 17:36:38.004108][info][36654][SensorBase.cpp:405] [CPMD464001G] Depth Streaming... frameRate=30.013912fps
+[08/12 17:36:38.671447][info][36663][SensorBase.cpp:405] [CPMD464001G] Color Streaming... frameRate=30.001987fps
+[08/12 17:36:38.704539][info][36645][VideoSensor.cpp:180] [CPMD464001G] Color backend frame callback, frameRate=29.996027fps
+[08/12 17:36:43.033556][info][36648][VideoSensor.cpp:180] [CPMD464001G] Depth backend frame callback, frameRate=30.013912fps
+[08/12 17:36:43.034491][info][36654][SensorBase.cpp:405] [CPMD464001G] Depth Streaming... frameRate=30.013912fps
+[08/12 17:36:43.704824][info][36663][SensorBase.cpp:405] [CPMD464001G] Color Streaming... frameRate=30.001987fps
+[08/12 17:36:43.737860][info][36645][VideoSensor.cpp:180] [CPMD464001G] Color backend frame callback, frameRate=30.001987fps
+[08/12 17:36:48.063943][info][36648][VideoSensor.cpp:180] [CPMD464001G] Depth backend frame callback, frameRate=30.019880fps
+[08/12 17:36:48.065124][info][36654][SensorBase.cpp:405] [CPMD464001G] Depth Streaming... frameRate=30.019880fps
+[08/12 17:36:48.738138][info][36663][SensorBase.cpp:405] [CPMD464001G] Color Streaming... frameRate=30.001987fps
+[08/12 17:36:48.771344][info][36645][VideoSensor.cpp:180] [CPMD464001G] Color backend frame callback, frameRate=30.001987fps
+[08/12 17:36:53.094446][info][36648][VideoSensor.cpp:180] [CPMD464001G] Depth backend frame callback, frameRate=30.013912fps
+[08/12 17:36:53.095401][info][36654][SensorBase.cpp:405] [CPMD464001G] Depth Streaming... frameRate=30.019880fps
+[08/12 17:36:53.771343][info][36663][SensorBase.cpp:405] [CPMD464001G] Color Streaming... frameRate=30.001987fps
+[08/12 17:36:53.804421][info][36645][VideoSensor.cpp:180] [CPMD464001G] Color backend frame callback, frameRate=30.001987fps
+[08/12 17:36:58.124865][info][36648][VideoSensor.cpp:180] [CPMD464001G] Depth backend frame callback, frameRate=30.019880fps
+[08/12 17:36:58.125751][info][36654][SensorBase.cpp:405] [CPMD464001G] Depth Streaming... frameRate=30.013912fps
+[08/12 17:36:58.771694][info][36663][SensorBase.cpp:405] [CPMD464001G] Color Streaming... frameRate=29.994001fps
+[08/12 17:36:58.804569][info][36645][VideoSensor.cpp:180] [CPMD464001G] Color backend frame callback, frameRate=29.994001fps
+[08/12 17:37:03.155347][info][36648][VideoSensor.cpp:180] [CPMD464001G] Depth backend frame callback, frameRate=30.019880fps
+[08/12 17:37:03.156294][info][36654][SensorBase.cpp:405] [CPMD464001G] Depth Streaming... frameRate=30.019880fps
+[08/12 17:37:03.804787][info][36663][SensorBase.cpp:405] [CPMD464001G] Color Streaming... frameRate=30.001987fps
+[08/12 17:37:03.837650][info][36645][VideoSensor.cpp:180] [CPMD464001G] Color backend frame callback, frameRate=30.001987fps
+[08/12 17:37:08.185927][info][36648][VideoSensor.cpp:180] [CPMD464001G] Depth backend frame callback, frameRate=30.013912fps
+[08/12 17:37:08.186756][info][36654][SensorBase.cpp:405] [CPMD464001G] Depth Streaming... frameRate=30.013912fps
+[08/12 17:37:08.837914][info][36663][SensorBase.cpp:405] [CPMD464001G] Color Streaming... frameRate=30.001987fps
+[08/12 17:37:08.870932][info][36645][VideoSensor.cpp:180] [CPMD464001G] Color backend frame callback, frameRate=30.001987fps
+[08/12 17:37:13.216359][info][36648][VideoSensor.cpp:180] [CPMD464001G] Depth backend frame callback, frameRate=30.019880fps
+[08/12 17:37:13.217055][info][36654][SensorBase.cpp:405] [CPMD464001G] Depth Streaming... frameRate=30.019880fps
+[08/12 17:37:13.871289][info][36663][SensorBase.cpp:405] [CPMD464001G] Color Streaming... frameRate=30.001987fps
+[08/12 17:37:13.904494][info][36645][VideoSensor.cpp:180] [CPMD464001G] Color backend frame callback, frameRate=29.996027fps
+[08/12 17:37:18.247020][info][36648][VideoSensor.cpp:180] [CPMD464001G] Depth backend frame callback, frameRate=30.013912fps
+[08/12 17:37:18.247997][info][36654][SensorBase.cpp:405] [CPMD464001G] Depth Streaming... frameRate=30.013912fps
+[08/12 17:37:18.904559][info][36663][SensorBase.cpp:405] [CPMD464001G] Color Streaming... frameRate=29.996027fps
+[08/12 17:37:18.937542][info][36645][VideoSensor.cpp:180] [CPMD464001G] Color backend frame callback, frameRate=30.001987fps
+[08/12 17:37:33.240437][info][43505][HostTimestampProvider.cpp:36] Update clock type to: realtime(0)
+[08/12 17:37:33.299776][info][43505][LinuxUsbPal.cpp:334] Create PollingDeviceWatcher!
+[08/12 17:37:33.299788][info][43505][DeviceManager.cpp:25] Current found device(s): (1)
+[08/12 17:37:33.299789][info][43505][DeviceManager.cpp:34] 	- Name: Gemini 345Lg, PID: 0x0813, SN/ID: CPMD464001G, Connection: USB3.2
+[08/12 17:37:33.299791][info][43505][DeviceManager.cpp:463] Enable net device enumeration: true
+[08/12 17:37:34.322557][info][43505][DeviceManager.cpp:25] Current device(s) list: (1)
+[08/12 17:37:34.322570][info][43505][DeviceManager.cpp:34] 	- Name: Gemini 345Lg, PID: 0x0813, SN/ID: CPMD464001G, Connection: USB3.2
+[08/12 17:37:34.322655][warning][43505][PropertyServer.cpp:120] [CPMD464001G] Not added to property map, property not found in OBPropertyBaseInfoMap, id=4037
+[08/12 17:37:34.322673][warning][43505][PropertyServer.cpp:120] [CPMD464001G] Not added to property map, property not found in OBPropertyBaseInfoMap, id=4059
+[08/12 17:37:34.322678][warning][43505][PropertyServer.cpp:120] [CPMD464001G] Not added to property map, property not found in OBPropertyBaseInfoMap, id=193
+[08/12 17:37:34.322680][warning][43505][PropertyServer.cpp:120] [CPMD464001G] Not added to property map, property not found in OBPropertyBaseInfoMap, id=194
+[08/12 17:37:34.322681][warning][43505][PropertyServer.cpp:120] [CPMD464001G] Not added to property map, property not found in OBPropertyBaseInfoMap, id=195
+[08/12 17:37:34.322698][warning][43505][PropertyServer.cpp:120] [CPMD464001G] Not added to property map, property not found in OBPropertyBaseInfoMap, id=4046
+[08/12 17:37:34.322700][warning][43505][PropertyServer.cpp:120] [CPMD464001G] Not added to property map, property not found in OBPropertyBaseInfoMap, id=2040
+[08/12 17:37:34.327527][info][43505][DeviceBase.cpp:742] key: AppSlot,value:2
+[08/12 17:37:34.327532][info][43505][DeviceBase.cpp:742] key: GxVer,value:V1.2.1
+[08/12 17:37:34.327532][info][43505][DeviceBase.cpp:742] key: HwVer,value:V1.1
+[08/12 17:37:34.327533][info][43505][DeviceBase.cpp:742] key: IspFwVer,value:2.1.17
+[08/12 17:37:34.327533][info][43505][DeviceBase.cpp:742] key: PresetVer,value:0.0.4
+[08/12 17:37:34.327533][info][43505][DeviceBase.cpp:742] key: cfg,value:0
+[08/12 17:37:34.327536][info][43505][DeviceBase.cpp:742] key: dtree,value:0
+[08/12 17:37:34.327536][info][43505][DeviceBase.cpp:742] key: postfliter,value:0
+[08/12 17:37:34.487691][info][43505][DeviceManager.cpp:200] Device created successfully! Name: Gemini 345Lg, PID: 0x0813, SN/ID: CPMD464001G FW: 1.9.03
+[08/12 17:37:34.491358][info][43505][ObLibuvcDevicePort.cpp:87] uvc_close done.
+[08/12 17:37:34.491361][info][43505][ObLibuvcDevicePort.cpp:88] ~ObLibuvcDevicePort done
+[08/12 17:37:34.517828][info][43505][ObLibuvcDevicePort.cpp:87] uvc_close done.
+[08/12 17:37:34.517835][info][43505][ObLibuvcDevicePort.cpp:88] ~ObLibuvcDevicePort done
+[08/12 17:37:35.456970][info][43667][HostTimestampProvider.cpp:36] Update clock type to: realtime(0)
+[08/12 17:37:35.458516][info][43667][LinuxUsbPal.cpp:334] Create PollingDeviceWatcher!
+[08/12 17:37:35.458523][info][43667][DeviceManager.cpp:25] Current found device(s): (1)
+[08/12 17:37:35.458524][info][43667][DeviceManager.cpp:34] 	- Name: Gemini 345Lg, PID: 0x0813, SN/ID: CPMD464001G, Connection: USB3.2
+[08/12 17:37:35.458525][info][43667][DeviceManager.cpp:463] Enable net device enumeration: true
+[08/12 17:37:36.464105][info][43667][DeviceManager.cpp:25] Current device(s) list: (1)
+[08/12 17:37:36.464118][info][43667][DeviceManager.cpp:34] 	- Name: Gemini 345Lg, PID: 0x0813, SN/ID: CPMD464001G, Connection: USB3.2
+[08/12 17:37:36.464412][warning][43667][PropertyServer.cpp:120] [CPMD464001G] Not added to property map, property not found in OBPropertyBaseInfoMap, id=4037
+[08/12 17:37:36.464438][warning][43667][PropertyServer.cpp:120] [CPMD464001G] Not added to property map, property not found in OBPropertyBaseInfoMap, id=4059
+[08/12 17:37:36.464439][warning][43667][PropertyServer.cpp:120] [CPMD464001G] Not added to property map, property not found in OBPropertyBaseInfoMap, id=193
+[08/12 17:37:36.464440][warning][43667][PropertyServer.cpp:120] [CPMD464001G] Not added to property map, property not found in OBPropertyBaseInfoMap, id=194
+[08/12 17:37:36.464441][warning][43667][PropertyServer.cpp:120] [CPMD464001G] Not added to property map, property not found in OBPropertyBaseInfoMap, id=195
+[08/12 17:37:36.464448][warning][43667][PropertyServer.cpp:120] [CPMD464001G] Not added to property map, property not found in OBPropertyBaseInfoMap, id=4046
+[08/12 17:37:36.464450][warning][43667][PropertyServer.cpp:120] [CPMD464001G] Not added to property map, property not found in OBPropertyBaseInfoMap, id=2040
+[08/12 17:37:36.468581][info][43667][DeviceBase.cpp:742] key: AppSlot,value:2
+[08/12 17:37:36.468583][info][43667][DeviceBase.cpp:742] key: GxVer,value:V1.2.1
+[08/12 17:37:36.468583][info][43667][DeviceBase.cpp:742] key: HwVer,value:V1.1
+[08/12 17:37:36.468584][info][43667][DeviceBase.cpp:742] key: IspFwVer,value:2.1.17
+[08/12 17:37:36.468584][info][43667][DeviceBase.cpp:742] key: PresetVer,value:0.0.4
+[08/12 17:37:36.468584][info][43667][DeviceBase.cpp:742] key: cfg,value:0
+[08/12 17:37:36.468585][info][43667][DeviceBase.cpp:742] key: dtree,value:0
+[08/12 17:37:36.468585][info][43667][DeviceBase.cpp:742] key: postfliter,value:0
+[08/12 17:37:36.632583][info][43667][DeviceManager.cpp:200] Device created successfully! Name: Gemini 345Lg, PID: 0x0813, SN/ID: CPMD464001G FW: 1.9.03
+[08/12 17:37:36.632679][info][43667][Pipeline.cpp:54] [CPMD464001G] Pipeline created with device: {name: Gemini 345Lg, sn: CPMD464001G}, @0x7B6424376BF0
+[08/12 17:37:36.635392][info][43667][Pipeline.cpp:228] [CPMD464001G] Check and set config done!
+[08/12 17:37:36.635525][info][43667][Pipeline.cpp:266] [CPMD464001G] Try to start streams!
+[08/12 17:37:36.635528][info][43667][VideoSensor.cpp:61] [CPMD464001G] Try to start stream: {type: Color, format: RGB, width: 640, height: 480, fps: 30}
+[08/12 17:37:36.635530][info][43667][SensorBase.cpp:216] [CPMD464001G] Stream state changed from STOPPED to STARTING@Color
+[08/12 17:37:36.635532][info][43667][VideoSensor.cpp:130] [CPMD464001G] Start backend stream: {type: Color, format: YUYV, width: 640, height: 480, fps: 30}
+[08/12 17:37:36.637743][info][43667][VideoSensor.cpp:61] [CPMD464001G] Try to start stream: {type: Depth, format: Y16, width: 640, height: 480, fps: 30}
+[08/12 17:37:36.637746][info][43667][SensorBase.cpp:216] [CPMD464001G] Stream state changed from STOPPED to STARTING@Depth
+[08/12 17:37:36.637749][info][43667][VideoSensor.cpp:130] [CPMD464001G] Start backend stream: {type: Depth, format: Z16, width: 640, height: 480, fps: 30}
+[08/12 17:37:36.640770][info][43667][Pipeline.cpp:293] [CPMD464001G] Start streams done!
+[08/12 17:37:36.640771][info][43667][Pipeline.cpp:250] [CPMD464001G] Pipeline start done!
+[08/12 17:37:36.739592][info][43716][SensorBase.cpp:216] [CPMD464001G] Stream state changed from STARTING to STREAMING@Depth
+[08/12 17:37:37.437661][info][43712][SensorBase.cpp:216] [CPMD464001G] Stream state changed from STARTING to STREAMING@Color
+[08/12 17:37:41.766991][info][43716][VideoSensor.cpp:180] [CPMD464001G] Depth backend frame callback, frameRate=30.236723fps
+[08/12 17:37:41.767711][info][43718][SensorBase.cpp:405] [CPMD464001G] Depth Streaming... frameRate=30.242737fps
+[08/12 17:37:42.470757][info][43712][VideoSensor.cpp:180] [CPMD464001G] Color backend frame callback, frameRate=30.200676fps
+[08/12 17:37:42.471269][info][43730][SensorBase.cpp:405] [CPMD464001G] Color Streaming... frameRate=30.206676fps
+[08/12 17:37:46.797882][info][43716][VideoSensor.cpp:180] [CPMD464001G] Depth backend frame callback, frameRate=30.013912fps
+[08/12 17:37:46.798577][info][43718][SensorBase.cpp:405] [CPMD464001G] Depth Streaming... frameRate=30.013912fps
+[08/12 17:37:47.503830][info][43712][VideoSensor.cpp:180] [CPMD464001G] Color backend frame callback, frameRate=30.001987fps
+[08/12 17:37:47.504350][info][43730][SensorBase.cpp:405] [CPMD464001G] Color Streaming... frameRate=30.001987fps
+[08/12 17:37:51.827979][info][43716][VideoSensor.cpp:180] [CPMD464001G] Depth backend frame callback, frameRate=30.019880fps
+[08/12 17:37:51.828546][info][43718][SensorBase.cpp:405] [CPMD464001G] Depth Streaming... frameRate=30.019880fps
+[08/12 17:37:52.504548][info][43730][SensorBase.cpp:405] [CPMD464001G] Color Streaming... frameRate=29.994001fps
+[08/12 17:37:52.537379][info][43712][VideoSensor.cpp:180] [CPMD464001G] Color backend frame callback, frameRate=30.001987fps
+[08/12 17:37:56.858548][info][43716][VideoSensor.cpp:180] [CPMD464001G] Depth backend frame callback, frameRate=30.013912fps
+[08/12 17:37:56.859133][info][43718][SensorBase.cpp:405] [CPMD464001G] Depth Streaming... frameRate=30.019880fps
+[08/12 17:37:57.537614][info][43730][SensorBase.cpp:405] [CPMD464001G] Color Streaming... frameRate=30.001987fps
+[08/12 17:37:57.570508][info][43712][VideoSensor.cpp:180] [CPMD464001G] Color backend frame callback, frameRate=30.001987fps
+[08/12 17:38:01.889471][info][43716][VideoSensor.cpp:180] [CPMD464001G] Depth backend frame callback, frameRate=30.019880fps
+[08/12 17:38:01.890092][info][43718][SensorBase.cpp:405] [CPMD464001G] Depth Streaming... frameRate=30.013912fps
+[08/12 17:38:02.570943][info][43730][SensorBase.cpp:405] [CPMD464001G] Color Streaming... frameRate=30.001987fps
+[08/12 17:38:02.603800][info][43712][VideoSensor.cpp:180] [CPMD464001G] Color backend frame callback, frameRate=29.996027fps
+[08/12 17:38:06.919544][info][43716][VideoSensor.cpp:180] [CPMD464001G] Depth backend frame callback, frameRate=30.013912fps
+[08/12 17:38:06.920201][info][43718][SensorBase.cpp:405] [CPMD464001G] Depth Streaming... frameRate=30.019880fps
+[08/12 17:38:07.604188][info][43730][SensorBase.cpp:405] [CPMD464001G] Color Streaming... frameRate=30.001987fps
+[08/12 17:38:07.636982][info][43712][VideoSensor.cpp:180] [CPMD464001G] Color backend frame callback, frameRate=30.001987fps
+[08/12 17:38:11.950247][info][43716][VideoSensor.cpp:180] [CPMD464001G] Depth backend frame callback, frameRate=30.019880fps
+[08/12 17:38:11.951038][info][43718][SensorBase.cpp:405] [CPMD464001G] Depth Streaming... frameRate=30.013912fps
+[08/12 17:38:12.637318][info][43730][SensorBase.cpp:405] [CPMD464001G] Color Streaming... frameRate=30.001987fps
+[08/12 17:38:12.670413][info][43712][VideoSensor.cpp:180] [CPMD464001G] Color backend frame callback, frameRate=30.001987fps
+[08/12 17:38:16.980653][info][43716][VideoSensor.cpp:180] [CPMD464001G] Depth backend frame callback, frameRate=30.013912fps
+[08/12 17:38:16.981316][info][43718][SensorBase.cpp:405] [CPMD464001G] Depth Streaming... frameRate=30.019880fps
+[08/12 17:38:17.670681][info][43730][SensorBase.cpp:405] [CPMD464001G] Color Streaming... frameRate=29.996027fps
+[08/12 17:38:17.703912][info][43712][VideoSensor.cpp:180] [CPMD464001G] Color backend frame callback, frameRate=29.996027fps
+[08/12 17:38:22.011158][info][43716][VideoSensor.cpp:180] [CPMD464001G] Depth backend frame callback, frameRate=30.019880fps
+[08/12 17:38:22.011947][info][43718][SensorBase.cpp:405] [CPMD464001G] Depth Streaming... frameRate=30.013912fps
+[08/12 17:38:22.703949][info][43730][SensorBase.cpp:405] [CPMD464001G] Color Streaming... frameRate=30.001987fps
+[08/12 17:38:22.737038][info][43712][VideoSensor.cpp:180] [CPMD464001G] Color backend frame callback, frameRate=30.001987fps
+[08/12 17:38:27.041427][info][43716][VideoSensor.cpp:180] [CPMD464001G] Depth backend frame callback, frameRate=30.019880fps
+[08/12 17:38:27.042021][info][43718][SensorBase.cpp:405] [CPMD464001G] Depth Streaming... frameRate=30.019880fps
+[08/12 17:38:27.737126][info][43730][SensorBase.cpp:405] [CPMD464001G] Color Streaming... frameRate=30.001987fps
+[08/12 17:38:27.770395][info][43712][VideoSensor.cpp:180] [CPMD464001G] Color backend frame callback, frameRate=30.001987fps
+[08/12 17:38:32.072088][info][43716][VideoSensor.cpp:180] [CPMD464001G] Depth backend frame callback, frameRate=30.013912fps
+[08/12 17:38:32.072792][info][43718][SensorBase.cpp:405] [CPMD464001G] Depth Streaming... frameRate=30.013912fps
+[08/12 17:38:32.770766][info][43730][SensorBase.cpp:405] [CPMD464001G] Color Streaming... frameRate=29.996027fps
+[08/12 17:38:32.803800][info][43712][VideoSensor.cpp:180] [CPMD464001G] Color backend frame callback, frameRate=29.996027fps
+[08/12 17:38:37.102597][info][43716][VideoSensor.cpp:180] [CPMD464001G] Depth backend frame callback, frameRate=30.013912fps
+[08/12 17:38:37.103134][info][43718][SensorBase.cpp:405] [CPMD464001G] Depth Streaming... frameRate=30.019880fps
+[08/12 17:38:37.803730][info][43730][SensorBase.cpp:405] [CPMD464001G] Color Streaming... frameRate=30.001987fps
+[08/12 17:38:37.836971][info][43712][VideoSensor.cpp:180] [CPMD464001G] Color backend frame callback, frameRate=30.001987fps
+[08/12 17:38:42.132993][info][43716][VideoSensor.cpp:180] [CPMD464001G] Depth backend frame callback, frameRate=30.019880fps
+[08/12 17:38:42.133669][info][43718][SensorBase.cpp:405] [CPMD464001G] Depth Streaming... frameRate=30.013912fps
+[08/12 17:38:42.836938][info][43730][SensorBase.cpp:405] [CPMD464001G] Color Streaming... frameRate=30.001987fps
+[08/12 17:38:42.870123][info][43712][VideoSensor.cpp:180] [CPMD464001G] Color backend frame callback, frameRate=30.001987fps
+[08/12 17:38:47.163535][info][43716][VideoSensor.cpp:180] [CPMD464001G] Depth backend frame callback, frameRate=30.019880fps
+[08/12 17:38:47.164126][info][43718][SensorBase.cpp:405] [CPMD464001G] Depth Streaming... frameRate=30.019880fps
+[08/12 17:38:47.870618][info][43730][SensorBase.cpp:405] [CPMD464001G] Color Streaming... frameRate=29.996027fps
+[08/12 17:38:47.903673][info][43712][VideoSensor.cpp:180] [CPMD464001G] Color backend frame callback, frameRate=29.996027fps
+[08/12 17:38:52.193908][info][43716][VideoSensor.cpp:180] [CPMD464001G] Depth backend frame callback, frameRate=30.013912fps
+[08/12 17:38:52.194752][info][43718][SensorBase.cpp:405] [CPMD464001G] Depth Streaming... frameRate=30.013912fps
+[08/12 17:38:52.903806][info][43730][SensorBase.cpp:405] [CPMD464001G] Color Streaming... frameRate=30.001987fps
+[08/12 17:38:52.936857][info][43712][VideoSensor.cpp:180] [CPMD464001G] Color backend frame callback, frameRate=30.001987fps
+[08/12 17:38:57.224723][info][43716][VideoSensor.cpp:180] [CPMD464001G] Depth backend frame callback, frameRate=30.013912fps
+[08/12 17:38:57.225435][info][43718][SensorBase.cpp:405] [CPMD464001G] Depth Streaming... frameRate=30.019880fps
+[08/12 17:38:57.937273][info][43730][SensorBase.cpp:405] [CPMD464001G] Color Streaming... frameRate=30.001987fps
+[08/12 17:38:57.970252][info][43712][VideoSensor.cpp:180] [CPMD464001G] Color backend frame callback, frameRate=30.001987fps
+[08/12 17:39:02.255280][info][43716][VideoSensor.cpp:180] [CPMD464001G] Depth backend frame callback, frameRate=30.019880fps
+[08/12 17:39:02.255944][info][43718][SensorBase.cpp:405] [CPMD464001G] Depth Streaming... frameRate=30.013912fps
+[08/12 17:39:02.970156][info][43730][SensorBase.cpp:405] [CPMD464001G] Color Streaming... frameRate=30.001987fps
+[08/12 17:39:03.003316][info][43712][VideoSensor.cpp:180] [CPMD464001G] Color backend frame callback, frameRate=30.001987fps
+[08/12 17:39:07.285718][info][43716][VideoSensor.cpp:180] [CPMD464001G] Depth backend frame callback, frameRate=30.013912fps
+[08/12 17:39:07.286244][info][43718][SensorBase.cpp:405] [CPMD464001G] Depth Streaming... frameRate=30.019880fps
+[08/12 17:39:07.970654][info][43730][SensorBase.cpp:405] [CPMD464001G] Color Streaming... frameRate=29.994001fps
+[08/12 17:39:08.003662][info][43712][VideoSensor.cpp:180] [CPMD464001G] Color backend frame callback, frameRate=29.994001fps
+[08/12 17:39:12.315987][info][43716][VideoSensor.cpp:180] [CPMD464001G] Depth backend frame callback, frameRate=30.019880fps
+[08/12 17:39:12.316525][info][43718][SensorBase.cpp:405] [CPMD464001G] Depth Streaming... frameRate=30.019880fps
+[08/12 17:39:13.003462][info][43730][SensorBase.cpp:405] [CPMD464001G] Color Streaming... frameRate=30.007948fps
+[08/12 17:39:13.036687][info][43712][VideoSensor.cpp:180] [CPMD464001G] Color backend frame callback, frameRate=30.001987fps
+[08/12 17:39:17.346522][info][43716][VideoSensor.cpp:180] [CPMD464001G] Depth backend frame callback, frameRate=30.019880fps
+[08/12 17:39:17.347334][info][43718][SensorBase.cpp:405] [CPMD464001G] Depth Streaming... frameRate=30.013912fps
+[08/12 17:39:18.036951][info][43730][SensorBase.cpp:405] [CPMD464001G] Color Streaming... frameRate=29.996027fps
+[08/12 17:39:18.070015][info][43712][VideoSensor.cpp:180] [CPMD464001G] Color backend frame callback, frameRate=30.001987fps
+[08/12 17:39:22.376897][info][43716][VideoSensor.cpp:180] [CPMD464001G] Depth backend frame callback, frameRate=30.013912fps
+[08/12 17:39:22.377823][info][43718][SensorBase.cpp:405] [CPMD464001G] Depth Streaming... frameRate=30.013912fps
+[08/12 17:39:23.070312][info][43730][SensorBase.cpp:405] [CPMD464001G] Color Streaming... frameRate=30.001987fps
+[08/12 17:39:23.103306][info][43712][VideoSensor.cpp:180] [CPMD464001G] Color backend frame callback, frameRate=30.001987fps
+[08/12 17:39:27.407643][info][43716][VideoSensor.cpp:180] [CPMD464001G] Depth backend frame callback, frameRate=30.013912fps
+[08/12 17:39:27.408514][info][43718][SensorBase.cpp:405] [CPMD464001G] Depth Streaming... frameRate=30.019880fps
+[08/12 17:39:28.103813][info][43730][SensorBase.cpp:405] [CPMD464001G] Color Streaming... frameRate=29.996027fps
+[08/12 17:39:28.136619][info][43712][VideoSensor.cpp:180] [CPMD464001G] Color backend frame callback, frameRate=30.001987fps
+[08/12 17:39:32.437966][info][43716][VideoSensor.cpp:180] [CPMD464001G] Depth backend frame callback, frameRate=30.019880fps
+[08/12 17:39:32.438749][info][43718][SensorBase.cpp:405] [CPMD464001G] Depth Streaming... frameRate=30.013912fps
+[08/12 17:39:33.136973][info][43730][SensorBase.cpp:405] [CPMD464001G] Color Streaming... frameRate=30.001987fps
+[08/12 17:39:33.169884][info][43712][VideoSensor.cpp:180] [CPMD464001G] Color backend frame callback, frameRate=29.996027fps
+[08/12 17:39:37.468627][info][43716][VideoSensor.cpp:180] [CPMD464001G] Depth backend frame callback, frameRate=30.019880fps
+[08/12 17:39:37.469330][info][43718][SensorBase.cpp:405] [CPMD464001G] Depth Streaming... frameRate=30.019880fps
+[08/12 17:39:38.170373][info][43730][SensorBase.cpp:405] [CPMD464001G] Color Streaming... frameRate=30.001987fps
+[08/12 17:39:38.203415][info][43712][VideoSensor.cpp:180] [CPMD464001G] Color backend frame callback, frameRate=30.001987fps
+[08/12 17:39:42.498972][info][43716][VideoSensor.cpp:180] [CPMD464001G] Depth backend frame callback, frameRate=30.013912fps
+[08/12 17:39:42.499720][info][43718][SensorBase.cpp:405] [CPMD464001G] Depth Streaming... frameRate=30.013912fps
+[08/12 17:39:43.203489][info][43730][SensorBase.cpp:405] [CPMD464001G] Color Streaming... frameRate=30.001987fps
+[08/12 17:39:43.236594][info][43712][VideoSensor.cpp:180] [CPMD464001G] Color backend frame callback, frameRate=30.001987fps
+[08/12 17:39:47.529534][info][43716][VideoSensor.cpp:180] [CPMD464001G] Depth backend frame callback, frameRate=30.019880fps
+[08/12 17:39:47.530385][info][43718][SensorBase.cpp:405] [CPMD464001G] Depth Streaming... frameRate=30.019880fps
+[08/12 17:39:48.236821][info][43730][SensorBase.cpp:405] [CPMD464001G] Color Streaming... frameRate=29.996027fps
+[08/12 17:39:48.270083][info][43712][VideoSensor.cpp:180] [CPMD464001G] Color backend frame callback, frameRate=29.996027fps
+[08/12 17:39:52.559976][info][43716][VideoSensor.cpp:180] [CPMD464001G] Depth backend frame callback, frameRate=30.013912fps
+[08/12 17:39:52.560712][info][43718][SensorBase.cpp:405] [CPMD464001G] Depth Streaming... frameRate=30.013912fps
+[08/12 17:39:53.270496][info][43730][SensorBase.cpp:405] [CPMD464001G] Color Streaming... frameRate=30.001987fps
+[08/12 17:39:53.303153][info][43712][VideoSensor.cpp:180] [CPMD464001G] Color backend frame callback, frameRate=30.001987fps
+[08/12 17:39:57.590713][info][43716][VideoSensor.cpp:180] [CPMD464001G] Depth backend frame callback, frameRate=30.013912fps
+[08/12 17:39:57.591479][info][43718][SensorBase.cpp:405] [CPMD464001G] Depth Streaming... frameRate=30.019880fps
+[08/12 17:39:58.303384][info][43730][SensorBase.cpp:405] [CPMD464001G] Color Streaming... frameRate=30.001987fps
+[08/12 17:39:58.336369][info][43712][VideoSensor.cpp:180] [CPMD464001G] Color backend frame callback, frameRate=30.001987fps
+[08/12 17:40:02.620902][info][43716][VideoSensor.cpp:180] [CPMD464001G] Depth backend frame callback, frameRate=30.019880fps
+[08/12 17:40:02.621634][info][43718][SensorBase.cpp:405] [CPMD464001G] Depth Streaming... frameRate=30.019880fps
+[08/12 17:40:03.336739][info][43730][SensorBase.cpp:405] [CPMD464001G] Color Streaming... frameRate=29.996027fps
+[08/12 17:40:03.369686][info][43712][VideoSensor.cpp:180] [CPMD464001G] Color backend frame callback, frameRate=29.996027fps
+[08/12 17:40:07.651555][info][43716][VideoSensor.cpp:180] [CPMD464001G] Depth backend frame callback, frameRate=30.019880fps
+[08/12 17:40:07.652384][info][43718][SensorBase.cpp:405] [CPMD464001G] Depth Streaming... frameRate=30.013912fps
+[08/12 17:40:08.370075][info][43730][SensorBase.cpp:405] [CPMD464001G] Color Streaming... frameRate=30.001987fps
+[08/12 17:40:08.403188][info][43712][VideoSensor.cpp:180] [CPMD464001G] Color backend frame callback, frameRate=30.001987fps
+[08/12 17:40:12.682208][info][43716][VideoSensor.cpp:180] [CPMD464001G] Depth backend frame callback, frameRate=30.013912fps
+[08/12 17:40:12.682988][info][43718][SensorBase.cpp:405] [CPMD464001G] Depth Streaming... frameRate=30.013912fps
+[08/12 17:40:13.403157][info][43730][SensorBase.cpp:405] [CPMD464001G] Color Streaming... frameRate=30.001987fps
+[08/12 17:40:13.436340][info][43712][VideoSensor.cpp:180] [CPMD464001G] Color backend frame callback, frameRate=30.001987fps
+[08/12 17:40:17.712671][info][43716][VideoSensor.cpp:180] [CPMD464001G] Depth backend frame callback, frameRate=30.019880fps
+[08/12 17:40:17.713297][info][43718][SensorBase.cpp:405] [CPMD464001G] Depth Streaming... frameRate=30.019880fps
+[08/12 17:40:18.436488][info][43730][SensorBase.cpp:405] [CPMD464001G] Color Streaming... frameRate=30.001987fps
+[08/12 17:40:18.469710][info][43712][VideoSensor.cpp:180] [CPMD464001G] Color backend frame callback, frameRate=29.996027fps
+[08/12 17:40:22.743224][info][43716][VideoSensor.cpp:180] [CPMD464001G] Depth backend frame callback, frameRate=30.013912fps
+[08/12 17:40:22.743985][info][43718][SensorBase.cpp:405] [CPMD464001G] Depth Streaming... frameRate=30.013912fps
+[08/12 17:40:23.436939][info][43730][SensorBase.cpp:405] [CPMD464001G] Color Streaming... frameRate=29.994001fps
+[08/12 17:40:23.503292][info][43712][VideoSensor.cpp:180] [CPMD464001G] Color backend frame callback, frameRate=30.001987fps
+[08/12 17:40:27.773574][info][43716][VideoSensor.cpp:180] [CPMD464001G] Depth backend frame callback, frameRate=30.019880fps
+[08/12 17:40:27.774249][info][43718][SensorBase.cpp:405] [CPMD464001G] Depth Streaming... frameRate=30.019880fps
+[08/12 17:40:28.470038][info][43730][SensorBase.cpp:405] [CPMD464001G] Color Streaming... frameRate=30.001987fps
+[08/12 17:40:28.536350][info][43712][VideoSensor.cpp:180] [CPMD464001G] Color backend frame callback, frameRate=30.001987fps
+[08/12 17:40:32.804100][info][43716][VideoSensor.cpp:180] [CPMD464001G] Depth backend frame callback, frameRate=30.013912fps
+[08/12 17:40:32.804769][info][43718][SensorBase.cpp:405] [CPMD464001G] Depth Streaming... frameRate=30.013912fps
+[08/12 17:40:33.503259][info][43730][SensorBase.cpp:405] [CPMD464001G] Color Streaming... frameRate=30.001987fps
+[08/12 17:40:33.569713][info][43712][VideoSensor.cpp:180] [CPMD464001G] Color backend frame callback, frameRate=29.996027fps
+[08/12 17:40:37.834522][info][43716][VideoSensor.cpp:180] [CPMD464001G] Depth backend frame callback, frameRate=30.019880fps
+[08/12 17:40:37.835306][info][43718][SensorBase.cpp:405] [CPMD464001G] Depth Streaming... frameRate=30.019880fps
+[08/12 17:40:38.536990][info][43730][SensorBase.cpp:405] [CPMD464001G] Color Streaming... frameRate=29.996027fps
+[08/12 17:40:38.603135][info][43712][VideoSensor.cpp:180] [CPMD464001G] Color backend frame callback, frameRate=30.001987fps
+[08/12 17:40:42.865028][info][43716][VideoSensor.cpp:180] [CPMD464001G] Depth backend frame callback, frameRate=30.013912fps
+[08/12 17:40:42.865749][info][43718][SensorBase.cpp:405] [CPMD464001G] Depth Streaming... frameRate=30.013912fps
+[08/12 17:40:43.569774][info][43730][SensorBase.cpp:405] [CPMD464001G] Color Streaming... frameRate=30.001987fps
+[08/12 17:40:43.636225][info][43712][VideoSensor.cpp:180] [CPMD464001G] Color backend frame callback, frameRate=30.001987fps
+[08/12 17:40:47.895668][info][43716][VideoSensor.cpp:180] [CPMD464001G] Depth backend frame callback, frameRate=30.019880fps
+[08/12 17:40:47.896343][info][43718][SensorBase.cpp:405] [CPMD464001G] Depth Streaming... frameRate=30.019880fps
+[08/12 17:40:48.603335][info][43730][SensorBase.cpp:405] [CPMD464001G] Color Streaming... frameRate=30.001987fps
+[08/12 17:40:48.669616][info][43712][VideoSensor.cpp:180] [CPMD464001G] Color backend frame callback, frameRate=30.001987fps
+[08/12 17:40:52.926185][info][43716][VideoSensor.cpp:180] [CPMD464001G] Depth backend frame callback, frameRate=30.013912fps
+[08/12 17:40:52.926800][info][43718][SensorBase.cpp:405] [CPMD464001G] Depth Streaming... frameRate=30.013912fps
+[08/12 17:40:53.636578][info][43730][SensorBase.cpp:405] [CPMD464001G] Color Streaming... frameRate=30.001987fps
+[08/12 17:40:53.669815][info][43712][VideoSensor.cpp:180] [CPMD464001G] Color backend frame callback, frameRate=29.994001fps
+[08/12 17:40:57.956593][info][43716][VideoSensor.cpp:180] [CPMD464001G] Depth backend frame callback, frameRate=30.019880fps
+[08/12 17:40:57.957330][info][43718][SensorBase.cpp:405] [CPMD464001G] Depth Streaming... frameRate=30.019880fps
+[08/12 17:40:58.669807][info][43730][SensorBase.cpp:405] [CPMD464001G] Color Streaming... frameRate=29.996027fps
+[08/12 17:40:58.702873][info][43712][VideoSensor.cpp:180] [CPMD464001G] Color backend frame callback, frameRate=30.001987fps
+[08/12 17:41:02.987197][info][43716][VideoSensor.cpp:180] [CPMD464001G] Depth backend frame callback, frameRate=30.013912fps
+[08/12 17:41:02.987987][info][43718][SensorBase.cpp:405] [CPMD464001G] Depth Streaming... frameRate=30.013912fps
