@@ -51,10 +51,21 @@ See the [Data Collection tutorial](data_collection.md) for full setup instructio
 **Quick start:**
 
 ```bash
+python gear_sonic/scripts/launch_data_collection.py
+```
+
+This reads `gear_sonic/config/launch_data_collection.yaml`. For a one-off
+override, keep the YAML defaults and pass only the values that change:
+
+```bash
 python gear_sonic/scripts/launch_data_collection.py \
     --camera-host 192.168.123.164 \
     --task-prompt "pick up the soda can and place it in the bin"
 ```
+
+Use `--config /path/to/my_collection.yaml` for a different complete collection
+profile. The profile's `runtime_profile` continues to point to
+`gear_sonic/config/launch_inference.yaml` for shared Gateway configuration.
 
 **Output:** A LeRobot v2.1 dataset directory, e.g.:
 
