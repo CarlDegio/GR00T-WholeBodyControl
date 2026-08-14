@@ -104,18 +104,52 @@ def open_video_connection(
 ) -> socket.socket:
     """Open the PICO video socket, binding its source to USBOnly when enabled."""
 
-    source_address: tuple[str, int] | None = None
-    if settings.pico_usb is not None:
-        if ipaddress.ip_address(request.ip) != ipaddress.ip_address(
-            settings.pico_usb.pico_ip
-        ):
-            raise OSError("video target is not the discovered PICO USB peer")
-        source_address = (settings.pico_usb.workstation_ip, 0)
-    return socket.create_connection(
-        (request.ip, request.port),
-        timeout=2.0,
-        source_address=source_address,
+    if settings.pico_usb is None:
+        return socket.create_connection((request.ip, request.port), timeout=2.0)
+    if ipaddress.ip_address(request.ip) != ipaddress.ip_address(
+        settings.pico_usb.pico_ip
+    ):
+        raise OSError("video target is not the discovered PICO USB peer")
+
+    connection = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        _bind_socket_to_interface(connection, settings.pico_usb.interface)
+        connection.settimeout(2.0)
+        connection.bind((settings.pico_usb.workstation_ip, 0))
+        connection.connect((request.ip, request.port))
+    except Exception:
+        connection.close()
+        raise
+    return connection
+
+
+def _bind_socket_to_interface(connection: socket.socket, interface: str) -> None:
+    try:
+        option = socket.SO_BINDTODEVICE
+    except AttributeError as exc:
+        raise OSError("SO_BINDTODEVICE is unavailable on this platform") from exc
+    connection.setsockopt(
+        socket.SOL_SOCKET,
+        option,
+        interface.encode("utf-8") + b"\0",
     )
+
+
+def create_control_listener(settings: BridgeSettings) -> socket.socket:
+    """Create a listener restricted to the discovered USB interface when enabled."""
+
+    listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        if settings.pico_usb is not None:
+            _bind_socket_to_interface(listener, settings.pico_usb.interface)
+        listener.bind((settings.control_host, settings.control_port))
+        listener.listen(2)
+        listener.settimeout(0.2)
+    except Exception:
+        listener.close()
+        raise
+    return listener
 
 
 class LatestFrameSlot:
@@ -473,11 +507,7 @@ class PicoVideoBridge:
     def serve_forever(self) -> None:
         """Listen until ``stop`` is called; source/session errors remain isolated."""
 
-        listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        listener.bind((self.settings.control_host, self.settings.control_port))
-        listener.listen(2)
-        listener.settimeout(0.2)
+        listener = create_control_listener(self.settings)
         with self._listener_lock:
             self._listener = listener
             bound_host, bound_port = listener.getsockname()[:2]

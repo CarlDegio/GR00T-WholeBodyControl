@@ -14,6 +14,7 @@ import pytest
 
 from gear_sonic.pico_video.bridge import (
     BridgeSettings,
+    create_control_listener,
     LatestFrameSlot,
     PicoVideoBridge,
     open_video_connection,
@@ -346,18 +347,8 @@ def test_usb_only_rejects_a_control_peer_outside_the_discovered_pico_link() -> N
 
 
 def test_video_socket_binds_the_discovered_usb_source_address(monkeypatch) -> None:
-    calls: list[tuple[tuple[str, int], float, tuple[str, int] | None]] = []
-    sentinel = object()
-
-    def fake_create_connection(
-        address: tuple[str, int],
-        timeout: float,
-        source_address: tuple[str, int] | None = None,
-    ) -> object:
-        calls.append((address, timeout, source_address))
-        return sentinel
-
-    monkeypatch.setattr(socket, "create_connection", fake_create_connection)
+    connection = FakeSocket()
+    monkeypatch.setattr(socket, "socket", lambda *_args: connection)
     request = CameraRequest(
         width=1280,
         height=480,
@@ -377,10 +368,92 @@ def test_video_socket_binds_the_discovered_usb_source_address(monkeypatch) -> No
 
     result = open_video_connection(request, settings)
 
-    assert result is sentinel
-    assert calls == [
-        ((PICO_USB.pico_ip, 12345), 2.0, (PICO_USB.workstation_ip, 0))
+    assert result is connection
+    assert connection.calls == [
+        ("setsockopt", socket.SOL_SOCKET, socket.SO_BINDTODEVICE, b"enx4662be5cb0cb\0"),
+        ("settimeout", 2.0),
+        ("bind", (PICO_USB.workstation_ip, 0)),
+        ("connect", (PICO_USB.pico_ip, 12345)),
     ]
+
+
+class FakeSocket:
+    def __init__(self) -> None:
+        self.calls: list[tuple[object, ...]] = []
+
+    def setsockopt(self, *args: object) -> None:
+        self.calls.append(("setsockopt", *args))
+
+    def settimeout(self, timeout: float) -> None:
+        self.calls.append(("settimeout", timeout))
+
+    def bind(self, address: tuple[str, int]) -> None:
+        self.calls.append(("bind", address))
+
+    def connect(self, address: tuple[str, int]) -> None:
+        self.calls.append(("connect", address))
+
+    def listen(self, backlog: int) -> None:
+        self.calls.append(("listen", backlog))
+
+    def close(self) -> None:
+        self.calls.append(("close",))
+
+
+class RejectingDeviceBindSocket(FakeSocket):
+    def setsockopt(self, *args: object) -> None:
+        super().setsockopt(*args)
+        if len(args) >= 2 and args[1] == socket.SO_BINDTODEVICE:
+            raise PermissionError("device binding rejected")
+
+
+def test_control_listener_binds_to_the_discovered_usb_interface(monkeypatch) -> None:
+    listener = FakeSocket()
+    monkeypatch.setattr(socket, "socket", lambda *_args: listener)
+    settings = BridgeSettings(
+        gateway_endpoint="inproc://unused",
+        control_host=PICO_USB.workstation_ip,
+        pico_usb=PICO_USB,
+    )
+
+    result = create_control_listener(settings)
+
+    assert result is listener
+    assert listener.calls == [
+        ("setsockopt", socket.SOL_SOCKET, socket.SO_REUSEADDR, 1),
+        ("setsockopt", socket.SOL_SOCKET, socket.SO_BINDTODEVICE, b"enx4662be5cb0cb\0"),
+        ("bind", (PICO_USB.workstation_ip, 13579)),
+        ("listen", 2),
+        ("settimeout", 0.2),
+    ]
+
+
+def test_usb_video_connection_fails_closed_when_device_bind_is_rejected(
+    monkeypatch,
+) -> None:
+    connection = RejectingDeviceBindSocket()
+    monkeypatch.setattr(socket, "socket", lambda *_args: connection)
+    request = CameraRequest(
+        width=1280,
+        height=480,
+        fps=30,
+        bitrate=4_000_000,
+        enable_mv_hevc=False,
+        render_mode=0,
+        port=12345,
+        camera="ZED",
+        ip=PICO_USB.pico_ip,
+    )
+    settings = BridgeSettings(
+        gateway_endpoint="inproc://unused",
+        control_host=PICO_USB.workstation_ip,
+        pico_usb=PICO_USB,
+    )
+
+    with pytest.raises(PermissionError, match="device binding rejected"):
+        open_video_connection(request, settings)
+
+    assert connection.calls[-1] == ("close",)
 
 
 def test_unreachable_video_endpoint_and_unknown_command_do_not_kill_control() -> None:

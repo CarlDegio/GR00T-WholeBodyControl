@@ -84,14 +84,10 @@ def _parse_properties(output: str) -> dict[str, str]:
 def _is_pico_rndis(properties: dict[str, str]) -> bool:
     if properties.get("ID_USB_DRIVER") != "rndis_host":
         return False
-    identity = " ".join(
-        properties.get(key, "")
-        for key in ("ID_VENDOR", "ID_MODEL", "ID_SERIAL")
-    ).upper()
-    return "PICO" in identity or (
-        properties.get("ID_VENDOR_ID", "").lower() == "05c6"
-        and properties.get("ID_MODEL_ID", "").lower() == "9024"
-    )
+    vendor = properties.get("ID_VENDOR", "").replace("_", " ").strip().upper()
+    model = properties.get("ID_MODEL", "").replace("_", " ").strip().upper()
+    serial = properties.get("ID_SERIAL", "").replace("_", " ").strip().upper()
+    return vendor == "PICO" and ("PICO" in model or serial.startswith("PICO PICO"))
 
 
 def _global_ipv4(record: dict[str, Any]) -> tuple[str, int] | None:
@@ -120,6 +116,7 @@ def discover_pico_usb_network(
     records = _parse_json(runner(address_command), command=address_command)
     candidates: list[PicoUsbNetwork] = []
     unusable: list[str] = []
+    inspection_failures: list[str] = []
 
     for record in records:
         ifname = str(record.get("ifname", ""))
@@ -131,7 +128,11 @@ def discover_pico_usb_network(
             "--query=property",
             f"--path=/sys/class/net/{ifname}",
         )
-        properties = _parse_properties(runner(property_command))
+        try:
+            properties = _parse_properties(runner(property_command))
+        except PicoUsbNetworkError as exc:
+            inspection_failures.append(f"{ifname}: {exc}")
+            continue
         if not _is_pico_rndis(properties):
             continue
 
@@ -170,7 +171,8 @@ def discover_pico_usb_network(
             unusable.append(f"{ifname} has no route to PICO peer {pico_ip}")
             continue
         selected = selected_routes[0]
-        if selected.get("dev") != ifname or selected.get("prefsrc") != workstation_ip:
+        selected_source = selected.get("from") or selected.get("prefsrc")
+        if selected.get("dev") != ifname or selected_source != workstation_ip:
             unusable.append(
                 f"route to {pico_ip} does not use PICO USB interface {ifname}"
             )
@@ -199,7 +201,13 @@ def discover_pico_usb_network(
     if unusable:
         raise PicoUsbNetworkError("; ".join(unusable))
     suffix = f" on interface {interface}" if interface else ""
+    inspection_detail = (
+        f"; inspection failures: {'; '.join(inspection_failures)}"
+        if inspection_failures
+        else ""
+    )
     raise PicoUsbNetworkError(
         "PICO USBOnly RNDIS network not found"
         f"{suffix}; connect PICO, select USBOnly, and wait for DHCP"
+        f"{inspection_detail}"
     )

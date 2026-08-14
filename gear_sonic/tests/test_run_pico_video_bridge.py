@@ -94,3 +94,20 @@ def test_bridge_cli_rejects_manual_bind_address_in_usb_only_mode() -> None:
 
     with pytest.raises(ValueError, match="local-test"):
         resolve_bridge_settings(args, usb_network_factory=lambda _interface: PICO_USB)
+
+
+@pytest.mark.parametrize("control_host", ["0.0.0.0", "192.168.1.20"])
+def test_local_test_mode_rejects_non_loopback_bind_address(control_host: str) -> None:
+    args = build_argument_parser().parse_args(
+        [
+            "--gateway-endpoint",
+            "tcp://127.0.0.1:6001",
+            "--network-mode",
+            "local-test",
+            "--control-host",
+            control_host,
+        ]
+    )
+
+    with pytest.raises(ValueError, match="loopback"):
+        resolve_bridge_settings(args)

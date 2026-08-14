@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 from collections.abc import Callable
+import ipaddress
 import logging
 import signal
 
@@ -97,6 +98,12 @@ def resolve_bridge_settings(
                 "--pico-usb-interface cannot be used with --network-mode local-test"
             )
         control_host = args.control_host or "127.0.0.1"
+        try:
+            local_test_address = ipaddress.ip_address(control_host)
+        except ValueError as exc:
+            raise ValueError("local-test control host must be a loopback IPv4 address") from exc
+        if not isinstance(local_test_address, ipaddress.IPv4Address) or not local_test_address.is_loopback:
+            raise ValueError("local-test control host must be a loopback IPv4 address")
     return BridgeSettings(
         gateway_endpoint=gateway_endpoint,
         stream=args.stream,
