@@ -18,11 +18,13 @@ Starts the full data collection stack in a single tmux session:
     │ (.venv_sim)                                     │
     └─────────────────────────────────────────────────┘
 
-    Window — gateways:
+    Window — gateways (3 panes):
     ┌────────────────────────┬────────────────────────┐
     │ SensorGateway          │ ControlGateway         │
     │ camera/state/config    │ typed recording input  │
-    └────────────────────────┴────────────────────────┘
+    ├────────────────────────┴────────────────────────┤
+    │ PICO Video Bridge (native USBOnly, supervised) │
+    └─────────────────────────────────────────────────┘
 
 Prerequisites:
     - tmux installed (sudo apt install tmux)
@@ -36,6 +38,7 @@ Usage (from repo root — no venv activation needed):
     python gear_sonic/scripts/launch_data_collection.py              # real robot (default)
     python gear_sonic/scripts/launch_data_collection.py --sim        # MuJoCo sim
     python gear_sonic/scripts/launch_data_collection.py --no-camera-viewer  # skip viewer
+    python gear_sonic/scripts/launch_data_collection.py --no-pico-video  # skip PICO video
 """
 
 from dataclasses import dataclass
@@ -132,6 +135,9 @@ class DataCollectionLaunchConfig:
     pico_waist_tracking: bool = False
     """Enable waist tracking on the teleop streamer."""
 
+    pico_video: bool = True
+    """Keep the SensorGateway-to-PICO USBOnly video bridge running."""
+
     # Data exporter options
     task_prompt: str = "demo"
     """Language task prompt for the data exporter."""
@@ -167,12 +173,15 @@ class DataCollectionLaunchConfig:
 SESSION_NAME = "sonic_data_collection"
 
 
-def _check_prerequisites(sim: bool = False):
+def _check_prerequisites(sim: bool = False, pico_video: bool = True):
     """Verify that required tools and venvs exist."""
     errors = []
 
     if not shutil.which("tmux"):
         errors.append("tmux is not installed. Install with: sudo apt install tmux")
+
+    if pico_video and not shutil.which("ffmpeg"):
+        errors.append("ffmpeg is required for PICO video encoding")
 
     repo_root = Path(__file__).resolve().parent.parent.parent
 
@@ -297,10 +306,24 @@ def build_camera_viewer_command(
     )
 
 
+def build_pico_video_command(
+    config: DataCollectionLaunchConfig,
+    repo_root: Path,
+) -> str:
+    """Build the supervised native USBOnly PICO video command."""
+    return (
+        f"cd {shlex.quote(str(repo_root))} && "
+        "source .venv_teleop/bin/activate && "
+        "python -m gear_sonic.scripts.run_pico_video_bridge "
+        f"--profile {shlex.quote(config.runtime_profile)} "
+        "--encoder h264_nvenc --stay-alive"
+    )
+
+
 def main(config: DataCollectionLaunchConfig):
     repo_root = Path(__file__).resolve().parent.parent.parent
 
-    _check_prerequisites(sim=config.sim)
+    _check_prerequisites(sim=config.sim, pico_video=config.pico_video)
     _kill_existing_session()
 
     print("=" * 60)
@@ -314,6 +337,7 @@ def main(config: DataCollectionLaunchConfig):
         print(f"  Checkpoint:      {config.deploy_checkpoint}")
     print(f"  Camera:          {config.camera_host}:{config.camera_port}")
     print(f"  Camera viewer:   {'Yes' if config.camera_viewer else 'No'}")
+    print(f"  PICO video:      {'USBOnly (supervised)' if config.pico_video else 'No'}")
     print(f"  Wrist cameras:   {'Yes' if config.record_wrist_cameras else 'No'}")
     print(f"  Chest camera:    {'Yes' if config.record_chest_camera else 'No'}")
     print(f"  Text-to-speech:  {'Yes' if config.text_to_speech else 'No'}")
@@ -333,6 +357,21 @@ def main(config: DataCollectionLaunchConfig):
         ["tmux", "split-window", "-h", "-t", f"{SESSION_NAME}:gateways"],
         check=True,
     )
+    if config.pico_video:
+        subprocess.run(
+            [
+                "tmux",
+                "split-window",
+                "-v",
+                "-t",
+                f"{SESSION_NAME}:gateways.1",
+            ],
+            check=True,
+        )
+        subprocess.run(
+            ["tmux", "select-layout", "-t", f"{SESSION_NAME}:gateways", "tiled"],
+            check=True,
+        )
     profile_arg = shlex.quote(config.runtime_profile)
     sensor_gateway_cmd = (
         f"cd {shlex.quote(str(repo_root))} && "
@@ -349,6 +388,9 @@ def main(config: DataCollectionLaunchConfig):
         "source .venv_teleop/bin/activate && "
         "python gear_sonic/scripts/run_control_gateway.py "
         f"--profile {profile_arg}"
+    )
+    pico_video_cmd = (
+        build_pico_video_command(config, repo_root) if config.pico_video else ""
     )
     subprocess.run(
         [
@@ -372,7 +414,22 @@ def main(config: DataCollectionLaunchConfig):
         ],
         check=True,
     )
-    print("Starting SensorGateway and ControlGateway (window: gateways)...")
+    if config.pico_video:
+        subprocess.run(
+            [
+                "tmux",
+                "send-keys",
+                "-t",
+                f"{SESSION_NAME}:gateways.2",
+                pico_video_cmd,
+                "C-m",
+            ],
+            check=True,
+        )
+    gateway_components = "SensorGateway, ControlGateway"
+    if config.pico_video:
+        gateway_components += ", and supervised PICO video"
+    print(f"Starting {gateway_components} (window: gateways)...")
     time.sleep(2.0)
     subprocess.run(
         ["tmux", "select-window", "-t", f"{SESSION_NAME}:data_collection"],
@@ -497,7 +554,10 @@ def main(config: DataCollectionLaunchConfig):
     print("    Pane 2 (top-right):    Data Exporter  <-- you are here")
     if config.camera_viewer:
         print("    Pane 3 (bottom-right): Camera Viewer")
-    print("  Window 'gateways': SensorGateway | ControlGateway")
+    gateway_summary = "SensorGateway | ControlGateway"
+    if config.pico_video:
+        gateway_summary += " | PICO Video (USBOnly, supervised)"
+    print(f"  Window 'gateways': {gateway_summary}")
     print()
     print("  ** deploy.sh (pane 0) is waiting for confirmation —")
     print("     click on pane 0 and press Enter to proceed **")

@@ -14,6 +14,7 @@ sys.modules.setdefault("tyro", types.ModuleType("tyro"))
 
 from gear_sonic.camera.sensor_server import ImageMessageSchema
 from gear_sonic.runtime.client import SensorGatewayClientError
+import gear_sonic.scripts.launch_data_collection as data_collection_launcher
 from gear_sonic.scripts.run_camera_viewer import (
     GatewayCameraClient,
     _gateway_rgb_streams,
@@ -23,6 +24,7 @@ from gear_sonic.scripts.run_camera_viewer import (
 from gear_sonic.scripts.launch_data_collection import (
     DataCollectionLaunchConfig,
     build_camera_viewer_command,
+    build_pico_video_command,
 )
 from gear_sonic.scripts.run_depth_camera_viewer import colorize_depth
 
@@ -182,6 +184,65 @@ def test_data_collection_launcher_viewer_uses_profile_without_direct_camera() ->
         "python gear_sonic/scripts/run_camera_viewer.py "
         "--profile '/tmp/runtime profile.yaml'"
     )
+
+
+def test_data_collection_launcher_keeps_pico_video_running_by_default() -> None:
+    config = DataCollectionLaunchConfig(runtime_profile="/tmp/runtime profile.yaml")
+
+    command = build_pico_video_command(config, Path("/workspace/sonic"))
+
+    assert config.pico_video is True
+    assert command == (
+        "cd /workspace/sonic && "
+        "source .venv_teleop/bin/activate && "
+        "python -m gear_sonic.scripts.run_pico_video_bridge "
+        "--profile '/tmp/runtime profile.yaml' "
+        "--encoder h264_nvenc --stay-alive"
+    )
+
+
+def test_data_collection_launcher_starts_pico_video_in_gateway_pane(
+    monkeypatch,
+) -> None:
+    commands: list[list[str]] = []
+
+    def run(command, **_kwargs):
+        commands.append(command)
+        return SimpleNamespace(returncode=1, stdout="")
+
+    monkeypatch.setattr(data_collection_launcher, "_check_prerequisites", lambda **_: None)
+    monkeypatch.setattr(data_collection_launcher, "_kill_existing_session", lambda: None)
+    monkeypatch.setattr(data_collection_launcher, "_create_tmux_session", lambda: None)
+    monkeypatch.setattr(data_collection_launcher, "_check_pane_alive", lambda _pane: True)
+    monkeypatch.setattr(data_collection_launcher, "_send_to_pane", lambda *_a, **_k: None)
+    monkeypatch.setattr(data_collection_launcher, "_get_local_ip", lambda: "unknown")
+    monkeypatch.setattr(data_collection_launcher.time, "sleep", lambda _seconds: None)
+    monkeypatch.setattr(data_collection_launcher.subprocess, "run", run)
+
+    data_collection_launcher.main(
+        DataCollectionLaunchConfig(runtime_profile="/tmp/runtime profile.yaml")
+    )
+    repo_root = Path(data_collection_launcher.__file__).resolve().parent.parent.parent
+    pico_command = build_pico_video_command(
+        DataCollectionLaunchConfig(runtime_profile="/tmp/runtime profile.yaml"),
+        repo_root,
+    )
+
+    assert [
+        "tmux",
+        "split-window",
+        "-v",
+        "-t",
+        "sonic_data_collection:gateways.1",
+    ] in commands
+    assert [
+        "tmux",
+        "send-keys",
+        "-t",
+        "sonic_data_collection:gateways.2",
+        pico_command,
+        "C-m",
+    ] in commands
 
 
 def test_rgb_viewer_ignores_depth_from_schema_v2_message() -> None:

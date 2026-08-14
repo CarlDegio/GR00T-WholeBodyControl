@@ -274,6 +274,7 @@ Training is the only one that requires Isaac Lab (installed separately).
 - [Gamepad Control](https://nvlabs.github.io/GR00T-WholeBodyControl/tutorials/gamepad.html)
 - [ZMQ Communication](https://nvlabs.github.io/GR00T-WholeBodyControl/tutorials/zmq.html)
 - [ZMQ Manager / PICO VR](https://nvlabs.github.io/GR00T-WholeBodyControl/tutorials/vr_wholebody_teleop.html)
+- [PICO Remote Vision from the Head Camera](https://nvlabs.github.io/GR00T-WholeBodyControl/tutorials/pico_remote_vision.html)
 
 ### Training
 - [Installation (Training)](https://nvlabs.github.io/GR00T-WholeBodyControl/getting_started/installation_training.html)
