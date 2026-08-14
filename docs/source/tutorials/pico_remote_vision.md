@@ -166,7 +166,8 @@ checked-in profile. The production bridge discovers the active PICO RNDIS
 interface, workstation address, and PICO gateway every time it starts. It
 binds TCP 13579 only to that workstation USB address and binds the outbound
 H.264 socket to the same source address. Startup fails closed when USBOnly is
-absent, ambiguous, or routed through another interface.
+absent, ambiguous, or routed through another interface unless supervised mode
+is explicitly enabled.
 
 With SensorGateway running, start the production bridge without a network
 override:
@@ -175,6 +176,17 @@ override:
 python gear_sonic/scripts/run_pico_video_bridge.py \
   --gateway-endpoint tcp://127.0.0.1:5560 \
   --encoder h264_nvenc
+```
+
+Use `--stay-alive` for a long-running collection process. In this mode the
+bridge waits while USBOnly is absent, checks the active native link every two
+seconds, and fully recreates the listener, SensorGateway client, and video
+session after a disconnect or DHCP address change:
+
+```bash
+python gear_sonic/scripts/run_pico_video_bridge.py \
+  --gateway-endpoint tcp://127.0.0.1:5560 \
+  --encoder h264_nvenc --stay-alive
 ```
 
 If multiple PICO headsets are attached, select the intended native interface
@@ -190,6 +202,30 @@ The PICO listens on TCP 12345 and advertises that endpoint in `OPEN_CAMERA`.
 The bridge accepts it only when both the control peer and video target match
 the discovered PICO USB peer. Wi-Fi and ordinary Ethernet clients cannot open
 a video session.
+
+## Data collection launcher
+
+`launch_data_collection.py` enables the supervised PICO video bridge by
+default. The `gateways` tmux window contains SensorGateway, ControlGateway,
+and a third PICO Video pane. The PICO does not have to be connected when data
+collection starts: the third pane waits for native USBOnly and begins serving
+after XRoboToolkit connects it. A later USB disconnect or address change is
+rediscovered without restarting data collection.
+
+```bash
+python gear_sonic/scripts/launch_data_collection.py
+```
+
+Only when no PICO video is wanted, disable that pane explicitly:
+
+```bash
+python gear_sonic/scripts/launch_data_collection.py --no-pico-video
+```
+
+The launcher still takes camera frames only from
+`camera_encoded/ego_view` in SensorGateway. It does not open the camera server
+directly and does not manage NetworkManager, USB gadget mode, routes, or
+firewall rules.
 
 In XRoboToolkit Remote Vision, select **SONIC_HEAD** and press **Listen**.
 Expected results are:

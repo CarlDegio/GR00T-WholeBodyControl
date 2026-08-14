@@ -27,10 +27,14 @@ from gear_sonic.pico_video.protocol import (
     frame_video_access_unit,
     parse_camera_request,
 )
-from gear_sonic.pico_video.usb_network import PicoUsbNetwork
+from gear_sonic.pico_video.usb_network import PicoUsbNetwork, PicoUsbNetworkError
 
 
 LOGGER = logging.getLogger(__name__)
+
+
+class PicoUsbLinkChanged(RuntimeError):
+    """The native PICO USBOnly identity or addressing changed while serving."""
 
 
 class VideoSource(Protocol):
@@ -326,11 +330,20 @@ class PicoVideoBridge:
         source: VideoSource,
         encoder_factory: Callable[[EncoderSettings], H264Encoder] = FfmpegH264Encoder,
         source_close: Callable[[], None] | None = None,
+        usb_network_probe: Callable[[], PicoUsbNetwork] | None = None,
+        usb_check_interval_s: float = 2.0,
+        shutdown_event: threading.Event | None = None,
     ) -> None:
+        if usb_check_interval_s < 0.0:
+            raise ValueError("USB network check interval cannot be negative")
         self.settings = settings
         self._source = source
         self._encoder_factory = encoder_factory
         self._source_close = source_close
+        self._usb_network_probe = usb_network_probe
+        self._usb_check_interval_s = usb_check_interval_s
+        self._next_usb_check_at = 0.0
+        self._shutdown_event = shutdown_event
         self._slot = LatestFrameSlot()
         self._stop = threading.Event()
         self._ready = threading.Event()
@@ -345,6 +358,33 @@ class PicoVideoBridge:
         self._cleaned = False
         self._frames_published = 0
         self._status_cards_published = 0
+
+    def _stop_requested(self) -> bool:
+        return self._stop.is_set() or (
+            self._shutdown_event is not None and self._shutdown_event.is_set()
+        )
+
+    def _check_usb_network(self) -> None:
+        expected = self.settings.pico_usb
+        if expected is None or self._usb_network_probe is None:
+            return
+        now = time.monotonic()
+        if now < self._next_usb_check_at:
+            return
+        self._next_usb_check_at = now + self._usb_check_interval_s
+        try:
+            current = self._usb_network_probe()
+        except PicoUsbNetworkError as exc:
+            raise PicoUsbLinkChanged(
+                f"PICO USBOnly link unavailable: {exc}"
+            ) from exc
+        if current != expected:
+            raise PicoUsbLinkChanged(
+                "PICO USBOnly link changed: "
+                f"expected {expected.interface} {expected.workstation_ip} -> "
+                f"{expected.pico_ip}, found {current.interface} "
+                f"{current.workstation_ip} -> {current.pico_ip}"
+            )
 
     @property
     def control_address(self) -> tuple[str, int]:
@@ -372,7 +412,7 @@ class PicoVideoBridge:
         status_period_s = 1.0 / self.settings.stale_fps
         next_status_at = 0.0
         next_stats_at = time.monotonic() + self.settings.stats_interval_s
-        while not self._stop.is_set():
+        while not self._stop_requested():
             started = time.monotonic()
             status = self._source.status
             try:
@@ -469,13 +509,14 @@ class PicoVideoBridge:
         connection.settimeout(0.2)
         control_peer_ip = str(connection.getpeername()[0])
         try:
-            while not self._stop.is_set():
+            while not self._stop_requested():
+                self._check_usb_network()
                 try:
                     chunk = connection.recv(64 * 1024)
                 except socket.timeout:
                     continue
                 except OSError:
-                    if self._stop.is_set():
+                    if self._stop_requested():
                         return
                     raise
                 if not chunk:
@@ -507,14 +548,27 @@ class PicoVideoBridge:
     def serve_forever(self) -> None:
         """Listen until ``stop`` is called; source/session errors remain isolated."""
 
+        if self._stop_requested():
+            self.stop()
+            return
         listener = create_control_listener(self.settings)
+        abort_start = False
         with self._listener_lock:
-            self._listener = listener
-            bound_host, bound_port = listener.getsockname()[:2]
-            advertised_host = (
-                "127.0.0.1" if self.settings.control_host == "0.0.0.0" else bound_host
-            )
-            self._control_address = (advertised_host, bound_port)
+            if self._stop_requested():
+                abort_start = True
+            else:
+                self._listener = listener
+                bound_host, bound_port = listener.getsockname()[:2]
+                advertised_host = (
+                    "127.0.0.1"
+                    if self.settings.control_host == "0.0.0.0"
+                    else bound_host
+                )
+                self._control_address = (advertised_host, bound_port)
+        if abort_start:
+            listener.close()
+            self.stop()
+            return
         self._producer = threading.Thread(
             target=self._producer_loop,
             name="pico-frame-producer",
@@ -532,20 +586,28 @@ class PicoVideoBridge:
                 self.settings.pico_usb.serial or "unknown",
             )
         try:
-            while not self._stop.is_set():
+            while not self._stop_requested():
+                self._check_usb_network()
                 try:
                     connection, _ = listener.accept()
                 except socket.timeout:
                     continue
                 except OSError:
-                    if self._stop.is_set():
+                    if self._stop_requested():
                         break
                     raise
                 with connection:
                     with self._listener_lock:
                         self._control_socket = connection
                     try:
-                        self._handle_control(connection)
+                        try:
+                            self._handle_control(connection)
+                        except OSError as exc:
+                            if not self._stop_requested():
+                                LOGGER.warning(
+                                    "PICO control connection stopped: %s",
+                                    exc,
+                                )
                     finally:
                         with self._listener_lock:
                             if self._control_socket is connection:

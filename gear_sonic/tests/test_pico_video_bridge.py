@@ -12,17 +12,19 @@ import cv2
 import numpy as np
 import pytest
 
+import gear_sonic.pico_video.bridge as bridge_module
 from gear_sonic.pico_video.bridge import (
     BridgeSettings,
     create_control_listener,
     LatestFrameSlot,
+    PicoUsbLinkChanged,
     PicoVideoBridge,
     open_video_connection,
 )
 from gear_sonic.pico_video.encoder import EncoderSettings
 from gear_sonic.pico_video.gateway_source import GatewayFrame
 from gear_sonic.pico_video.protocol import CameraRequest, ProtocolError
-from gear_sonic.pico_video.usb_network import PicoUsbNetwork
+from gear_sonic.pico_video.usb_network import PicoUsbNetwork, PicoUsbNetworkError
 
 
 TEST_ACCESS_UNIT = b"\x00\x00\x00\x01\x09\xf0\x00\x00\x01\x65\xaa"
@@ -344,6 +346,98 @@ def test_usb_only_rejects_a_control_peer_outside_the_discovered_pico_link() -> N
 
     with pytest.raises(ProtocolError, match="discovered PICO USB peer"):
         bridge._validate_profile(request, control_peer_ip=request.ip)
+
+
+def test_bridge_detects_when_pico_usb_address_changes() -> None:
+    changed_network = PicoUsbNetwork(
+        interface=PICO_USB.interface,
+        workstation_ip="192.168.210.20",
+        pico_ip="192.168.210.85",
+        prefix_length=24,
+        serial=PICO_USB.serial,
+    )
+    bridge = PicoVideoBridge(
+        BridgeSettings(
+            gateway_endpoint="inproc://unused",
+            control_host=PICO_USB.workstation_ip,
+            pico_usb=PICO_USB,
+        ),
+        source=StaleSource(),
+        usb_network_probe=lambda: changed_network,
+        usb_check_interval_s=0.0,
+    )
+
+    with pytest.raises(PicoUsbLinkChanged, match="changed"):
+        bridge._check_usb_network()
+
+
+def test_bridge_detects_when_pico_usb_link_disappears() -> None:
+    def unavailable() -> PicoUsbNetwork:
+        raise PicoUsbNetworkError("PICO USBOnly RNDIS network not found")
+
+    bridge = PicoVideoBridge(
+        BridgeSettings(
+            gateway_endpoint="inproc://unused",
+            control_host=PICO_USB.workstation_ip,
+            pico_usb=PICO_USB,
+        ),
+        source=StaleSource(),
+        usb_network_probe=unavailable,
+        usb_check_interval_s=0.0,
+    )
+
+    with pytest.raises(PicoUsbLinkChanged, match="unavailable"):
+        bridge._check_usb_network()
+
+
+def test_bridge_does_not_start_after_external_shutdown_was_requested(
+    monkeypatch,
+) -> None:
+    shutdown_event = threading.Event()
+    shutdown_event.set()
+
+    def unexpected_listener(_settings: BridgeSettings) -> socket.socket:
+        raise AssertionError("listener must not be created after shutdown")
+
+    monkeypatch.setattr(
+        bridge_module,
+        "create_control_listener",
+        unexpected_listener,
+    )
+    bridge = PicoVideoBridge(
+        BridgeSettings(
+            gateway_endpoint="inproc://unused",
+            control_host="127.0.0.1",
+            control_port=0,
+            encoder="libx264",
+        ),
+        source=StaleSource(),
+        shutdown_event=shutdown_event,
+    )
+
+    bridge.serve_forever()
+
+
+def test_external_shutdown_stops_an_active_bridge() -> None:
+    shutdown_event = threading.Event()
+    bridge = PicoVideoBridge(
+        BridgeSettings(
+            gateway_endpoint="inproc://unused",
+            control_host="127.0.0.1",
+            control_port=0,
+            encoder="libx264",
+        ),
+        source=StaleSource(),
+        shutdown_event=shutdown_event,
+    )
+    thread = threading.Thread(target=bridge.serve_forever)
+    thread.start()
+    assert bridge.wait_until_ready(timeout_s=2.0)
+
+    shutdown_event.set()
+    thread.join(timeout=2.0)
+
+    assert not thread.is_alive()
 
 
 def test_video_socket_binds_the_discovered_usb_source_address(monkeypatch) -> None:
