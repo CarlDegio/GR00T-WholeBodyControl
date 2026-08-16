@@ -15,12 +15,12 @@ launch_data_collection:
   pico_vis_smpl: false
   pico_waist_tracking: false
   pico_video: true
-  task_prompt: demo
+  task_prompt: collect the pill bottle
   dataset_name: ''
   runtime_profile: gear_sonic/config/launch_inference.yaml
-  record_wrist_cameras: false
-  record_chest_camera: false
+  record_wrist_cameras: true
+  record_chest_camera: true
   text_to_speech: true
   camera_viewer: true
-  camera_host: localhost
+  camera_host: 192.168.123.164
   camera_port: 5555

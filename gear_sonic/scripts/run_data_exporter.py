@@ -96,7 +96,7 @@ class SonicDataExporterConfig:
     defer_video_encoding: bool = True
     """Keep encoded camera frames in memory and encode videos when saving the episode."""
 
-    video_encoder_threads: int = 8
+    video_encoder_threads: int = 16
     """Maximum encoder threads used while saving each deferred video."""
 
     text_to_speech: bool = True
@@ -349,13 +349,17 @@ class GrootDataCollector:
                     f"Started recording {self.current_episode_index}", blocking=False
                 )
             elif self._episode_state.get_state() == self._episode_state.NEED_TO_SAVE:
-                self._print_and_say("Stopping recording, preparing to save", blocking=False)
+                self._print_and_say_yellow(
+                    "Stopping recording, preparing to save", blocking=False
+                )
             elif self._episode_state.get_state() == self._episode_state.IDLE:
                 self._print_and_say("Saved episode and back to idle state", blocking=False)
         elif key == "e":
             if self._episode_state.get_state() == self._episode_state.RECORDING:
                 self._episode_state.change_state()  # → NEED_TO_SAVE
-                self._print_and_say("Stopping recording, preparing to save", blocking=False)
+                self._print_and_say_yellow(
+                    "Stopping recording, preparing to save", blocking=False
+                )
         
         elif key == "x":
             if self._episode_state.get_state() == self._episode_state.RECORDING:
@@ -578,7 +582,7 @@ class GrootDataCollector:
                 self.data_exporter.save_episode()
                 self.sonic_timing_monitor.reset()
                 self._initial_yaw = None
-                self._print_and_say("Finished saving episode")
+                self._print_and_say_yellow("Finished saving episode")
             else:
                 self._print_and_say("Skipping save: no frames collected", say=False)
             self._episode_state.change_state()
