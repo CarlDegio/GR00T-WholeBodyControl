@@ -1,5 +1,20 @@
 # Dual RGB-D Camera Calibration Implementation Plan
 
+## Execution update
+
+After this plan was written, live inspection and `origin/agent_full` commit
+`7218ea2` established that the new head camera is an Orbbec Gemini 345Lg,
+not the old head RealSense. Execution adapted Task 1 as follows:
+
+- ported the tested Orbbec driver and composed-camera factory integration;
+- enabled Orbbec RGB-D for `ego_view` and RealSense RGB-D only for
+  `chest_view`;
+- preserved raw source K6 distortion and actual post-undistortion output
+  coefficients separately; and
+- used `left_wrist` and `right_wrist` as the actual wire keys.
+
+Later RealSense-only wording below records the initial plan, not final hardware.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Stream aligned RGB-D from the robot head and chest cameras, capture both complete calibrations once, consume the saved values locally, and omit calibration metadata from normal robot packets.

@@ -1199,7 +1199,6 @@ class VisualServoController:
         self.desired_heading_rad: float | None = None
         self.heading_setpoint_error_rad: float | None = None
         self.last_visual_yaw_error_rad: float | None = None
-        self.yaw_error_trusted = False
         self.yaw_error_source = "unavailable"
         self.table_visible_last_update = False
         self.table_loss_alignment_done = False
@@ -1269,152 +1268,6 @@ class VisualServoController:
     @staticmethod
     def _slew(previous: float, desired: float, delta: float) -> float:
         return previous + max(-delta, min(delta, desired - previous))
-
-    @staticmethod
-    def _wrapped_angle(value: float) -> float:
-        return math.remainder(float(value), 2.0 * math.pi)
-
-    def _orientation_headings(
-        self, orientation: Mapping[str, Any] | None
-    ) -> tuple[float, float] | None:
-        if orientation is None:
-            return None
-        try:
-            actual = float(orientation["actual_heading_rad"])
-            setpoint = float(orientation["heading_setpoint_rad"])
-        except (KeyError, TypeError, ValueError):
-            return None
-        if not math.isfinite(actual) or not math.isfinite(setpoint):
-            return None
-        for age_name in ("state_age_s", "telemetry_age_s"):
-            raw_age = orientation.get(age_name)
-            if raw_age is None:
-                continue
-            try:
-                age = float(raw_age)
-            except (TypeError, ValueError):
-                return None
-            if not math.isfinite(age) or age < 0.0 or age > self.orientation_stale_s:
-                return None
-        return self._wrapped_angle(actual), self._wrapped_angle(setpoint)
-
-    def _propagate_yaw_error(
-        self, orientation: Mapping[str, Any] | None
-    ) -> float | None:
-        headings = self._orientation_headings(orientation)
-        if self.desired_heading_rad is None or headings is None:
-            return None
-        actual_heading, heading_setpoint = headings
-        yaw_error = self._wrapped_angle(
-            self.desired_heading_rad - actual_heading
-        )
-        self.heading_setpoint_error_rad = self._wrapped_angle(
-            self.desired_heading_rad - heading_setpoint
-        )
-        self.yaw_error_source = "propagated_heading"
-        self.yaw_error_trusted = True
-        self.last_errors = (
-            self.last_errors[0], self.last_errors[1], yaw_error
-        )
-        return yaw_error
-
-    def _refresh_yaw_error(
-        self,
-        observation: RawServoObservation,
-        visual_yaw_error: float,
-        orientation: Mapping[str, Any] | None,
-    ) -> tuple[float, bool]:
-        headings = self._orientation_headings(orientation)
-        table_was_visible = self.table_visible_last_update
-        table_visible = observation.table is not None
-        if table_visible:
-            self.last_visual_yaw_error_rad = float(visual_yaw_error)
-            self.table_visible_last_update = True
-            self.table_loss_alignment_done = False
-            if headings is not None:
-                actual_heading, _ = headings
-                self.desired_heading_rad = self._wrapped_angle(
-                    actual_heading + visual_yaw_error
-                )
-        else:
-            self.table_visible_last_update = False
-
-        if self.desired_heading_rad is not None and headings is not None:
-            actual_heading, heading_setpoint = headings
-            yaw_error = self._wrapped_angle(
-                self.desired_heading_rad - actual_heading
-            )
-            self.heading_setpoint_error_rad = self._wrapped_angle(
-                self.desired_heading_rad - heading_setpoint
-            )
-            self.yaw_error_source = (
-                "visual_calibrated_heading"
-                if table_visible
-                else "propagated_heading"
-            )
-            self.yaw_error_trusted = True
-        elif table_visible:
-            yaw_error = float(visual_yaw_error)
-            self.heading_setpoint_error_rad = None
-            self.yaw_error_source = "visual"
-            self.yaw_error_trusted = True
-        elif self.last_visual_yaw_error_rad is not None:
-            yaw_error = self.last_visual_yaw_error_rad
-            self.heading_setpoint_error_rad = None
-            self.yaw_error_source = "held_visual_unpropagated"
-            self.yaw_error_trusted = False
-        else:
-            yaw_error = math.inf
-            self.heading_setpoint_error_rad = None
-            self.yaw_error_source = "unavailable"
-            self.yaw_error_trusted = False
-
-        self.last_errors = (
-            self.last_errors[0],
-            self.last_errors[1],
-            float(yaw_error),
-        )
-        return float(yaw_error), table_was_visible and not table_visible
-
-    def _yaw_is_stable(self, yaw_error: float) -> bool:
-        if not self.yaw_error_trusted or abs(yaw_error) > self.yaw_lock_rad:
-            return False
-        return (
-            self.heading_setpoint_error_rad is None
-            or abs(self.heading_setpoint_error_rad) <= self.yaw_lock_rad
-        )
-
-    def _yaw_command(self, *, speed_limit: float) -> ServoCommand:
-        control_error = (
-            self.last_errors[2]
-            if self.heading_setpoint_error_rad is None
-            else self.heading_setpoint_error_rad
-        )
-        if not self.yaw_error_trusted or not math.isfinite(control_error):
-            self.current = self._zero()
-            return self.current
-        desired_wz = self._clip(
-            self.heading_setpoint_gain * control_error
-            if self.heading_setpoint_error_rad is not None
-            else control_error,
-            speed_limit,
-        )
-        if abs(control_error) <= math.radians(0.25):
-            desired_wz = 0.0
-        next_wz = self._clip(
-            self._slew(self.current.wz, desired_wz, 0.05), speed_limit
-        )
-        self.current = ServoCommand(0.0, 0.0, next_wz, self.command_ttl_s)
-        return self.current
-
-    def _begin_global_yaw(
-        self, *, context: str, resume_phase: ServoPhase
-    ) -> ServoCommand:
-        self.yaw_resume_phase = resume_phase
-        self.yaw_correction_context = context
-        self.yaw_stable_frames = 0
-        self._transition(ServoPhase.GLOBAL_YAW_ALIGN, context)
-        return self._yaw_command(speed_limit=0.10)
 
     def _enforce_min_linear_speed(
         self, vx: float, vy: float
@@ -1499,13 +1352,7 @@ class VisualServoController:
         self.last_errors = errors
         return errors
 
-    def update(
-        self,
-        observation: RawServoObservation,
-        *,
-        now: float,
-        orientation: Mapping[str, Any] | None = None,
-    ) -> ServoCommand:
+    def update(self, observation: RawServoObservation, *, now: float) -> ServoCommand:
         if self.terminal:
             return self.current
         self.last_transition_reason = None
@@ -1513,38 +1360,7 @@ class VisualServoController:
         limited = self._check_limits(now)
         if limited is not None:
             return limited
-        forward_error, right_error, visual_yaw_error = self._update_filter(
-            observation
-        )
-        yaw_error, table_lost = self._refresh_yaw_error(
-            observation, visual_yaw_error, orientation
-        )
-
-        if self.phase is ServoPhase.GLOBAL_YAW_ALIGN:
-            self.invalid_frames = 0
-            stable_yaw = self._yaw_is_stable(yaw_error)
-            self.yaw_stable_frames = (
-                self.yaw_stable_frames + 1 if stable_yaw else 0
-            )
-            if self.yaw_stable_frames >= self.yaw_lock_frames_required:
-                context = self.yaw_correction_context or "global yaw correction"
-                resume = self.yaw_resume_phase or ServoPhase.TRANSLATE_TARGET
-                if not self.table_visible_last_update:
-                    self.table_loss_alignment_done = True
-                self.yaw_resume_phase = None
-                self.yaw_correction_context = None
-                return self._transition(
-                    resume, f"{context} aligned within one degree"
-                )
-            if not self.yaw_error_trusted:
-                return self.note_invalid(
-                    "orientation telemetry unavailable for global yaw",
-                    hard=False,
-                    now=now,
-                    integrated=True,
-                    orientation=orientation,
-                )
-            return self._yaw_command(speed_limit=0.10)
+        forward_error, right_error, yaw_error = self._update_filter(observation)
 
         if (
             self.phase is not ServoPhase.VERTICAL_RECENTER
@@ -1589,32 +1405,19 @@ class VisualServoController:
             if self._visibility_guarded(observation):
                 self.resume_phase = self.phase
                 self.invalid_frames = 0
-                return self._transition(
-                    ServoPhase.RECENTER, "target visibility guard"
-                )
+                return self._transition(ServoPhase.RECENTER, "target visibility guard")
             if observation.table is None:
                 return self.note_invalid(
-                    "missing table geometry",
-                    hard=False,
-                    now=now,
-                    integrated=True,
-                    orientation=orientation,
+                    "missing table geometry", hard=False, now=now, integrated=True
                 )
             self.invalid_frames = 0
-            if (
-                self.phase is ServoPhase.YAW_ALIGN
-                and abs(yaw_error) <= self.yaw_trim_entry_rad
-            ):
-                self._transition(
-                    ServoPhase.YAW_TRIM, "coarse yaw within 8 degrees"
-                )
+            if self.phase is ServoPhase.YAW_ALIGN and abs(yaw_error) <= self.yaw_trim_entry_rad:
+                self._transition(ServoPhase.YAW_TRIM, "coarse yaw within 8 degrees")
 
         if self.phase is ServoPhase.RECENTER:
             self.invalid_frames = 0
             recovered = self._target_center_recovered(observation)
-            self.recenter_stable_frames = (
-                self.recenter_stable_frames + 1 if recovered else 0
-            )
+            self.recenter_stable_frames = self.recenter_stable_frames + 1 if recovered else 0
             if self.recenter_stable_frames >= self.recenter_frames_required:
                 resume = self.resume_phase or ServoPhase.YAW_ALIGN
                 if observation.table is None and resume in {
@@ -1626,62 +1429,57 @@ class VisualServoController:
                         hard=False,
                         now=now,
                         integrated=True,
-                        orientation=orientation,
                     )
                 self.resume_phase = None
                 return self._transition(resume, "target recentered")
             controlled_right = 0.0 if abs(right_error) <= 0.03 else right_error
-            desired_vy = self._clip(
-                -0.6 * controlled_right, self.max_lateral_speed_m_s
-            )
+            desired_vy = self._clip(-0.6 * controlled_right, self.max_lateral_speed_m_s)
             vx, vy = self._enforce_min_linear_speed(0.0, desired_vy)
-            self.current = ServoCommand(vx, vy, 0.0, self.command_ttl_s)
+            self.current = ServoCommand(
+                vx,
+                vy,
+                0.0,
+                self.command_ttl_s,
+            )
             return self.current
 
         if self.phase is ServoPhase.YAW_TRIM:
-            stable_yaw = self._yaw_is_stable(yaw_error)
-            self.yaw_stable_frames = (
-                self.yaw_stable_frames + 1 if stable_yaw else 0
-            )
+            stable_yaw = abs(yaw_error) <= self.yaw_lock_rad
+            self.yaw_stable_frames = self.yaw_stable_frames + 1 if stable_yaw else 0
             if self.yaw_stable_frames >= self.yaw_lock_frames_required:
                 return self._transition(
-                    ServoPhase.TRANSLATE_TARGET,
-                    "closed-loop yaw stable within one degree",
+                    ServoPhase.TRANSLATE_TARGET, "fine yaw stable for three frames"
                 )
-            return self._yaw_command(speed_limit=0.10)
+            controlled_yaw = 0.0 if stable_yaw else yaw_error
+            desired_wz = self._clip(controlled_yaw, 0.10)
+            next_wz = self._clip(
+                self._slew(self.current.wz, desired_wz, 0.05), 0.10
+            )
+            self.current = ServoCommand(0.0, 0.0, next_wz, self.command_ttl_s)
+            return self.current
 
         if self.phase is ServoPhase.YAW_ALIGN:
-            return self._yaw_command(speed_limit=0.15)
+            desired_wz = self._clip(yaw_error, 0.15)
+            self.current = ServoCommand(
+                0.0,
+                0.0,
+                self._clip(self._slew(self.current.wz, desired_wz, 0.05), 0.15),
+                self.command_ttl_s,
+            )
+            return self.current
 
         if self.phase is ServoPhase.TRANSLATE_TARGET:
             self.invalid_frames = 0
-            if table_lost and not self.table_loss_alignment_done:
-                return self._begin_global_yaw(
-                    context="last tracked table yaw",
-                    resume_phase=ServoPhase.TRANSLATE_TARGET,
-                )
-
             forward_stable = (
                 abs(forward_error) <= self.forward_tolerance_m + 1.0e-12
             )
             lateral_stable = (
                 abs(right_error) <= self.lateral_tolerance_m + 1.0e-12
             )
-            position_stable = forward_stable and lateral_stable
-            self.stable_frames = (
-                self.stable_frames + 1 if position_stable else 0
-            )
-            if position_stable:
-                self.current = self._zero()
-                if self.stable_frames < self.stable_frames_required:
-                    return self.current
-                if not self._yaw_is_stable(yaw_error):
-                    return self._begin_global_yaw(
-                        context="final yaw",
-                        resume_phase=ServoPhase.TRANSLATE_TARGET,
-                    )
+            stable = forward_stable and lateral_stable
+            self.stable_frames = self.stable_frames + 1 if stable else 0
+            if self.stable_frames >= self.stable_frames_required:
                 return self._stop("aligned")
-
             # Keep translation axis-aligned: center the target laterally before
             # changing standoff distance. Sending vx and vy together produces
             # poor diagonal steps on the physical robot.
@@ -1694,7 +1492,12 @@ class VisualServoController:
                 desired_vx = self._clip(0.5 * forward_error, 0.20)
                 desired_vy = 0.0
             vx, vy = self._enforce_min_linear_speed(desired_vx, desired_vy)
-            self.current = ServoCommand(vx, vy, 0.0, self.command_ttl_s)
+            self.current = ServoCommand(
+                vx,
+                vy,
+                0.0,
+                self.command_ttl_s,
+            )
             return self.current
 
         return self.current
@@ -1706,13 +1509,11 @@ class VisualServoController:
         hard: bool,
         now: float,
         integrated: bool = False,
-        orientation: Mapping[str, Any] | None = None,
     ) -> ServoCommand:
         if self.terminal:
             return self.current
         if not integrated:
             self._integrate(now)
-        self._propagate_yaw_error(orientation)
         limited = self._check_limits(now)
         if limited is not None:
             return limited
@@ -2547,17 +2348,8 @@ class RawServoRuntime:
             "phase": self.controller.phase,
             "resume_phase": self.controller.resume_phase,
             "vertical_resume_phase": self.controller.vertical_resume_phase,
-            "yaw_resume_phase": self.controller.yaw_resume_phase,
-            "yaw_correction_context": self.controller.yaw_correction_context,
             "transition_reason": self.controller.last_transition_reason,
             "filtered_errors": list(self.controller.last_errors),
-            "visual_yaw_error_rad": self.controller.last_visual_yaw_error_rad,
-            "desired_heading_rad": self.controller.desired_heading_rad,
-            "heading_setpoint_error_rad": (
-                self.controller.heading_setpoint_error_rad
-            ),
-            "yaw_error_source": self.controller.yaw_error_source,
-            "yaw_error_trusted": self.controller.yaw_error_trusted,
             "invalid_frames": self.controller.invalid_frames,
             "stable_frames": self.controller.stable_frames,
             "yaw_stable_frames": self.controller.yaw_stable_frames,
@@ -2791,7 +2583,6 @@ class RawServoRuntime:
             self._discard_event_diagnostic(event)
             return True
         previous_command = self.controller.current
-        orientation = self._orientation_diagnostics(now)
         recovered_from_soft_stale = False
         if event.kind == "initialized":
             if self.phase not in {"inference", "switching"} or event.observation is None:
@@ -2807,9 +2598,7 @@ class RawServoRuntime:
             self.phase = "aligning"
             self.controller.reset(now)
             self.last_observation_at = float(now)
-            command = self.controller.update(
-                event.observation, now=now, orientation=orientation
-            )
+            command = self.controller.update(event.observation, now=now)
             self._record("initialized", details=dict(event.details or {}))
             self.logger(f"[RawServo] ALIGNING output={self.output_dir}")
         elif event.kind == "observation":
@@ -2822,19 +2611,14 @@ class RawServoRuntime:
                 recovered_from_soft_stale = True
                 self._record("camera_soft_recovered")
                 self.logger("[RawServo] RESUME camera stream recovered")
-            command = self.controller.update(
-                event.observation, now=now, orientation=orientation
-            )
+            command = self.controller.update(event.observation, now=now)
         elif event.kind == "invalid":
             if self.phase != "aligning":
                 self._discard_event_diagnostic(event)
                 return False
             self.last_observation_at = produced_at
             command = self.controller.note_invalid(
-                event.error or "invalid perception",
-                hard=event.hard,
-                now=now,
-                orientation=orientation,
+                event.error or "invalid perception", hard=event.hard, now=now
             )
         else:
             self._discard_event_diagnostic(event)
@@ -2845,7 +2629,7 @@ class RawServoRuntime:
             control_applied=True,
             controller_state=self._controller_diagnostics(),
             command=self._command_diagnostics(command),
-            orientation=orientation,
+            orientation=self._orientation_diagnostics(now),
         )
         self._record(
             "control_update",

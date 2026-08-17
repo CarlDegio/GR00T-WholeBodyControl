@@ -11,7 +11,7 @@ Usage (on robot)::
         --ego-view-device-id 18443010E1ABC12300 \\
         --port 5555
 
-Supported camera types: ``oak``, ``oak_mono``, ``realsense``,
+Supported camera types: ``oak``, ``oak_mono``, ``realsense``, ``orbbec``,
 ``usb``, or a path to an ``.mp4`` file for replay testing.
 
 Run ``python -m gear_sonic.camera.composed_camera --help`` for all options.
@@ -88,8 +88,17 @@ class ComposedCameraConfig:
     realsense_enable_depth: bool = False
     """Whether RealSense cameras should publish depth alongside color."""
 
+    orbbec_enable_depth: bool = False
+    """Whether Orbbec cameras should publish aligned depth alongside color."""
+
     realsense_depth_mount: str = CameraMountPosition.CHEST_VIEW.value
     """RealSense mount that publishes aligned depth when depth is enabled."""
+    realsense_depth_mounts: tuple[str, ...] = ()
+    """RealSense mounts that publish aligned depth; overrides the singular setting."""
+
+    publish_camera_info: bool = False
+    """Include camera calibration metadata in composed messages."""
+
 
     run_as_server: bool = True
     """Run as ZMQ PUB server (set False for in-process usage)."""
@@ -122,12 +131,23 @@ class ComposedCameraConfig:
             CameraMountPosition.HEAD.value,
             CameraMountPosition.CHEST_VIEW.value,
         }
-        if self.realsense_depth_mount not in valid_depth_mounts:
+        requested_depth_mounts = (
+            self.realsense_depth_mounts
+            if self.realsense_depth_mounts
+            else (self.realsense_depth_mount,)
+        )
+        invalid = sorted(set(requested_depth_mounts) - valid_depth_mounts)
+        if invalid:
             choices = ", ".join(sorted(valid_depth_mounts))
             raise ValueError(
-                f"realsense_depth_mount must be one of {choices}, "
-                f"got {self.realsense_depth_mount!r}"
+                f"realsense depth mounts must be selected from {choices}, "
+                f"got {invalid!r}"
             )
+
+    @property
+    def enabled_realsense_depth_mounts(self) -> frozenset[str]:
+        mounts = self.realsense_depth_mounts or (self.realsense_depth_mount,)
+        return frozenset(mounts)
 
 
 class ComposedCameraSensor(Sensor, SensorServer):
@@ -430,10 +450,26 @@ class ComposedCameraSensor(Sensor, SensorServer):
             realsense_config.fps = self.config.fps
             realsense_config.enable_depth = (
                 self.config.realsense_enable_depth
-                and mount_position == self.config.realsense_depth_mount
+                and mount_position in self.config.enabled_realsense_depth_mounts
             )
             return RealSenseSensor(
                 config=realsense_config,
+                mount_position=mount_position,
+                device_id=device_id,
+            )
+
+        elif camera_type == "orbbec":
+            from gear_sonic.camera.drivers.orbbec import OrbbecConfig, OrbbecSensor
+
+            print(
+                f"Initializing Orbbec sensor for camera type: {camera_type}, "
+                f"device: {device_id}"
+            )
+            orbbec_config = OrbbecConfig()
+            orbbec_config.fps = self.config.fps
+            orbbec_config.enable_depth = self.config.orbbec_enable_depth
+            return OrbbecSensor(
+                config=orbbec_config,
                 mount_position=mount_position,
                 device_id=device_id,
             )
@@ -555,7 +591,8 @@ class ComposedCameraSensor(Sensor, SensorServer):
         for _mount, camera_data in message.items():
             all_timestamps.update(camera_data.get("timestamps", {}))
             all_images.update(camera_data.get("images", {}))
-            all_camera_info.update(camera_data.get("camera_info", {}))
+            if self.config.publish_camera_info:
+                all_camera_info.update(camera_data.get("camera_info", {}))
         img_schema = ImageMessageSchema(
             timestamps=all_timestamps,
             images=all_images,
@@ -790,15 +827,26 @@ class ComposedCameraHttpClient:
             grabber.stop()
 
 
+def run_server_from_config(config: ComposedCameraConfig) -> None:
+    """Run the composed server and always release its camera workers."""
+    composed_camera = ComposedCameraSensor(config)
+    print("Running composed camera server...")
+    try:
+        composed_camera.run_server()
+    except KeyboardInterrupt:
+        print("Stopping camera server...")
+    finally:
+        composed_camera.close()
+
+
+
 if __name__ == "__main__":
     import tyro
 
     config = tyro.cli(ComposedCameraConfig)
 
     if config.run_as_server:
-        composed_camera = ComposedCameraSensor(config)
-        print("Running composed camera server...")
-        composed_camera.run_server()
+        run_server_from_config(config)
     else:
         composed_client = ComposedCameraClientSensor(
             server_ip="localhost", port=config.port

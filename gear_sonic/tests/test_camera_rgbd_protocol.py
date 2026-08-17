@@ -55,7 +55,14 @@ def _fake_realsense_module():
         def get_stream(self, stream):
             assert stream == fake_rs.stream.color
             intrinsics = types.SimpleNamespace(
-                fx=500.0, fy=501.0, ppx=320.0, ppy=240.0, width=640, height=480
+                fx=500.0,
+                fy=501.0,
+                ppx=320.0,
+                ppy=240.0,
+                width=640,
+                height=480,
+                model="distortion.brown_conrady",
+                coeffs=[0.1, -0.2, 0.01, -0.02, 0.03],
             )
             return types.SimpleNamespace(
                 as_video_stream_profile=lambda: types.SimpleNamespace(
@@ -210,6 +217,17 @@ def test_realsense_depth_uses_color_aligned_frames_and_publishes_calibration(
         "cy": 240.0,
         "width": 640,
         "height": 480,
+        "distortion_model": "distortion.brown_conrady",
+        "distortion_coeffs": [0.1, -0.2, 0.01, -0.02, 0.03],
+        "distortion_coeff_order": ["k1", "k2", "p1", "p2", "k3"],
+        "source_distortion_model": "distortion.brown_conrady",
+        "source_distortion_coeffs": [0.1, -0.2, 0.01, -0.02, 0.03],
+        "rgb_undistorted": False,
+        "camera_type": "realsense",
+        "camera_serial": "fake-device",
+        "color_image_dim": [640, 480],
+        "depth_image_dim": [640, 480],
+        "fps": 30,
         "depth_scale_m": 0.001,
         "depth_aligned_to": "chest_view",
     }
@@ -239,7 +257,91 @@ def test_realsense_rgb_only_still_publishes_live_color_intrinsics(monkeypatch):
         "cy": 240.0,
         "width": 640,
         "height": 480,
+        "distortion_model": "distortion.brown_conrady",
+        "distortion_coeffs": [0.1, -0.2, 0.01, -0.02, 0.03],
+        "distortion_coeff_order": ["k1", "k2", "p1", "p2", "k3"],
+        "source_distortion_model": "distortion.brown_conrady",
+        "source_distortion_coeffs": [0.1, -0.2, 0.01, -0.02, 0.03],
+        "rgb_undistorted": False,
+        "camera_type": "realsense",
+        "camera_serial": "fake-device",
+        "color_image_dim": [640, 480],
+        "depth_image_dim": None,
+        "fps": 30,
     }
+
+def test_composed_camera_supports_dual_depth_and_optional_camera_info(monkeypatch):
+    from gear_sonic.camera.composed_camera import (
+        ComposedCameraConfig,
+        ComposedCameraSensor,
+    )
+
+    class FakeRealSenseConfig:
+        created = []
+
+        def __init__(self):
+            self.fps = 30
+            self.enable_depth = False
+            self.__class__.created.append(self)
+
+    class FakeRealSenseSensor:
+        def __init__(self, **kwargs):
+            self.config = kwargs["config"]
+
+    fake_driver = types.ModuleType("gear_sonic.camera.drivers.realsense")
+    fake_driver.RealSenseConfig = FakeRealSenseConfig
+    fake_driver.RealSenseSensor = FakeRealSenseSensor
+    monkeypatch.setitem(sys.modules, "gear_sonic.camera.drivers.realsense", fake_driver)
+
+    composed = object.__new__(ComposedCameraSensor)
+    composed.config = ComposedCameraConfig(
+        realsense_enable_depth=True,
+        realsense_depth_mounts=("ego_view", "chest_view"),
+        publish_camera_info=False,
+    )
+    composed._instantiate_camera("ego_view", "realsense")
+    composed._instantiate_camera("chest_view", "realsense")
+    composed._instantiate_camera("left_wrist_view", "realsense")
+
+    assert [config.enable_depth for config in FakeRealSenseConfig.created] == [
+        True,
+        True,
+        False,
+    ]
+
+    message = {
+        "ego_view": {
+            "timestamps": {"ego_view": 1.0, "ego_view_depth": 1.0},
+            "images": {
+                "ego_view": np.zeros((1, 1, 3), dtype=np.uint8),
+                "ego_view_depth": np.ones((1, 1), dtype=np.uint16),
+            },
+            "camera_info": {"ego_view": {"fx": 500.0}},
+        },
+        "chest_view": {
+            "timestamps": {"chest_view": 1.0, "chest_view_depth": 1.0},
+            "images": {
+                "chest_view": np.zeros((1, 1, 3), dtype=np.uint8),
+                "chest_view_depth": np.ones((1, 1), dtype=np.uint16),
+            },
+            "camera_info": {"chest_view": {"fx": 501.0}},
+        },
+    }
+    normal = ImageMessageSchema.deserialize(
+        composed.serialize_message(message)
+    ).asdict()
+    assert normal["camera_info"] == {}
+
+    composed.config.publish_camera_info = True
+    calibration = ImageMessageSchema.deserialize(
+        composed.serialize_message(message)
+    ).asdict()
+    assert calibration["camera_info"] == {
+        "ego_view": {"fx": 500.0},
+        "chest_view": {"fx": 501.0},
+    }
+
+
 
 
 def test_composed_camera_enables_depth_only_for_chest_and_merges_camera_info(
@@ -269,7 +371,9 @@ def test_composed_camera_enables_depth_only_for_chest_and_merges_camera_info(
     monkeypatch.setitem(sys.modules, "gear_sonic.camera.drivers.realsense", fake_driver)
 
     composed = object.__new__(ComposedCameraSensor)
-    composed.config = ComposedCameraConfig(realsense_enable_depth=True)
+    composed.config = ComposedCameraConfig(
+        realsense_enable_depth=True, publish_camera_info=True
+    )
     composed._instantiate_camera("ego_view", "realsense")
     composed._instantiate_camera("chest_view", "realsense")
 

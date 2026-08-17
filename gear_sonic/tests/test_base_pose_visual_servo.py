@@ -383,6 +383,19 @@ def snapshot(
         timestamp=10.0,
     )
 
+def fixed_calibration(**overrides: float | int) -> RawServoCalibration:
+    values: dict[str, float | int] = {
+        "width": 640,
+        "height": 480,
+        "fx": 607.878662,
+        "fy": 608.063232,
+        "cx": 319.858765,
+        "cy": 259.731140,
+    }
+    values.update(overrides)
+    return RawServoCalibration(**values)
+
+
 
 def observation(
     *,
@@ -420,6 +433,24 @@ def observation(
         image_width=640,
         image_height=image_height,
     )
+
+
+def orientation(
+    actual_heading_rad: float,
+    heading_setpoint_rad: float | None = None,
+    *,
+    age_s: float = 0.01,
+) -> dict[str, float]:
+    return {
+        "actual_heading_rad": actual_heading_rad,
+        "heading_setpoint_rad": (
+            actual_heading_rad
+            if heading_setpoint_rad is None
+            else heading_setpoint_rad
+        ),
+        "state_age_s": age_s,
+        "telemetry_age_s": age_s,
+    }
 
 
 def target_payload() -> dict[str, object]:
@@ -463,19 +494,20 @@ def test_target_schema_is_strict_and_contains_no_motion_plan() -> None:
         validate_raw_servo_target(unsure)
 
 
-def test_fixed_calibration_fov_transform_and_live_intrinsic_guard() -> None:
-    calibration = RawServoCalibration()
+def test_saved_calibration_geometry_skips_live_intrinsic_delta_guard() -> None:
+    calibration = fixed_calibration()
     assert calibration.horizontal_fov_deg == pytest.approx(55.526508, abs=1e-5)
     assert calibration.vertical_fov_deg == pytest.approx(43.077882, abs=1e-5)
     calibration.validate_snapshot(snapshot())
 
     optical_axis = calibration.camera_to_body(np.array([[0.0, 0.0, 1.0]]))[0]
-    assert optical_axis[0] == pytest.approx(math.cos(math.radians(25.0)))
+    assert optical_axis[0] == pytest.approx(math.cos(math.radians(38.0)))
     assert optical_axis[1] == pytest.approx(0.0)
-    assert optical_axis[2] == pytest.approx(1.2 - math.sin(math.radians(25.0)))
+    assert optical_axis[2] == pytest.approx(1.2 - math.sin(math.radians(38.0)))
 
-    with pytest.raises(BasePoseCameraError, match="intrinsics differ"):
-        calibration.validate_snapshot(snapshot(fx=611.0))
+    calibration.validate_snapshot(snapshot(fx=611.0))
+    with pytest.raises(BasePoseCameraError, match="expected 600x480"):
+        fixed_calibration(width=600).validate_snapshot(snapshot())
 
 
 def test_target_uses_eroded_mask_depth_and_bbox_center_for_lateral_error() -> None:
@@ -483,7 +515,7 @@ def test_target_uses_eroded_mask_depth_and_bbox_center_for_lateral_error() -> No
     depth[200:205, 250:390] = 9000
     mask = np.zeros((480, 640), dtype=bool)
     mask[180:340, 220:440] = True
-    calibration = RawServoCalibration(camera_pitch_deg=0.0)
+    calibration = fixed_calibration(camera_pitch_deg=0.0)
 
     geometry = estimate_target_geometry(
         snapshot(depth),
@@ -502,7 +534,7 @@ def test_target_uses_eroded_mask_depth_and_bbox_center_for_lateral_error() -> No
 def test_table_mask_depth_recovers_front_facing_horizontal_edge() -> None:
     mask = np.zeros((480, 640), dtype=bool)
     mask[120:360, 100:540] = True
-    calibration = RawServoCalibration(camera_height_m=0.0, camera_pitch_deg=0.0)
+    calibration = fixed_calibration(camera_height_m=0.0, camera_pitch_deg=0.0)
 
     geometry = estimate_table_geometry(snapshot(), mask, calibration)
 
@@ -562,7 +594,7 @@ def test_controller_rejects_invalid_horizontal_guard_and_recovery_fractions(
         )
 
 
-def test_controller_nonzero_translation_preserves_direction_at_minimum_speed() -> None:
+def test_controller_translation_prioritizes_lateral_axis_when_both_errors_active() -> None:
     controller = VisualServoController()
     controller.reset(1.0)
     controller.phase = ServoPhase.TRANSLATE_TARGET
@@ -570,11 +602,17 @@ def test_controller_nonzero_translation_preserves_direction_at_minimum_speed() -
         observation(forward=1.2, right=0.26666666666666666), now=1.1
     )
 
-    assert math.hypot(command.vx, command.vy) == pytest.approx(0.30)
-    assert command.vx > 0.0
-    assert command.vy < 0.0
-    assert command.vx / -command.vy == pytest.approx(1.25)
-    assert command.wz == 0.0
+    assert command.velocity == pytest.approx((0.0, -0.30, 0.0))
+
+
+def test_controller_translation_uses_forward_axis_after_lateral_alignment() -> None:
+    controller = VisualServoController()
+    controller.reset(1.0)
+    controller.phase = ServoPhase.TRANSLATE_TARGET
+
+    command = controller.update(observation(forward=1.2, right=0.0), now=1.1)
+
+    assert command.velocity == pytest.approx((0.30, 0.0, 0.0))
 
 
 def test_controller_minimum_speed_scaling_can_exceed_prefloor_lateral_limit() -> None:
@@ -595,8 +633,8 @@ def test_controller_accepts_configurable_prefloor_lateral_limit() -> None:
 
     command = controller.update(observation(forward=1.2, right=1.0), now=1.1)
 
-    assert math.hypot(command.vx, command.vy) == pytest.approx(0.30)
-    assert command.vx / -command.vy == pytest.approx(0.20 / 0.12)
+    assert controller.max_lateral_speed_m_s == pytest.approx(0.12)
+    assert command.velocity == pytest.approx((0.0, -0.30, 0.0))
 
 
 @pytest.mark.parametrize("limit", [0.0, -0.1, math.nan, math.inf])
@@ -639,7 +677,7 @@ def test_raw_servo_default_standoff_is_point_eight_meters(tmp_path) -> None:
 
     for index in range(5):
         command = runtime.controller.update(
-            observation(forward=0.80, include_table=False),
+            observation(forward=0.80),
             now=1.1 + index * 0.1,
         )
 
@@ -662,7 +700,8 @@ def test_raw_servo_runtime_uses_configured_prefloor_lateral_limit(tmp_path) -> N
         observation(forward=1.2, right=1.0), now=1.1
     )
 
-    assert command.vx / -command.vy == pytest.approx(0.20 / 0.12)
+    assert runtime.controller.max_lateral_speed_m_s == pytest.approx(0.12)
+    assert command.velocity == pytest.approx((0.0, -0.30, 0.0))
 
 
 def test_controller_default_completion_tolerances_are_ten_centimeters() -> None:
@@ -672,7 +711,7 @@ def test_controller_default_completion_tolerances_are_ten_centimeters() -> None:
 
     for index in range(5):
         command = controller.update(
-            observation(forward=0.90, right=0.10, include_table=False),
+            observation(forward=0.90, right=0.10),
             now=1.1 + index * 0.1,
         )
 
@@ -759,7 +798,7 @@ def test_runtime_passes_configured_completion_tolerances_to_controller(
     assert runtime.controller.lateral_tolerance_m == pytest.approx(0.08)
 
 
-def test_raw_servo_default_runtime_limit_is_sixty_seconds(tmp_path) -> None:
+def test_raw_servo_default_runtime_limit_is_one_hundred_eighty_seconds(tmp_path) -> None:
     runtime = RawServoRuntime(
         BasePosePlannerConfig(task="align", output_root=str(tmp_path)),
         publish=lambda _: None,
@@ -768,10 +807,10 @@ def test_raw_servo_default_runtime_limit_is_sixty_seconds(tmp_path) -> None:
     runtime.controller.reset(1.0)
     runtime.controller.phase = ServoPhase.TRANSLATE_TARGET
 
-    runtime.controller.update(observation(forward=1.0), now=60.9)
+    runtime.controller.update(observation(forward=1.0), now=180.9)
     assert not runtime.controller.terminal
 
-    runtime.controller.update(observation(forward=1.0), now=61.0)
+    runtime.controller.update(observation(forward=1.0), now=181.0)
     assert runtime.controller.terminal_reason == "maximum run time reached"
 
 
@@ -859,11 +898,11 @@ def test_controller_requires_five_stable_visual_frames_and_hard_loss_is_immediat
     controller.phase = ServoPhase.TRANSLATE_TARGET
     for index in range(4):
         command = controller.update(
-            observation(include_table=False), now=1.1 + index * 0.1
+            observation(), now=1.1 + index * 0.1
         )
         assert not controller.terminal
         assert command.velocity == (0.0, 0.0, 0.0)
-    controller.update(observation(include_table=False), now=1.5)
+    controller.update(observation(), now=1.5)
     assert controller.terminal_reason == "aligned"
 
     controller.reset(2.0)
@@ -1228,10 +1267,10 @@ def test_runtime_deadline_stops_before_republishing_nonzero_command(tmp_path) ->
     runtime.phase = "aligning"
     runtime.controller.reset(1.0)
     runtime.controller.current = ServoCommand(0.30, 0.0, 0.0, 0.15)
-    runtime.last_observation_at = 60.9
-    runtime.next_publish_at = 61.05
+    runtime.last_observation_at = 180.9
+    runtime.next_publish_at = 181.05
 
-    command = runtime.publish_due(61.0)
+    command = runtime.publish_due(181.0)
 
     assert command is not None and command.velocity == (0.0, 0.0, 0.0)
     assert runtime.phase == "idle"
@@ -1251,7 +1290,7 @@ def test_observation_allows_missing_table_and_carries_target_box() -> None:
     )
 
     value = _observation(
-        snapshot(), target, None, RawServoCalibration(camera_pitch_deg=0.0)
+        snapshot(), target, None, fixed_calibration(camera_pitch_deg=0.0)
     )
 
     assert value.table is None
@@ -1700,7 +1739,11 @@ def test_raw_launch_uses_direct_camera_and_never_starts_lingbot() -> None:
 
     assert "--mode raw_yoloe_servo" in command
     assert "--camera-host head-camera --camera-port 5555" in command
-    assert "--camera-pitch-deg -25.0" in command
+    assert "--camera-pitch-deg -38.0" in command
+    assert "--camera-roll-deg 0.0" in command
+    assert "--camera-yaw-deg 0.0" in command
+    assert "--camera-forward-offset-m 0.0" in command
+    assert "--camera-lateral-offset-m 0.0" in command
     assert "--raw-target-distance-m 0.65" in command
     assert "--raw-forward-tolerance-m 0.06" in command
     assert "--raw-lateral-tolerance-m 0.08" in command
@@ -1710,7 +1753,7 @@ def test_raw_launch_uses_direct_camera_and_never_starts_lingbot() -> None:
 
 
 def test_target_prompt_and_schema_no_longer_request_table() -> None:
-    prompt = build_raw_servo_target_prompt("align to the blue basket", RawServoCalibration())
+    prompt = build_raw_servo_target_prompt("align to the blue basket", fixed_calibration())
 
     assert "primary_target" in prompt
     assert "support_surface" not in prompt
@@ -2222,25 +2265,111 @@ def test_trim_yaw_cap_and_three_frame_lock_before_translation() -> None:
     assert command.wz == pytest.approx(0.10)
     assert controller.phase is ServoPhase.YAW_TRIM
 
-    for index in range(4):
+    assert controller.filtered is not None
+    controller.filtered[2] = math.radians(0.5)
+    for index in range(3):
         command = controller.update(
-            observation(yaw=math.radians(2.0)), now=1.2 + index * 0.1
+            observation(yaw=math.radians(0.5)), now=1.2 + index * 0.1
         )
 
     assert controller.phase is ServoPhase.TRANSLATE_TARGET
     assert command.velocity == (0.0, 0.0, 0.0)
 
 
-def test_translate_phase_accepts_missing_table_and_finishes_in_five_frames() -> None:
+def test_table_loss_immediately_rotates_to_last_visual_heading() -> None:
     controller = VisualServoController()
     controller.reset(1.0)
     controller.phase = ServoPhase.TRANSLATE_TARGET
 
+    controller.update(
+        observation(forward=1.2, yaw=math.radians(5.0)),
+        now=1.1,
+        orientation=orientation(0.0, 0.0),
+    )
+    command = controller.update(
+        observation(forward=1.2, include_table=False),
+        now=1.2,
+        orientation=orientation(math.radians(2.0), 0.0),
+    )
+
+    assert controller.phase is ServoPhase.GLOBAL_YAW_ALIGN
+    assert controller.yaw_correction_context == "last tracked table yaw"
+    assert controller.last_errors[2] == pytest.approx(math.radians(3.0))
+    assert controller.yaw_error_source == "propagated_heading"
+    assert command.wz == pytest.approx(0.05)
+
+
+def test_global_yaw_waits_for_actual_heading_after_setpoint_arrives() -> None:
+    controller = VisualServoController()
+    controller.reset(1.0)
+    controller.phase = ServoPhase.TRANSLATE_TARGET
+    target_heading = math.radians(5.0)
+
+    controller.update(
+        observation(forward=1.2, yaw=target_heading),
+        now=1.1,
+        orientation=orientation(0.0, 0.0),
+    )
+    controller.update(
+        observation(forward=1.2, include_table=False),
+        now=1.2,
+        orientation=orientation(0.0, 0.0),
+    )
+    command = controller.update(
+        observation(forward=1.2, include_table=False),
+        now=1.3,
+        orientation=orientation(0.0, target_heading),
+    )
+
+    assert command.wz == pytest.approx(0.0)
+    assert controller.phase is ServoPhase.GLOBAL_YAW_ALIGN
+    assert controller.yaw_stable_frames == 0
+
+    for index in range(3):
+        command = controller.update(
+            observation(forward=1.2, include_table=False),
+            now=1.4 + index * 0.1,
+            orientation=orientation(target_heading, target_heading),
+        )
+
+    assert command.velocity == (0.0, 0.0, 0.0)
+    assert controller.phase is ServoPhase.TRANSLATE_TARGET
+    assert controller.table_loss_alignment_done
+
+
+def test_final_stop_requires_position_stability_and_yaw_below_one_degree() -> None:
+    controller = VisualServoController()
+    controller.reset(1.0)
+    controller.phase = ServoPhase.TRANSLATE_TARGET
+    target_heading = math.radians(2.0)
+
     for index in range(5):
         command = controller.update(
-            observation(include_table=False), now=1.1 + index * 0.1
+            observation(yaw=target_heading),
+            now=1.1 + index * 0.1,
+            orientation=orientation(0.0, 0.0),
+        )
+
+    assert command.wz > 0.0
+    assert controller.phase is ServoPhase.GLOBAL_YAW_ALIGN
+    assert controller.terminal_reason is None
+
+    for index in range(3):
+        controller.update(
+            observation(include_table=False),
+            now=1.6 + index * 0.1,
+            orientation=orientation(target_heading, target_heading),
+        )
+    assert controller.phase is ServoPhase.TRANSLATE_TARGET
+
+    for index in range(5):
+        command = controller.update(
+            observation(include_table=False),
+            now=1.9 + index * 0.1,
+            orientation=orientation(target_heading, target_heading),
         )
 
     assert command.velocity == (0.0, 0.0, 0.0)
     assert controller.phase is ServoPhase.DONE
     assert controller.terminal_reason == "aligned"
+    assert abs(controller.last_errors[2]) <= math.radians(1.0)

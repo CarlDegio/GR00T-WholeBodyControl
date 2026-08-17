@@ -20,6 +20,11 @@ class DetectionFrameData:
     frame_index: int
     camera_timestamp: float
     rgb: np.ndarray
+    camera_stream: str | None = None
+    attempt_id: int | None = None
+    failover_stage: str | None = None
+    reference_source_stream: str | None = None
+    reference_kind: str | None = None
     target_bbox_xyxy: tuple[float, float, float, float] | None = None
     target_mask: np.ndarray | None = field(default=None, repr=False)
     target_track_id: int | None = None
@@ -164,6 +169,13 @@ class FrameDiagnosticsWriter:
         record = {
             "frame_index": int(frame.frame_index),
             "camera_timestamp": float(frame.camera_timestamp),
+            "camera_stream": frame.camera_stream,
+            "attempt_id": (
+                None if frame.attempt_id is None else int(frame.attempt_id)
+            ),
+            "failover_stage": frame.failover_stage,
+            "reference_source_stream": frame.reference_source_stream,
+            "reference_kind": frame.reference_kind,
             "perception_kind": frame.perception_kind,
             "perception_error": frame.perception_error,
             "control_applied": applied,

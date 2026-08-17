@@ -20,6 +20,7 @@ from typing import Any, Callable, Iterator, Literal, TextIO
 
 import zmq
 
+from gear_sonic.camera.calibration import DEFAULT_CAMERA_INTRINSICS_PATH
 from gear_sonic.utils.inference.base_pose import (
     BasePoseConfig,
     BasePoseResult,
@@ -58,13 +59,24 @@ class BasePosePlannerConfig:
     camera_port: int = 5555
     camera_timeout_ms: int = 15000
     camera_stream: str = "ego_view"
+    camera_intrinsics_path: str = str(DEFAULT_CAMERA_INTRINSICS_PATH)
     camera_height_m: float = 1.2
-    camera_pitch_deg: float = -25.0
+    camera_pitch_deg: float = -38.0
     vertical_fov_deg: float = 43.077882
     camera_roll_deg: float = 0.0
     camera_yaw_deg: float = 0.0
     camera_forward_offset_m: float = 0.0
     camera_lateral_offset_m: float = 0.0
+    dual_head_camera_stream: str = "ego_view"
+    dual_chest_camera_stream: str = "chest_view"
+    dual_chest_camera_height_m: float = 1.0
+    dual_chest_camera_pitch_deg: float = -3.0
+    dual_chest_camera_roll_deg: float = 0.0
+    dual_chest_camera_yaw_deg: float = 0.0
+    dual_chest_camera_forward_offset_m: float = 0.0
+    dual_chest_camera_lateral_offset_m: float = 0.0
+    dual_match_tolerance_frames: int = 30
+    dual_initialization_grace_s: float = 30.0
     depth_visual_max_m: float = 3.0
     codex_timeout_seconds: float = 600.0
     output_root: str = "outputs/base_pose_adjustment"
@@ -85,16 +97,9 @@ class BasePosePlannerConfig:
     raw_horizontal_guard_fraction: float = 0.25
     raw_horizontal_recovery_fraction: float = 0.30
     raw_orientation_telemetry_source: str = "tcp://127.0.0.1:5565"
-    raw_camera_width: int = 640
-    raw_camera_height: int = 480
-    raw_camera_fx: float = 607.878662
-    raw_camera_fy: float = 608.063232
-    raw_camera_cx: float = 319.858765
-    raw_camera_cy: float = 259.731140
-    raw_intrinsic_tolerance_px: float = 2.0
     raw_command_ttl_s: float = 0.15
     raw_camera_stale_s: float = 0.4
-    raw_max_run_s: float = 60.0
+    raw_max_run_s: float = 180.0
 
 
 @dataclass(frozen=True)
@@ -645,6 +650,9 @@ def _raw_servo_main(
         run_raw_servo_worker,
         validate_raw_servo_dependencies,
     )
+    from gear_sonic.utils.inference.base_pose_dual_visual_servo import (
+        run_dual_raw_servo_worker,
+    )
     from gear_sonic.utils.teleop.sonic_orientation_telemetry import (
         LatestOrientationTelemetry,
     )
@@ -685,8 +693,21 @@ def _raw_servo_main(
         publish=socket.send_string,
         orientation_provider=orientation_provider,
     )
+    worker_target = (
+        run_dual_raw_servo_worker
+        if config.mode == "dual_raw_yoloe_servo"
+        else run_raw_servo_worker
+    )
+    worker_kwargs = {
+        "observation_events": runtime.observation_events,
+        "diagnostics": runtime.diagnostics,
+    }
+    if config.mode == "dual_raw_yoloe_servo":
+        worker_kwargs["table_required"] = (
+            lambda: runtime.controller.table_required
+        )
     worker = threading.Thread(
-        target=run_raw_servo_worker,
+        target=worker_target,
         args=(
             config,
             runtime.requests,
@@ -696,10 +717,7 @@ def _raw_servo_main(
         ),
         name="base-pose-raw-yoloe-servo",
         daemon=True,
-        kwargs={
-            "observation_events": runtime.observation_events,
-            "diagnostics": runtime.diagnostics,
-        },
+        kwargs=worker_kwargs,
     )
     worker.start()
     running = True
@@ -739,7 +757,7 @@ def main(config: BasePosePlannerConfig) -> None:
     socket.setsockopt(zmq.LINGER, 0)
     endpoint = f"tcp://{config.host}:{config.port}"
     socket.bind(endpoint)
-    if config.mode == "raw_yoloe_servo":
+    if config.mode in {"raw_yoloe_servo", "dual_raw_yoloe_servo"}:
         try:
             _raw_servo_main(config, socket, endpoint)
         finally:

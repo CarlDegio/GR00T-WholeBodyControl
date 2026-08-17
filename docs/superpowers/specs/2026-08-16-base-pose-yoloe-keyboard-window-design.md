@@ -1,5 +1,14 @@
 # Base Pose YOLOE Keyboard Planner Window Design
 
+> **Superseded behavior:** The exclusive-heartbeat design below was rejected
+> after operator review. The final behavior keeps YOLOE selected initially and
+> preserves the unmodified `agent_full` key-triggered keyboard publisher. Each
+> `w/s/a/d/q/e/Space` message overrides YOLOE only for its existing 0.5-second
+> duration; the relay then automatically returns to YOLOE. `x` exits the
+> keyboard source. No idle keyboard heartbeat is published. The keyboard runs
+> visibly in `inference` pane 5 rather than in a separate tmux window. This
+> note is the authoritative correction to the historical design sections below.
+
 ## Goal
 
 When `launch_inference.py` runs with `planner_input=base_pose` and

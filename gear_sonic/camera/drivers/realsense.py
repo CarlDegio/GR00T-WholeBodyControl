@@ -100,6 +100,21 @@ class RealSenseSensor(Sensor, SensorServer):
                 "cy": float(intrinsics.ppy),
                 "width": int(intrinsics.width),
                 "height": int(intrinsics.height),
+                "distortion_model": str(intrinsics.model),
+                "distortion_coeffs": [
+                    float(value) for value in intrinsics.coeffs
+                ],
+                "distortion_coeff_order": ["k1", "k2", "p1", "p2", "k3"],
+                "source_distortion_model": str(intrinsics.model),
+                "source_distortion_coeffs": [
+                    float(value) for value in intrinsics.coeffs
+                ],
+                "rgb_undistorted": False,
+                "camera_type": "realsense",
+                "camera_serial": selected_serial,
+                "color_image_dim": list(config.color_image_dim),
+                "depth_image_dim": list(config.depth_image_dim) if config.enable_depth else None,
+                "fps": int(config.fps),
             }
             if config.enable_depth:
                 self._depth_aligner = rs.align(rs.stream.color)
@@ -116,7 +131,6 @@ class RealSenseSensor(Sensor, SensorServer):
                 )
         except Exception as e:
             raise RuntimeError(f"Failed to start RealSense pipeline: {e}")
-
         self._realsense_config = config
         self._run_as_server = run_as_server
         if self._run_as_server:

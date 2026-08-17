@@ -18,6 +18,11 @@ import msgpack
 import numpy as np
 import zmq
 
+from gear_sonic.camera.calibration import (
+    CameraCalibrationError,
+    DEFAULT_CAMERA_INTRINSICS_PATH,
+    load_camera_intrinsics,
+)
 from gear_sonic.camera.sensor_server import ImageMessageSchema
 from gear_sonic.utils.inference.object_nav_geometry import (
     FORWARD_SPEED,
@@ -191,8 +196,22 @@ class ComposedRGBDCamera:
     DEPTH_KEY = "chest_view_depth"
     SCHEMA_VERSION = 2
 
-    def __init__(self, host: str, port: int, timeout_ms: int = 3000):
+    def __init__(
+        self,
+        host: str,
+        port: int,
+        timeout_ms: int = 3000,
+        calibration_path: str | Path | None = DEFAULT_CAMERA_INTRINSICS_PATH,
+    ):
         self.timeout_ms = int(timeout_ms)
+        self._configured_camera_info: dict[str, Any] | None = None
+        if calibration_path is not None:
+            try:
+                self._configured_camera_info = load_camera_intrinsics(
+                    calibration_path
+                )[self.COLOR_KEY].asdict()
+            except CameraCalibrationError as exc:
+                raise ObjectNavCameraError(str(exc)) from exc
         self._last_timestamp: float | None = None
         self._context = zmq.Context()
         self._socket = self._context.socket(zmq.SUB)
@@ -203,7 +222,11 @@ class ComposedRGBDCamera:
         self._socket.connect(f"tcp://{host}:{int(port)}")
 
     @classmethod
-    def decode_payload(cls, payload: Mapping[str, Any]) -> RGBDSnapshot:
+    def decode_payload(
+        cls,
+        payload: Mapping[str, Any],
+        calibration: Mapping[str, Any] | None = None,
+    ) -> RGBDSnapshot:
         if payload.get("schema_version") != cls.SCHEMA_VERSION:
             raise ObjectNavCameraError("unsupported camera schema_version")
         decoded = ImageMessageSchema.deserialize(
@@ -214,7 +237,7 @@ class ComposedRGBDCamera:
         timestamps = decoded.get("timestamps", {})
         if cls.COLOR_KEY not in images or cls.DEPTH_KEY not in images:
             raise ObjectNavCameraError("camera payload requires chest_view RGB and depth")
-        info = camera_info.get(cls.COLOR_KEY)
+        info = calibration if calibration is not None else camera_info.get(cls.COLOR_KEY)
         if not isinstance(info, Mapping):
             raise ObjectNavCameraError("chest_view camera_info is missing")
         if info.get("depth_aligned_to") != cls.COLOR_KEY:
@@ -271,7 +294,9 @@ class ComposedRGBDCamera:
                 raise ObjectNavCameraError("timed out waiting for fresh chest RGB-D")
             try:
                 payload = msgpack.unpackb(self._socket.recv(), raw=False)
-                snapshot = self.decode_payload(payload)
+                snapshot = self.decode_payload(
+                    payload, calibration=self._configured_camera_info
+                )
             except ObjectNavCameraError:
                 raise
             except Exception as exc:

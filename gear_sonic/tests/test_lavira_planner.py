@@ -22,6 +22,7 @@ import pytest
 # import side-effect free in this software-only test suite.
 sys.modules.setdefault("tyro", types.ModuleType("tyro"))
 
+from gear_sonic.scripts import launch_inference
 from gear_sonic.scripts.launch_inference import (
     InferenceLaunchConfig,
     _check_prerequisites,
@@ -179,6 +180,56 @@ def test_launch_lavira_starts_depth_viewer_in_same_pane_shell() -> None:
 
 def test_launch_uses_long_timeout_for_low_rate_lingbot_frames() -> None:
     assert InferenceLaunchConfig().lavira_camera_timeout_ms == 15000
+
+
+def test_raw_yoloe_base_pose_builds_key_triggered_manual_keyboard_and_relay() -> None:
+    config = InferenceLaunchConfig(
+        planner_input="base_pose",
+        base_pose_mode="raw_yoloe_servo",
+        base_pose_manual_keyboard_port=6002,
+    )
+
+    keyboard = launch_inference.build_base_pose_manual_keyboard_command(
+        config, Path("/workspace/sonic")
+    )
+    relay = build_reasan_planner_command(config, Path("/workspace/sonic"))
+
+    assert keyboard == (
+        "cd /workspace/sonic && source .venv_teleop/bin/activate && "
+        "python gear_sonic/scripts/keyboard_planner_thread_server.py "
+        "--port 6002 --hz 20 --host localhost"
+    )
+    assert "--manual-source tcp://127.0.0.1:6002" in relay
+
+
+@pytest.mark.parametrize(
+    ("planner_input", "base_pose_mode", "expected"),
+    [
+        ("base_pose", "raw_yoloe_servo", True),
+        ("base_pose", "rgb", False),
+        ("lavira", "raw_yoloe_servo", False),
+        ("keyboard", "raw_yoloe_servo", False),
+    ],
+)
+def test_manual_keyboard_window_is_raw_yoloe_base_pose_only(
+    planner_input: str,
+    base_pose_mode: str,
+    expected: bool,
+) -> None:
+    config = InferenceLaunchConfig(
+        planner_input=planner_input,  # type: ignore[arg-type]
+        base_pose_mode=base_pose_mode,  # type: ignore[arg-type]
+    )
+
+    assert launch_inference.uses_base_pose_manual_keyboard(config) is expected
+
+
+def test_non_raw_base_pose_relay_has_no_manual_source() -> None:
+    config = InferenceLaunchConfig(planner_input="base_pose", base_pose_mode="rgb")
+
+    relay = build_reasan_planner_command(config, Path("/workspace/sonic"))
+
+    assert "--manual-source" not in relay
 
 
 def test_base_pose_rgb_uses_ego_camera_without_starting_lingbot() -> None:

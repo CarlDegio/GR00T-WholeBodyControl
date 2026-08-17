@@ -1,5 +1,14 @@
 # Base Pose YOLOE Keyboard Planner Window Implementation Plan
 
+> **Superseded behavior:** Task 1's exclusive heartbeat and the related
+> `--exclusive` arguments were removed after operator review. The final
+> implementation starts with YOLOE selected, uses the unchanged `agent_full`
+> key-triggered publisher, applies a manual key for its existing 0.5-second
+> command duration, and then automatically falls back to YOLOE. The manual
+> port 5566 and relay arbitration remain, but the keyboard now runs visibly in
+> `inference` pane 5 instead of a dedicated tmux window. This note overrides
+> the historical execution steps below.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Add a dedicated, exclusive WASD/QE keyboard planner tmux window to raw-YOLOE BasePose launches, with safe zero hold and automatic YOLOE recovery after the keyboard exits.

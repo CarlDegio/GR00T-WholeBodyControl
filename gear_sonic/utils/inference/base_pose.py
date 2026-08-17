@@ -19,12 +19,29 @@ import msgpack
 import numpy as np
 import zmq
 
+from gear_sonic.camera.calibration import (
+    CameraCalibrationError,
+    DEFAULT_CAMERA_INTRINSICS_PATH,
+    load_camera_intrinsics,
+)
 from gear_sonic.camera.sensor_server import ImageMessageSchema
 from gear_sonic.scripts.run_depth_camera_viewer import colorize_depth
 
 
-BasePoseMode = Literal["rgb", "rgbd", "rgb_depth_query", "raw_yoloe_servo"]
-BASE_POSE_MODES = {"rgb", "rgbd", "rgb_depth_query", "raw_yoloe_servo"}
+BasePoseMode = Literal[
+    "rgb",
+    "rgbd",
+    "rgb_depth_query",
+    "raw_yoloe_servo",
+    "dual_raw_yoloe_servo",
+]
+BASE_POSE_MODES = {
+    "rgb",
+    "rgbd",
+    "rgb_depth_query",
+    "raw_yoloe_servo",
+    "dual_raw_yoloe_servo",
+}
 BasePoseVisionBackend = Literal["codex", "qwenvl"]
 BASE_POSE_VISION_BACKENDS = {"codex", "qwenvl"}
 DEFAULT_QWENVL_PLUS_MODEL = "qwen3-vl-plus"
@@ -249,6 +266,22 @@ class AlignedRGBDSnapshot:
     timestamp: float
 
 
+@dataclass(frozen=True)
+class DualRGBDCapture:
+    """Independently decoded RGB-D streams from one composed-camera packet."""
+
+    snapshots: Mapping[str, AlignedRGBDSnapshot]
+    errors: Mapping[str, str]
+
+    def require(self, stream_name: str) -> AlignedRGBDSnapshot:
+        snapshot = self.snapshots.get(stream_name)
+        if snapshot is not None:
+            return snapshot
+        raise BasePoseCameraError(
+            self.errors.get(stream_name, f"camera payload requires {stream_name} RGB-D")
+        )
+
+
 @dataclass
 class BasePoseConfig:
     task: str
@@ -265,7 +298,7 @@ class BasePoseConfig:
     camera_timeout_ms: int = 15000
     camera_stream: str = "ego_view"
     camera_height_m: float = 1.2
-    camera_pitch_deg: float = -25.0
+    camera_pitch_deg: float = -38.0
     vertical_fov_deg: float = 43.077882
     camera_forward_offset_m: float = 0.0
     camera_lateral_offset_m: float = 0.0
@@ -457,12 +490,21 @@ class AlignedRGBDCamera:
         require_depth: bool = False,
         required_depth_source: str | None = None,
         timeout_ms: int = 15000,
+        calibration_path: str | Path | None = DEFAULT_CAMERA_INTRINSICS_PATH,
     ):
         self.stream_name = stream_name
         self.depth_key = f"{stream_name}_depth"
         self.require_depth = bool(require_depth)
         self.required_depth_source = required_depth_source
         self.timeout_ms = int(timeout_ms)
+        self._configured_camera_info: dict[str, Any] | None = None
+        if calibration_path is not None:
+            try:
+                self._configured_camera_info = load_camera_intrinsics(
+                    calibration_path
+                )[stream_name].asdict()
+            except CameraCalibrationError as exc:
+                raise BasePoseCameraError(str(exc)) from exc
         self._last_timestamp: float | None = None
         self._context = zmq.Context()
         self._socket = self._context.socket(zmq.SUB)
@@ -483,7 +525,14 @@ class AlignedRGBDCamera:
         timestamps = decoded.get("timestamps", {})
         if self.stream_name not in images:
             raise BasePoseCameraError(f"camera payload requires {self.stream_name} RGB")
-        info = info_map.get(self.stream_name)
+        packet_info = info_map.get(self.stream_name)
+        configured_info = getattr(self, "_configured_camera_info", None)
+        if isinstance(configured_info, Mapping):
+            info = dict(configured_info)
+            if isinstance(packet_info, Mapping) and packet_info.get("depth_source"):
+                info["depth_source"] = packet_info["depth_source"]
+        else:
+            info = packet_info
         if not isinstance(info, Mapping):
             raise BasePoseCameraError(f"{self.stream_name} camera_info is missing")
         rgb = np.asarray(images[self.stream_name])
@@ -577,6 +626,107 @@ class AlignedRGBDCamera:
             if time.monotonic() >= deadline:
                 raise BasePoseCameraError(
                     "timed out waiting for a newer head-camera frame"
+                )
+
+    def close(self) -> None:
+        self._socket.close()
+        self._context.term()
+
+
+class DualAlignedRGBDCamera:
+    """Read multiple aligned RGB-D streams through one composed-camera socket."""
+
+    def __init__(
+        self,
+        host: str,
+        port: int,
+        *,
+        stream_names: Sequence[str] = ("ego_view", "chest_view"),
+        timeout_ms: int = 15000,
+        calibration_path: str | Path | None = DEFAULT_CAMERA_INTRINSICS_PATH,
+    ):
+        names = tuple(str(name) for name in stream_names)
+        if (
+            len(names) < 2
+            or len(set(names)) != len(names)
+            or any(not name for name in names)
+        ):
+            raise ValueError("dual RGB-D stream names must be distinct and non-empty")
+        self.stream_names = names
+        self.timeout_ms = int(timeout_ms)
+        configured: Mapping[str, Any] = {}
+        if calibration_path is not None:
+            try:
+                configured = load_camera_intrinsics(calibration_path)
+            except CameraCalibrationError as exc:
+                raise BasePoseCameraError(str(exc)) from exc
+        self._decoders: dict[str, AlignedRGBDCamera] = {}
+        for stream_name in names:
+            decoder = object.__new__(AlignedRGBDCamera)
+            decoder.stream_name = stream_name
+            decoder.depth_key = f"{stream_name}_depth"
+            decoder.require_depth = True
+            decoder.required_depth_source = None
+            camera_info = configured.get(stream_name)
+            decoder._configured_camera_info = (
+                None if camera_info is None else camera_info.asdict()
+            )
+            self._decoders[stream_name] = decoder
+        self._last_timestamps: dict[str, float] = {}
+        self._context = zmq.Context()
+        self._socket = self._context.socket(zmq.SUB)
+        self._socket.setsockopt_string(zmq.SUBSCRIBE, "")
+        self._socket.setsockopt(zmq.CONFLATE, 1)
+        self._socket.setsockopt(zmq.RCVHWM, 1)
+        self._socket.setsockopt(zmq.LINGER, 0)
+        self._socket.connect(f"tcp://{host}:{int(port)}")
+
+    def decode_payload(self, payload: Mapping[str, Any]) -> DualRGBDCapture:
+        snapshots: dict[str, AlignedRGBDSnapshot] = {}
+        errors: dict[str, str] = {}
+        for stream_name in self.stream_names:
+            try:
+                snapshots[stream_name] = self._decoders[stream_name].decode_payload(
+                    payload
+                )
+            except BasePoseCameraError as exc:
+                errors[stream_name] = str(exc)
+        return DualRGBDCapture(snapshots=snapshots, errors=errors)
+
+    def capture(self) -> DualRGBDCapture:
+        deadline = time.monotonic() + self.timeout_ms / 1000.0
+        while True:
+            remaining_ms = max(0, int((deadline - time.monotonic()) * 1000))
+            if not self._socket.poll(remaining_ms):
+                raise BasePoseCameraError(
+                    "timed out waiting for a fresh dual-camera frame"
+                )
+            try:
+                payload = msgpack.unpackb(self._socket.recv(), raw=False)
+                decoded = self.decode_payload(payload)
+            except BasePoseCameraError:
+                raise
+            except Exception as exc:
+                raise BasePoseCameraError(
+                    "failed to decode dual-camera message"
+                ) from exc
+            fresh: dict[str, AlignedRGBDSnapshot] = {}
+            errors = dict(decoded.errors)
+            for stream_name, snapshot in decoded.snapshots.items():
+                if self._last_timestamps.get(stream_name) != snapshot.timestamp:
+                    fresh[stream_name] = snapshot
+                else:
+                    errors[stream_name] = (
+                        f"timed out waiting for newer {stream_name} frame"
+                    )
+            if fresh:
+                self._last_timestamps.update(
+                    {name: snapshot.timestamp for name, snapshot in fresh.items()}
+                )
+                return DualRGBDCapture(snapshots=fresh, errors=errors)
+            if time.monotonic() >= deadline:
+                raise BasePoseCameraError(
+                    "timed out waiting for newer dual-camera frames"
                 )
 
     def close(self) -> None:
@@ -1396,7 +1546,7 @@ class BasePoseRunner:
             config.camera_port,
             stream_name=config.camera_stream,
             require_depth=require_depth,
-            required_depth_source="lingbot-depth" if require_depth else None,
+            required_depth_source=None,
             timeout_ms=config.camera_timeout_ms,
         )
         if client is not None:

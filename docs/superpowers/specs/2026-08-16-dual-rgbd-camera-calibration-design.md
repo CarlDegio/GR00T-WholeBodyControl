@@ -1,5 +1,23 @@
 # Dual RGB-D Camera Calibration Capture Design
 
+## Implementation update: new Orbbec head camera
+
+Live hardware inspection and the latest `origin/agent_full` camera commit
+showed that the replaced head camera is an Orbbec Gemini 345Lg, serial
+`CPMD464001G`; only the chest RGB-D camera remains RealSense.
+
+The implemented and live-verified contract is therefore:
+
+- Orbbec `ego_view` RGB plus color-aligned raw uint16 depth;
+- RealSense `chest_view` RGB plus color-aligned raw uint16 depth;
+- RealSense `left_wrist` and `right_wrist` RGB only;
+- complete metadata only in the one-shot calibration launcher; and
+- no `camera_info` in normal streaming.
+
+The saved entry preserves both the published-image distortion and the source
+lens distortion. The Orbbec SDK undistorts the published image before depth
+alignment, while the captured chest RealSense coefficients are all zero.
+
 ## Goal
 
 Capture and preserve the complete live intrinsics for the robot's head and

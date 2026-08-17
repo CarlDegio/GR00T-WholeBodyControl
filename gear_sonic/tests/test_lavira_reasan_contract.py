@@ -8,6 +8,7 @@ import sys
 import numpy as np
 import pytest
 
+from gear_sonic.scripts import lavira_sonic_relay as direct_relay
 from gear_sonic.scripts.lavira_planner import (
     VelocityCommand,
     build_reasan_velocity_message,
@@ -107,6 +108,50 @@ def test_direct_relay_cli_exposes_configurable_lateral_limit(
     args = parse_direct_relay_args()
 
     assert args.max_lateral_speed_m_s == pytest.approx(expected_limit)
+
+
+def test_direct_relay_manual_source_is_optional(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(sys, "argv", ["lavira_sonic_relay.py"])
+
+    args = parse_direct_relay_args()
+
+    assert args.manual_source == ""
+
+
+def _latest(velocity: list[float], *, received_at: float) -> LatestCommand:
+    latest = LatestCommand()
+    latest.update(
+        {
+            "velocity": np.asarray(velocity, dtype=np.float32),
+            "duration": 2.0,
+        },
+        received_at,
+    )
+    return latest
+
+
+def test_direct_relay_fresh_manual_command_overrides_automatic() -> None:
+    automatic = _latest([0.3, 0.0, 0.0], received_at=10.0)
+    manual = _latest([0.0, 0.0, 0.0], received_at=10.4)
+
+    selected = direct_relay.select_velocity(
+        automatic, manual, now=10.5, timeout=0.7
+    )
+
+    assert selected.tolist() == pytest.approx([0.0, 0.0, 0.0])
+
+
+def test_direct_relay_stale_manual_falls_back_to_automatic() -> None:
+    automatic = _latest([0.3, 0.0, 0.0], received_at=10.4)
+    manual = _latest([0.0, 0.0, 0.5], received_at=9.0)
+
+    selected = direct_relay.select_velocity(
+        automatic, manual, now=10.5, timeout=0.7
+    )
+
+    assert selected.tolist() == pytest.approx([0.3, 0.0, 0.0])
 
 
 def test_direct_relay_decodes_lavira_command_without_reasan() -> None:

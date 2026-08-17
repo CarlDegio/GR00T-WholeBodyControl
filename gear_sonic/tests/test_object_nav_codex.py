@@ -230,6 +230,38 @@ def test_composed_camera_rejects_malformed_rgbd_payload() -> None:
     with pytest.raises(ObjectNavCameraError, match="RGB and depth"):
         ComposedRGBDCamera.decode_payload(malformed)
 
+def test_composed_camera_uses_saved_calibration_without_packet_camera_info() -> None:
+    payload = ImageMessageSchema(
+        timestamps={"chest_view": 1.0, "chest_view_depth": 1.0},
+        images={
+            "chest_view": np.zeros((2, 3, 3), dtype=np.uint8),
+            "chest_view_depth": np.full((2, 3), 1000, dtype=np.uint16),
+        },
+    ).serialize()
+    calibration = {
+        "fx": 500.0,
+        "fy": 501.0,
+        "cx": 1.0,
+        "cy": 0.5,
+        "width": 3,
+        "height": 2,
+        "depth_scale_m": 0.001,
+        "depth_aligned_to": "chest_view",
+    }
+
+    snapshot = ComposedRGBDCamera.decode_payload(
+        payload, calibration=calibration
+    )
+
+    assert snapshot.fx == 500.0
+    assert snapshot.fy == 501.0
+    assert snapshot.depth_scale_m == 0.001
+    np.testing.assert_array_equal(
+        snapshot.depth_mm, np.full((2, 3), 1000.0, dtype=np.float32)
+    )
+
+
+
 
 def test_codex_client_builds_read_only_image_command_with_proxy_environment(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch

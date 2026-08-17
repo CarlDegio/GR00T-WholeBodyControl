@@ -117,13 +117,29 @@ class LatestCommand:
         self.value = value
         self.received_at = now
 
-    def velocity(self, now: float, timeout: float) -> np.ndarray:
+    def is_fresh(self, now: float, timeout: float) -> bool:
         if self.value is None or self.received_at is None:
-            return np.zeros(3, dtype=np.float32)
+            return False
         age = max(0.0, now - self.received_at)
-        if age > min(timeout, float(self.value["duration"])):
+        return age <= min(timeout, float(self.value["duration"]))
+
+    def velocity(self, now: float, timeout: float) -> np.ndarray:
+        if not self.is_fresh(now, timeout):
             return np.zeros(3, dtype=np.float32)
+        assert self.value is not None
         return np.asarray(self.value["velocity"], dtype=np.float32).copy()
+
+
+def select_velocity(
+    automatic: LatestCommand,
+    manual: LatestCommand | None,
+    *,
+    now: float,
+    timeout: float,
+) -> np.ndarray:
+    if manual is not None and manual.is_fresh(now, timeout):
+        return manual.velocity(now, timeout)
+    return automatic.velocity(now, timeout)
 
 
 @dataclass(frozen=True)
@@ -233,6 +249,7 @@ class PlannerState:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--source", default="tcp://127.0.0.1:5558")
+    parser.add_argument("--manual-source", default="")
     parser.add_argument("--output", default="tcp://*:5563")
     parser.add_argument("--hz", type=float, default=20.0)
     parser.add_argument("--timeout", type=float, default=0.7)
@@ -264,6 +281,13 @@ def main() -> None:
     source.setsockopt(zmq.CONFLATE, 1)
     source.setsockopt(zmq.LINGER, 0)
     source.connect(args.source)
+    manual_source = None
+    if args.manual_source:
+        manual_source = context.socket(zmq.SUB)
+        manual_source.setsockopt(zmq.SUBSCRIBE, b"")
+        manual_source.setsockopt(zmq.CONFLATE, 1)
+        manual_source.setsockopt(zmq.LINGER, 0)
+        manual_source.connect(args.manual_source)
     output = context.socket(zmq.PUB)
     output.setsockopt(zmq.LINGER, 0)
     output.bind(args.output)
@@ -276,6 +300,7 @@ def main() -> None:
         orientation_tracker = OrientationTracker()
     planner = PlannerState()
     latest = LatestCommand()
+    manual_latest = LatestCommand() if manual_source is not None else None
     state_subscriber = None
     frozen_pose: FrozenPlannerPose | None = None
     ready_path = Path(args.hold_ready_file).resolve() if args.hold_ready_file else None
@@ -306,6 +331,8 @@ def main() -> None:
         f"{args.hz:g} Hz, timeout={args.timeout:g}s, "
         f"max_lateral={args.max_lateral_speed_m_s:g}m/s"
     )
+    if args.manual_source:
+        print(f"[LaViRA Relay] exclusive manual source <- {args.manual_source}")
     if args.orientation_telemetry_output:
         print(
             "[LaViRA Relay] orientation telemetry -> "
@@ -314,21 +341,25 @@ def main() -> None:
     next_tick = time.monotonic()
     try:
         while running:
-            while True:
-                try:
-                    raw = source.recv(zmq.NOBLOCK)
-                except zmq.Again:
-                    break
-                try:
-                    latest.update(
-                        decode_velocity_command(
-                            raw,
-                            max_lateral_speed_m_s=args.max_lateral_speed_m_s,
-                        ),
-                        time.monotonic(),
-                    )
-                except ValueError as exc:
-                    print(f"[LaViRA Relay] Ignored command: {exc}")
+            inputs = [("automatic", source, latest)]
+            if manual_source is not None and manual_latest is not None:
+                inputs.append(("manual", manual_source, manual_latest))
+            for label, input_socket, command_state in inputs:
+                while True:
+                    try:
+                        raw = input_socket.recv(zmq.NOBLOCK)
+                    except zmq.Again:
+                        break
+                    try:
+                        command_state.update(
+                            decode_velocity_command(
+                                raw,
+                                max_lateral_speed_m_s=args.max_lateral_speed_m_s,
+                            ),
+                            time.monotonic(),
+                        )
+                    except ValueError as exc:
+                        print(f"[LaViRA Relay] Ignored {label} command: {exc}")
             now = time.monotonic()
             if now >= next_tick:
                 latch_completed = False
@@ -365,7 +396,9 @@ def main() -> None:
                             latch_completed = True
                             print("[LaViRA Relay] Current upper body and hands latched")
                 planner_message = planner.message(
-                    latest.velocity(now, args.timeout),
+                    select_velocity(
+                        latest, manual_latest, now=now, timeout=args.timeout
+                    ),
                     period,
                     frozen_pose=frozen_pose,
                 )
@@ -405,6 +438,8 @@ def main() -> None:
             request_path.unlink(missing_ok=True)
         if orientation_output is not None:
             orientation_output.close()
+        if manual_source is not None:
+            manual_source.close()
         source.close()
         output.close()
 

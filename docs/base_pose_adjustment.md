@@ -25,6 +25,19 @@ directly from port `5555`; it does not start LingBot. The `rgbd` and
 fall back to raw RealSense depth or RGB-only planning when enhanced depth is
 unavailable.
 
+The `dual_raw_yoloe_servo` experiment requires both `ego_view` and
+`chest_view`, each with its aligned `<stream>_depth` image in the same composed
+camera packet. Start the repository's dual RGB-D configuration with:
+
+```bash
+./start_camera_calibration_server.zsh
+```
+
+Despite its calibration-oriented name, this command continuously publishes
+the dual RGB-D set needed by the servo. The runtime loads both saved intrinsic
+records from `gear_sonic/config/camera_intrinsics.json`; it never substitutes
+one camera's intrinsics for the other.
+
 To start either camera configuration and save the first valid `ego_view` RGB
 frame received after startup, use the wrapper below. It connects the ZMQ
 subscriber before starting the camera process and saves a lossless PNG under
@@ -73,11 +86,30 @@ python gear_sonic/scripts/launch_inference.py \
     tools/yoloe26m/weights/yoloe-26m-seg.pt
 ```
 
-The raw servo expects `640x480` RGB-D and validates the live intrinsics against
-`fx=607.878662`, `fy=608.063232`, `cx=319.858765`, `cy=259.731140` with a
-`2 px` tolerance. The approximate camera extrinsics default to height `1.2 m`,
-pitch `-25°`, roll/yaw `0°`, and zero forward/lateral offset. Override the
-corresponding `--base-pose-camera-*` arguments if a measured calibration becomes
+Dual head/chest raw-depth YOLOE alignment:
+
+```bash
+source .venv_inference/bin/activate
+python gear_sonic/scripts/launch_inference.py \
+  --planner-input base_pose \
+  --base-pose-mode dual_raw_yoloe_servo \
+  --base-pose-task "align to the blue basket" \
+  --base-pose-dual-head-camera-stream ego_view \
+  --base-pose-dual-chest-camera-stream chest_view \
+  --base-pose-dual-chest-camera-pitch-deg -3 \
+  --base-pose-dual-match-tolerance-frames 30 \
+  --base-pose-dual-initialization-grace-s 30 \
+  --base-pose-raw-max-run-s 180 \
+  --base-pose-raw-yoloe-model-path \
+    tools/yoloe26m/weights/yoloe-26m-seg.pt
+```
+
+The raw modes expect aligned RGB-D at the dimensions stored in
+`gear_sonic/config/camera_intrinsics.json`. Head extrinsics default to height
+`1.2 m`, pitch `-38°`; dual-mode chest extrinsics default to height `1.0 m`,
+pitch `-3°`. Both default to zero roll/yaw and zero forward/lateral offset.
+Override the corresponding `--base-pose-camera-*` or
+`--base-pose-dual-chest-camera-*` arguments when measured extrinsics are
 available.
 
 RGB-only:
@@ -143,22 +175,20 @@ relay. Its visual state machine is:
    always completes first.
 4. `YAW_TRIM`: enter below 8 degrees, limit `|wz|` to `0.10 rad/s`, and lock
    yaw after the filtered error remains within 4 degrees for three frames.
-5. `TRANSLATE_TARGET`: hold `wz=0`, use `vx/vy` to reach the target box center
-   and `0.80 m` standoff. Finish after five stable frames with both the
-   filtered forward and lateral errors inside their default `0.10 m`
-   tolerances. The table track is optional in this phase.
+5. `TRANSLATE_TARGET`: hold `wz=0` and issue only one translation axis at a
+   time. If the filtered lateral error is outside tolerance, use only `vy` to
+   center the target; once lateral alignment is inside tolerance, use only
+   `vx` to reach the `0.80 m` standoff. Finish after five stable frames with
+   both errors inside their default `0.10 m` tolerances. The table track is
+   optional in this phase.
 
-Whenever translation is nonzero, the controller preserves the requested
-`(vx, vy)` direction and raises the combined linear speed
-`sqrt(vx^2 + vy^2)` to at least `0.30 m/s`. Zero translation and pure-yaw
-commands are unchanged. Before this minimum-speed scaling, the proportional
-lateral request is limited by `base_pose_raw_max_lateral_speed_m_s`, which
-defaults to `0.16 m/s`. The 0.30 m/s scaling is allowed to raise `abs(vy)` above
-that value so the upper-level vector keeps its requested direction. The final
-relay then restores the configured lateral bound by multiplying both `vx` and
-`vy` by the same factor. For example, `(vx=0.30, vy=0.20)` becomes
-`(vx=0.24, vy=0.16)`; this final relay output may have a combined speed below
-`0.30 m/s`. The launcher forwards the single setting as
+Whenever translation is nonzero, the controller raises the active axis speed
+to at least `0.30 m/s`; its raw YOLOE commands always satisfy `vx == 0` or
+`vy == 0`. Zero translation and pure-yaw commands are unchanged. Before this
+minimum-speed scaling, the proportional lateral request is limited by
+`base_pose_raw_max_lateral_speed_m_s`, which defaults to `0.16 m/s`. The final
+relay restores that configured lateral bound for `vy`. The launcher forwards
+the single setting as
 `--raw-max-lateral-speed-m-s` to the planner and
 `--max-lateral-speed-m-s` to the relay.
 
@@ -169,7 +199,9 @@ active at zero velocity; the 30th terminates it through the existing
 the expected target ID disappears but any class-0 target remains, the worker
 immediately adopts the highest-confidence class-0 ID and records the old/new
 IDs in diagnostics. A true class mismatch with no class-0 target, `Space`, or
-`60 s` elapsed time stops immediately and requires a new `n`. A continuous
+`180 s` of YOLOE detection time stops immediately and requires a new `n`. The
+runtime budget begins when the first dual YOLOE attempt starts detecting, so
+Codex/Qwen grounding does not consume it. A continuous
 tracking gap over `0.4 s` instead enters a recoverable soft-stale hold: the
 runtime keeps the generation active, publishes zero velocity, and resumes on
 the first fresh valid observation. An observation already more than `0.4 s`
@@ -184,6 +216,45 @@ SONIC Planner does not consume angular velocity directly. The relay integrates
 the servo's `wz` at `20 Hz` and sends the resulting target `facing` vector, so
 `wz` is a bounded target-heading slew rate; actual body yaw rate is determined
 by SONIC Planner and the whole-body controller.
+
+### Dual-camera failover
+
+In `dual_raw_yoloe_servo`, the initial head and chest RGB frames are grounded
+at the same time. Each camera runs independent target and table requests, so
+one failed view does not discard the other. A view is initially eligible only
+when both target and table boxes validate. Head is selected when both views are
+eligible; otherwise the eligible view starts the workflow.
+
+Each camera grounding runs in its own process. Once either view becomes
+eligible, the other process gets at most 30 more seconds by default. If it does
+not return in that grace period, its complete process group is terminated and
+the eligible view starts YOLOE immediately. Configure this with
+`base_pose_dual_initialization_grace_s`.
+
+For each active YOLOE attempt, a valid frame requires the target, table, target
+depth geometry, and table-edge depth geometry together. A successful complete
+frame resets the failover cycle and permits later switching in either
+direction. Every fifth complete frame is considered for an atomic
+`LatestReference` update containing a copy of that same RGB image, target box,
+and the table box whose geometry validated. The two cameras keep independent
+latest-reference gates.
+
+Each matching stage tolerates 30 consecutive invalid frames. On the 30th, the
+runtime immediately publishes zero velocity, remains in Planner mode, resets
+YOLOE and the controller to `YAW_ALIGN`, and advances without changing the
+navigation generation:
+
+1. Switch from camera A to camera B. Use B's successful initial RGB/boxes when
+   available; otherwise use A's initial RGB/boxes as a cross-camera reference.
+2. If B also fails, switch back to A and use A's latest coherent reference,
+   falling back to A's initial reference when no latest reference exists.
+3. Only if this A retry also fails for 30 consecutive frames does the current
+   navigation terminate.
+
+The same three-stage cycle can start again after any intervening success. Old
+or future-attempt events cannot resume motion. The navigation-wide timeout
+starts when the first YOLOE detection attempt begins, defaults to 180 seconds,
+and is not extended by camera switches.
 
 The symmetric horizontal intervals are launch parameters. Set
 `base_pose_raw_horizontal_guard_fraction` for entry and
@@ -221,7 +292,8 @@ plus strict command bounds, not environmental obstacle avoidance.
 
 Diagnostics for each request are written below
 `outputs/base_pose_adjustment/<timestamp>/` (raw runs use
-`raw_yoloe_<timestamp>_g<generation>/`). Each raw run saves the exact task
+`raw_yoloe_<timestamp>_g<generation>/`; dual runs use
+`dual_raw_yoloe_<timestamp>_g<generation>/`). Each raw run saves the exact task
 request in `target_prompt.txt`, `target_schema.json`, and `target_result.json`,
 and the independent table request in `table_prompt.txt`, `table_schema.json`,
 and `table_result.json`. The pixel-space two-class handoff, including all table
@@ -254,7 +326,13 @@ does not see a valid yaw before the first nonzero heading target,
 relative origin. Missing or malformed telemetry only affects these diagnostic
 fields; it never pauses, terminates, or changes visual-servo commands. The
 launcher uses `base_pose_orientation_telemetry_port=5565` by default and only
-opens this side channel for `base_pose_mode=raw_yoloe_servo`.
+opens this side channel for `base_pose_mode=raw_yoloe_servo` or
+`base_pose_mode=dual_raw_yoloe_servo`.
+
+Dual runs also write `initial_reference_summary.json`, per-camera initial RGB-D
+and grounding outputs, and the attempt provenance fields `camera_stream`,
+`attempt_id`, `failover_stage`, `reference_source_stream`, and
+`reference_kind` into per-frame diagnostics.
 
 Normal shutdown stops motion and joins the perception worker before draining
 and joining the diagnostic writer, then reports `diagnostics flushed`.

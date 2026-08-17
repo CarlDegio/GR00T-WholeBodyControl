@@ -1,0 +1,106 @@
+{
+  "format_version": 1,
+  "capture_id": "20260816_new_orbbec_head",
+  "robot_host": "192.168.123.164",
+  "streams": {
+    "ego_view": {
+      "fx": 398.3928527832031,
+      "fy": 398.3507080078125,
+      "cx": 335.33514404296875,
+      "cy": 238.265869140625,
+      "width": 640,
+      "height": 480,
+      "distortion_model": "OBCameraDistortionModel.BROWN_CONRADY_K6",
+      "distortion_coeffs": [
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0
+      ],
+      "distortion_coeff_order": [
+        "k1",
+        "k2",
+        "p1",
+        "p2",
+        "k3",
+        "k4",
+        "k5",
+        "k6"
+      ],
+      "source_distortion_model": "OBCameraDistortionModel.BROWN_CONRADY_K6",
+      "source_distortion_coeffs": [
+        0.20650894939899445,
+        -0.09592948853969574,
+        -0.00037053809501230717,
+        0.00012240317300893366,
+        -0.003967238124459982,
+        0.5910233855247498,
+        -0.10028794407844543,
+        -0.026343297213315964
+      ],
+      "rgb_undistorted": true,
+      "camera_type": "orbbec",
+      "camera_serial": "CPMD464001G",
+      "color_image_dim": [
+        640,
+        480
+      ],
+      "depth_image_dim": [
+        640,
+        480
+      ],
+      "fps": 30,
+      "depth_scale_m": 0.001,
+      "depth_aligned_to": "ego_view"
+    },
+    "chest_view": {
+      "fx": 607.461181640625,
+      "fy": 607.4806518554688,
+      "cx": 312.74774169921875,
+      "cy": 253.5120391845703,
+      "width": 640,
+      "height": 480,
+      "distortion_model": "distortion.inverse_brown_conrady",
+      "distortion_coeffs": [
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0
+      ],
+      "distortion_coeff_order": [
+        "k1",
+        "k2",
+        "p1",
+        "p2",
+        "k3"
+      ],
+      "source_distortion_model": "distortion.inverse_brown_conrady",
+      "source_distortion_coeffs": [
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0
+      ],
+      "rgb_undistorted": false,
+      "camera_type": "realsense",
+      "camera_serial": "408122070390",
+      "color_image_dim": [
+        640,
+        480
+      ],
+      "depth_image_dim": [
+        640,
+        480
+      ],
+      "fps": 30,
+      "depth_scale_m": 0.0010000000474974513,
+      "depth_aligned_to": "chest_view"
+    }
+  }
+}

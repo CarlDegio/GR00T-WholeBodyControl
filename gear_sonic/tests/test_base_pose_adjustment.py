@@ -36,6 +36,7 @@ from gear_sonic.utils.inference.base_pose import (
     BasePoseRunner,
     BasePoseValidationError,
     CodexStructuredVisionClient,
+    DualAlignedRGBDCamera,
     QwenVLStructuredVisionClient,
     _dashscope_api_key,
     build_base_pose_prompt,
@@ -501,6 +502,118 @@ def test_dynamic_ego_rgbd_decode_requires_aligned_pure_lingbot_uint16() -> None:
     bad["camera_info"]["ego_view"]["depth_source"] = "realsense"
     with pytest.raises(BasePoseCameraError, match="depth_source"):
         camera.decode_payload(bad)
+
+def test_ego_rgbd_decode_uses_saved_calibration_without_packet_camera_info() -> None:
+    source = snapshot()
+    schema = ImageMessageSchema(
+        timestamps={"ego_view": 12.0, "ego_view_depth": 12.0},
+        images={"ego_view": source.rgb, "ego_view_depth": source.depth_raw},
+    )
+    camera = object.__new__(AlignedRGBDCamera)
+    camera.stream_name = "ego_view"
+    camera.depth_key = "ego_view_depth"
+    camera.require_depth = True
+    camera.required_depth_source = None
+    camera._configured_camera_info = {
+        "fx": source.fx,
+        "fy": source.fy,
+        "cx": source.cx,
+        "cy": source.cy,
+        "width": 20,
+        "height": 10,
+        "depth_scale_m": 0.001,
+        "depth_aligned_to": "ego_view",
+    }
+
+    decoded = camera.decode_payload(schema.serialize())
+
+    assert decoded.fx == 100.0
+    assert decoded.fy == 100.0
+    assert decoded.depth_scale_m == 0.001
+    assert decoded.depth_aligned_to == "ego_view"
+
+
+def _dual_stream_decoder(
+    stream_name: str,
+    *,
+    width: int = 20,
+    height: int = 10,
+) -> AlignedRGBDCamera:
+    decoder = object.__new__(AlignedRGBDCamera)
+    decoder.stream_name = stream_name
+    decoder.depth_key = f"{stream_name}_depth"
+    decoder.require_depth = True
+    decoder.required_depth_source = None
+    decoder._configured_camera_info = {
+        "fx": 100.0,
+        "fy": 101.0,
+        "cx": 9.5,
+        "cy": 4.5,
+        "width": width,
+        "height": height,
+        "depth_scale_m": 0.001,
+        "depth_aligned_to": stream_name,
+    }
+    return decoder
+
+
+def test_dual_rgbd_decodes_both_streams_from_one_composed_payload() -> None:
+    assert DualAlignedRGBDCamera is not None
+    camera = object.__new__(DualAlignedRGBDCamera)
+    camera.stream_names = ("ego_view", "chest_view")
+    camera._decoders = {
+        stream: _dual_stream_decoder(stream)
+        for stream in camera.stream_names
+    }
+    rgb = np.zeros((10, 20, 3), dtype=np.uint8)
+    head_depth = np.full((10, 20), 1100, dtype=np.uint16)
+    chest_depth = np.full((10, 20), 1400, dtype=np.uint16)
+    payload = ImageMessageSchema(
+        timestamps={"ego_view": 12.0, "chest_view": 12.0},
+        images={
+            "ego_view": rgb,
+            "ego_view_depth": head_depth,
+            "chest_view": rgb + 1,
+            "chest_view_depth": chest_depth,
+        },
+    ).serialize()
+
+    capture = camera.decode_payload(payload)
+
+    assert set(capture.snapshots) == {"ego_view", "chest_view"}
+    assert capture.errors == {}
+    assert capture.snapshots["ego_view"].depth_raw is not None
+    assert capture.snapshots["chest_view"].depth_raw is not None
+    assert int(capture.snapshots["ego_view"].depth_raw[0, 0]) == 1100
+    assert int(capture.snapshots["chest_view"].depth_raw[0, 0]) == 1400
+
+
+def test_dual_rgbd_isolates_one_malformed_stream() -> None:
+    assert DualAlignedRGBDCamera is not None
+    camera = object.__new__(DualAlignedRGBDCamera)
+    camera.stream_names = ("ego_view", "chest_view")
+    camera._decoders = {
+        stream: _dual_stream_decoder(stream)
+        for stream in camera.stream_names
+    }
+    rgb = np.zeros((10, 20, 3), dtype=np.uint8)
+    payload = ImageMessageSchema(
+        timestamps={"ego_view": 12.0, "chest_view": 12.0},
+        images={
+            "ego_view": rgb,
+            "ego_view_depth": np.full((10, 20), 1100, dtype=np.uint16),
+            "chest_view": rgb,
+            "chest_view_depth": np.full((9, 20), 1400, dtype=np.uint16),
+        },
+    ).serialize()
+
+    capture = camera.decode_payload(payload)
+
+    assert set(capture.snapshots) == {"ego_view"}
+    assert "chest_view" in capture.errors
+    assert "shapes do not match" in capture.errors["chest_view"]
+
+
 
 
 def test_roi_depth_statistics_and_intrinsic_backprojection() -> None:
