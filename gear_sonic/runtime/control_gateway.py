@@ -314,7 +314,19 @@ class NavigationControlState:
         if not all(math.isfinite(value) for value in velocity):
             raise ValueError("base-pose velocity must be finite")
         vx, vy, wz = velocity
-        if abs(vx) > 0.300001 or abs(vy) > 0.000001 or abs(wz) > 0.400001:
+        motion_profile = str(parameters.get("motion_profile", "sequence"))
+        if motion_profile == "sequence":
+            unsafe = abs(vx) > 0.300001 or abs(vy) > 0.000001 or abs(wz) > 0.400001
+        elif motion_profile == "yoloe_servo":
+            unsafe = (
+                abs(vx) > 0.400001
+                or abs(vy) > 0.400001
+                or abs(wz) > 0.300001
+                or (abs(vx) > 0.000001 and abs(vy) > 0.000001)
+            )
+        else:
+            raise ValueError("unsupported base-pose motion profile")
+        if unsafe:
             raise ValueError("base-pose velocity exceeds the planner safety envelope")
         self.mode = "base_pose_motion"
         self.manual_velocity = velocity

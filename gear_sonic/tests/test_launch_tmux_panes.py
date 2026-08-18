@@ -455,6 +455,22 @@ def test_base_pose_qwenvl_command_loads_local_key_without_persisting_by_default(
     assert "--persist-diagnostics" not in command
 
 
+def test_base_pose_yoloe_command_uses_aligned_raw_depth_and_local_model() -> None:
+    command = build_base_pose_agent_command(
+        InferenceLaunchConfig(
+            base_pose_enabled=True,
+            base_pose_task="align",
+            base_pose_mode="raw_yoloe_servo",
+        ),
+        Path("/workspace/sonic"),
+    )
+
+    assert "--mode raw_yoloe_servo" in command
+    assert "--depth-stream camera/ego_view_depth" in command
+    assert "--raw-yoloe-model-path tools/yoloe26m/weights/yoloe-26m-seg.pt" in command
+    assert "--raw-head-target-distance-m 0.9" in command
+
+
 def test_runtime_sidecars_are_read_only_and_navdp_uses_gateway_by_default() -> None:
     config = InferenceLaunchConfig(camera_host="192.168.123.164")
     root = Path("/workspace/sonic")

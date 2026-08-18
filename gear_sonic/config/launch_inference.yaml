@@ -195,6 +195,8 @@ launch_inference:
   # For rgbd/rgb_depth_query, configure a LingBot stream aligned to this camera.
   # The existing derived/lingbot_depth stream is aligned to chest_view.
   base_pose_depth_stream: derived/lingbot_depth
+  base_pose_yoloe_depth_stream: camera/ego_view_depth
+  base_pose_camera_intrinsics_path: gear_sonic/config/camera_intrinsics.json
   base_pose_camera_timeout_ms: 15000
   base_pose_planner_hz: 20.0
   base_pose_transition_pause: 0.5
@@ -202,6 +204,22 @@ launch_inference:
   base_pose_translation_speed: 0.3
   base_pose_persist_diagnostics: false
   base_pose_output_root: outputs/base_pose_adjustment
+  base_pose_yoloe_model_path: tools/yoloe26m/weights/yoloe-26m-seg.pt
+  base_pose_yoloe_device: '0'
+  base_pose_yoloe_confidence: 0.25
+  base_pose_yoloe_imgsz: 640
+  base_pose_raw_servo_hz: 10.0
+  base_pose_raw_head_target_distance_m: 0.90
+  base_pose_raw_forward_tolerance_m: 0.10
+  base_pose_raw_lateral_tolerance_m: 0.10
+  base_pose_raw_min_linear_speed_m_s: 0.40
+  base_pose_raw_max_lateral_speed_m_s: 0.40
+  base_pose_raw_min_yaw_speed_rad_s: 0.10
+  base_pose_raw_yaw_tolerance_deg: 8.0
+  base_pose_raw_yaw_coarse_speed_rad_s: 0.30
+  base_pose_raw_yaw_trim_speed_rad_s: 0.20
+  base_pose_raw_camera_stale_s: 0.40
+  base_pose_raw_max_run_s: 180.0
   navdp_root: /home/user/Project/NavDP/baselines/x-navdp
   navdp_checkpoint: /home/user/Project/NavDP/baselines/x-navdp/checkpoints/x-navdp_posttrain.ckpt
   fastlio_workspace: /home/user/Project/fastlio_humanoid_ws

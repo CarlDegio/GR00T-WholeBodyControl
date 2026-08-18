@@ -29,7 +29,7 @@ from gear_sonic.utils.inference.base_pose_sensor import SensorGatewayBasePoseCam
 @dataclass
 class BasePoseAgentConfig:
     task: str
-    mode: Literal["rgb", "rgbd", "rgb_depth_query"] = "rgb"
+    mode: str = "rgb"
     vision_backend: Literal["codex", "qwenvl"] = "codex"
     model: str = "gpt-5.6-sol"
     qwenvl_model: str = "qwen3-vl-plus"
@@ -55,6 +55,41 @@ class BasePoseAgentConfig:
     translation_scale: float = 1.0
     persist_diagnostics: bool = False
     output_root: str = "outputs/base_pose_adjustment"
+    camera_intrinsics_path: str = "gear_sonic/config/camera_intrinsics.json"
+    camera_host: str = "localhost"
+    camera_port: int = 5555
+    camera_pitch_deg: float = -38.0
+    camera_roll_deg: float = 0.0
+    camera_yaw_deg: float = 0.0
+    camera_forward_offset_m: float = 0.0
+    camera_lateral_offset_m: float = 0.0
+    final_stop_count: int = 3
+    raw_yoloe_model_path: str = "tools/yoloe26m/weights/yoloe-26m-seg.pt"
+    raw_yoloe_device: str = "0"
+    raw_yoloe_confidence: float = 0.25
+    raw_yoloe_imgsz: int = 640
+    raw_reference_update_interval_frames: int = 5
+    raw_reference_update_min_confidence: float = 0.35
+    raw_reference_update_min_iou: float = 0.50
+    raw_servo_hz: float = 10.0
+    raw_head_target_distance_m: float = 0.90
+    raw_chest_target_distance_m: float = 0.80
+    raw_forward_tolerance_m: float = 0.10
+    raw_lateral_tolerance_m: float = 0.10
+    raw_min_linear_speed_m_s: float = 0.40
+    raw_max_lateral_speed_m_s: float = 0.40
+    raw_min_yaw_speed_rad_s: float = 0.10
+    raw_yaw_tolerance_deg: float = 8.0
+    raw_yaw_coarse_speed_rad_s: float = 0.30
+    raw_yaw_trim_speed_rad_s: float = 0.20
+    raw_forward_recenter_yaw_speed_rad_s: float = 0.30
+    raw_horizontal_guard_fraction: float = 0.25
+    raw_horizontal_recovery_fraction: float = 0.30
+    raw_command_ttl_s: float = 0.15
+    raw_camera_stale_s: float = 0.4
+    raw_max_run_s: float = 180.0
+    raw_post_stop_sample_s: float = 3.0
+    raw_allow_missing_table: Literal[0, 1] = 0
 
 
 @dataclass(frozen=True)
@@ -230,6 +265,13 @@ def run_inference_worker(
 
 
 def main(config: BasePoseAgentConfig) -> None:
+    if config.mode == "raw_yoloe_servo":
+        from gear_sonic.scripts.base_pose_yolo_agent import run_base_pose_yolo_agent
+
+        run_base_pose_yolo_agent(config)
+        return
+    if config.mode not in {"rgb", "rgbd", "rgb_depth_query"}:
+        raise ValueError(f"unsupported base-pose mode: {config.mode}")
     context = zmq.Context.instance()
     intent = ControlGatewayIntentClient(
         config.control_gateway_intent_endpoint,

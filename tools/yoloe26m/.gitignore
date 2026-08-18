@@ -1,0 +1,7 @@
+assets/
+config/
+datasets/
+outputs/
+weights/
+*.log
+

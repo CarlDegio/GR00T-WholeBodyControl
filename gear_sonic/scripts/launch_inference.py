@@ -238,7 +238,7 @@ class InferenceLaunchConfig:
     base_pose_task: str = ""
     """Fixed manipulation task used whenever B starts Base-Pose alignment."""
 
-    base_pose_mode: Literal["rgb", "rgbd", "rgb_depth_query"] = "rgb"
+    base_pose_mode: Literal["rgb", "rgbd", "rgb_depth_query", "raw_yoloe_servo"] = "rgb"
     """Agent-near-compatible observation modality."""
 
     base_pose_vision_backend: Literal["codex", "qwenvl"] = "codex"
@@ -251,6 +251,8 @@ class InferenceLaunchConfig:
     base_pose_codex_timeout_seconds: float = 600.0
     base_pose_camera_stream: str = "ego_view"
     base_pose_depth_stream: str = "derived/lingbot_depth"
+    base_pose_yoloe_depth_stream: str = "camera/ego_view_depth"
+    base_pose_camera_intrinsics_path: str = "gear_sonic/config/camera_intrinsics.json"
     base_pose_camera_timeout_ms: int = 15000
     base_pose_planner_hz: float = 20.0
     base_pose_transition_pause: float = 0.5
@@ -258,6 +260,22 @@ class InferenceLaunchConfig:
     base_pose_translation_speed: float = 0.3
     base_pose_persist_diagnostics: bool = False
     base_pose_output_root: str = "outputs/base_pose_adjustment"
+    base_pose_yoloe_model_path: str = "tools/yoloe26m/weights/yoloe-26m-seg.pt"
+    base_pose_yoloe_device: str = "0"
+    base_pose_yoloe_confidence: float = 0.25
+    base_pose_yoloe_imgsz: int = 640
+    base_pose_raw_servo_hz: float = 10.0
+    base_pose_raw_head_target_distance_m: float = 0.90
+    base_pose_raw_forward_tolerance_m: float = 0.10
+    base_pose_raw_lateral_tolerance_m: float = 0.10
+    base_pose_raw_min_linear_speed_m_s: float = 0.40
+    base_pose_raw_max_lateral_speed_m_s: float = 0.40
+    base_pose_raw_min_yaw_speed_rad_s: float = 0.10
+    base_pose_raw_yaw_tolerance_deg: float = 8.0
+    base_pose_raw_yaw_coarse_speed_rad_s: float = 0.30
+    base_pose_raw_yaw_trim_speed_rad_s: float = 0.20
+    base_pose_raw_camera_stale_s: float = 0.40
+    base_pose_raw_max_run_s: float = 180.0
 
     navdp_root: str = "/home/user/Project/NavDP/baselines/x-navdp"
     navdp_checkpoint: str = (
@@ -628,6 +646,32 @@ def build_base_pose_agent_command(
     diagnostics = (
         "--persist-diagnostics " if config.base_pose_persist_diagnostics else ""
     )
+    depth_stream = (
+        config.base_pose_yoloe_depth_stream
+        if config.base_pose_mode == "raw_yoloe_servo"
+        else config.base_pose_depth_stream
+    )
+    yoloe = ""
+    if config.base_pose_mode == "raw_yoloe_servo":
+        yoloe = (
+            f"--camera-intrinsics-path {shlex.quote(config.base_pose_camera_intrinsics_path)} "
+            f"--raw-yoloe-model-path {shlex.quote(config.base_pose_yoloe_model_path)} "
+            f"--raw-yoloe-device {shlex.quote(config.base_pose_yoloe_device)} "
+            f"--raw-yoloe-confidence {config.base_pose_yoloe_confidence} "
+            f"--raw-yoloe-imgsz {config.base_pose_yoloe_imgsz} "
+            f"--raw-servo-hz {config.base_pose_raw_servo_hz} "
+            f"--raw-head-target-distance-m {config.base_pose_raw_head_target_distance_m} "
+            f"--raw-forward-tolerance-m {config.base_pose_raw_forward_tolerance_m} "
+            f"--raw-lateral-tolerance-m {config.base_pose_raw_lateral_tolerance_m} "
+            f"--raw-min-linear-speed-m-s {config.base_pose_raw_min_linear_speed_m_s} "
+            f"--raw-max-lateral-speed-m-s {config.base_pose_raw_max_lateral_speed_m_s} "
+            f"--raw-min-yaw-speed-rad-s {config.base_pose_raw_min_yaw_speed_rad_s} "
+            f"--raw-yaw-tolerance-deg {config.base_pose_raw_yaw_tolerance_deg} "
+            f"--raw-yaw-coarse-speed-rad-s {config.base_pose_raw_yaw_coarse_speed_rad_s} "
+            f"--raw-yaw-trim-speed-rad-s {config.base_pose_raw_yaw_trim_speed_rad_s} "
+            f"--raw-camera-stale-s {config.base_pose_raw_camera_stale_s} "
+            f"--raw-max-run-s {config.base_pose_raw_max_run_s} "
+        )
     return (
         f"cd {quoted_root} && {local_env}"
         ".venv_inference/bin/python gear_sonic/scripts/base_pose_agent.py "
@@ -638,7 +682,7 @@ def build_base_pose_agent_command(
         f"{codex_fast}"
         f"--codex-timeout-seconds {config.base_pose_codex_timeout_seconds} "
         f"--camera-stream {shlex.quote(config.base_pose_camera_stream)} "
-        f"--depth-stream {shlex.quote(config.base_pose_depth_stream)} "
+        f"--depth-stream {shlex.quote(depth_stream)} "
         f"--camera-timeout-ms {config.base_pose_camera_timeout_ms} "
         f"--sensor-gateway-endpoint tcp://127.0.0.1:{config.sensor_gateway_port} "
         f"--sensor-gateway-request-timeout-ms {config.vla_sensor_gateway_request_timeout_ms} "
@@ -650,6 +694,7 @@ def build_base_pose_agent_command(
         f"--transition-pause {config.base_pose_transition_pause} "
         f"--rotation-speed {config.base_pose_rotation_speed} "
         f"--translation-speed {config.base_pose_translation_speed} "
+        f"{yoloe}"
         f"{diagnostics}"
         f"--output-root {shlex.quote(config.base_pose_output_root)}"
     )
@@ -971,7 +1016,7 @@ def _check_prerequisites(config: InferenceLaunchConfig):
         if not 0.0 < config.base_pose_translation_speed <= 0.3:
             errors.append("--base-pose-translation-speed must be in (0, 0.3]")
         if (
-            config.base_pose_mode != "rgb"
+            config.base_pose_mode in {"rgbd", "rgb_depth_query"}
             and config.base_pose_depth_stream == "derived/lingbot_depth"
             and config.base_pose_camera_stream != "chest_view"
         ):
@@ -980,6 +1025,43 @@ def _check_prerequisites(config: InferenceLaunchConfig):
                 "--base-pose-camera-stream chest_view or provide an ego-aligned "
                 "LingBot depth stream"
             )
+        if config.base_pose_mode == "raw_yoloe_servo":
+            expected_depth = f"camera/{config.base_pose_camera_stream}_depth"
+            if config.base_pose_yoloe_depth_stream != expected_depth:
+                errors.append(
+                    "raw_yoloe_servo requires the raw depth stream aligned to its RGB: "
+                    f"--base-pose-yoloe-depth-stream {expected_depth}"
+                )
+            for value, label in (
+                (config.base_pose_yoloe_confidence, "YOLOE confidence"),
+                (config.base_pose_raw_servo_hz, "raw servo frequency"),
+                (config.base_pose_raw_head_target_distance_m, "target distance"),
+                (config.base_pose_raw_forward_tolerance_m, "forward tolerance"),
+                (config.base_pose_raw_lateral_tolerance_m, "lateral tolerance"),
+                (config.base_pose_raw_min_linear_speed_m_s, "minimum linear speed"),
+                (config.base_pose_raw_max_lateral_speed_m_s, "maximum lateral speed"),
+                (config.base_pose_raw_min_yaw_speed_rad_s, "minimum yaw speed"),
+                (config.base_pose_raw_yaw_tolerance_deg, "yaw tolerance"),
+                (config.base_pose_raw_yaw_coarse_speed_rad_s, "coarse yaw speed"),
+                (config.base_pose_raw_yaw_trim_speed_rad_s, "trim yaw speed"),
+                (config.base_pose_raw_camera_stale_s, "camera stale timeout"),
+                (config.base_pose_raw_max_run_s, "maximum run time"),
+            ):
+                if value <= 0.0:
+                    errors.append(f"Base-Pose {label} must be positive")
+            if not 0.0 < config.base_pose_yoloe_confidence <= 1.0:
+                errors.append("Base-Pose YOLOE confidence must be in (0, 1]")
+            if config.base_pose_yoloe_imgsz <= 0:
+                errors.append("Base-Pose YOLOE image size must be positive")
+            for relative_path, label in (
+                (config.base_pose_yoloe_model_path, "YOLOE model"),
+                (config.base_pose_camera_intrinsics_path, "camera intrinsics"),
+            ):
+                path = Path(relative_path)
+                if not path.is_absolute():
+                    path = repo_root / path
+                if not path.is_file():
+                    errors.append(f"Base-Pose {label} not found: {path}")
         if (
             config.base_pose_vision_backend == "qwenvl"
             and not os.environ.get("DASHSCOPE_API_KEY", "").strip()
