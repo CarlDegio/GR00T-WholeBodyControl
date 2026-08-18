@@ -66,7 +66,8 @@ def main() -> None:
     print(f"[OperatorCLI] ControlGateway: {endpoint}")
     print(
         "Keys: k=start/stop, i=pose, o=planner, p=pause, [/]=hands; "
-        "PLANNER: w/a/s/d/q/e/n/space (single-key, no Enter); "
+        "PLANNER: w/a/s/d/q/e manual, n=LaViRA, b=BasePose, space=cancel "
+        "(single-key, no Enter); "
         ": enters a full command line"
     )
     time.sleep(0.2)

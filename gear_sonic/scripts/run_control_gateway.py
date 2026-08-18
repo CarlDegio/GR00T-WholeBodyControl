@@ -173,18 +173,18 @@ def run_control_gateway(settings: ControlGatewaySettings) -> None:
         *,
         source: str,
         input_key: str | None = None,
-    ) -> None:
+    ) -> bool:
         if action.mode == "ignored":
             log_control_route(
                 source,
                 "navigation_key",
                 (),
-                result="ignored",
+                result=action.reason or "ignored",
                 key=input_key,
                 generation=action.generation,
                 navigation_state=navigation.mode,
             )
-            return
+            return False
         navigation_pub.send_string(
             build_navigation_message(
                 mode=action.mode,
@@ -197,7 +197,14 @@ def run_control_gateway(settings: ControlGatewaySettings) -> None:
                 action.agent_event,
                 {"generation": action.generation},
             )
-        destinations = ("NavDP",) + (("LaViRA",) if action.agent_event else ())
+        agent_destinations: tuple[str, ...] = ()
+        if action.agent_event == "start_navigation":
+            agent_destinations = ("LaViRA",)
+        elif action.agent_event == "start_base_pose":
+            agent_destinations = ("BasePose",)
+        elif action.agent_event == "cancel_navigation":
+            agent_destinations = ("LaViRA", "BasePose")
+        destinations = ("NavDP",) + agent_destinations
         log_control_route(
             source,
             action.mode,
@@ -206,7 +213,9 @@ def run_control_gateway(settings: ControlGatewaySettings) -> None:
             key=input_key,
             velocity=action.velocity,
             agent_event=action.agent_event,
+            reason=action.reason,
         )
+        return True
 
     try:
         poller = zmq.Poller()
@@ -222,16 +231,21 @@ def run_control_gateway(settings: ControlGatewaySettings) -> None:
                     command = OperatorCommand.from_json(payload)
                     routed = router.route(command)
                     last_command_id = command.command_id
+                    command_accepted = routed.accepted
+                    command_reason = routed.reason
                     if routed.accepted:
                         if command.name == "navigation_key":
                             key = command.parameters.get("key")
                             if not isinstance(key, str) or len(key) != 1:
                                 raise ValueError("navigation_key requires one string key")
-                            publish_navigation_action(
-                                navigation.handle_key(key, now=time.monotonic()),
+                            action = navigation.handle_key(key, now=time.monotonic())
+                            command_accepted = publish_navigation_action(
+                                action,
                                 source=command.metadata.source,
                                 input_key="Space" if key == " " else key.upper(),
                             )
+                            if not command_accepted:
+                                command_reason = action.reason or "navigation request ignored"
                         elif command.name == "navigation_goal":
                             action = navigation.accept_goal(command.parameters)
                             goal = command.parameters.get("goal_base")
@@ -261,7 +275,11 @@ def run_control_gateway(settings: ControlGatewaySettings) -> None:
                                 confidence=float(command.parameters.get("confidence", 0.0)),
                             )
                         elif command.name == "navigation_agent_status":
-                            if not navigation.accept_status(command.parameters):
+                            if command.metadata.source != "lavira_agent":
+                                raise ValueError("navigation status requires lavira_agent source")
+                            if not navigation.accept_status(
+                                command.parameters, owner="lavira"
+                            ):
                                 raise ValueError("stale navigation agent status")
                             generation = int(command.parameters["generation"])
                             navigation_pub.send_string(
@@ -286,6 +304,51 @@ def run_control_gateway(settings: ControlGatewaySettings) -> None:
                                 state=str(command.parameters.get("state", "failed")),
                                 reason=str(command.parameters.get("reason", "")),
                             )
+                        elif command.name == "base_pose_velocity":
+                            if command.metadata.source != "base_pose_agent":
+                                raise ValueError("base-pose velocity requires base_pose_agent source")
+                            action = navigation.accept_base_pose_velocity(
+                                command.parameters,
+                                now=time.monotonic(),
+                            )
+                            publish_navigation_action(
+                                action,
+                                source=command.metadata.source,
+                            )
+                        elif command.name == "base_pose_status":
+                            if command.metadata.source != "base_pose_agent":
+                                raise ValueError("base-pose status requires base_pose_agent source")
+                            if not navigation.accept_status(
+                                command.parameters, owner="base_pose"
+                            ):
+                                raise ValueError("stale base-pose status")
+                            generation = int(command.parameters["generation"])
+                            navigation_pub.send_string(
+                                build_navigation_message(
+                                    mode="stop",
+                                    generation=generation,
+                                )
+                            )
+                            log_control_route(
+                                command.metadata.source,
+                                "base_pose_status",
+                                ("NavDP", "ControlGateway status subscribers"),
+                                generation=generation,
+                                state=str(command.parameters.get("state", "failed")),
+                                reason=str(command.parameters.get("reason", "")),
+                            )
+                        elif command.name == "select_pose_mode":
+                            publish_navigation_action(
+                                navigation.handle_key(" ", now=time.monotonic()),
+                                source=command.metadata.source,
+                                input_key="POSE mode",
+                            )
+                            log_control_route(
+                                command.metadata.source,
+                                command.name,
+                                ("VLA", "DataExporter", "typed subscribers"),
+                                navigation_result="cancelled",
+                            )
                         else:
                             log_control_route(
                                 command.metadata.source,
@@ -296,9 +359,14 @@ def run_control_gateway(settings: ControlGatewaySettings) -> None:
                             "navigation_key",
                             "navigation_goal",
                             "navigation_agent_status",
+                            "base_pose_velocity",
+                            "base_pose_status",
                         }:
                             dispatch_pub.send_string(command.to_json())
-                        accepted_commands += 1
+                        if command_accepted:
+                            accepted_commands += 1
+                        else:
+                            rejected_commands += 1
                     else:
                         rejected_commands += 1
                     ack = CommandAck(
@@ -308,10 +376,10 @@ def run_control_gateway(settings: ControlGatewaySettings) -> None:
                             ttl_ms=settings.command_ttl_ms,
                         ),
                         command_id=command.command_id,
-                        accepted=routed.accepted,
+                        accepted=command_accepted,
                         system_state="ready",
                         control_mode="unobserved",
-                        reason=routed.reason,
+                        reason=command_reason,
                     )
                     ack_sequence += 1
                     status_pub.send_string(

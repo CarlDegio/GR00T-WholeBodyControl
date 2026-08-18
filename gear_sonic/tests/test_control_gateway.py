@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import argparse
 
+import pytest
+
 from gear_sonic.runtime.contracts import OperatorCommand
 from gear_sonic.runtime.control_gateway import (
     ControlGatewayCore,
@@ -132,23 +134,75 @@ def test_navigation_can_start_during_the_existing_manual_hold_window() -> None:
     assert started.agent_event == "start_navigation"
     assert started.generation == 1
     assert state.manual_velocity == (0.0, 0.0, 0.0)
-    assert state.mode == "nav_pending"
+    assert state.mode == "lavira_pending"
 
 
 def test_navigation_state_ignores_motion_and_repeat_n_during_nav() -> None:
     state = NavigationControlState()
     started = state.handle_key("n", now=1.0)
     assert started.agent_event == "start_navigation"
-    assert state.mode == "nav_pending"
+    assert state.mode == "lavira_pending"
 
-    for key in ("w", "a", "s", "d", "q", "e", "n"):
+    for key in ("w", "a", "s", "d", "q", "e", "n", "b"):
         ignored = state.handle_key(key, now=1.1)
         assert ignored.mode == "ignored"
         assert ignored.generation == started.generation
-    assert state.mode == "nav_pending"
+        assert ignored.reason == "navigation_busy:lavira"
+    assert state.mode == "lavira_pending"
 
     cancelled = state.handle_key(" ", now=1.2)
     assert cancelled.mode == "stop"
     assert cancelled.agent_event == "cancel_navigation"
     assert cancelled.generation == started.generation + 1
     assert state.mode == "listen_wasd"
+
+
+def test_b_starts_base_pose_and_rejects_lavira_until_space() -> None:
+    state = NavigationControlState()
+
+    started = state.handle_key("b", now=1.0)
+
+    assert started.mode == "stop"
+    assert started.agent_event == "start_base_pose"
+    assert state.mode == "base_pose_inference"
+    rejected = state.handle_key("n", now=1.1)
+    assert rejected.mode == "ignored"
+    assert rejected.reason == "navigation_busy:base_pose"
+    assert rejected.generation == started.generation
+
+
+def test_base_pose_velocity_is_bounded_and_times_out_safe() -> None:
+    state = NavigationControlState(base_pose_command_timeout_s=0.2)
+    started = state.handle_key("b", now=1.0)
+    action = state.accept_base_pose_velocity(
+        {"generation": started.generation, "velocity": [0.3, 0.0, 0.0]},
+        now=1.1,
+    )
+
+    assert action.mode == "manual_velocity"
+    assert state.mode == "base_pose_motion"
+    assert state.tick(now=1.29) is None
+    timeout = state.tick(now=1.3)
+    assert timeout is not None
+    assert timeout.mode == "stop"
+    assert timeout.agent_event == "cancel_navigation"
+    assert timeout.reason == "base_pose_velocity_timeout"
+    assert timeout.generation == started.generation + 1
+    assert state.mode == "listen_wasd"
+
+
+def test_base_pose_velocity_rejects_stale_or_unsafe_commands() -> None:
+    state = NavigationControlState()
+    started = state.handle_key("b", now=1.0)
+
+    with pytest.raises(ValueError, match="safety envelope"):
+        state.accept_base_pose_velocity(
+            {"generation": started.generation, "velocity": [0.31, 0.0, 0.0]},
+            now=1.1,
+        )
+    state.handle_key(" ", now=1.2)
+    with pytest.raises(ValueError, match="stale"):
+        state.accept_base_pose_velocity(
+            {"generation": started.generation, "velocity": [0.0, 0.0, 0.0]},
+            now=1.3,
+        )

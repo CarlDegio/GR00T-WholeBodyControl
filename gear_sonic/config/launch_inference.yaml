@@ -180,6 +180,28 @@ launch_inference:
   lavira_codex_timeout_seconds: 180.0
   lavira_min_confidence: 0.6
   lavira_output_root: outputs/object_nav
+  base_pose_enabled: true
+  base_pose_task: *vla_task_prompt
+  base_pose_mode: rgb
+  base_pose_vision_backend: codex
+  base_pose_model: gpt-5.6-sol
+  base_pose_qwenvl_model: qwen3-vl-plus
+  base_pose_qwenvl_base_url: https://dashscope-intl.aliyuncs.com/compatible-mode/v1
+  base_pose_qwenvl_thinking_budget: 500
+  base_pose_reasoning_effort: max
+  base_pose_codex_fast: true
+  base_pose_codex_timeout_seconds: 600.0
+  base_pose_camera_stream: ego_view
+  # For rgbd/rgb_depth_query, configure a LingBot stream aligned to this camera.
+  # The existing derived/lingbot_depth stream is aligned to chest_view.
+  base_pose_depth_stream: derived/lingbot_depth
+  base_pose_camera_timeout_ms: 15000
+  base_pose_planner_hz: 20.0
+  base_pose_transition_pause: 0.5
+  base_pose_rotation_speed: 0.4
+  base_pose_translation_speed: 0.3
+  base_pose_persist_diagnostics: false
+  base_pose_output_root: outputs/base_pose_adjustment
   navdp_root: /home/user/Project/NavDP/baselines/x-navdp
   navdp_checkpoint: /home/user/Project/NavDP/baselines/x-navdp/checkpoints/x-navdp_posttrain.ckpt
   fastlio_workspace: /home/user/Project/fastlio_humanoid_ws

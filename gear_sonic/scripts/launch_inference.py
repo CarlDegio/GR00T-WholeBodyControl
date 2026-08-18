@@ -1,8 +1,8 @@
 """All-in-one tmux launcher for SONIC VLA inference.
 
-The inference window always contains eight panes: C++ deploy, operator CLI,
-VLA, LaViRA, NavDP planner/server, SensorGateway, and ControlGateway. Simulation
-and data collection use optional additional windows.
+The inference window contains the core deploy, operator, VLA, navigation, and
+gateway panes, plus an optional Base-Pose agent pane. Simulation and data
+collection use optional additional windows.
 
 Prerequisites:
     - tmux installed (sudo apt install tmux)
@@ -231,6 +231,33 @@ class InferenceLaunchConfig:
 
     lavira_output_root: str = "outputs/object_nav"
     """Directory where LaViRA stores ObjectNav diagnostics."""
+
+    base_pose_enabled: bool = False
+    """Start the independently triggered Base-Pose navigation agent."""
+
+    base_pose_task: str = ""
+    """Fixed manipulation task used whenever B starts Base-Pose alignment."""
+
+    base_pose_mode: Literal["rgb", "rgbd", "rgb_depth_query"] = "rgb"
+    """Agent-near-compatible observation modality."""
+
+    base_pose_vision_backend: Literal["codex", "qwenvl"] = "codex"
+    base_pose_model: str = "gpt-5.6-sol"
+    base_pose_qwenvl_model: str = "qwen3-vl-plus"
+    base_pose_qwenvl_base_url: str = "https://dashscope-intl.aliyuncs.com/compatible-mode/v1"
+    base_pose_qwenvl_thinking_budget: int = 500
+    base_pose_reasoning_effort: str = "max"
+    base_pose_codex_fast: bool = True
+    base_pose_codex_timeout_seconds: float = 600.0
+    base_pose_camera_stream: str = "ego_view"
+    base_pose_depth_stream: str = "derived/lingbot_depth"
+    base_pose_camera_timeout_ms: int = 15000
+    base_pose_planner_hz: float = 20.0
+    base_pose_transition_pause: float = 0.5
+    base_pose_rotation_speed: float = 0.4
+    base_pose_translation_speed: float = 0.3
+    base_pose_persist_diagnostics: bool = False
+    base_pose_output_root: str = "outputs/base_pose_adjustment"
 
     navdp_root: str = "/home/user/Project/NavDP/baselines/x-navdp"
     navdp_checkpoint: str = (
@@ -582,6 +609,52 @@ def build_planner_input_command(config: InferenceLaunchConfig, repo_root: Path) 
     )
 
 
+def build_base_pose_agent_command(
+    config: InferenceLaunchConfig, repo_root: Path
+) -> str:
+    """Build the independent ControlGateway-backed Base-Pose agent."""
+
+    quoted_root = shlex.quote(str(repo_root))
+    local_env = ""
+    backend = f"--vision-backend {config.base_pose_vision_backend} "
+    if config.base_pose_vision_backend == "qwenvl":
+        local_env = "set -a; [ ! -f .env.local ] || . ./.env.local; set +a; "
+        backend += (
+            f"--qwenvl-model {shlex.quote(config.base_pose_qwenvl_model)} "
+            f"--qwenvl-base-url {shlex.quote(config.base_pose_qwenvl_base_url)} "
+            f"--qwenvl-thinking-budget {config.base_pose_qwenvl_thinking_budget} "
+        )
+    codex_fast = "" if config.base_pose_codex_fast else "--no-codex-fast "
+    diagnostics = (
+        "--persist-diagnostics " if config.base_pose_persist_diagnostics else ""
+    )
+    return (
+        f"cd {quoted_root} && {local_env}"
+        ".venv_inference/bin/python gear_sonic/scripts/base_pose_agent.py "
+        f"--task {shlex.quote(config.base_pose_task)} "
+        f"--mode {config.base_pose_mode} {backend}"
+        f"--model {shlex.quote(config.base_pose_model)} "
+        f"--reasoning-effort {shlex.quote(config.base_pose_reasoning_effort)} "
+        f"{codex_fast}"
+        f"--codex-timeout-seconds {config.base_pose_codex_timeout_seconds} "
+        f"--camera-stream {shlex.quote(config.base_pose_camera_stream)} "
+        f"--depth-stream {shlex.quote(config.base_pose_depth_stream)} "
+        f"--camera-timeout-ms {config.base_pose_camera_timeout_ms} "
+        f"--sensor-gateway-endpoint tcp://127.0.0.1:{config.sensor_gateway_port} "
+        f"--sensor-gateway-request-timeout-ms {config.vla_sensor_gateway_request_timeout_ms} "
+        f"--sensor-gateway-max-age-ms {config.vla_sensor_gateway_max_age_ms} "
+        f"--sensor-gateway-max-skew-ms {config.vla_sensor_gateway_max_skew_ms} "
+        f"--control-gateway-endpoint tcp://127.0.0.1:{config.control_gateway_dispatch_port} "
+        f"--control-gateway-intent-endpoint tcp://127.0.0.1:{config.control_gateway_intent_port} "
+        f"--planner-hz {config.base_pose_planner_hz} "
+        f"--transition-pause {config.base_pose_transition_pause} "
+        f"--rotation-speed {config.base_pose_rotation_speed} "
+        f"--translation-speed {config.base_pose_translation_speed} "
+        f"{diagnostics}"
+        f"--output-root {shlex.quote(config.base_pose_output_root)}"
+    )
+
+
 def build_lingbot_command(config: InferenceLaunchConfig, repo_root: Path) -> str:
     """Build the independent background LingBot depth-completion process."""
     quoted_root = shlex.quote(str(repo_root))
@@ -888,6 +961,37 @@ def _check_prerequisites(config: InferenceLaunchConfig):
                 f"robot camera is not reachable at {config.camera_host}:{config.camera_port}"
             )
 
+    if config.base_pose_enabled:
+        if not config.base_pose_task.strip():
+            errors.append("--base-pose-task is required when Base-Pose is enabled")
+        if config.base_pose_planner_hz <= 0.0:
+            errors.append("--base-pose-planner-hz must be positive")
+        if not 0.0 < config.base_pose_rotation_speed <= 0.4:
+            errors.append("--base-pose-rotation-speed must be in (0, 0.4]")
+        if not 0.0 < config.base_pose_translation_speed <= 0.3:
+            errors.append("--base-pose-translation-speed must be in (0, 0.3]")
+        if (
+            config.base_pose_mode != "rgb"
+            and config.base_pose_depth_stream == "derived/lingbot_depth"
+            and config.base_pose_camera_stream != "chest_view"
+        ):
+            errors.append(
+                "derived/lingbot_depth is aligned to chest_view; configure "
+                "--base-pose-camera-stream chest_view or provide an ego-aligned "
+                "LingBot depth stream"
+            )
+        if (
+            config.base_pose_vision_backend == "qwenvl"
+            and not os.environ.get("DASHSCOPE_API_KEY", "").strip()
+            and not _dotenv_has_nonempty_value(
+                repo_root / ".env.local", "DASHSCOPE_API_KEY"
+            )
+        ):
+            errors.append(
+                "Base-Pose Qwen-VL requires DASHSCOPE_API_KEY in the launcher "
+                "environment or the gitignored .env.local file"
+            )
+
     deploy_dir = repo_root / "gear_sonic_deploy"
     if not (deploy_dir / "deploy.sh").exists():
         errors.append(
@@ -1080,7 +1184,8 @@ def main(config: InferenceLaunchConfig):
     print(f"  PC IP:           {_get_local_ip()}")
     print("=" * 60)
 
-    runtime_pane_count = 2
+    base_pose_runtime_enabled = config.keyboard_planner and config.base_pose_enabled
+    runtime_pane_count = 2 + int(base_pose_runtime_enabled)
     pane_ids = _create_tmux_session(6 + runtime_pane_count)
     print(f"Created tmux session: {SESSION_NAME}")
 
@@ -1137,6 +1242,14 @@ def main(config: InferenceLaunchConfig):
         build_control_gateway_command(config, repo_root),
         wait=1.0,
     )
+    if base_pose_runtime_enabled:
+        runtime_index += 1
+        print(f"Starting Base-Pose agent (pane {6 + runtime_index})...")
+        _send_to_pane(
+            runtime_panes[runtime_index],
+            build_base_pose_agent_command(config, repo_root),
+            wait=1.0,
+        )
 
     # --- Pane 2: VLA Inference ---
     inference_cmd = build_vla_inference_command(config, repo_root)
@@ -1217,6 +1330,9 @@ def main(config: InferenceLaunchConfig):
     print(f"    Pane {runtime_label_index}: Read-only SensorGateway")
     runtime_label_index += 1
     print(f"    Pane {runtime_label_index}: ControlGateway Router")
+    runtime_label_index += 1
+    if config.keyboard_planner and config.base_pose_enabled:
+        print(f"    Pane {runtime_label_index}: Base-Pose Agent")
     if config.data_exporter:
         print("    Window 'data_exporter':")
         print("      Data Exporter (.venv_data_collection)")
@@ -1228,7 +1344,10 @@ def main(config: InferenceLaunchConfig):
     print("  Planner workflow:")
     print("    1. In pane 1: k (start) -> o (PLANNER mode)")
     if config.planner_input == "lavira":
-        print("    2. In pane 3: N starts AgentNav; Space cancels and stops")
+        if config.base_pose_enabled:
+            print("    2. In pane 1: N starts AgentNav; B starts Base-Pose; Space cancels")
+        else:
+            print("    2. In pane 1: N starts AgentNav; Space cancels and stops")
     else:
         print("    2. In pane 3: W/S/A/D/Q/E for safety-guarded locomotion")
     print("    3. In pane 1: i (POSE mode)")

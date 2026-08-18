@@ -17,6 +17,7 @@ from gear_sonic.scripts.launch_inference import (
     _clear_stale_fastlio_processes,
     _dotenv_has_nonempty_value,
     _parse_pane_ids,
+    build_base_pose_agent_command,
     build_fastlio_command,
     build_fastlio_supervisor_command,
     build_slam_debug_command,
@@ -239,6 +240,9 @@ def test_yaml_contains_every_launch_parameter() -> None:
     assert loaded.lavira_mission == "blue basket"
     assert loaded.lavira_global_target == "blue basket"
     assert loaded.lavira_vision_backend == "qwenvl"
+    assert loaded.base_pose_enabled is True
+    assert loaded.base_pose_task == loaded.prompt
+    assert loaded.base_pose_mode == "rgb"
     assert loaded.slam_debug is False
 
 
@@ -417,6 +421,38 @@ def test_lavira_uses_only_control_and_sensor_gateways() -> None:
     assert "--port 5558" not in command
     assert "--status-port 5559" not in command
     assert "5564" not in command
+
+
+def test_base_pose_agent_uses_gateway_arbitration_and_fixed_task() -> None:
+    config = InferenceLaunchConfig(
+        base_pose_enabled=True,
+        base_pose_task="align with the medicine bottle and basket",
+    )
+    command = build_base_pose_agent_command(config, Path("/workspace/sonic"))
+
+    assert "gear_sonic/scripts/base_pose_agent.py" in command
+    assert "--task 'align with the medicine bottle and basket'" in command
+    assert "--mode rgb" in command
+    assert "--sensor-gateway-endpoint tcp://127.0.0.1:5560" in command
+    assert "--control-gateway-endpoint tcp://127.0.0.1:5565" in command
+    assert "--control-gateway-intent-endpoint tcp://127.0.0.1:5561" in command
+    assert "--port 5558" not in command
+
+
+def test_base_pose_qwenvl_command_loads_local_key_without_persisting_by_default() -> None:
+    command = build_base_pose_agent_command(
+        InferenceLaunchConfig(
+            base_pose_enabled=True,
+            base_pose_task="align",
+            base_pose_vision_backend="qwenvl",
+        ),
+        Path("/workspace/sonic"),
+    )
+
+    assert ". ./.env.local" in command
+    assert "--vision-backend qwenvl" in command
+    assert "--qwenvl-thinking-budget 500" in command
+    assert "--persist-diagnostics" not in command
 
 
 def test_runtime_sidecars_are_read_only_and_navdp_uses_gateway_by_default() -> None:
