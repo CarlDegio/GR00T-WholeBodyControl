@@ -200,22 +200,6 @@ class DualCameraFailoverCoordinator:
     ) -> DualCameraAttempt | None:
         if self._active_attempt_id == attempt.attempt_id or attempt.stage == "initial":
             origin = attempt.live_stream
-            return self._attempt(
-                origin,
-                self._initial_reference(origin),
-                stage="origin_text",
-                origin_stream=origin,
-            )
-        if attempt.stage == "origin_text":
-            origin = attempt.origin_stream
-            return self._attempt(
-                origin,
-                self._initial_reference(origin),
-                stage="origin_qwen",
-                origin_stream=origin,
-            )
-        if attempt.stage == "origin_qwen":
-            origin = attempt.origin_stream
             alternate = self._other(origin)
             return self._attempt(
                 alternate,
@@ -233,6 +217,22 @@ class DualCameraFailoverCoordinator:
                 origin_stream=origin,
             )
         if attempt.stage == "alternate_qwen":
+            origin = attempt.origin_stream
+            return self._attempt(
+                origin,
+                self._initial_reference(origin),
+                stage="origin_text",
+                origin_stream=origin,
+            )
+        if attempt.stage == "origin_text":
+            origin = attempt.origin_stream
+            return self._attempt(
+                origin,
+                self._initial_reference(origin),
+                stage="origin_qwen",
+                origin_stream=origin,
+            )
+        if attempt.stage == "origin_qwen":
             return None
         raise ValueError(f"unsupported failover stage: {attempt.stage}")
 
@@ -263,7 +263,6 @@ def dual_calibrations_from_config(
             fy=head.fy,
             cx=head.cx,
             cy=head.cy,
-            camera_height_m=float(config.camera_height_m),
             camera_pitch_deg=float(config.camera_pitch_deg),
             camera_roll_deg=float(config.camera_roll_deg),
             camera_yaw_deg=float(config.camera_yaw_deg),
@@ -277,7 +276,6 @@ def dual_calibrations_from_config(
             fy=chest.fy,
             cx=chest.cx,
             cy=chest.cy,
-            camera_height_m=float(config.dual_chest_camera_height_m),
             camera_pitch_deg=float(config.dual_chest_camera_pitch_deg),
             camera_roll_deg=float(config.dual_chest_camera_roll_deg),
             camera_yaw_deg=float(config.dual_chest_camera_yaw_deg),

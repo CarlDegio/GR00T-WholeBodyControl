@@ -1,9 +1,8 @@
-# G1 head-vision base-pose adjustment
+# G1 YOLOE base-pose adjustment
 
-`base_pose` is a SONIC planner command source independent of AgentNav. The model
-authors the complete ordered sequence of rotations and forward/backward
-translations; the runtime validates the sequence and converts each value to a
-fixed-speed SONIC segment without changing the requested angle or distance.
+`base_pose` provides the raw-depth YOLOE closed-loop SONIC command source,
+independent of AgentNav. It supports one head RGB-D stream or coordinated head
+and chest RGB-D streams.
 
 ## Camera server
 
@@ -17,13 +16,8 @@ That script mirrors the existing multi-camera device configuration but selects
 `ego_view` as the one RealSense mount that publishes aligned depth. The existing
 `start_camera_server.zsh` remains chest-depth compatible for AgentNav.
 
-The `rgb` experiment consumes only `ego_view`. The `raw_yoloe_servo`
-experiment consumes `ego_view` plus its RealSense-aligned raw uint16 depth
-directly from port `5555`; it does not start LingBot. The `rgbd` and
-`rgb_depth_query` experiments require the deployment machine's
-`.venv_lingbot_depth` environment and local LingBot-Depth model. They never
-fall back to raw RealSense depth or RGB-only planning when enhanced depth is
-unavailable.
+The `raw_yoloe_servo` mode consumes `ego_view` plus its RealSense-aligned
+raw uint16 depth directly from port `5555`; it does not start LingBot.
 
 The `dual_raw_yoloe_servo` experiment requires both `ego_view` and
 `chest_view`, each with its aligned `<stream>_depth` image in the same composed
@@ -37,37 +31,6 @@ Despite its calibration-oriented name, this command continuously publishes
 the dual RGB-D set needed by the servo. The runtime loads both saved intrinsic
 records from `gear_sonic/config/camera_intrinsics.json`; it never substitutes
 one camera's intrinsics for the other.
-
-To start either camera configuration and save the first valid `ego_view` RGB
-frame received after startup, use the wrapper below. It connects the ZMQ
-subscriber before starting the camera process and saves a lossless PNG under
-`outputs/camera_startup/` by default:
-
-```bash
-./start_camera_and_save_first_ego_frame.zsh base_pose
-./start_camera_and_save_first_ego_frame.zsh original
-```
-
-An explicit output path can be supplied as the second argument:
-
-```bash
-./start_camera_and_save_first_ego_frame.zsh base_pose /tmp/ego_first.png
-```
-
-When the camera server runs on the robot and this repository runs on the
-deployment machine, start the subscriber on the deployment machine first:
-
-```bash
-./start_camera_and_save_first_ego_frame.zsh remote 192.168.123.164
-```
-
-Then start `start_base_pose_camera_server.zsh` or `start_camera_server.zsh` on
-the robot. The remote mode never launches a local camera process; it receives
-from the robot's TCP port `5555`, saves the first received frame on the
-deployment machine, and exits. If the robot camera is already publishing, it
-saves the first frame received after the deployment-side subscriber connects.
-The output path and a non-default port can be supplied as the third and fourth
-arguments, respectively.
 
 ## Launch examples
 
@@ -108,41 +71,15 @@ python gear_sonic/scripts/launch_inference.py \
 ```
 
 The raw modes expect aligned RGB-D at the dimensions stored in
-`gear_sonic/config/camera_intrinsics.json`. Head extrinsics default to height
-`1.2 m`, pitch `-38°`; dual-mode chest extrinsics default to height `1.0 m`,
-pitch `-3°`. Both default to zero roll/yaw and zero forward/lateral offset.
+`gear_sonic/config/camera_intrinsics.json`. Head extrinsics default to pitch `-38°`; dual-mode chest extrinsics default
+to pitch `-3°`. Both default to zero roll/yaw and zero forward/lateral offset.
 Override the corresponding `--base-pose-camera-*` or
 `--base-pose-dual-chest-camera-*` arguments when measured extrinsics are
 available.
 
-RGB-only:
-
-```bash
-.venv_inference/bin/python gear_sonic/scripts/launch_inference.py \
-  --planner-input base_pose \
-  --base-pose-mode rgb \
-  --base-pose-task "put the cup into the tray"
-```
-
-LingBot RGB-D or two-stage ROI depth lookup:
-
-```bash
-.venv_inference/bin/python gear_sonic/scripts/launch_inference.py \
-  --planner-input base_pose \
-  --base-pose-mode rgbd \
-  --base-pose-task "put the cup into the tray"
-
-.venv_inference/bin/python gear_sonic/scripts/launch_inference.py \
-  --planner-input base_pose \
-  --base-pose-mode rgb_depth_query \
-  --base-pose-task "put the cup into the tray"
-```
-
-If `--base-pose-task` is empty, the launcher uses `--prompt`. Defaults are
-`gpt-5.6-sol`, xhigh reasoning effort with Fast enabled, a `600 s` Codex
-timeout, camera height
-`1.2 m`, pitch `-25°`, and vertical FOV `43.077882°`. Camera intrinsics and
-horizontal FOV come from the live frame.
+If `--base-pose-task` is empty, the launcher uses `--prompt`. Initial target
+and desk grounding defaults to `gpt-5.6-sol`, xhigh reasoning effort with Fast
+enabled, and a `600 s` Codex timeout.
 
 ## Raw YOLOE servo behavior
 
@@ -158,16 +95,9 @@ original-image pixels and passed in `visual_prompts`, with the primary target
 assigned class `0` and every desk box assigned class `1`. The resulting visual
 embeddings, rather than text-only class embeddings, are installed in YOLOE-26M
 before persistent BoT-SORT tracking begins at `10 Hz`. The primary box controls
-target centering and the eroded target mask provides robust raw-depth range.
-For the table, the per-column upper envelope is expressed as height above the
-image bottom. Points below 85% of its 90th-percentile height are rejected and
-interior gaps are linearly rebuilt. Retained runs no wider than 2% of the image
-inside either outer 10% are removed without interpolation. All rebuilt envelope
-pixels, including interpolated pixels, form the image-space RANSAC candidates.
-The selected pixel line gates real contour depths in the 0.15--4.0 m range;
-those points are deprojected and refitted in body XY. The final physical line
-must be at least 0.35 m long and controls yaw perpendicular to the table edge.
-Candidate ranking does not use distance from the robot.
+target centering and the eroded target mask provides robust raw-depth range; a
+RANSAC line fitted to valid table-mask contour depth controls yaw perpendicular
+to the near table edge.
 
 The bounded controller publishes at `20 Hz` through the existing direct 5558
 relay. Its visual state machine is:
@@ -376,17 +306,15 @@ does it write `finished` with `reason=aligned`. Configure the duration with
 - In pane 1, press `k`. The relay requests a fresh `g1_debug` sample, latches
   the measured 17-DoF upper body and both 7-DoF hands, and starts C++ in Planner
   mode only after the latch is ready. A second `k` stops the C++ loop.
-- In pane 3, press `n` only while IDLE to capture a new frame and request a new
-  plan.
-- Press `Space` in pane 3 to cancel inference or motion, discard every remaining
-  step, and keep publishing Planner IDLE with the latched upper body and hands.
-  Press `n` for a new observation before moving again.
+- In pane 3, press `n` only while IDLE to start a new grounding and YOLOE servo
+  generation.
+- Press `Space` in pane 3 to cancel grounding or closed-loop motion and publish
+  repeated zero-velocity stops. Press `n` to start a new generation.
 - Press `x` in pane 3 to exit the base-pose source. The direct relay continues
   to publish IDLE until the C++ loop is stopped with `k`.
 
 The base-pose path deliberately bypasses MID-360/REASAN. It is intended for
-table-side adjustment and relies on the model's visible-scene safety judgment
-plus strict command bounds, not environmental obstacle avoidance.
+table-side adjustment and does not provide environmental obstacle avoidance.
 
 Diagnostics for each request are written below
 `outputs/base_pose_adjustment/<timestamp>/` (raw runs use

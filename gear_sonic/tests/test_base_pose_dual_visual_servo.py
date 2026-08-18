@@ -24,7 +24,6 @@ from gear_sonic.scripts.launch_inference import (
 )
 from gear_sonic.utils.inference.base_pose import (
     AlignedRGBDSnapshot,
-    BASE_POSE_MODES,
     DualRGBDCapture,
 )
 from gear_sonic.utils.inference.base_pose_dual_visual_servo import (
@@ -142,7 +141,7 @@ def test_coordinator_starts_only_camera_with_an_initial_reference() -> None:
     assert attempt.reference.stream_name == CHEST
 
 
-def test_coordinator_runs_origin_text_qwen_before_alternate_text_qwen() -> None:
+def test_coordinator_runs_alternate_text_qwen_before_origin_text_qwen() -> None:
     head_initial = reference(HEAD, marker=1)
     chest_initial = reference(CHEST, marker=2)
     coordinator = DualCameraFailoverCoordinator(
@@ -152,21 +151,7 @@ def test_coordinator_runs_origin_text_qwen_before_alternate_text_qwen() -> None:
     first = coordinator.start()
     coordinator.mark_success(first)
 
-    origin_text = coordinator.advance_after_failure(first)
-    assert origin_text is not None
-    assert origin_text.live_stream == HEAD
-    assert origin_text.reference is head_initial
-    assert origin_text.stage == "origin_text"
-    assert origin_text.origin_stream == HEAD
-
-    origin_qwen = coordinator.advance_after_failure(origin_text)
-    assert origin_qwen is not None
-    assert origin_qwen.live_stream == HEAD
-    assert origin_qwen.reference is head_initial
-    assert origin_qwen.stage == "origin_qwen"
-    assert origin_qwen.origin_stream == HEAD
-
-    alternate_text = coordinator.advance_after_failure(origin_qwen)
+    alternate_text = coordinator.advance_after_failure(first)
     assert alternate_text is not None
     assert alternate_text.live_stream == CHEST
     assert alternate_text.reference is chest_initial
@@ -180,7 +165,21 @@ def test_coordinator_runs_origin_text_qwen_before_alternate_text_qwen() -> None:
     assert alternate_qwen.stage == "alternate_qwen"
     assert alternate_qwen.origin_stream == HEAD
 
-    assert coordinator.advance_after_failure(alternate_qwen) is None
+    origin_text = coordinator.advance_after_failure(alternate_qwen)
+    assert origin_text is not None
+    assert origin_text.live_stream == HEAD
+    assert origin_text.reference is head_initial
+    assert origin_text.stage == "origin_text"
+    assert origin_text.origin_stream == HEAD
+
+    origin_qwen = coordinator.advance_after_failure(origin_text)
+    assert origin_qwen is not None
+    assert origin_qwen.live_stream == HEAD
+    assert origin_qwen.reference is head_initial
+    assert origin_qwen.stage == "origin_qwen"
+    assert origin_qwen.origin_stream == HEAD
+
+    assert coordinator.advance_after_failure(origin_qwen) is None
 
 
 def test_coordinator_uses_cross_camera_prompt_when_alternate_has_no_initial() -> None:
@@ -192,11 +191,7 @@ def test_coordinator_uses_cross_camera_prompt_when_alternate_has_no_initial() ->
     first = coordinator.start()
     coordinator.mark_success(first)
 
-    origin_text = coordinator.advance_after_failure(first)
-    assert origin_text is not None
-    origin_qwen = coordinator.advance_after_failure(origin_text)
-    assert origin_qwen is not None
-    alternate_text = coordinator.advance_after_failure(origin_qwen)
+    alternate_text = coordinator.advance_after_failure(first)
     assert alternate_text is not None
     assert alternate_text.live_stream == CHEST
     assert alternate_text.reference is head_initial
@@ -218,22 +213,18 @@ def test_coordinator_success_resets_cycle_for_repeated_switching() -> None:
     )
     head = coordinator.start()
     coordinator.mark_success(head)
-    origin_text = coordinator.advance_after_failure(head)
-    assert origin_text is not None
-    origin_qwen = coordinator.advance_after_failure(origin_text)
-    assert origin_qwen is not None
-    chest = coordinator.advance_after_failure(origin_qwen)
+    chest = coordinator.advance_after_failure(head)
     assert chest is not None and chest.live_stream == CHEST
 
     coordinator.mark_success(chest)
     chest_text = coordinator.advance_after_failure(chest)
 
     assert chest_text is not None
-    assert chest_text.live_stream == CHEST
-    assert chest_text.reference is chest_initial
-    assert chest_text.stage == "origin_text"
+    assert chest_text.live_stream == HEAD
+    assert chest_text.reference is head_initial
+    assert chest_text.stage == "alternate_text"
     assert chest_text.origin_stream == CHEST
-    assert chest_text.attempt_id == 5
+    assert chest_text.attempt_id == 3
 
 
 def test_dual_calibrations_use_each_saved_stream_and_chest_minus_three_pitch(
@@ -248,13 +239,11 @@ def test_dual_calibrations_use_each_saved_stream_and_chest_minus_three_pitch(
         camera_intrinsics_path="ignored.json",
         dual_head_camera_stream=HEAD,
         dual_chest_camera_stream=CHEST,
-        camera_height_m=1.2,
         camera_pitch_deg=-38.0,
         camera_roll_deg=0.0,
         camera_yaw_deg=0.0,
         camera_forward_offset_m=0.0,
         camera_lateral_offset_m=0.0,
-        dual_chest_camera_height_m=1.0,
         dual_chest_camera_pitch_deg=-3.0,
         dual_chest_camera_roll_deg=0.0,
         dual_chest_camera_yaw_deg=0.0,
@@ -267,7 +256,6 @@ def test_dual_calibrations_use_each_saved_stream_and_chest_minus_three_pitch(
     assert calibrations[HEAD].fx == 400.0
     assert calibrations[HEAD].camera_pitch_deg == -38.0
     assert calibrations[CHEST].fx == 607.0
-    assert calibrations[CHEST].camera_height_m == 1.0
     assert calibrations[CHEST].camera_pitch_deg == -3.0
 
 
@@ -857,13 +845,13 @@ def test_worker_gives_each_attempt_thirty_frames_before_failover_exit(
     ] == [29, 29, 29, 29, 29]
     assert len(switching) == 4
     assert [event.details["live_stream"] for event in switching] == [
-        HEAD, HEAD, CHEST, CHEST
+        CHEST, CHEST, HEAD, HEAD
     ]
     assert tracker.starts == [
         1,
-        "hybrid:blue basket",
-        62,
         "all_text:blue basket:desk",
+        62,
+        "hybrid:blue basket",
         123,
     ]
     assert len(errors) == 1
@@ -1011,7 +999,9 @@ def test_worker_still_requires_table_during_initialization(
 
 
 
-def test_worker_origin_qwen_uses_fresh_same_camera_frame(tmp_path: Path) -> None:
+def test_worker_alternate_qwen_uses_fresh_other_camera_frame(
+    tmp_path: Path,
+) -> None:
     stop_event = threading.Event()
 
     class RecoverOnQwenTracker:
@@ -1056,15 +1046,15 @@ def test_worker_origin_qwen_uses_fresh_same_camera_frame(tmp_path: Path) -> None
     switching = [event for event in emitted if event.kind == "switching"]
     assert len(initialized) == 2
     assert len(switching) == 2
-    assert tracker.starts == [1, "hybrid", 68]
+    assert tracker.starts == [1, "all_text", 68]
     assert switching[0].details["reference_kind"] == "initial"
-    assert switching[0].details["reference_source_stream"] == HEAD
-    assert switching[0].details["prompt_mode"] == "target_text_surface_visual"
-    assert switching[1].details["failover_stage"] == "origin_qwen"
+    assert switching[0].details["reference_source_stream"] == CHEST
+    assert switching[0].details["prompt_mode"] == "target_text_surface_text"
+    assert switching[1].details["failover_stage"] == "alternate_qwen"
     qwen_initialized = initialized[-1]
-    assert qwen_initialized.details["live_stream"] == HEAD
+    assert qwen_initialized.details["live_stream"] == CHEST
     assert qwen_initialized.details["reference_kind"] == "qwen"
-    assert qwen_initialized.details["reference_source_stream"] == HEAD
+    assert qwen_initialized.details["reference_source_stream"] == CHEST
     assert qwen_initialized.details["prompt_mode"] == "visual"
 
 
@@ -1128,9 +1118,14 @@ def test_worker_applies_saved_reference_before_and_during_origin_text(
         def start_text(self, _reference_rgb, *, surface_prompt, **_kwargs):
             return self._begin("text", surface_prompt)
 
+        def start_all_text(self, *, surface_prompt, **_kwargs):
+            return self._begin("all_text", surface_prompt)
+
         def track(self, _rgb):
             self.calls += 1
             if self.attempt == 1 and self.calls > 7:
+                return []
+            if self.attempt in {2, 3}:
                 return []
             return _valid_instances()
 
@@ -1158,12 +1153,17 @@ def test_worker_applies_saved_reference_before_and_during_origin_text(
         latest_reference_updater_factory=lambda: updater,
     )
 
-    assert updater.submitted == [(HEAD, 5), (HEAD, 40)]
+    assert updater.submitted == [(HEAD, 5), (HEAD, 100)]
     assert updater.closed
-    assert tracker.starts[:2] == [("visual", "desk"), ("text", "desk")]
+    assert tracker.starts[:4] == [
+        ("visual", "desk"),
+        ("all_text", "desk"),
+        ("visual", "desk"),
+        ("text", "desk"),
+    ]
     assert tracker.installed == [
         ("visual", f"target:{HEAD}:5", f"desk:{HEAD}:5"),
-        ("text", None, f"desk:{HEAD}:40"),
+        ("text", None, f"desk:{HEAD}:100"),
     ]
     applied = [
         event
@@ -1179,7 +1179,7 @@ def test_worker_applies_saved_reference_before_and_during_origin_text(
     assert [
         event.details["latest_reference_refresh"]["source_frame"]
         for event in applied
-    ] == [5, 40]
+    ] == [5, 100]
 
 
 def servo_observation() -> RawServoObservation:
@@ -1373,14 +1373,26 @@ def test_diagnostics_record_dual_camera_attempt_provenance(tmp_path: Path) -> No
     assert row["prompt_mode"] == "target_text_surface_visual"
 
 
-def test_dual_raw_yoloe_mode_is_registered_with_expected_defaults() -> None:
-    assert "dual_raw_yoloe_servo" in BASE_POSE_MODES
+def test_dual_raw_yoloe_mode_has_expected_defaults() -> None:
     planner = BasePosePlannerConfig(task="align", mode="dual_raw_yoloe_servo")
     launch = InferenceLaunchConfig(
         planner_input="base_pose",
         base_pose_mode="dual_raw_yoloe_servo",
     )
 
+    assert "camera_height_m" not in BasePosePlannerConfig.__dataclass_fields__
+    assert (
+        "dual_chest_camera_height_m"
+        not in BasePosePlannerConfig.__dataclass_fields__
+    )
+    assert (
+        "base_pose_camera_height_m"
+        not in InferenceLaunchConfig.__dataclass_fields__
+    )
+    assert (
+        "base_pose_dual_chest_camera_height_m"
+        not in InferenceLaunchConfig.__dataclass_fields__
+    )
     assert planner.dual_head_camera_stream == HEAD
     assert planner.dual_chest_camera_stream == CHEST
     assert planner.dual_chest_camera_pitch_deg == -3.0
@@ -1424,6 +1436,8 @@ def test_dual_raw_yoloe_launch_uses_direct_dual_rgbd_and_raw_relay() -> None:
     assert "--camera-host robot-camera --camera-port 5555" in planner_command
     assert "--dual-head-camera-stream ego_view" in planner_command
     assert "--dual-chest-camera-stream chest_view" in planner_command
+    assert "--dual-chest-camera-height-m" not in planner_command
+    assert "--camera-height-m" not in planner_command
     assert "--dual-chest-camera-pitch-deg -3.0" in planner_command
     assert "--dual-match-tolerance-frames 30" in planner_command
     assert "--dual-initialization-grace-s 30.0" in planner_command

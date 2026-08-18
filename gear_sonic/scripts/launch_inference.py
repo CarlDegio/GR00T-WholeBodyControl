@@ -164,16 +164,13 @@ class InferenceLaunchConfig:
     """SONIC planner command source used in pane 3."""
 
     base_pose_mode: Literal[
-        "rgb",
-        "rgbd",
-        "rgb_depth_query",
         "raw_yoloe_servo",
         "dual_raw_yoloe_servo",
-    ] = "rgb"
-    """Head-vision input experiment used by the base-pose planner."""
+    ] = "raw_yoloe_servo"
+    """Raw-depth YOLOE visual-servo mode."""
 
     base_pose_vision_backend: Literal["codex", "qwenvl"] = "codex"
-    """Vision provider used by BasePose planning and depth queries."""
+    """Vision provider used for initial YOLOE reference grounding."""
 
     base_pose_task: str = ""
     """Manipulation task for base-pose adjustment; defaults to ``prompt``."""
@@ -201,14 +198,8 @@ class InferenceLaunchConfig:
     base_pose_camera_stream: str = "ego_view"
     """Head RGB stream; aligned depth is read from ``<stream>_depth``."""
 
-    base_pose_camera_height_m: float = 1.2
-    """Head camera optical-center height above the ground (m)."""
-
     base_pose_camera_pitch_deg: float = -38.0
     """Head camera optical-axis pitch under the positive-upward convention."""
-
-    base_pose_vertical_fov_deg: float = 43.077882
-    """Full head-camera vertical field of view."""
 
     base_pose_camera_forward_offset_m: float = 0.0
     """Configured camera optical-center forward offset from the base."""
@@ -227,9 +218,6 @@ class InferenceLaunchConfig:
 
     base_pose_dual_chest_camera_stream: str = "chest_view"
     """Chest RGB-D stream used by dual raw YOLOE."""
-
-    base_pose_dual_chest_camera_height_m: float = 1.0
-    """Chest camera optical-center height above the ground (m)."""
 
     base_pose_dual_chest_camera_pitch_deg: float = -3.0
     """Chest camera pitch under the positive-upward convention."""
@@ -317,44 +305,17 @@ class InferenceLaunchConfig:
     base_pose_manual_keyboard_port: int = 5566
     """Key-triggered raw-YOLOE manual keyboard publisher port."""
 
-    base_pose_depth_port: int = 5564
-    """Local pure LingBot RGB-D stream used by the two depth modes."""
-
     base_pose_camera_timeout_ms: int = 15000
     """Timeout for a fresh base-pose camera snapshot."""
 
     base_pose_codex_timeout_seconds: float = 600.0
     """Timeout for each base-pose Codex inference call."""
 
-    base_pose_rotation_speed: float = 0.4
-    """Fixed SONIC yaw speed used to execute model rotations (rad/s)."""
-
-    base_pose_translation_speed: float = 0.3
-    """Fixed SONIC forward/backward speed used for model translations (m/s)."""
-
-    base_pose_rotation_scale: float = 1.0
-    """Scale applied to model-authored rotation angles before execution."""
-
-    base_pose_translation_scale: float = 1.0
-    """Scale applied to model-authored translation distances before execution."""
-
-    base_pose_transition_pause: float = 0.5
-    """Planner IDLE duration between model-authored motion steps (s)."""
-
     base_pose_final_stop_count: int = 3
     """Number of zero-motion publications after completion or cancellation."""
 
-    base_pose_depth_visual_max_m: float = 3.0
-    """Maximum range in the attached fixed-scale color depth image."""
-
     base_pose_output_root: str = "outputs/base_pose_adjustment"
     """Root for RGB/depth/prompts/results and execution diagnostics."""
-
-    base_pose_lingbot_model: str = "robbyant/lingbot-depth-pretrain-vitl-14-v0.5"
-    """LingBot-Depth checkpoint used by base-pose depth modes."""
-
-    base_pose_lingbot_root: str = "/home/user/Project/lingbot-depth"
-    """LingBot-Depth checkout on the deployment machine."""
 
     lavira_mission: str = ""
     """Mission sent to LaViRA when --planner-input lavira is selected."""
@@ -532,8 +493,6 @@ def _base_pose_planner_command(config: InferenceLaunchConfig, repo_root: Path) -
             f"{shlex.quote(config.base_pose_dual_head_camera_stream)} "
             f"--dual-chest-camera-stream "
             f"{shlex.quote(config.base_pose_dual_chest_camera_stream)} "
-            f"--dual-chest-camera-height-m "
-            f"{config.base_pose_dual_chest_camera_height_m} "
             f"--dual-chest-camera-pitch-deg "
             f"{config.base_pose_dual_chest_camera_pitch_deg} "
             f"--dual-chest-camera-roll-deg "
@@ -562,23 +521,15 @@ def _base_pose_planner_command(config: InferenceLaunchConfig, repo_root: Path) -
         f"--host {shlex.quote(config.keyboard_planner_host)} "
         f"--port {config.keyboard_planner_port} "
         f"--planner-hz {config.keyboard_planner_publish_rate} "
-        f"--transition-pause {config.base_pose_transition_pause} "
         f"--final-stop-count {config.base_pose_final_stop_count} "
-        f"--rotation-speed {config.base_pose_rotation_speed} "
-        f"--translation-speed {config.base_pose_translation_speed} "
-        f"--rotation-scale {config.base_pose_rotation_scale} "
-        f"--translation-scale {config.base_pose_translation_scale} "
         f"--camera-timeout-ms {config.base_pose_camera_timeout_ms} "
         f"--camera-stream {shlex.quote(config.base_pose_camera_stream)} "
-        f"--camera-height-m {config.base_pose_camera_height_m} "
         f"--camera-pitch-deg {config.base_pose_camera_pitch_deg} "
         f"--camera-roll-deg {config.base_pose_camera_roll_deg} "
         f"--camera-yaw-deg {config.base_pose_camera_yaw_deg} "
-        f"--vertical-fov-deg {config.base_pose_vertical_fov_deg} "
         f"--camera-forward-offset-m {config.base_pose_camera_forward_offset_m} "
         f"--camera-lateral-offset-m {config.base_pose_camera_lateral_offset_m} "
         f"{dual_camera}"
-        f"--depth-visual-max-m {config.base_pose_depth_visual_max_m} "
         f"--codex-timeout-seconds {config.base_pose_codex_timeout_seconds} "
         f"--output-root {shlex.quote(config.base_pose_output_root)} "
         f"--raw-yoloe-model-path "
@@ -617,36 +568,10 @@ def _base_pose_planner_command(config: InferenceLaunchConfig, repo_root: Path) -
         f"--raw-orientation-telemetry-source "
         f"tcp://127.0.0.1:{config.base_pose_orientation_telemetry_port}"
     )
-    if config.base_pose_mode in {
-        "rgb",
-        "raw_yoloe_servo",
-        "dual_raw_yoloe_servo",
-    }:
-        return (
-            f"cd {quoted_root} && "
-            f"{planner} --camera-host {shlex.quote(config.camera_host)} "
-            f"--camera-port {config.camera_port}"
-        )
-
     return (
         f"cd {quoted_root} && "
-        f"ready_file=/tmp/sonic_base_pose_lingbot_ready_$$; rm -f $ready_file; "
-        f"PYTHONPATH={quoted_root} .venv_lingbot_depth/bin/python "
-        f"gear_sonic/scripts/run_lingbot_depth_viewer.py "
-        f"--camera-host {shlex.quote(config.camera_host)} "
-        f"--camera-port {config.camera_port} "
-        f"--stream-name {shlex.quote(config.base_pose_camera_stream)} "
-        f"--publish-port {config.base_pose_depth_port} "
-        f"--ready-file $ready_file "
-        f"--model {shlex.quote(config.base_pose_lingbot_model)} "
-        f"--lingbot-root {shlex.quote(config.base_pose_lingbot_root)} & "
-        f"viewer_pid=$!; "
-        f"trap 'kill $viewer_pid 2>/dev/null; rm -f $ready_file' EXIT; "
-        f"while [ ! -f $ready_file ]; do "
-        f"kill -0 $viewer_pid 2>/dev/null || {{ wait $viewer_pid; exit 1; }}; "
-        f"sleep 0.2; done; "
-        f"{planner} --camera-host 127.0.0.1 "
-        f"--camera-port {config.base_pose_depth_port}"
+        f"{planner} --camera-host {shlex.quote(config.camera_host)} "
+        f"--camera-port {config.camera_port}"
     )
 
 
@@ -796,15 +721,6 @@ def _check_prerequisites(config: InferenceLaunchConfig):
         if not (config.base_pose_task.strip() or config.prompt.strip()):
             errors.append(
                 "--base-pose-task or --prompt is required when --planner-input base_pose"
-            )
-        if (
-            config.base_pose_mode
-            not in {"rgb", "raw_yoloe_servo", "dual_raw_yoloe_servo"}
-            and not (repo_root / ".venv_lingbot_depth" / "bin" / "python").exists()
-        ):
-            errors.append(
-                ".venv_lingbot_depth not found; it is required by base-pose "
-                "rgbd and rgb_depth_query modes"
             )
 
     deploy_dir = repo_root / "gear_sonic_deploy"

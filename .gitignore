@@ -229,7 +229,3 @@ models/
 # Downloaded from HuggingFace (hf download)
 sample_data/
 sonic_release/
-
-# Local generated assets and inference schema
-gear_sonic/utils/inference/object_nav_policy.schema.json
-image/

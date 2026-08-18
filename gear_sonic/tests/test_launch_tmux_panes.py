@@ -58,7 +58,7 @@ def test_raw_yoloe_launches_key_triggered_base_keyboard_in_pane(
     ]
 
 
-def test_non_raw_base_pose_does_not_launch_base_keyboard_in_pane(
+def test_non_base_pose_input_does_not_launch_base_keyboard_in_pane(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     calls: list[tuple[str, str, float]] = []
@@ -69,7 +69,7 @@ def test_non_raw_base_pose_does_not_launch_base_keyboard_in_pane(
     )
 
     launch_inference._launch_base_pose_manual_keyboard_pane(
-        InferenceLaunchConfig(planner_input="base_pose", base_pose_mode="rgb"),
+        InferenceLaunchConfig(planner_input="keyboard"),
         Path("/workspace/sonic"),
         "%13",
     )
@@ -118,7 +118,7 @@ def test_raw_yoloe_launches_live_event_log_window(
     assert calls[1][5] == "C-m"
 
 
-def test_non_raw_mode_does_not_launch_live_event_log_window(
+def test_non_base_pose_input_does_not_launch_live_event_log_window(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     calls: list[list[str]] = []
@@ -129,7 +129,7 @@ def test_non_raw_mode_does_not_launch_live_event_log_window(
     )
 
     launch_inference._launch_base_pose_event_log_window(
-        InferenceLaunchConfig(planner_input="base_pose", base_pose_mode="rgb"),
+        InferenceLaunchConfig(planner_input="keyboard"),
         Path("/workspace/sonic"),
     )
 

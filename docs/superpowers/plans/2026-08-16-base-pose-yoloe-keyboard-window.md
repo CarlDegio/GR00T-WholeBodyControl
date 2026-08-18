@@ -315,7 +315,7 @@ Mock `subprocess.run` and call `_launch_base_pose_manual_keyboard_window`. Asser
 ]
 ```
 
-Also assert the helper makes no subprocess calls for `base_pose_mode="rgb"`.
+Also assert the helper makes no subprocess calls when `planner_input="keyboard"`.
 
 - [ ] **Step 5: Implement the tmux helper and main-flow call**
 

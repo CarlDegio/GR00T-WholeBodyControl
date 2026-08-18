@@ -206,7 +206,6 @@ def test_raw_yoloe_base_pose_builds_key_triggered_manual_keyboard_and_relay() ->
     ("planner_input", "base_pose_mode", "expected"),
     [
         ("base_pose", "raw_yoloe_servo", True),
-        ("base_pose", "rgb", False),
         ("lavira", "raw_yoloe_servo", False),
         ("keyboard", "raw_yoloe_servo", False),
     ],
@@ -222,42 +221,6 @@ def test_manual_keyboard_window_is_raw_yoloe_base_pose_only(
     )
 
     assert launch_inference.uses_base_pose_manual_keyboard(config) is expected
-
-
-def test_non_raw_base_pose_relay_has_no_manual_source() -> None:
-    config = InferenceLaunchConfig(planner_input="base_pose", base_pose_mode="rgb")
-
-    relay = build_reasan_planner_command(config, Path("/workspace/sonic"))
-
-    assert "--manual-source" not in relay
-
-
-def test_base_pose_rgb_uses_ego_camera_without_starting_lingbot() -> None:
-    config = InferenceLaunchConfig(
-        planner_input="base_pose",
-        prompt="put the cup in the tray",
-        camera_host="g1-camera",
-        camera_port=5555,
-    )
-
-    command = build_planner_input_command(config, Path("/workspace/sonic"))
-
-    assert "base_pose_planner.py" in command
-    assert "--task 'put the cup in the tray'" in command
-    assert "--mode rgb" in command
-    assert "--vision-backend codex" in command
-    assert "--model gpt-5.6-sol" in command
-    assert "--reasoning-effort xhigh" in command
-    assert "--codex-timeout-seconds 600.0" in command
-    assert "--rotation-scale 1.0" in command
-    assert "--translation-scale 1.0" in command
-    assert "--no-codex-fast" not in command
-    assert "--camera-stream ego_view" in command
-    assert "--camera-height-m 1.2" in command
-    assert "--camera-host g1-camera --camera-port 5555" in command
-    assert ".venv_lingbot_depth" not in command
-    assert "run_lingbot_depth_viewer.py" not in command
-    assert "--planner-ready-file" not in command
 
 
 def test_base_pose_can_disable_codex_fast() -> None:
@@ -321,8 +284,8 @@ def test_base_pose_relay_uses_default_lateral_limit() -> None:
 
 def test_orientation_telemetry_relay_is_raw_base_pose_only() -> None:
     config = InferenceLaunchConfig(
-        planner_input="base_pose",
-        base_pose_mode="rgb",
+        planner_input="lavira",
+        base_pose_mode="raw_yoloe_servo",
         base_pose_orientation_telemetry_port=6001,
     )
 
@@ -339,8 +302,6 @@ def test_base_pose_can_select_qwenvl_plus_backend() -> None:
         base_pose_qwenvl_model="qwen3-vl-plus",
         base_pose_qwenvl_base_url="https://dashscope.example/v1",
         base_pose_qwenvl_thinking_budget=2048,
-        base_pose_rotation_scale=1.25,
-        base_pose_translation_scale=0.75,
     )
 
     command = build_planner_input_command(config, Path("/workspace/sonic"))
@@ -349,32 +310,11 @@ def test_base_pose_can_select_qwenvl_plus_backend() -> None:
     assert "--qwenvl-model qwen3-vl-plus" in command
     assert "--qwenvl-base-url https://dashscope.example/v1" in command
     assert "--qwenvl-thinking-budget 2048" in command
-    assert "--rotation-scale 1.25" in command
-    assert "--translation-scale 0.75" in command
     assert ".venv_inference/bin/python" in command
     assert ".venv_lingbot_depth" not in command
 
 
-@pytest.mark.parametrize("mode", ["rgbd", "rgb_depth_query"])
-def test_base_pose_depth_modes_start_parameterized_ego_lingbot(mode: str) -> None:
-    config = InferenceLaunchConfig(
-        planner_input="base_pose",
-        base_pose_mode=mode,  # type: ignore[arg-type]
-        base_pose_task="press the red button",
-    )
-
-    command = build_planner_input_command(config, Path("/workspace/sonic"))
-
-    assert ".venv_lingbot_depth/bin/python" in command
-    assert "run_lingbot_depth_viewer.py" in command
-    assert "--stream-name ego_view" in command
-    assert "--publish-port 5564" in command
-    assert "base_pose_planner.py" in command
-    assert f"--mode {mode}" in command
-    assert "--camera-host 127.0.0.1 --camera-port 5564" in command
-
-
-def test_base_pose_uses_stateless_direct_relay_without_reasan() -> None:
+def test_raw_base_pose_uses_direct_relay_without_reasan() -> None:
     config = InferenceLaunchConfig(planner_input="base_pose", reasan_avoidance=True)
 
     command = build_reasan_planner_command(config, Path("/workspace/sonic"))
