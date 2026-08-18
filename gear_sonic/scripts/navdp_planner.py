@@ -147,7 +147,12 @@ __all__ = [
 def main(config: NavDPPlannerConfig) -> None:
     import cv2
     import zmq
-    from gear_sonic.runtime.visualization import VisualizationPublisher
+    from gear_sonic.runtime.visualization import (
+        NAVDP_ACTOR_RAY_STREAM,
+        NAVDP_HEAD_RGBD_STREAM,
+        NAVDP_SLAM_2D_STREAM,
+        VisualizationPublisher,
+    )
 
     install_shutdown_signal_handlers()
 
@@ -523,25 +528,40 @@ def main(config: NavDPPlannerConfig) -> None:
             last_output_blocked = output_blocked
 
             if config.visualize or visualization_publisher is not None:
-                canvas = compose_reasan_navigation_view(
-                    points,
+                actor_ray_panel = render_actor_ray_panel(
                     current_rays,
-                    trajectory,
-                    slam_map_xy=slam_map_xy,
+                    trajectory=trajectory,
+                    velocity=velocity,
+                )
+                slam_2d_panel = render_slam_world_panel(
+                    slam_map_xy,
                     pose=pose,
                     world_goal=world_goal,
+                    trajectory_world=None,
                     robot_history=robot_history,
-                    velocity=velocity,
                 )
                 head_rgbd = compose_head_rgbd_view(latest_rgb, latest_depth)
                 if visualization_publisher is not None:
                     visualization_publisher.publish(
-                        "visualization/navdp_navigation", canvas
+                        NAVDP_ACTOR_RAY_STREAM, actor_ray_panel
                     )
                     visualization_publisher.publish(
-                        "visualization/navdp_head_rgbd", head_rgbd
+                        NAVDP_SLAM_2D_STREAM, slam_2d_panel
+                    )
+                    visualization_publisher.publish(
+                        NAVDP_HEAD_RGBD_STREAM, head_rgbd
                     )
                 if config.visualize:
+                    canvas = compose_reasan_navigation_view(
+                        points,
+                        current_rays,
+                        trajectory,
+                        slam_map_xy=slam_map_xy,
+                        pose=pose,
+                        world_goal=world_goal,
+                        robot_history=robot_history,
+                        velocity=velocity,
+                    )
                     cv2.imshow("NavDP + MID360 + FAST-LIO world map", canvas)
                     cv2.imshow("NavDP Head RGB-D", head_rgbd)
                     if cv2.waitKey(1) & 0xFF == 27:

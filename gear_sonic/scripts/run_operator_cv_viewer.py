@@ -16,12 +16,15 @@ from gear_sonic.runtime.contracts import OperatorCommand
 from gear_sonic.runtime.control_client import ControlGatewaySubscriber
 from gear_sonic.runtime.control_gateway import BASE_POSE_RUNTIME_STATUS_COMMAND
 from gear_sonic.runtime.snapshot import SnapshotRequest
-from gear_sonic.runtime.visualization import VISUALIZATION_STREAMS
+from gear_sonic.runtime.visualization import (
+    NAVDP_ACTOR_RAY_STREAM,
+    NAVDP_SLAM_2D_STREAM,
+    VISUALIZATION_STREAMS,
+)
 
 
-NAVIGATION_STREAM = "visualization/navdp_navigation"
-HEAD_RGBD_STREAM = "visualization/navdp_head_rgbd"
-LINGBOT_STREAM = "visualization/lingbot_depth"
+ACTOR_RAY_STREAM = NAVDP_ACTOR_RAY_STREAM
+SLAM_2D_STREAM = NAVDP_SLAM_2D_STREAM
 HEAD_RGB_STREAM = "camera/ego_view"
 CHEST_RGB_STREAM = "camera/chest_view"
 LEFT_WRIST_RGB_STREAM = "camera/left_wrist"
@@ -32,8 +35,15 @@ CAMERA_RGB_STREAMS = (
     LEFT_WRIST_RGB_STREAM,
     RIGHT_WRIST_RGB_STREAM,
 )
-DISPLAY_STREAMS = VISUALIZATION_STREAMS + CAMERA_RGB_STREAMS
-BASE_POSE_ACTIVE_COLOR = (32, 178, 255)
+DISPLAY_STREAMS = (
+    ACTOR_RAY_STREAM,
+    SLAM_2D_STREAM,
+    LEFT_WRIST_RGB_STREAM,
+    RIGHT_WRIST_RGB_STREAM,
+    HEAD_RGB_STREAM,
+    CHEST_RGB_STREAM,
+)
+BASE_POSE_ACTIVE_COLOR = (0, 0, 255)
 BASE_POSE_TERMINAL_STATES = frozenset({"reached", "failed", "stopped"})
 
 
@@ -218,19 +228,20 @@ def _draw_base_pose_status(
     if state is None or state.state == "idle":
         return
     bar_height = min(34, canvas.shape[0])
-    overlay = canvas[:bar_height].copy()
+    status_area = canvas[-bar_height:]
+    overlay = status_area.copy()
     overlay[:] = (22, 28, 36)
     cv2.addWeighted(
         overlay,
         0.82,
-        canvas[:bar_height],
+        status_area,
         0.18,
         0.0,
-        canvas[:bar_height],
+        status_area,
     )
     color = BASE_POSE_ACTIVE_COLOR if state.active else (110, 190, 110)
     cv2.putText(
-        canvas,
+        status_area,
         state.status_text(),
         (12, min(24, bar_height - 5)),
         cv2.FONT_HERSHEY_SIMPLEX,
@@ -248,31 +259,41 @@ def compose_visualization_canvas(
     height: int = 900,
     base_pose: BasePoseViewerState | None = None,
 ) -> np.ndarray:
-    """Place navigation, depth, chest, and wrist views into one canvas."""
+    """Compose four navigation/manipulation panels above two body cameras."""
 
     if width < 2 or height < 2:
         raise ValueError("viewer dimensions must be at least 2x2")
     top_height = height // 2
-    remaining_height = height - top_height
-    middle_height = remaining_height // 2
-    bottom_height = remaining_height - middle_height
-    left_width = width // 2
-    right_width = width - left_width
-    camera_widths = [width // 4] * 3
-    camera_widths.append(width - sum(camera_widths))
+    bottom_height = height - top_height
+    top_widths = [width // 4] * 3
+    top_widths.append(width - sum(top_widths))
+    bottom_widths = [width // 2, width - width // 2]
     empty = np.empty((0, 0, 3), dtype=np.uint8)
-    navigation = _letterbox(
-        frames.get(NAVIGATION_STREAM, empty), width, top_height
+    actor_ray = _letterbox(
+        frames.get(ACTOR_RAY_STREAM, empty),
+        top_widths[0],
+        top_height,
     )
-    head = _letterbox(
-        frames.get(HEAD_RGBD_STREAM, empty), left_width, middle_height
+    slam_2d = _letterbox(
+        frames.get(SLAM_2D_STREAM, empty),
+        top_widths[1],
+        top_height,
     )
-    lingbot = _letterbox(
-        frames.get(LINGBOT_STREAM, empty), right_width, middle_height
+    left_wrist = _labeled_letterbox(
+        frames.get(LEFT_WRIST_RGB_STREAM, empty),
+        top_widths[2],
+        top_height,
+        "LEFT WRIST RGB",
+    )
+    right_wrist = _labeled_letterbox(
+        frames.get(RIGHT_WRIST_RGB_STREAM, empty),
+        top_widths[3],
+        top_height,
+        "RIGHT WRIST RGB",
     )
     head_rgb = _labeled_letterbox(
         frames.get(HEAD_RGB_STREAM, empty),
-        camera_widths[0],
+        bottom_widths[0],
         bottom_height,
         "HEAD RGB",
         active=(
@@ -282,7 +303,7 @@ def compose_visualization_canvas(
     )
     chest = _labeled_letterbox(
         frames.get(CHEST_RGB_STREAM, empty),
-        camera_widths[1],
+        bottom_widths[1],
         bottom_height,
         "CHEST RGB",
         active=(
@@ -290,23 +311,10 @@ def compose_visualization_canvas(
             and base_pose.is_active_camera(CHEST_RGB_STREAM)
         ),
     )
-    left_wrist = _labeled_letterbox(
-        frames.get(LEFT_WRIST_RGB_STREAM, empty),
-        camera_widths[2],
-        bottom_height,
-        "LEFT WRIST RGB",
-    )
-    right_wrist = _labeled_letterbox(
-        frames.get(RIGHT_WRIST_RGB_STREAM, empty),
-        camera_widths[3],
-        bottom_height,
-        "RIGHT WRIST RGB",
-    )
     canvas = np.vstack(
         (
-            navigation,
-            np.hstack((head, lingbot)),
-            np.hstack((head_rgb, chest, left_wrist, right_wrist)),
+            np.hstack((actor_ray, slam_2d, left_wrist, right_wrist)),
+            np.hstack((head_rgb, chest)),
         )
     )
     _draw_base_pose_status(canvas, base_pose)
@@ -331,18 +339,16 @@ def gateway_frame_to_bgr(stream: str, payload: np.ndarray) -> np.ndarray | None:
 
 def _mock_frames(frame_index: int) -> dict[str, np.ndarray]:
     sizes = {
-        NAVIGATION_STREAM: (300, 900),
-        HEAD_RGBD_STREAM: (260, 640),
-        LINGBOT_STREAM: (260, 640),
+        ACTOR_RAY_STREAM: (500, 500),
+        SLAM_2D_STREAM: (500, 500),
         HEAD_RGB_STREAM: (480, 640),
         CHEST_RGB_STREAM: (480, 640),
         LEFT_WRIST_RGB_STREAM: (480, 640),
         RIGHT_WRIST_RGB_STREAM: (480, 640),
     }
     titles = {
-        NAVIGATION_STREAM: "NAVDP / MID360 / FAST-LIO",
-        HEAD_RGBD_STREAM: "HEAD RGB-D",
-        LINGBOT_STREAM: "LINGBOT DEPTH",
+        ACTOR_RAY_STREAM: "ACTORRAY / VELOCITY",
+        SLAM_2D_STREAM: "FAST-LIO SLAM 2D",
         HEAD_RGB_STREAM: "HEAD RGB",
         CHEST_RGB_STREAM: "CHEST RGB",
         LEFT_WRIST_RGB_STREAM: "LEFT WRIST RGB",

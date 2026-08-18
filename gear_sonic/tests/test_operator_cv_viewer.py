@@ -4,14 +4,13 @@ import numpy as np
 
 from gear_sonic.runtime.contracts import MessageMetadata, OperatorCommand
 from gear_sonic.scripts.run_operator_cv_viewer import (
+    ACTOR_RAY_STREAM,
     BASE_POSE_ACTIVE_COLOR,
     CHEST_RGB_STREAM,
     HEAD_RGB_STREAM,
-    HEAD_RGBD_STREAM,
     LEFT_WRIST_RGB_STREAM,
-    LINGBOT_STREAM,
-    NAVIGATION_STREAM,
     RIGHT_WRIST_RGB_STREAM,
+    SLAM_2D_STREAM,
     BasePoseViewerState,
     compose_visualization_canvas,
     gateway_frame_to_bgr,
@@ -37,11 +36,10 @@ def _command(
     )
 
 
-def test_composer_preserves_all_seven_views_in_one_canvas() -> None:
+def test_composer_places_four_panels_above_two_aligned_body_cameras() -> None:
     frames = {
-        NAVIGATION_STREAM: np.full((30, 90, 3), (10, 20, 30), dtype=np.uint8),
-        HEAD_RGBD_STREAM: np.full((26, 64, 3), (40, 50, 60), dtype=np.uint8),
-        LINGBOT_STREAM: np.full((26, 64, 3), (70, 80, 90), dtype=np.uint8),
+        ACTOR_RAY_STREAM: np.full((124, 100, 3), (10, 20, 30), dtype=np.uint8),
+        SLAM_2D_STREAM: np.full((124, 100, 3), (40, 50, 60), dtype=np.uint8),
         HEAD_RGB_STREAM: np.full((48, 64, 3), (101, 112, 123), dtype=np.uint8),
         CHEST_RGB_STREAM: np.full((48, 64, 3), (11, 22, 33), dtype=np.uint8),
         LEFT_WRIST_RGB_STREAM: np.full((48, 64, 3), (44, 55, 66), dtype=np.uint8),
@@ -51,13 +49,12 @@ def test_composer_preserves_all_seven_views_in_one_canvas() -> None:
     canvas = compose_visualization_canvas(frames, width=400, height=300)
 
     assert canvas.shape == (300, 400, 3)
-    assert np.any(np.all(canvas == (10, 20, 30), axis=2))
-    assert np.any(np.all(canvas == (40, 50, 60), axis=2))
-    assert np.any(np.all(canvas == (70, 80, 90), axis=2))
-    assert np.any(np.all(canvas == (101, 112, 123), axis=2))
-    assert np.any(np.all(canvas == (11, 22, 33), axis=2))
-    assert np.any(np.all(canvas == (44, 55, 66), axis=2))
-    assert np.any(np.all(canvas == (77, 88, 99), axis=2))
+    np.testing.assert_array_equal(canvas[80, 50], (10, 20, 30))
+    np.testing.assert_array_equal(canvas[80, 150], (40, 50, 60))
+    np.testing.assert_array_equal(canvas[80, 250], (44, 55, 66))
+    np.testing.assert_array_equal(canvas[80, 350], (77, 88, 99))
+    np.testing.assert_array_equal(canvas[230, 100], (101, 112, 123))
+    np.testing.assert_array_equal(canvas[230, 300], (11, 22, 33))
 
 
 def test_composer_leaves_missing_views_black() -> None:
@@ -132,8 +129,8 @@ def test_composer_highlights_only_the_active_base_pose_camera() -> None:
         base_pose=state,
     )
 
-    np.testing.assert_array_equal(canvas[226, 1], BASE_POSE_ACTIVE_COLOR)
-    assert not np.array_equal(canvas[226, 101], BASE_POSE_ACTIVE_COLOR)
+    np.testing.assert_array_equal(canvas[151, 1], BASE_POSE_ACTIVE_COLOR)
+    assert not np.array_equal(canvas[151, 201], BASE_POSE_ACTIVE_COLOR)
 
 
 def test_non_right_wrist_camera_is_converted_to_bgr_without_rotation() -> None:
