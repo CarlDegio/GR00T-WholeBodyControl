@@ -29,6 +29,7 @@ from gear_sonic.scripts.launch_inference import (
     build_livox_command,
     build_lingbot_command,
     build_planner_input_command,
+    build_planner_velocity_executor_command,
     build_navdp_planner_command,
     build_navdp_server_command,
     build_sensor_gateway_command,
@@ -368,8 +369,8 @@ def test_navdp_stack_commands_use_ros_topics_and_official_xnavdp_server() -> Non
     assert "--control-hz 20.0" in planner
     assert "--mpc-hz 10.0" in planner
     assert "--goal-tolerance-m 0.5" in planner
-    assert "--radar-timeout-s 0.75" in planner
-    assert "--output-endpoint 'tcp://*:5563'" in planner
+    assert "--radar-timeout-s" not in planner
+    assert "--output-endpoint 'tcp://*:5568'" in planner
     assert "source /opt/ros/humble/setup.bash" in planner
     assert config.navdp_root == "/home/user/Project/NavDP/baselines/x-navdp"
     assert config.navdp_checkpoint.endswith("/x-navdp_posttrain.ckpt")
@@ -476,6 +477,7 @@ def test_runtime_sidecars_are_read_only_and_navdp_uses_gateway_by_default() -> N
     root = Path("/workspace/sonic")
     gateway = build_sensor_gateway_command(config, root)
     planner = build_navdp_planner_command(config, root)
+    executor = build_planner_velocity_executor_command(config, root)
 
     assert "run_sensor_gateway.py" in gateway
     assert "run_operator_cv_viewer.py" in gateway
@@ -496,6 +498,10 @@ def test_runtime_sidecars_are_read_only_and_navdp_uses_gateway_by_default() -> N
     assert "--sensor-input" not in planner
     assert "--sensor-gateway-endpoint tcp://127.0.0.1:5560" in planner
     assert "run_sensor_gateway" not in planner
+    assert "--output-endpoint 'tcp://*:5568'" in planner
+    assert "planner_velocity_executor.py" in executor
+    assert "--navdp-velocity-endpoint tcp://127.0.0.1:5568" in executor
+    assert "--output-endpoint 'tcp://*:5563'" in executor
 
 
 def test_slam_debug_records_raw_inputs_and_fastlio_outputs_per_run() -> None:
@@ -534,7 +540,7 @@ def test_vla_uses_only_gateway_inputs_and_preserves_control_endpoints() -> None:
     assert "--action-zmq-port" not in gateway
 
 
-def test_navdp_gateway_input_is_explicit_and_keeps_the_same_output_contract() -> None:
+def test_navdp_is_a_pure_velocity_producer_for_the_shared_executor() -> None:
     config = InferenceLaunchConfig()
 
     planner = build_navdp_planner_command(config, Path("/workspace/sonic"))
@@ -544,7 +550,8 @@ def test_navdp_gateway_input_is_explicit_and_keeps_the_same_output_contract() ->
     assert "--camera-port" not in planner
     assert "--sensor-gateway-endpoint tcp://127.0.0.1:5560" in planner
     assert "--navdp-server http://127.0.0.1:19999" in planner
-    assert "--output-endpoint 'tcp://*:5563'" in planner
+    assert "--output-endpoint 'tcp://*:5568'" in planner
+    assert "--radar-timeout-s" not in planner
 
 
 def test_launcher_runs_readiness_gate_synchronously(monkeypatch) -> None:

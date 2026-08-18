@@ -1,0 +1,219 @@
+from __future__ import annotations
+
+import math
+from types import SimpleNamespace
+
+import numpy as np
+import pytest
+
+from gear_sonic.planner_control import (
+    NavigationCommand,
+    PlannerVelocityCommand,
+    PlannerVelocityExecutorCore,
+    SafetySnapshot,
+    build_planner_velocity_message,
+    decode_planner_velocity_message,
+)
+from gear_sonic.scripts.planner_velocity_executor import PlannerSafetySensorMonitor
+
+
+def navigation(
+    mode: str,
+    *,
+    generation: int = 1,
+    velocity: tuple[float, float, float] | None = None,
+    source: str = "",
+) -> NavigationCommand:
+    return NavigationCommand(
+        mode=mode,
+        generation=generation,
+        timestamp=1.0,
+        velocity=velocity,
+        source=source,
+    )
+
+
+def fresh_safety(now: float, depth: np.ndarray | None = None) -> SafetySnapshot:
+    return SafetySnapshot(now, depth)
+
+
+class FakeSafetySensorClient:
+    def __init__(self, *, depth_error: Exception | None = None) -> None:
+        self.depth_error = depth_error
+        self.lidar_frame = SimpleNamespace(
+            metadata=SimpleNamespace(timestamp_ns=12_300_000_000),
+        )
+        self.depth_frame = SimpleNamespace(
+            attributes={"camera_info": {"depth_scale_m": 0.001}},
+        )
+
+    def request_snapshot(self, _request):
+        return SimpleNamespace(
+            complete=True,
+            frames={PlannerSafetySensorMonitor.LIDAR_STREAM: self.lidar_frame},
+        )
+
+    def read_snapshot(self, _request, *, retries: int):
+        assert retries == 0
+        if self.depth_error is not None:
+            raise self.depth_error
+        stream = PlannerSafetySensorMonitor.DEPTH_STREAM
+        return SimpleNamespace(
+            arrays={stream: np.full((2, 3), 750, dtype=np.uint16)},
+            snapshot=SimpleNamespace(frames={stream: self.depth_frame}),
+        )
+
+
+def test_navdp_velocity_protocol_preserves_generation_and_heading_frame() -> None:
+    payload = build_planner_velocity_message(
+        generation=8,
+        source="navdp",
+        velocity=(0.3, 0.0, 0.4),
+        timestamp=12.5,
+        heading_target_rad=0.7,
+        heading_reference_rad=0.2,
+    )
+
+    assert decode_planner_velocity_message(payload) == PlannerVelocityCommand(
+        generation=8,
+        timestamp=12.5,
+        source="navdp",
+        velocity=(0.3, 0.0, 0.4),
+        heading_target_rad=0.7,
+        heading_reference_rad=0.2,
+    )
+
+
+def test_safety_monitor_uses_sensor_receive_times_and_scales_raw_depth() -> None:
+    monitor = PlannerSafetySensorMonitor(
+        "inproc://unused",
+        poll_hz=20.0,
+        request_timeout_ms=100,
+        max_age_ms=1000.0,
+        client=FakeSafetySensorClient(),
+    )
+
+    monitor.poll_once()
+    snapshot = monitor.snapshot()
+
+    assert snapshot.radar_timestamp_s == pytest.approx(12.3)
+    np.testing.assert_allclose(snapshot.depth_m, 0.75)
+    monitor.close()
+
+
+def test_safety_monitor_preserves_fresh_radar_when_depth_is_unavailable() -> None:
+    monitor = PlannerSafetySensorMonitor(
+        "inproc://unused",
+        poll_hz=20.0,
+        request_timeout_ms=100,
+        max_age_ms=1000.0,
+        client=FakeSafetySensorClient(depth_error=RuntimeError("depth unavailable")),
+    )
+
+    with pytest.raises(RuntimeError, match="depth unavailable"):
+        monitor.poll_once()
+
+    snapshot = monitor.snapshot()
+    assert snapshot.radar_timestamp_s == pytest.approx(12.3)
+    assert snapshot.depth_m is None
+    monitor.close()
+
+
+def test_wasd_and_base_pose_share_the_same_manual_execution_path() -> None:
+    core = PlannerVelocityExecutorCore()
+    assert core.accept_navigation(
+        navigation(
+            "manual_velocity",
+            velocity=(0.0, 0.15, 0.0),
+            source="operator_console",
+        ),
+        now=10.0,
+    )
+    wasd = core.decide(now=10.1, safety=fresh_safety(10.1))
+    assert wasd.velocity == pytest.approx((0.0, 0.15, 0.0))
+    assert wasd.source == "operator_console"
+
+    assert core.accept_navigation(
+        navigation(
+            "manual_velocity",
+            generation=2,
+            velocity=(0.3, 0.0, 0.0),
+            source="base_pose_agent",
+        ),
+        now=11.0,
+    )
+    base_pose = core.decide(now=11.1, safety=fresh_safety(11.1))
+    assert base_pose.velocity == pytest.approx((0.3, 0.0, 0.0))
+    assert base_pose.source == "base_pose_agent"
+
+
+def test_common_radar_and_depth_safety_apply_to_every_source() -> None:
+    core = PlannerVelocityExecutorCore(radar_timeout_s=0.75)
+    core.accept_navigation(
+        navigation("manual_velocity", velocity=(0.3, 0.0, 0.1)), now=1.0
+    )
+
+    radar_stop = core.decide(now=2.0, safety=SafetySnapshot())
+    assert radar_stop.velocity == (0.0, 0.0, 0.0)
+    assert radar_stop.reason == "radar_timeout"
+
+    depth = np.ones((60, 60), dtype=np.float32)
+    depth.flat[:2001] = 0.09
+    depth_stop = core.decide(now=2.1, safety=fresh_safety(2.1, depth))
+    assert depth_stop.velocity == (0.0, 0.0, 0.0)
+    assert depth_stop.reason == "depth_hard_stop"
+
+
+def test_missing_or_future_dated_radar_is_fail_safe() -> None:
+    core = PlannerVelocityExecutorCore()
+    core.accept_navigation(
+        navigation("manual_velocity", velocity=(0.3, 0.0, 0.0)), now=0.0
+    )
+
+    missing = core.decide(now=0.1, safety=SafetySnapshot())
+    future = core.decide(now=1.0, safety=SafetySnapshot(radar_timestamp_s=2.0))
+
+    assert missing.reason == "radar_timeout"
+    assert future.reason == "radar_timeout"
+    assert missing.velocity == future.velocity == (0.0, 0.0, 0.0)
+
+
+def test_stale_or_wrong_generation_navdp_output_cannot_move_robot() -> None:
+    core = PlannerVelocityExecutorCore(navdp_timeout_s=0.3)
+    core.accept_navigation(navigation("nav_goal", generation=5), now=10.0)
+    assert not core.accept_planner_velocity(
+        PlannerVelocityCommand(4, 1.0, "navdp", (0.3, 0.0, 0.0)), now=10.1
+    )
+    waiting = core.decide(now=10.1, safety=fresh_safety(10.1))
+    assert waiting.velocity == (0.0, 0.0, 0.0)
+
+    assert core.accept_planner_velocity(
+        PlannerVelocityCommand(5, 1.0, "navdp", (0.3, 0.0, 0.2)), now=10.2
+    )
+    assert core.decide(now=10.49, safety=fresh_safety(10.49)).velocity == pytest.approx(
+        (0.3, 0.0, 0.2)
+    )
+    expired = core.decide(now=10.51, safety=fresh_safety(10.51))
+    assert expired.velocity == (0.0, 0.0, 0.0)
+    assert expired.reason == "navdp_velocity_timeout"
+
+
+def test_navdp_fastlio_heading_is_rebased_to_current_sonic_heading() -> None:
+    core = PlannerVelocityExecutorCore()
+    core.sonic.heading = 1.0
+    core.accept_navigation(navigation("nav_goal", generation=3), now=5.0)
+    core.accept_planner_velocity(
+        PlannerVelocityCommand(
+            3,
+            1.0,
+            "navdp",
+            (0.2, 0.0, 0.3),
+            heading_target_rad=0.7,
+            heading_reference_rad=0.2,
+        ),
+        now=5.1,
+    )
+
+    core.decide(now=5.1, safety=fresh_safety(5.1))
+
+    assert core.sonic.heading == pytest.approx(math.remainder(1.5, 2.0 * math.pi))

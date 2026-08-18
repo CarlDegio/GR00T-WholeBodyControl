@@ -8,6 +8,7 @@ from gear_sonic.runtime.config import load_runtime_profile
 from gear_sonic.runtime.endpoints import ENDPOINTS
 from gear_sonic.scripts.lavira_planner import LaviraPlannerConfig
 from gear_sonic.scripts.navdp_planner import NavDPPlannerConfig, XNAVDP_G1_MPC_DEFAULTS
+from gear_sonic.scripts.planner_velocity_executor import PlannerVelocityExecutorConfig
 from gear_sonic.scripts.run_lingbot_depth_viewer import LingBotDepthViewerConfig
 from gear_sonic.scripts.run_vla_inference import InferenceConfig
 
@@ -56,6 +57,7 @@ def test_profile_parameters_match_current_process_defaults() -> None:
     profile = load_runtime_profile()
     lavira = LaviraPlannerConfig(mission="", global_target="")
     navdp = NavDPPlannerConfig()
+    executor = PlannerVelocityExecutorConfig()
     vla = InferenceConfig()
     lingbot = LingBotDepthViewerConfig()
 
@@ -93,7 +95,6 @@ def test_profile_parameters_match_current_process_defaults() -> None:
         navdp_profile["sensor_gateway_max_skew_ms"]
         == navdp.sensor_gateway_max_skew_ms
     )
-    assert navdp_profile["radar_timeout_s"] == navdp.radar_timeout_s
     assert navdp_profile["odometry_timeout_s"] == navdp.odom_timeout_s
     assert navdp_profile["trajectory_timeout_s"] == navdp.trajectory_timeout_s
     assert navdp_profile["visualize"] is navdp.visualize
@@ -101,6 +102,18 @@ def test_profile_parameters_match_current_process_defaults() -> None:
     assert navdp_profile["actorray_output_dir"] == navdp.actorray_output_dir
     assert navdp_profile["actorray_record_fps"] == navdp.actorray_record_fps
     assert profile.component("xnavdp_mpc") == XNAVDP_G1_MPC_DEFAULTS
+
+    executor_profile = profile.component("planner_executor")
+    assert executor_profile["control_hz"] == executor.control_hz
+    assert executor_profile["radar_timeout_s"] == executor.radar_timeout_s
+    assert (
+        executor_profile["manual_velocity_timeout_s"]
+        == executor.manual_velocity_timeout_s
+    )
+    assert (
+        executor_profile["navdp_velocity_timeout_s"]
+        == executor.navdp_velocity_timeout_s
+    )
 
     lingbot_profile = profile.component("lingbot_depth")
     assert lingbot_profile["model"] == lingbot.model

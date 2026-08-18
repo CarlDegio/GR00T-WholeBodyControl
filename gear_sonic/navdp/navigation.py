@@ -3,16 +3,19 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-import json
 import math
-import time
-from typing import Any, Literal, Mapping, Sequence
+from dataclasses import dataclass
+from typing import Sequence
 
 import numpy as np
 
-COMMAND_TYPE = "sonic_navigation_command"
-STATUS_TYPE = "sonic_navigation_status"
+from gear_sonic.planner_control.protocol import (
+    COMMAND_TYPE,
+    STATUS_TYPE,
+    NavigationCommand,
+    build_navigation_message,
+    decode_navigation_message,
+)
 
 
 @dataclass(frozen=True)
@@ -20,69 +23,6 @@ class Pose2D:
     x: float
     y: float
     yaw: float
-
-
-@dataclass(frozen=True)
-class NavigationCommand:
-    mode: Literal["manual_velocity", "nav_goal", "stop"]
-    generation: int
-    timestamp: float
-    velocity: tuple[float, float, float] | None = None
-    goal_base: tuple[float, float] | None = None
-    target: str = ""
-    target_type: str = ""
-    confidence: float = 0.0
-
-
-def build_navigation_message(
-    *,
-    mode: str,
-    generation: int,
-    timestamp: float | None = None,
-    velocity: Sequence[float] | None = None,
-    goal_base: Sequence[float] | None = None,
-    target: str = "",
-    target_type: str = "",
-    confidence: float = 0.0,
-) -> str:
-    payload: dict[str, Any] = {
-        "type": COMMAND_TYPE,
-        "version": 1,
-        "generation": int(generation),
-        "mode": mode,
-        "timestamp": time.time() if timestamp is None else float(timestamp),
-    }
-    if velocity is not None:
-        payload["velocity"] = dict(zip(("vx", "vy", "wz"), map(float, velocity)))
-    if goal_base is not None:
-        payload["goal_base"] = {"x": float(goal_base[0]), "y": float(goal_base[1])}
-        payload.update(
-            target=str(target), target_type=str(target_type), confidence=float(confidence)
-        )
-    return json.dumps(payload)
-
-
-def decode_navigation_message(message: str | bytes | Mapping[str, Any]) -> NavigationCommand:
-    payload = json.loads(message) if isinstance(message, (str, bytes)) else dict(message)
-    if payload.get("type") != COMMAND_TYPE or payload.get("version") != 1:
-        raise ValueError("unsupported navigation command")
-    mode = payload.get("mode")
-    if mode not in {"manual_velocity", "nav_goal", "stop"}:
-        raise ValueError("invalid navigation mode")
-    velocity = payload.get("velocity")
-    goal = payload.get("goal_base")
-    return NavigationCommand(
-        mode=mode,
-        generation=int(payload["generation"]),
-        timestamp=float(payload["timestamp"]),
-        velocity=None
-        if velocity is None
-        else tuple(float(velocity[key]) for key in ("vx", "vy", "wz")),
-        goal_base=None if goal is None else (float(goal["x"]), float(goal["y"])),
-        target=str(payload.get("target", "")),
-        target_type=str(payload.get("target_type", "")),
-        confidence=float(payload.get("confidence", 0.0)),
-    )
 
 
 def base_goal_to_world(goal: Sequence[float], pose: Pose2D) -> tuple[float, float]:

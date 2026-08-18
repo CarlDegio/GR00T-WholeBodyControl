@@ -23,7 +23,7 @@ from gear_sonic.runtime.control_gateway import (
     NavigationControlAction,
     NavigationControlState,
 )
-from gear_sonic.scripts.navdp_planner import build_navigation_message
+from gear_sonic.planner_control import build_navigation_message
 
 
 @dataclass(frozen=True)
@@ -190,6 +190,7 @@ def run_control_gateway(settings: ControlGatewaySettings) -> None:
                 mode=action.mode,
                 generation=action.generation,
                 velocity=action.velocity,
+                source=source,
             )
         )
         if action.agent_event is not None:
@@ -204,7 +205,7 @@ def run_control_gateway(settings: ControlGatewaySettings) -> None:
             agent_destinations = ("BasePose",)
         elif action.agent_event == "cancel_navigation":
             agent_destinations = ("LaViRA", "BasePose")
-        destinations = ("NavDP",) + agent_destinations
+        destinations = ("PlannerExecutor", "NavDP") + agent_destinations
         log_control_route(
             source,
             action.mode,
@@ -268,7 +269,7 @@ def run_control_gateway(settings: ControlGatewaySettings) -> None:
                             log_control_route(
                                 command.metadata.source,
                                 "navigation_goal",
-                                ("NavDP",),
+                                ("PlannerExecutor", "NavDP"),
                                 generation=action.generation,
                                 goal_base=goal,
                                 target=str(command.parameters.get("target", "")),
@@ -299,7 +300,7 @@ def run_control_gateway(settings: ControlGatewaySettings) -> None:
                             log_control_route(
                                 command.metadata.source,
                                 "navigation_agent_status",
-                                ("NavDP", "LaViRA"),
+                                ("PlannerExecutor", "NavDP", "LaViRA"),
                                 generation=generation,
                                 state=str(command.parameters.get("state", "failed")),
                                 reason=str(command.parameters.get("reason", "")),
@@ -332,7 +333,11 @@ def run_control_gateway(settings: ControlGatewaySettings) -> None:
                             log_control_route(
                                 command.metadata.source,
                                 "base_pose_status",
-                                ("NavDP", "ControlGateway status subscribers"),
+                                (
+                                    "PlannerExecutor",
+                                    "NavDP",
+                                    "ControlGateway status subscribers",
+                                ),
                                 generation=generation,
                                 state=str(command.parameters.get("state", "failed")),
                                 reason=str(command.parameters.get("reason", "")),

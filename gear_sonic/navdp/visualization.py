@@ -148,7 +148,7 @@ def format_direction_chain_diagnostics(
     mpc_angular_velocity: float,
     fastlio_yaw: float,
     fastlio_yaw_delta: float,
-    sonic_target_heading: float,
+    fastlio_target_heading: float,
 ) -> str:
     """Expose the lateral/yaw signs at every navigation control boundary."""
     path = np.asarray(trajectory, dtype=np.float32).reshape(-1, 2)
@@ -159,7 +159,7 @@ def format_direction_chain_diagnostics(
         f"mpc_wz={float(mpc_angular_velocity):+.3f} "
         f"fastlio_yaw={float(fastlio_yaw):+.3f} "
         f"fastlio_dyaw={float(fastlio_yaw_delta):+.3f} "
-        f"sonic_heading={float(sonic_target_heading):+.3f}"
+        f"fastlio_target_heading={float(fastlio_target_heading):+.3f}"
     )
 
 
@@ -533,19 +533,6 @@ def render_slam_world_panel(
         cv2.LINE_AA,
     )
     return panel
-
-
-def depth_requires_stop(
-    depth_m: np.ndarray, *, stop_distance_m: float = 0.10, min_area_pixels: int = 2000
-) -> bool:
-    mask = np.isfinite(depth_m) & (depth_m > 0.0) & (depth_m < stop_distance_m)
-    try:
-        import cv2
-
-        count, _, stats, _ = cv2.connectedComponentsWithStats(mask.astype(np.uint8), 8)
-        return bool(count > 1 and int(stats[1:, cv2.CC_STAT_AREA].max()) > min_area_pixels)
-    except ImportError:
-        return int(mask.sum()) > min_area_pixels
 
 
 def render_head_depth_panel(

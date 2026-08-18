@@ -727,7 +727,7 @@ def build_navdp_planner_command(config: InferenceLaunchConfig, repo_root: Path) 
         else ""
     )
     navigation_status = profile.endpoint("navigation_status")
-    planner_relay = profile.endpoint("planner_relay")
+    navdp_velocity = profile.endpoint("navdp_velocity")
     return (
         "unset COLCON_CURRENT_PREFIX AMENT_PREFIX_PATH CMAKE_PREFIX_PATH; "
         "source /opt/ros/humble/setup.bash && "
@@ -736,7 +736,7 @@ def build_navdp_planner_command(config: InferenceLaunchConfig, repo_root: Path) 
         "python gear_sonic/scripts/navdp_planner.py "
         f"--command-endpoint {shlex.quote(profile.endpoint_uri('navigation_command'))} "
         f"--status-endpoint {shlex.quote(f'tcp://*:{navigation_status.port}')} "
-        f"--output-endpoint {shlex.quote(f'tcp://*:{planner_relay.port}')} "
+        f"--output-endpoint {shlex.quote(f'tcp://*:{navdp_velocity.port}')} "
         f"--sensor-gateway-endpoint "
         f"{shlex.quote(profile.endpoint_uri('sensor_gateway_metadata'))} "
         f"--navdp-server {shlex.quote(profile.endpoint_uri('xnavdp_http'))} "
@@ -751,13 +751,35 @@ def build_navdp_planner_command(config: InferenceLaunchConfig, repo_root: Path) 
         f"--heading-preview-s {settings['heading_preview_s']} "
         f"--goal-tolerance-m {settings['goal_tolerance_m']} "
         f"--navdp-stop-threshold {settings['stop_threshold']} "
-        f"--radar-timeout-s {settings['radar_timeout_s']} "
         f"--odom-timeout-s {settings['odometry_timeout_s']} "
         f"--trajectory-timeout-s {settings['trajectory_timeout_s']} "
         f"--navdp-request-timeout-s {settings['request_timeout_s']} "
         f"--no-visualize --visualization-gateway-endpoint "
         f"{shlex.quote(profile.endpoint_uri('sensor_gateway_visualization_ingress'))} "
         f"{recording}"
+    )
+
+
+def build_planner_velocity_executor_command(
+    config: InferenceLaunchConfig, repo_root: Path
+) -> str:
+    profile = _runtime_profile(config)
+    settings = profile.component("planner_executor")
+    planner_relay = profile.endpoint("planner_relay")
+    return (
+        f"cd {shlex.quote(str(repo_root))} && source .venv_teleop/bin/activate && "
+        "python gear_sonic/scripts/planner_velocity_executor.py "
+        f"--command-endpoint {shlex.quote(profile.endpoint_uri('navigation_command'))} "
+        f"--navdp-velocity-endpoint {shlex.quote(profile.endpoint_uri('navdp_velocity'))} "
+        f"--output-endpoint {shlex.quote(f'tcp://*:{planner_relay.port}')} "
+        f"--sensor-gateway-endpoint {shlex.quote(profile.endpoint_uri('sensor_gateway_metadata'))} "
+        f"--control-hz {settings['control_hz']} "
+        f"--manual-velocity-timeout-s {settings['manual_velocity_timeout_s']} "
+        f"--navdp-velocity-timeout-s {settings['navdp_velocity_timeout_s']} "
+        f"--radar-timeout-s {settings['radar_timeout_s']} "
+        f"--sensor-gateway-poll-hz {settings['sensor_gateway_poll_hz']} "
+        f"--sensor-gateway-request-timeout-ms {settings['sensor_gateway_request_timeout_ms']} "
+        f"--sensor-gateway-max-age-ms {settings['sensor_gateway_max_age_ms']}"
     )
 
 
@@ -1267,7 +1289,7 @@ def main(config: InferenceLaunchConfig):
     print("=" * 60)
 
     base_pose_runtime_enabled = config.keyboard_planner and config.base_pose_enabled
-    runtime_pane_count = 2 + int(base_pose_runtime_enabled)
+    runtime_pane_count = 2 + int(config.keyboard_planner) + int(base_pose_runtime_enabled)
     pane_ids = _create_tmux_session(6 + runtime_pane_count)
     print(f"Created tmux session: {SESSION_NAME}")
 
@@ -1324,6 +1346,14 @@ def main(config: InferenceLaunchConfig):
         build_control_gateway_command(config, repo_root),
         wait=1.0,
     )
+    if config.keyboard_planner:
+        runtime_index += 1
+        print(f"Starting shared Planner velocity executor (pane {6 + runtime_index})...")
+        _send_to_pane(
+            runtime_panes[runtime_index],
+            build_planner_velocity_executor_command(config, repo_root),
+            wait=1.0,
+        )
     if base_pose_runtime_enabled:
         runtime_index += 1
         print(f"Starting Base-Pose agent (pane {6 + runtime_index})...")
@@ -1406,13 +1436,16 @@ def main(config: InferenceLaunchConfig):
     print("    Pane 1: SONIC Operator CLI")
     print("    Pane 2: VLA Inference")
     print("    Pane 3: LaViRA Semantic + LISTEN_WASD")
-    print("    Pane 4: NavDP Continuous Planner + Safety")
+    print("    Pane 4: NavDP Velocity Producer")
     print("    Pane 5: NavDP Server")
     runtime_label_index = 6
     print(f"    Pane {runtime_label_index}: Read-only SensorGateway")
     runtime_label_index += 1
     print(f"    Pane {runtime_label_index}: ControlGateway Router")
     runtime_label_index += 1
+    if config.keyboard_planner:
+        print(f"    Pane {runtime_label_index}: Shared Planner Velocity Executor + Safety")
+        runtime_label_index += 1
     if config.keyboard_planner and config.base_pose_enabled:
         print(f"    Pane {runtime_label_index}: Base-Pose Agent")
     if config.data_exporter:

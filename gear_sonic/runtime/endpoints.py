@@ -97,8 +97,8 @@ def _build_endpoints() -> Mapping[str, EndpointSpec]:
             5558,
             Transport.ZMQ,
             "SonicControlGateway",
-            ("navdp_planner",),
-            purpose="Manual velocity, semantic navigation goal, and stop commands",
+            ("planner_velocity_executor", "navdp_planner"),
+            purpose="Arbitrated manual velocity, semantic goal, and stop commands",
         ),
         EndpointSpec(
             "navigation_status",
@@ -112,9 +112,9 @@ def _build_endpoints() -> Mapping[str, EndpointSpec]:
             "planner_relay",
             5563,
             Transport.ZMQ,
-            "navdp_planner",
+            "planner_velocity_executor",
             ("run_vla_inference",),
-            purpose="SONIC planner binary messages selected by the launcher",
+            purpose="Safety-filtered SONIC planner binary messages",
         ),
         EndpointSpec(
             "lingbot_depth",
@@ -137,7 +137,14 @@ def _build_endpoints() -> Mapping[str, EndpointSpec]:
             5560,
             Transport.ZMQ,
             "SonicSensorGateway",
-            ("VLA", "NavDP", "LaViRA", "LingBot Depth", "data exporter"),
+            (
+                "VLA",
+                "NavDP",
+                "planner_velocity_executor",
+                "LaViRA",
+                "LingBot Depth",
+                "data exporter",
+            ),
             purpose="Shared-memory snapshots, health, and readiness queries",
         ),
         EndpointSpec(
@@ -179,6 +186,14 @@ def _build_endpoints() -> Mapping[str, EndpointSpec]:
             "SonicSensorGateway",
             ("run_vla_inference",),
             purpose="Best-effort segmented VLA latency telemetry",
+        ),
+        EndpointSpec(
+            "navdp_velocity",
+            5568,
+            Transport.ZMQ,
+            "navdp_planner",
+            ("planner_velocity_executor",),
+            purpose="Generation-scoped NavDP body velocity and heading targets",
         ),
     )
     by_name = {endpoint.name: endpoint for endpoint in endpoints}

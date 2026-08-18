@@ -16,6 +16,7 @@ endpoints:
   control_gateway_dispatch: {host: 127.0.0.1, port: 5565}
   sensor_gateway_visualization_ingress: {host: 127.0.0.1, port: 5566}
   vla_timing_ingress: {host: 127.0.0.1, port: 5567}
+  navdp_velocity: {host: 127.0.0.1, port: 5568}
   xnavdp_http: {host: 127.0.0.1, port: 19999}
 ros_topics:
   lidar: /livox/lidar
@@ -65,13 +66,20 @@ components:
     sensor_gateway_request_timeout_ms: 100
     sensor_gateway_max_age_ms: 1000.0
     sensor_gateway_max_skew_ms: 5.0
-    radar_timeout_s: 0.75
     odometry_timeout_s: 0.3
     trajectory_timeout_s: 2.5
     visualize: true
     record_actorray: false
     actorray_output_dir: outputs/navdp
     actorray_record_fps: 20.0
+  planner_executor:
+    control_hz: 20.0
+    manual_velocity_timeout_s: 0.70
+    navdp_velocity_timeout_s: 0.30
+    radar_timeout_s: 0.75
+    sensor_gateway_poll_hz: 20.0
+    sensor_gateway_request_timeout_ms: 100
+    sensor_gateway_max_age_ms: 1000.0
   xnavdp_mpc:
     horizon_steps: 30
     desired_velocity: 0.3
