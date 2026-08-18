@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import signal
+import threading
 from types import SimpleNamespace
 
 import pytest
@@ -103,6 +104,34 @@ def test_recovery_sends_typed_stop_before_stopping_fastlio(monkeypatch) -> None:
         ("sleep", 0.1),
         ("stop", process),
     ]
+
+
+def test_tmux_sighup_requests_normal_fastlio_cleanup(monkeypatch) -> None:
+    installed: dict[signal.Signals, object] = {}
+    restored: dict[signal.Signals, object] = {}
+    previous_handlers = {
+        signum: object() for signum in run_fastlio_supervisor._SHUTDOWN_SIGNALS
+    }
+
+    def fake_signal(signum, handler):
+        if callable(handler):
+            installed[signum] = handler
+        else:
+            restored[signum] = handler
+        return previous_handlers[signum]
+
+    monkeypatch.setattr(run_fastlio_supervisor.signal, "signal", fake_signal)
+    stop = threading.Event()
+
+    previous = run_fastlio_supervisor._install_shutdown_signal_handlers(stop)
+
+    assert set(installed) == {signal.SIGHUP, signal.SIGINT, signal.SIGTERM}
+    installed[signal.SIGHUP](signal.SIGHUP, None)
+    assert stop.is_set()
+    assert previous == previous_handlers
+
+    run_fastlio_supervisor._restore_signal_handlers(previous)
+    assert restored == previous_handlers
 
 
 def test_group_wait_does_not_treat_exited_launch_parent_as_cleanup_complete(

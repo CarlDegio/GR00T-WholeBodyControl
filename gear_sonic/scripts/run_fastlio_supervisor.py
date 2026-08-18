@@ -22,6 +22,9 @@ from gear_sonic.runtime.slam_recovery import (
 )
 
 
+_SHUTDOWN_SIGNALS = (signal.SIGHUP, signal.SIGINT, signal.SIGTERM)
+
+
 @dataclass(frozen=True)
 class FastLioSupervisorSettings:
     profile_name: str
@@ -155,6 +158,25 @@ def _cancel_navigation_and_stop_fastlio(
     _stop_fastlio(process)
 
 
+def _install_shutdown_signal_handlers(
+    stop: threading.Event,
+) -> dict[signal.Signals, Any]:
+    """Turn terminal/tmux shutdown into the normal FAST-LIO cleanup path."""
+
+    def request_stop(_signum=None, _frame=None) -> None:
+        stop.set()
+
+    return {
+        signum: signal.signal(signum, request_stop)
+        for signum in _SHUTDOWN_SIGNALS
+    }
+
+
+def _restore_signal_handlers(previous_handlers: dict[signal.Signals, Any]) -> None:
+    for signum, handler in previous_handlers.items():
+        signal.signal(signum, handler)
+
+
 def _quaternion_yaw(orientation: Any) -> float:
     x = float(orientation.x)
     y = float(orientation.y)
@@ -200,9 +222,6 @@ def run_fastlio_supervisor(settings: FastLioSupervisorSettings) -> None:
         source="slam_recovery",
     )
 
-    def request_stop(_signum=None, _frame=None) -> None:
-        stop.set()
-
     def on_odometry(message: Any) -> None:
         nonlocal pending_reason
         if pending_reason is not None:
@@ -213,8 +232,7 @@ def run_fastlio_supervisor(settings: FastLioSupervisorSettings) -> None:
             monotonic_s=now_s,
         )
 
-    previous_sigint = signal.signal(signal.SIGINT, request_stop)
-    previous_sigterm = signal.signal(signal.SIGTERM, request_stop)
+    previous_signal_handlers = _install_shutdown_signal_handlers(stop)
     subscription = node.create_subscription(
         Odometry,
         settings.odometry_topic,
@@ -251,14 +269,18 @@ def run_fastlio_supervisor(settings: FastLioSupervisorSettings) -> None:
             )
     finally:
         del subscription
-        signal.signal(signal.SIGINT, previous_sigint)
-        signal.signal(signal.SIGTERM, previous_sigterm)
-        if child is not None:
-            _stop_fastlio(child)
-        control.close()
-        node.destroy_node()
-        if rclpy.ok():
-            rclpy.shutdown()
+        try:
+            # Keep the shutdown handlers installed until the detached FAST-LIO
+            # process group is gone.  A second tmux/terminal signal must not
+            # interrupt the cleanup half way through.
+            if child is not None:
+                _stop_fastlio(child)
+        finally:
+            control.close()
+            node.destroy_node()
+            if rclpy.ok():
+                rclpy.shutdown()
+            _restore_signal_handlers(previous_signal_handlers)
 
 
 def main() -> None:
