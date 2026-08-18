@@ -2217,6 +2217,9 @@ def _client_from_config(config: Any) -> Any:
             model=config.qwenvl_model,
             base_url=config.qwenvl_base_url,
             thinking_budget=config.qwenvl_thinking_budget,
+            enable_thinking=bool(
+                getattr(config, "qwenvl_enable_thinking", True)
+            ),
             timeout_seconds=config.codex_timeout_seconds,
         )
     return CodexStructuredVisionClient(

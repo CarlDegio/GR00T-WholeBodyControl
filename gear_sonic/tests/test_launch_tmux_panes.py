@@ -243,7 +243,7 @@ def test_yaml_contains_every_launch_parameter() -> None:
     assert loaded.lavira_vision_backend == "qwenvl"
     assert loaded.base_pose_enabled is True
     assert loaded.base_pose_task == loaded.prompt
-    assert loaded.base_pose_mode == "rgb"
+    assert loaded.base_pose_mode == "dual_raw_yoloe_servo"
     assert loaded.slam_debug is False
 
 
@@ -433,7 +433,11 @@ def test_base_pose_agent_uses_gateway_arbitration_and_fixed_task() -> None:
 
     assert "gear_sonic/scripts/base_pose_agent.py" in command
     assert "--task 'align with the medicine bottle and basket'" in command
-    assert "--mode rgb" in command
+    assert "--mode dual_raw_yoloe_servo" in command
+    assert "--dual-head-camera-stream ego_view" in command
+    assert "--dual-head-depth-stream camera/ego_view_depth" in command
+    assert "--dual-chest-camera-stream chest_view" in command
+    assert "--dual-chest-depth-stream camera/chest_view_depth" in command
     assert "--sensor-gateway-endpoint tcp://127.0.0.1:5560" in command
     assert "--control-gateway-endpoint tcp://127.0.0.1:5565" in command
     assert "--control-gateway-intent-endpoint tcp://127.0.0.1:5561" in command
@@ -476,13 +480,16 @@ def test_base_pose_yoloe_command_uses_aligned_raw_depth_and_local_model() -> Non
     assert "--orientation-output-endpoint 'tcp://*:5569'" in executor
 
 
-def test_orientation_telemetry_is_disabled_outside_raw_yoloe_mode() -> None:
+def test_orientation_telemetry_is_enabled_for_dual_raw_yoloe_mode() -> None:
     executor = build_planner_velocity_executor_command(
-        InferenceLaunchConfig(base_pose_enabled=True, base_pose_mode="rgb"),
+        InferenceLaunchConfig(
+            base_pose_enabled=True,
+            base_pose_mode="dual_raw_yoloe_servo",
+        ),
         Path("/workspace/sonic"),
     )
 
-    assert "--orientation-output-endpoint" not in executor
+    assert "--orientation-output-endpoint 'tcp://*:5569'" in executor
 
 
 def test_runtime_sidecars_are_read_only_and_navdp_uses_gateway_by_default() -> None:

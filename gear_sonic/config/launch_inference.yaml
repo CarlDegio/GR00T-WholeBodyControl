@@ -191,34 +191,48 @@ launch_inference:
   lavira_output_root: outputs/object_nav
   base_pose_enabled: true
   base_pose_task: *vla_task_prompt
-  base_pose_mode: rgb
+  base_pose_mode: dual_raw_yoloe_servo
   base_pose_vision_backend: codex
   base_pose_model: gpt-5.6-sol
   base_pose_qwenvl_model: qwen3-vl-plus
   base_pose_qwenvl_base_url: https://dashscope-intl.aliyuncs.com/compatible-mode/v1
   base_pose_qwenvl_thinking_budget: 500
-  base_pose_reasoning_effort: max
+  base_pose_reasoning_effort: xhigh
   base_pose_codex_fast: true
   base_pose_codex_timeout_seconds: 600.0
   base_pose_camera_stream: ego_view
-  # For rgbd/rgb_depth_query, configure a LingBot stream aligned to this camera.
-  # The existing derived/lingbot_depth stream is aligned to chest_view.
-  base_pose_depth_stream: derived/lingbot_depth
   base_pose_yoloe_depth_stream: camera/ego_view_depth
   base_pose_camera_intrinsics_path: gear_sonic/config/camera_intrinsics.json
+  base_pose_camera_pitch_deg: -38.0
+  base_pose_camera_roll_deg: 0.0
+  base_pose_camera_yaw_deg: 0.0
+  base_pose_camera_forward_offset_m: 0.0
+  base_pose_camera_lateral_offset_m: 0.0
+  base_pose_dual_head_camera_stream: ego_view
+  base_pose_dual_head_depth_stream: camera/ego_view_depth
+  base_pose_dual_chest_camera_stream: chest_view
+  base_pose_dual_chest_depth_stream: camera/chest_view_depth
+  base_pose_dual_chest_camera_pitch_deg: -3.0
+  base_pose_dual_chest_camera_roll_deg: 0.0
+  base_pose_dual_chest_camera_yaw_deg: 0.0
+  base_pose_dual_chest_camera_forward_offset_m: 0.0
+  base_pose_dual_chest_camera_lateral_offset_m: 0.0
+  base_pose_dual_match_tolerance_frames: 30
+  base_pose_dual_initialization_grace_s: 30.0
+  base_pose_dual_qwenvl_fallback_model: qwen3-vl-8b-instruct
   base_pose_camera_timeout_ms: 15000
   base_pose_planner_hz: 20.0
-  base_pose_transition_pause: 0.5
-  base_pose_rotation_speed: 0.4
-  base_pose_translation_speed: 0.3
-  base_pose_persist_diagnostics: false
   base_pose_output_root: outputs/base_pose_adjustment
   base_pose_yoloe_model_path: tools/yoloe26m/weights/yoloe-26m-seg.pt
   base_pose_yoloe_device: '0'
   base_pose_yoloe_confidence: 0.25
   base_pose_yoloe_imgsz: 640
+  base_pose_raw_reference_update_interval_frames: 5
+  base_pose_raw_reference_update_min_confidence: 0.35
+  base_pose_raw_reference_update_min_iou: 0.50
   base_pose_raw_servo_hz: 10.0
   base_pose_raw_head_target_distance_m: 0.90
+  base_pose_raw_chest_target_distance_m: 0.80
   base_pose_raw_forward_tolerance_m: 0.10
   base_pose_raw_lateral_tolerance_m: 0.10
   base_pose_raw_min_linear_speed_m_s: 0.40
@@ -227,8 +241,13 @@ launch_inference:
   base_pose_raw_yaw_tolerance_deg: 8.0
   base_pose_raw_yaw_coarse_speed_rad_s: 0.30
   base_pose_raw_yaw_trim_speed_rad_s: 0.20
+  base_pose_raw_forward_recenter_yaw_speed_rad_s: 0.30
+  base_pose_raw_horizontal_guard_fraction: 0.25
+  base_pose_raw_horizontal_recovery_fraction: 0.30
   base_pose_raw_camera_stale_s: 0.40
   base_pose_raw_max_run_s: 180.0
+  base_pose_raw_post_stop_sample_s: 3.0
+  base_pose_raw_allow_missing_table: 0
   navdp_root: /home/user/Project/NavDP/baselines/x-navdp
   navdp_checkpoint: /home/user/Project/NavDP/baselines/x-navdp/checkpoints/x-navdp_posttrain.ckpt
   fastlio_workspace: /home/user/Project/fastlio_humanoid_ws

@@ -15,7 +15,13 @@ from gear_sonic.runtime.control_client import (
     ControlGatewayIntentClient,
     ControlGatewaySubscriber,
 )
-from gear_sonic.utils.inference.base_pose_sensor import SensorGatewayBasePoseCamera
+from gear_sonic.utils.inference.base_pose_dual_visual_servo import (
+    run_dual_raw_servo_worker,
+)
+from gear_sonic.utils.inference.base_pose_sensor import (
+    SensorGatewayBasePoseCamera,
+    SensorGatewayDualBasePoseCamera,
+)
 from gear_sonic.utils.inference.base_pose_visual_servo import (
     RawServoRuntime,
     run_raw_servo_worker,
@@ -117,9 +123,18 @@ class GatewayRawServoAdapter:
         self.runtime.shutdown()
 
 
-def run_base_pose_yolo_agent(config: Any) -> None:
-    """Run single-camera YOLOE alignment without owning the SONIC output socket."""
+def raw_servo_worker_for_mode(mode: str) -> Callable[..., None]:
+    if mode == "raw_yoloe_servo":
+        return run_raw_servo_worker
+    if mode == "dual_raw_yoloe_servo":
+        return run_dual_raw_servo_worker
+    raise ValueError(f"unsupported BasePose YOLOE mode: {mode}")
 
+
+def run_base_pose_yolo_agent(config: Any) -> None:
+    """Run single- or dual-camera YOLOE without owning the SONIC socket."""
+
+    worker_target = raw_servo_worker_for_mode(config.mode)
     validate_raw_servo_dependencies(config)
     context = zmq.Context.instance()
     intent = ControlGatewayIntentClient(
@@ -170,18 +185,39 @@ def run_base_pose_yolo_agent(config: Any) -> None:
         context=context,
         accepted_names={"start_base_pose", "cancel_navigation"},
     )
-    camera = SensorGatewayBasePoseCamera(
-        config.sensor_gateway_endpoint,
-        camera_stream=config.camera_stream,
-        depth_stream=config.depth_stream,
-        require_depth=True,
-        timeout_ms=config.camera_timeout_ms,
-        request_timeout_ms=config.sensor_gateway_request_timeout_ms,
-        max_age_ms=config.sensor_gateway_max_age_ms,
-        max_skew_ms=config.sensor_gateway_max_skew_ms,
-    )
+    dual_mode = config.mode == "dual_raw_yoloe_servo"
+    if dual_mode:
+        camera = SensorGatewayDualBasePoseCamera(
+            config.sensor_gateway_endpoint,
+            stream_depths={
+                config.dual_head_camera_stream: config.dual_head_depth_stream,
+                config.dual_chest_camera_stream: config.dual_chest_depth_stream,
+            },
+            timeout_ms=config.camera_timeout_ms,
+            request_timeout_ms=config.sensor_gateway_request_timeout_ms,
+            max_age_ms=config.sensor_gateway_max_age_ms,
+            max_skew_ms=config.sensor_gateway_max_skew_ms,
+        )
+        stream_summary = (
+            f"head={config.dual_head_camera_stream}/"
+            f"{config.dual_head_depth_stream} "
+            f"chest={config.dual_chest_camera_stream}/"
+            f"{config.dual_chest_depth_stream}"
+        )
+    else:
+        camera = SensorGatewayBasePoseCamera(
+            config.sensor_gateway_endpoint,
+            camera_stream=config.camera_stream,
+            depth_stream=config.depth_stream,
+            require_depth=True,
+            timeout_ms=config.camera_timeout_ms,
+            request_timeout_ms=config.sensor_gateway_request_timeout_ms,
+            max_age_ms=config.sensor_gateway_max_age_ms,
+            max_skew_ms=config.sensor_gateway_max_skew_ms,
+        )
+        stream_summary = f"stream={config.camera_stream}/{config.depth_stream}"
     worker = threading.Thread(
-        target=run_raw_servo_worker,
+        target=worker_target,
         args=(
             config,
             adapter.runtime.requests,
@@ -195,13 +231,13 @@ def run_base_pose_yolo_agent(config: Any) -> None:
             "camera_factory": lambda: camera,
             "table_required": lambda: adapter.runtime.controller.table_required,
         },
-        name="base-pose-yoloe",
+        name="base-pose-dual-yoloe" if dual_mode else "base-pose-yoloe",
         daemon=True,
     )
     worker.start()
     print(
-        f"[BasePose/YOLOE] waiting for B; stream={config.camera_stream} "
-        f"depth={config.depth_stream} task={config.task!r}"
+        f"[BasePose/YOLOE] waiting for B; mode={config.mode} "
+        f"{stream_summary} task={config.task!r}"
     )
     try:
         while True:
