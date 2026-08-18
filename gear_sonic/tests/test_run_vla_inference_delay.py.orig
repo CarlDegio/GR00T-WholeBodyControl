@@ -13,15 +13,13 @@ from gear_sonic.scripts.run_vla_inference import (
 )
 from gear_sonic.utils.inference.vla_utils import calculate_latency_compensated_index
 from gear_sonic.utils.teleop.zmq.zmq_planner_sender import (
-    build_planner_message,
     DEFAULT_WALKING_STYLE,
-    describe_walking_style,
     HEADER_SIZE,
-    MOTION_MODE_SETS,
-    next_walking_style,
-    override_planner_walking_style,
     WALKING_STYLE_CYCLE,
     WalkingStyle,
+    build_planner_message,
+    next_walking_style,
+    override_planner_walking_style,
 )
 
 
@@ -128,16 +126,6 @@ class PlannerWalkingStyleTest(unittest.TestCase):
 
     def test_default_is_slow_walk_and_cycle_wraps(self):
         self.assertEqual(DEFAULT_WALKING_STYLE, WalkingStyle.SLOW_WALK)
-        self.assertEqual(len(MOTION_MODE_SETS), 4)
-        self.assertEqual(
-            tuple(len(modes) for _, modes in MOTION_MODE_SETS),
-            (6, 5, 7, 7),
-        )
-        self.assertEqual(len(WALKING_STYLE_CYCLE), 4)
-        self.assertEqual(
-            tuple(int(mode) for mode in WALKING_STYLE_CYCLE),
-            (1, 2, 20, 21),
-        )
         style = DEFAULT_WALKING_STYLE
         observed = []
         for _ in WALKING_STYLE_CYCLE:
@@ -147,12 +135,6 @@ class PlannerWalkingStyleTest(unittest.TestCase):
         self.assertEqual(tuple(observed), WALKING_STYLE_CYCLE)
         self.assertEqual(style, DEFAULT_WALKING_STYLE)
 
-    def test_mode_description_reports_set_cycle_position_and_id(self):
-        self.assertEqual(
-            describe_walking_style(WalkingStyle.CAREFUL),
-            "Set 3 Additional Styled Walking | cycle=3/4 | mode=20 CAREFUL",
-        )
-
     def test_override_changes_walking_mode_but_preserves_idle(self):
         moving = build_planner_message(
             WalkingStyle.INJURED_WALK,
@@ -160,9 +142,13 @@ class PlannerWalkingStyleTest(unittest.TestCase):
             [1.0, 0.0, 0.0],
             speed=0.3,
         )
-        updated = override_planner_walking_style(moving, WalkingStyle.ZOMBIE_WALK)
+        updated = override_planner_walking_style(
+            moving, WalkingStyle.ZOMBIE_WALK
+        )
 
-        self.assertEqual(self.planner_mode(updated), WalkingStyle.ZOMBIE_WALK)
+        self.assertEqual(
+            self.planner_mode(updated), WalkingStyle.ZOMBIE_WALK
+        )
         offset = len(b"planner") + HEADER_SIZE
         self.assertEqual(updated[:offset], moving[:offset])
         self.assertEqual(updated[offset + 4 :], moving[offset + 4 :])
@@ -172,22 +158,6 @@ class PlannerWalkingStyleTest(unittest.TestCase):
         )
         self.assertIs(
             override_planner_walking_style(idle, WalkingStyle.WALK), idle
-        )
-
-    def test_every_selectable_mode_can_be_written_to_a_moving_packet(self):
-        moving = build_planner_message(
-            WalkingStyle.SLOW_WALK,
-            [1.0, 0.0, 0.0],
-            [1.0, 0.0, 0.0],
-            speed=0.3,
-        )
-
-        self.assertEqual(
-            tuple(
-                self.planner_mode(override_planner_walking_style(moving, mode))
-                for mode in WALKING_STYLE_CYCLE
-            ),
-            tuple(int(mode) for mode in WALKING_STYLE_CYCLE),
         )
 
     def test_relay_enforces_selected_style_on_every_moving_message(self):

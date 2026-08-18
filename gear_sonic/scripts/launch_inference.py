@@ -252,13 +252,19 @@ class InferenceLaunchConfig:
     base_pose_dual_initialization_grace_s: float = 30.0
     """Wait for the second dual-camera grounding result after one succeeds."""
 
+    base_pose_dual_qwenvl_fallback_model: str = "qwen3-vl-8b-instruct"
+    """Qwen model used to re-ground a failed camera's current frame."""
+
     base_pose_raw_yoloe_model_path: str = (
         "tools/yoloe26m/weights/yoloe-26m-seg.pt"
     )
     """Local YOLOE-26M segmentation checkpoint for raw visual servo."""
 
-    base_pose_raw_target_distance_m: float = 0.80
-    """Desired raw-depth target standoff for closed-loop alignment."""
+    base_pose_raw_head_target_distance_m: float = 0.90
+    """Head-camera raw-depth target standoff for closed-loop alignment."""
+
+    base_pose_raw_chest_target_distance_m: float = 0.80
+    """Chest-camera raw-depth target standoff for closed-loop alignment."""
 
     base_pose_raw_forward_tolerance_m: float = 0.10
     """Raw-servo forward completion tolerance in meters."""
@@ -266,8 +272,29 @@ class InferenceLaunchConfig:
     base_pose_raw_lateral_tolerance_m: float = 0.10
     """Raw-servo lateral completion tolerance in meters."""
 
-    base_pose_raw_max_lateral_speed_m_s: float = 0.16
+    base_pose_raw_min_linear_speed_m_s: float = 0.40
+    """Minimum nonzero raw-servo translation speed in m/s."""
+
+    base_pose_raw_max_lateral_speed_m_s: float = 0.40
     """Maximum raw-servo request and final relay lateral speed in m/s."""
+
+    base_pose_raw_min_yaw_speed_rad_s: float = 0.10
+    """Minimum nonzero closed-loop raw-servo yaw speed in rad/s."""
+
+    base_pose_raw_yaw_tolerance_deg: float = 8.0
+    """Shared yaw tolerance for trim, global alignment, and final completion."""
+
+    base_pose_raw_yaw_coarse_speed_rad_s: float = 0.30
+    """Maximum raw-servo coarse yaw speed in rad/s."""
+
+    base_pose_raw_yaw_trim_speed_rad_s: float = 0.20
+    """Maximum raw-servo trim/global-correction yaw speed in rad/s."""
+
+    base_pose_raw_forward_recenter_yaw_speed_rad_s: float = 0.30
+    """Chest forward-recenter yaw speed magnitude in rad/s."""
+
+    base_pose_raw_live_camera_viewer: bool = True
+    """Open a head/chest RGB window while an N-triggered raw run is active."""
 
     base_pose_raw_horizontal_guard_fraction: float = 0.25
     """Raw-servo side protection margin; 0.25 means enter outside 25--75%."""
@@ -277,6 +304,12 @@ class InferenceLaunchConfig:
 
     base_pose_raw_max_run_s: float = 180.0
     """Maximum raw-servo runtime after YOLOE detection begins."""
+
+    base_pose_raw_post_stop_sample_s: float = 3.0
+    """Zero-command heading and visual-error sampling after alignment."""
+
+    base_pose_raw_allow_missing_table: Literal[0, 1] = 0
+    """Set to 1 to make table detection optional after raw-servo initialization."""
 
     base_pose_orientation_telemetry_port: int = 5565
     """Local relay-to-raw-servo measured-yaw telemetry port."""
@@ -442,6 +475,14 @@ def uses_base_pose_manual_keyboard(config: InferenceLaunchConfig) -> bool:
     )
 
 
+def uses_base_pose_event_log_window(config: InferenceLaunchConfig) -> bool:
+    return (
+        config.planner_input == "base_pose"
+        and config.base_pose_mode
+        in {"raw_yoloe_servo", "dual_raw_yoloe_servo"}
+    )
+
+
 def build_base_pose_manual_keyboard_command(
     config: InferenceLaunchConfig,
     repo_root: Path,
@@ -453,6 +494,18 @@ def build_base_pose_manual_keyboard_command(
         f"--port {config.base_pose_manual_keyboard_port} "
         f"--hz {config.keyboard_planner_publish_rate} "
         f"--host {shlex.quote(config.keyboard_planner_host)}"
+    )
+
+
+def build_base_pose_event_log_command(
+    config: InferenceLaunchConfig,
+    repo_root: Path,
+) -> str:
+    return (
+        f"cd {shlex.quote(str(repo_root))} && "
+        ".venv_inference/bin/python "
+        "gear_sonic/scripts/follow_base_pose_servo_events.py "
+        f"--output-root {shlex.quote(config.base_pose_output_root)}"
     )
 
 
@@ -468,6 +521,10 @@ def _base_pose_planner_command(config: InferenceLaunchConfig, repo_root: Path) -
             f"{config.base_pose_qwenvl_thinking_budget} "
         )
     codex_fast = "" if config.base_pose_codex_fast else "--no-codex-fast "
+    live_camera_viewer = (
+        "" if config.base_pose_raw_live_camera_viewer
+        else "--no-raw-live-camera-viewer "
+    )
     dual_camera = ""
     if config.base_pose_mode == "dual_raw_yoloe_servo":
         dual_camera = (
@@ -491,6 +548,8 @@ def _base_pose_planner_command(config: InferenceLaunchConfig, repo_root: Path) -
             f"{config.base_pose_dual_match_tolerance_frames} "
             f"--dual-initialization-grace-s "
             f"{config.base_pose_dual_initialization_grace_s} "
+            f"--dual-qwenvl-fallback-model "
+            f"{shlex.quote(config.base_pose_dual_qwenvl_fallback_model)} "
         )
     planner = (
         ".venv_inference/bin/python gear_sonic/scripts/base_pose_planner.py "
@@ -524,18 +583,37 @@ def _base_pose_planner_command(config: InferenceLaunchConfig, repo_root: Path) -
         f"--output-root {shlex.quote(config.base_pose_output_root)} "
         f"--raw-yoloe-model-path "
         f"{shlex.quote(config.base_pose_raw_yoloe_model_path)} "
-        f"--raw-target-distance-m {config.base_pose_raw_target_distance_m} "
+        f"--raw-head-target-distance-m "
+        f"{config.base_pose_raw_head_target_distance_m} "
+        f"--raw-chest-target-distance-m "
+        f"{config.base_pose_raw_chest_target_distance_m} "
         f"--raw-forward-tolerance-m "
         f"{config.base_pose_raw_forward_tolerance_m} "
         f"--raw-lateral-tolerance-m "
         f"{config.base_pose_raw_lateral_tolerance_m} "
+        f"--raw-min-linear-speed-m-s "
+        f"{config.base_pose_raw_min_linear_speed_m_s} "
         f"--raw-max-lateral-speed-m-s "
         f"{config.base_pose_raw_max_lateral_speed_m_s} "
+        f"--raw-min-yaw-speed-rad-s "
+        f"{config.base_pose_raw_min_yaw_speed_rad_s} "
+        f"--raw-yaw-tolerance-deg "
+        f"{config.base_pose_raw_yaw_tolerance_deg} "
+        f"--raw-yaw-coarse-speed-rad-s "
+        f"{config.base_pose_raw_yaw_coarse_speed_rad_s} "
+        f"--raw-yaw-trim-speed-rad-s "
+        f"{config.base_pose_raw_yaw_trim_speed_rad_s} "
+        f"--raw-forward-recenter-yaw-speed-rad-s "
+        f"{config.base_pose_raw_forward_recenter_yaw_speed_rad_s} "
+        f"{live_camera_viewer}"
         f"--raw-horizontal-guard-fraction "
         f"{config.base_pose_raw_horizontal_guard_fraction} "
         f"--raw-horizontal-recovery-fraction "
         f"{config.base_pose_raw_horizontal_recovery_fraction} "
         f"--raw-max-run-s {config.base_pose_raw_max_run_s} "
+        f"--raw-post-stop-sample-s {config.base_pose_raw_post_stop_sample_s} "
+        f"--raw-allow-missing-table "
+        f"{config.base_pose_raw_allow_missing_table} "
         f"--raw-orientation-telemetry-source "
         f"tcp://127.0.0.1:{config.base_pose_orientation_telemetry_port}"
     )
@@ -908,6 +986,30 @@ def _launch_base_pose_manual_keyboard_pane(
     )
 
 
+def _launch_base_pose_event_log_window(
+    config: InferenceLaunchConfig,
+    repo_root: Path,
+) -> None:
+    if not uses_base_pose_event_log_window(config):
+        return
+    subprocess.run(
+        ["tmux", "new-window", "-t", SESSION_NAME, "-n", "yoloe_log"],
+        check=True,
+    )
+    subprocess.run(
+        [
+            "tmux",
+            "send-keys",
+            "-t",
+            f"{SESSION_NAME}:yoloe_log",
+            build_base_pose_event_log_command(config, repo_root),
+            "C-m",
+        ],
+        check=True,
+    )
+    print("Starting live YOLOE servo event log (window: yoloe_log)...")
+
+
 def main(config: InferenceLaunchConfig):
     repo_root = Path(__file__).resolve().parent.parent.parent
 
@@ -1012,11 +1114,22 @@ def main(config: InferenceLaunchConfig):
     keyboard_script = textwrap.dedent(
         """\
         import zmq, time
+        from gear_sonic.utils.teleop.zmq.zmq_planner_sender import (
+            DEFAULT_WALKING_STYLE,
+            describe_walking_style,
+            next_walking_style,
+        )
         ctx = zmq.Context()
         pub = ctx.socket(zmq.PUB)
         pub.bind('tcp://localhost:5580')
         time.sleep(0.5)
-        print('Keyboard publisher ready. Keys: p=pause, k=start/stop, i=pose mode, o=planner mode, [/]=toggle hands, t=prompt')
+        motion_mode = DEFAULT_WALKING_STYLE
+        print(
+            'Keyboard publisher ready. Keys: p=pause, k=start/stop, '
+            'm=next motion mode (4 selected styles), i=pose mode, o=planner mode, '
+            '[/]=toggle hands, t=prompt'
+        )
+        print('Current planner motion mode: ' + describe_walking_style(motion_mode))
         while True:
             key = input()
             if key.startswith('t '):
@@ -1024,7 +1137,14 @@ def main(config: InferenceLaunchConfig):
                 print('Sent prompt: ' + key[2:])
             else:
                 pub.send_string(key)
-                print('Sent: ' + key)
+                if key == 'm':
+                    motion_mode = next_walking_style(motion_mode)
+                    print(
+                        'Sent: m | Current planner motion mode: '
+                        + describe_walking_style(motion_mode)
+                    )
+                else:
+                    print('Sent: ' + key)
     """
     )
     encoded = base64.b64encode(keyboard_script.encode()).decode()
@@ -1078,6 +1198,8 @@ def main(config: InferenceLaunchConfig):
         else:
             print("REASEN avoidance disabled; MID-360 pane left idle.")
 
+    _launch_base_pose_event_log_window(config, repo_root)
+
     if config.data_exporter:
         subprocess.run(
             ["tmux", "new-window", "-t", SESSION_NAME, "-n", "data_exporter"],
@@ -1107,6 +1229,11 @@ def main(config: InferenceLaunchConfig):
         )
         print("Starting data exporter (window: data_exporter)...")
         time.sleep(2.0)
+        subprocess.run(
+            ["tmux", "select-window", "-t", f"{SESSION_NAME}:inference"],
+        )
+
+    if uses_base_pose_event_log_window(config) and not config.data_exporter:
         subprocess.run(
             ["tmux", "select-window", "-t", f"{SESSION_NAME}:inference"],
         )
@@ -1156,6 +1283,10 @@ def main(config: InferenceLaunchConfig):
         print("    Window 'data_exporter':")
         print("      Data Exporter (.venv_data_collection)")
         print()
+    if uses_base_pose_event_log_window(config):
+        print("  Window 'yoloe_log':")
+        print("    Live raw_servo_events.jsonl (automatically follows each run)")
+        print()
     print()
     print("  ** deploy.sh (pane 0) is waiting for confirmation --")
     print("     click on pane 0 and press Enter to proceed **")
@@ -1182,6 +1313,7 @@ def main(config: InferenceLaunchConfig):
     print("  Keyboard controls (type in pane 1):")
     print("    p        - Pause / resume inference")
     print("    k        - Start / stop C++ control loop")
+    print("    m        - Cycle SLOW_WALK/WALK/CAREFUL/OBJECT_CARRYING")
     print("    i        - Send initial pose")
     print("    [        - Toggle left hand open/closed (initial pose)")
     print("    ]        - Toggle right hand open/closed (initial pose)")
@@ -1193,7 +1325,7 @@ def main(config: InferenceLaunchConfig):
     print()
     print("  Navigation:")
     print("    Ctrl+b, arrow keys  - Switch between panes")
-    if config.sim or config.data_exporter:
+    if config.sim or config.data_exporter or uses_base_pose_event_log_window(config):
         print("    Ctrl+b, n / p       - Next / previous window")
     print("    Ctrl+b, d           - Detach from session")
     print("    Ctrl+\\              - Kill entire session")

@@ -21,6 +21,7 @@ Keyboard commands (received via ZMQ from the standalone keyboard publisher):
   o  -> switch to PLANNER mode (enables relay of WASD sidecar on :5558)
   i  -> switch to POSE mode (VLA latent actions; relay disabled)
   p  -> pause / resume the policy loop (POSE mode only)
+  m  -> cycle SLOW_WALK, WALK, CAREFUL, and OBJECT_CARRYING
   t  -> change prompt at runtime (publisher sends ``prompt:<text>``)
   [  -> toggle left hand open/closed for initial pose
   ]  -> toggle right hand open/closed for initial pose
@@ -65,7 +66,12 @@ from gear_sonic.utils.teleop.solver.hand.g1_gripper_ik_solver import (
 from gear_sonic.utils.teleop.zmq.zmq_planner_sender import (
     build_command_message,
     build_planner_message,
+    DEFAULT_WALKING_STYLE,
+    describe_walking_style,
+    next_walking_style,
+    override_planner_walking_style,
     pack_pose_message,
+    WalkingStyle,
 )
 
 
@@ -632,6 +638,11 @@ def main(config: InferenceConfig):
     inference_interval = 1.0 / config.rate
 
     zmq_frame_counter = 0
+    planner_walking_style: WalkingStyle = DEFAULT_WALKING_STYLE
+    print_green(
+        f"Planner motion mode (default): "
+        f"{describe_walking_style(planner_walking_style)}"
+    )
 
     PROMPT_MSG_PREFIX = "prompt:"
 
@@ -640,6 +651,7 @@ def main(config: InferenceConfig):
         nonlocal initial_pose_left_hand_closed, initial_pose_right_hand_closed
         nonlocal cached_action_chunk, action_chunk_index, last_inference_time
         nonlocal zmq_frame_counter
+        nonlocal planner_walking_style
 
         key = keyboard_listener.read_msg()
         if key is None:
@@ -663,6 +675,12 @@ def main(config: InferenceConfig):
             print("Keyboard: 'e' (stop recording success -- handled by data exporter)")
         elif key == "f":
             print("Keyboard: 'f' (stop recording failure -- handled by data exporter)")
+        elif key == "m":
+            planner_walking_style = next_walking_style(planner_walking_style)
+            print_green(
+                f"Planner motion mode -> "
+                f"{describe_walking_style(planner_walking_style)}"
+            )
         elif key == "i":
             print("Switch to pose mode")
             zmq_frame_counter = 0
@@ -809,7 +827,11 @@ def main(config: InferenceConfig):
                     pass
 
             if cpp_loop_running and cpp_mode == "PLANNER":
-                _relay_planner_messages(planner_relay_sub, zmq_socket)
+                _relay_planner_messages(
+                    planner_relay_sub,
+                    zmq_socket,
+                    walking_style=planner_walking_style,
+                )
                 print("In Planner mode...", end="", flush=True)
                 _sleep_remaining(t_start, loop_period)
                 print(".", end="", flush=True)
@@ -914,13 +936,16 @@ def main(config: InferenceConfig):
 
 
 def _relay_planner_messages(
-    planner_relay_sub: zmq.Socket, action_pub: zmq.Socket
+    planner_relay_sub: zmq.Socket,
+    action_pub: zmq.Socket,
+    *,
+    walking_style: WalkingStyle = DEFAULT_WALKING_STYLE,
 ) -> int:
-    """Forward all pending planner-sidecar messages from :5558 SUB to :5556 PUB."""
+    """Forward planner messages with the selected walking style enforced."""
     relayed = 0
     while planner_relay_sub.poll(0):
         message = planner_relay_sub.recv(zmq.NOBLOCK)
-        action_pub.send(message)
+        action_pub.send(override_planner_walking_style(message, walking_style))
         relayed += 1
     return relayed
 

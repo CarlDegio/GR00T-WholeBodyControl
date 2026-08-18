@@ -79,7 +79,8 @@ python gear_sonic/scripts/launch_inference.py \
   --planner-input base_pose \
   --base-pose-mode raw_yoloe_servo \
   --base-pose-task "align to the blue basket" \
-  --base-pose-raw-target-distance-m 0.80 \
+  --base-pose-raw-head-target-distance-m 0.90 \
+  --base-pose-raw-chest-target-distance-m 0.80 \
   --base-pose-raw-forward-tolerance-m 0.10 \
   --base-pose-raw-lateral-tolerance-m 0.10 \
   --base-pose-raw-yoloe-model-path \
@@ -97,6 +98,8 @@ python gear_sonic/scripts/launch_inference.py \
   --base-pose-dual-head-camera-stream ego_view \
   --base-pose-dual-chest-camera-stream chest_view \
   --base-pose-dual-chest-camera-pitch-deg -3 \
+  --base-pose-raw-head-target-distance-m 0.90 \
+  --base-pose-raw-chest-target-distance-m 0.80 \
   --base-pose-dual-match-tolerance-frames 30 \
   --base-pose-dual-initialization-grace-s 30 \
   --base-pose-raw-max-run-s 180 \
@@ -145,14 +148,14 @@ horizontal FOV come from the live frame.
 
 After `n`, two independent Codex or Qwen grounding requests run concurrently
 against the same initial RGB image. The task request uses the current raw-servo
-prompt to identify only the primary target. The table request uses exactly the
+prompt to identify only the primary target. The desk request uses exactly the
 single-target prompt from `tools/yoloe26m/auto_refer_detect.py` with its target
-set to `table`, and it preserves every visible table box. Both results must
+set to `desk`, and it preserves every visible desk box. Both results must
 validate before YOLOE or robot motion starts.
 
 That same RGB frame becomes YOLOE's `refer_image`; the boxes are converted to
 original-image pixels and passed in `visual_prompts`, with the primary target
-assigned class `0` and every table box assigned class `1`. The resulting visual
+assigned class `0` and every desk box assigned class `1`. The resulting visual
 embeddings, rather than text-only class embeddings, are installed in YOLOE-26M
 before persistent BoT-SORT tracking begins at `10 Hz`. The primary box controls
 target centering and the eroded target mask provides robust raw-depth range; a
@@ -163,45 +166,86 @@ The bounded controller publishes at `20 Hz` through the existing direct 5558
 relay. Its visual state machine is:
 
 1. `YAW_ALIGN`: rotate from the table edge estimate, with `vx=vy=0` and
-   `|wz|<=0.15 rad/s`.
-2. `VERTICAL_RECENTER`: if the target-box bottom edge rises above `y=75 px`,
-   stop the interrupted command immediately and use only `vx=+0.30 m/s`.
-   Hold zero after the bottom edge reaches `y=110 px` and resume after three
-   recovered visual frames.
-3. `RECENTER`: if the target-box horizontal center crosses the left/right
+   `|wz|<=0.30 rad/s`.
+2. `RECENTER`: if the target-box horizontal center crosses the left/right
    25%/75% visibility guard, stop yaw immediately and use only `vy` until its
    center stays inside the 30--70% recovery band for three visual frames. Then
-   resume the interrupted yaw phase. If both guards trigger, vertical recovery
-   always completes first.
-4. `YAW_TRIM`: enter below 8 degrees, limit `|wz|` to `0.10 rad/s`, and lock
-   yaw after the filtered error remains within 4 degrees for three frames.
-5. `TRANSLATE_TARGET`: hold `wz=0` and issue only one translation axis at a
+   resume the interrupted yaw phase.
+3. `YAW_TRIM`: enter within the configured yaw tolerance, limit `|wz|` to
+   `0.20 rad/s`, and lock yaw after the filtered error remains within that
+   tolerance for three frames.
+4. `TRANSLATE_TARGET`: hold `wz=0` and issue only one translation axis at a
    time. If the filtered lateral error is outside tolerance, use only `vy` to
    center the target; once lateral alignment is inside tolerance, use only
-   `vx` to reach the `0.80 m` standoff. Finish after five stable frames with
-   both errors inside their default `0.10 m` tolerances. The table track is
-   optional in this phase.
+   `vx` to reach the active camera's standoff (`0.90 m` for head and `0.80 m`
+   for chest by default). Finish after five stable frames with
+   both errors inside their default `0.10 m` tolerances and the final yaw
+   error inside the configured tolerance for all five consecutive frames.
+   The table track is optional in this phase.
+
+The target box's vertical image coordinate does not trigger a recovery state,
+motion command, or reference-update pause.
+
+Every nonzero closed-loop yaw command has magnitude at least
+`base_pose_raw_min_yaw_speed_rad_s`, defaulting to `0.10 rad/s`. The launcher
+forwards it as `--raw-min-yaw-speed-rad-s`. Commands reverse through zero so
+neither direction emits a sub-minimum transient. Inside the accepted yaw band,
+the controller holds zero while counting stable frames.
+
+`base_pose_raw_yaw_tolerance_deg` is shared by `YAW_TRIM`,
+`GLOBAL_YAW_ALIGN`, and `TRANSLATE_TARGET`, and defaults to `8.0` degrees. The
+launcher forwards it to the planner as `--raw-yaw-tolerance-deg`.
+
+The coarse and trim yaw limits are independently configurable as
+`base_pose_raw_yaw_coarse_speed_rad_s` and
+`base_pose_raw_yaw_trim_speed_rad_s`, defaulting to `0.30` and `0.20 rad/s`.
+The launcher forwards them as `--raw-yaw-coarse-speed-rad-s` and
+`--raw-yaw-trim-speed-rad-s`. Global yaw correction uses the trim limit.
 
 Whenever translation is nonzero, the controller raises the active axis speed
-to at least `0.30 m/s`; its raw YOLOE commands always satisfy `vx == 0` or
-`vy == 0`. Zero translation and pure-yaw commands are unchanged. Before this
+to at least `base_pose_raw_min_linear_speed_m_s`, which defaults to
+`0.40 m/s`; its raw YOLOE commands always satisfy `vx == 0` or `vy == 0`.
+Zero translation and pure-yaw commands are unchanged. Before this
 minimum-speed scaling, the proportional lateral request is limited by
-`base_pose_raw_max_lateral_speed_m_s`, which defaults to `0.16 m/s`. The final
-relay restores that configured lateral bound for `vy`. The launcher forwards
-the single setting as
-`--raw-max-lateral-speed-m-s` to the planner and
+`base_pose_raw_max_lateral_speed_m_s`, which also defaults to `0.40 m/s`.
+The final relay restores that configured lateral bound for `vy`. The launcher
+forwards `--raw-min-linear-speed-m-s` and
+`--raw-max-lateral-speed-m-s` to the planner, and forwards
 `--max-lateral-speed-m-s` to the relay.
 
-Any required invalid observation commands zero on that same frame. The first
-29 consecutive soft tracking misses keep the current run
-active at zero velocity; the 30th terminates it through the existing
-`tracking lost` stop path. If
-the expected target ID disappears but any class-0 target remains, the worker
-immediately adopts the highest-confidence class-0 ID and records the old/new
-IDs in diagnostics. A true class mismatch with no class-0 target, `Space`, or
-`180 s` of YOLOE detection time stops immediately and requires a new `n`. The
-runtime budget begins when the first dual YOLOE attempt starts detecting, so
-Codex/Qwen grounding does not consume it. A continuous
+During the chest-camera forward approach, crossing the horizontal visibility
+guard no longer pauses longitudinal motion for a pure rotation. The controller
+keeps the current distance-controlled `vx` and adds a fixed-magnitude `wz`
+toward the basket, so the basket is brought back toward the image center while
+the robot continues to approach. The yaw magnitude defaults to `0.30 rad/s`
+and is configurable as
+`base_pose_raw_forward_recenter_yaw_speed_rad_s`, forwarded to the planner as
+`--raw-forward-recenter-yaw-speed-rad-s`. Only the sign changes with the
+left/right image direction; head-camera recenter behavior is unchanged.
+
+Any required invalid observation commands zero on that same frame. In
+single-camera `raw_yoloe_servo`, the first 29 consecutive failures of the
+required target/desk detection or depth geometry keep the current run active
+at zero velocity. Desk is counted only while the current controller phase
+requires it. On the 30th, YOLOE clears its tracking state and switches both
+classes to pure text: `blue basket` for
+class `0` and `desk` for class `1`. The controller remains in its current servo
+phase and the missing-frame counter starts a second 30-frame window.
+
+When both text classes are detected with valid target and desk geometry, their
+boxes on that exact RGB frame immediately rebuild the normal two-class visual
+prompt. Tracking and the every-fifth-frame target-reference updater then resume
+from that visual reference. If the two-text mode instead misses either class or
+valid geometry for 30 consecutive frames, the current navigation terminates.
+The text and reconstructed visual prompt artifacts include the source frame in
+their filenames for audit.
+
+If the expected target ID disappears but any class-0 target remains, the
+worker immediately adopts the highest-confidence class-0 ID and records the
+old/new IDs in diagnostics. A true class mismatch with no class-0 target,
+`Space`, or `180 s` of YOLOE detection time stops immediately and requires a
+new `n`. The runtime budget begins when the first YOLOE attempt starts
+detecting, so Codex/Qwen grounding does not consume it. A continuous
 tracking gap over `0.4 s` instead enters a recoverable soft-stale hold: the
 runtime keeps the generation active, publishes zero velocity, and resumes on
 the first fresh valid observation. An observation already more than `0.4 s`
@@ -222,7 +266,7 @@ by SONIC Planner and the whole-body controller.
 In `dual_raw_yoloe_servo`, the initial head and chest RGB frames are grounded
 at the same time. Each camera runs independent target and table requests, so
 one failed view does not discard the other. A view is initially eligible only
-when both target and table boxes validate. Head is selected when both views are
+when both target and desk boxes validate. Head is selected when both views are
 eligible; otherwise the eligible view starts the workflow.
 
 Each camera grounding runs in its own process. Once either view becomes
@@ -231,30 +275,56 @@ not return in that grace period, its complete process group is terminated and
 the eligible view starts YOLOE immediately. Configure this with
 `base_pose_dual_initialization_grace_s`.
 
-For each active YOLOE attempt, a valid frame requires the target, table, target
-depth geometry, and table-edge depth geometry together. A successful complete
+For each active YOLOE attempt, a valid frame requires the target, desk, target
+depth geometry, and desk-edge depth geometry together. A successful complete
 frame resets the failover cycle and permits later switching in either
 direction. Every fifth complete frame is considered for an atomic
 `LatestReference` update containing a copy of that same RGB image, target box,
-and the table box whose geometry validated. The two cameras keep independent
+and the desk box whose geometry validated. The two cameras keep independent
 latest-reference gates.
 
-Each matching stage tolerates 30 consecutive invalid frames. On the 30th, the
-runtime immediately publishes zero velocity, remains in Planner mode, resets
-YOLOE and the controller to `YAW_ALIGN`, and advances without changing the
-navigation generation:
+The accepted frame indices are `5, 10, 15, ...`, exactly matching the saved
+`review_samples/raw` cadence. An independent YOLOE encoder validates the new
+target and desk visual embeddings off the servo thread. The active tracker
+installs both embeddings atomically in visual mode. In `origin_text` it updates
+only the visual desk embedding; `alternate_text` keeps both classes text-only
+for that entire attempt. BoT-SORT state and controller state are kept, and a
+successful installation changes the attempt's diagnostic `reference_kind` to
+`latest`.
 
-1. Switch from camera A to camera B. Use B's successful initial RGB/boxes when
-   available; otherwise use A's initial RGB/boxes as a cross-camera reference.
-2. If B also fails, switch back to A and use A's latest coherent reference,
-   falling back to A's initial reference when no latest reference exists.
-3. Only if this A retry also fails for 30 consecutive frames does the current
-   navigation terminate.
+Each YOLOE detection stage tolerates 30 consecutive invalid frames. On the
+30th, the runtime immediately publishes zero velocity, remains in Planner
+mode, resets YOLOE and the controller, and advances without changing the
+navigation generation. Camera A is the camera used by the attempt that just
+failed; camera B is the other camera. The bounded order is:
 
-The same three-stage cycle can start again after any intervening success. Old
-or future-attempt events cannot resume motion. The navigation-wide timeout
-starts when the first YOLOE detection attempt begins, defaults to 180 seconds,
-and is not extended by camera switches.
+1. Stay on A for `origin_text`: class `0` uses the target text embedding and
+   class `1` uses A's visual desk embedding.
+2. If that fails, stay on A for `origin_qwen`. Capture one new A frame and run
+   the exact same target and desk grounding prompts used at initial setup with
+   `qwen3-vl-8b-instruct`. The returned target and desk boxes become a new
+   two-class YOLOE visual prompt, followed by another 30-frame detection window.
+3. If the Qwen call fails, or the resulting YOLOE attempt fails, switch to B
+   for `alternate_text`. Both the target and `desk` use YOLOE text embeddings;
+   no visual desk box is installed during this stage.
+4. If that fails, stay on B for `alternate_qwen`. Capture one new B frame,
+   re-run the same Qwen grounding round, install its boxes as the two visual
+   prompts, and allow the final 30-frame detection window.
+5. If the Qwen call or YOLOE detection fails again, terminate the current
+   navigation.
+
+A Qwen API/validation failure advances immediately rather than consuming a
+30-frame YOLOE window. The fallback model is configurable through
+`base_pose_dual_qwenvl_fallback_model` / `--dual-qwenvl-fallback-model`; its
+default is `qwen3-vl-8b-instruct`. Credentials continue to come from
+`DASHSCOPE_API_KEY` in the environment or `.venv_inference/.env` and are never
+written to run artifacts.
+
+The same four-stage recovery cycle starts from whichever camera most recently
+produced a successful complete frame. Old or future-attempt events cannot
+resume motion. The navigation-wide timeout starts when the first YOLOE
+detection attempt begins, defaults to 180 seconds, and is not extended by
+camera switches.
 
 The symmetric horizontal intervals are launch parameters. Set
 `base_pose_raw_horizontal_guard_fraction` for entry and
@@ -272,6 +342,27 @@ forwards them as `--raw-forward-tolerance-m` and
 `--raw-lateral-tolerance-m`. Each value must be finite and strictly positive.
 The controller uses the configured values for both the velocity deadbands and
 the five-consecutive-frame completion test.
+
+The longitudinal arrival distance is configured independently for each camera:
+
+- launcher: `base_pose_raw_head_target_distance_m` (default `0.90 m`) and
+  `base_pose_raw_chest_target_distance_m` (default `0.80 m`);
+- direct `base_pose_planner.py`: `--raw-head-target-distance-m` and
+  `--raw-chest-target-distance-m`.
+
+In dual-camera mode the runtime selects the corresponding value whenever the
+active YOLOE camera changes. Single-camera `raw_yoloe_servo` uses the head value
+by default; if its configured stream is the chest stream, it uses the chest
+value.
+
+After those five frames and the final yaw check pass, the runtime immediately
+publishes zero-velocity `stop` messages and enters `post_stop_sampling`.
+For `3.0 s` by default it keeps the active camera and YOLOE tracker running
+at the normal detector rate, updates heading and visual errors, and never
+issues a nonzero command or starts camera failover. Only after this window
+does it write `finished` with `reason=aligned`. Configure the duration with
+`base_pose_raw_post_stop_sample_s` / `--raw-post-stop-sample-s`; set it to
+`0` to retain immediate completion.
 
 ## Operator state machine
 
@@ -308,6 +399,13 @@ newer frame, cancellation, or shutdown remains in the log with
 `control_applied=false` and null controller/command metadata. Every fifth frame
 still saves an unannotated RGB PNG and separate target/table mask PNGs under
 `review_samples/`.
+Successful table-edge estimates also record `line_endpoints_xy_m` and
+`line_endpoints_px` under `geometry.table`. For sampled frames, the diagnostic
+thread writes a separate `*_table_edge.png` image with a red selected edge and
+yellow endpoints over the white table mask. The original binary `*_table.png`
+remains unchanged for replay and machine processing; overlay rendering and PNG
+I/O never run on the servo control path.
+
 
 In raw mode, each applied frame also receives a top-level `orientation` object
 from the relay's `g1_debug.base_quat` sample and its exact integrated SONIC
@@ -329,6 +427,15 @@ launcher uses `base_pose_orientation_telemetry_port=5565` by default and only
 opens this side channel for `base_pose_mode=raw_yoloe_servo` or
 `base_pose_mode=dual_raw_yoloe_servo`.
 
+Applied frame records also expose `visual_yaw_error_rad`,
+`desired_heading_rad`, `heading_setpoint_error_rad`, `yaw_error_source`, and
+`yaw_error_trusted` inside `controller`. During `post_stop_sampling`,
+`post_stop_elapsed_s`, total/valid/invalid sample counts, and the configured
+duration are updated on every frame. `raw_servo_events.jsonl` writes an
+explicit `post_stop_sampling_started` event and copies the final counts into
+the later `finished` event, so stopped-pose drift can be measured without
+inferring the window from timestamps.
+
 Dual runs also write `initial_reference_summary.json`, per-camera initial RGB-D
 and grounding outputs, and the attempt provenance fields `camera_stream`,
 `attempt_id`, `failover_stage`, `reference_source_stream`, and
@@ -343,6 +450,24 @@ runtime emits one warning and disables diagnostics for that generation without
 terminating robot control. Global cancellation/failure events that occur before
 a request directory is known are appended to
 `outputs/base_pose_adjustment/runtime_events.jsonl`.
+
+For both raw YOLOE modes, every successfully written
+`raw_servo_events.jsonl` record is also printed as the exact same JSON line in
+the Base Pose planner bash pane. When launched through `launch_inference.py`, a
+second tmux window named `yoloe_log` also follows the current run and
+automatically switches to the next `gN` run. Use `Ctrl+b, n` or `Ctrl+b, p` to
+move between the inference and live-log windows.
+
+After an idle `N` request is accepted, Base Pose opens one OpenCV window named
+`Base Pose Cameras` containing only the configured head and chest RGB streams.
+The viewer runs as a separate process with `.venv_teleop/bin/python`, whose
+OpenCV build includes the Qt GUI backend; the planner itself continues to run in
+`.venv_inference`. The existing `launch_inference` command does not change.
+The viewer closes when navigation completes, is cancelled, or the planner exits;
+a busy/repeated `N` never creates a duplicate process. Set
+`base_pose_raw_live_camera_viewer=false` (or pass
+`--no-raw-live-camera-viewer` directly to `base_pose_planner.py`) for headless
+runs.
 
 For lightweight offline review, raw YOLOE runs also sample review artifacts in
 this per-run layout:

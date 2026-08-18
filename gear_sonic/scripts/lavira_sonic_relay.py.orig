@@ -27,7 +27,7 @@ from gear_sonic.utils.teleop.zmq.zmq_planner_sender import (
 
 
 COMMAND_MESSAGE_TYPE = "navila_reasan_velocity_command"
-DEFAULT_MAX_LATERAL_SPEED_M_S = 0.40
+DEFAULT_MAX_LATERAL_SPEED_M_S = 0.16
 COMMAND_LOWER = np.array(
     [-0.5, -DEFAULT_MAX_LATERAL_SPEED_M_S, -1.0], dtype=np.float32
 )

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 from pathlib import Path
 import sys
 import types
@@ -76,6 +77,65 @@ def test_non_raw_base_pose_does_not_launch_base_keyboard_in_pane(
     assert calls == []
 
 
+def test_raw_yoloe_launches_live_event_log_window(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[list[str]] = []
+    monkeypatch.setattr(
+        launch_inference.subprocess,
+        "run",
+        lambda command, **_kwargs: calls.append(command),
+    )
+    config = InferenceLaunchConfig(
+        planner_input="base_pose",
+        base_pose_mode="raw_yoloe_servo",
+        base_pose_output_root="outputs/custom base pose",
+    )
+
+    launch_inference._launch_base_pose_event_log_window(
+        config, Path("/workspace/sonic")
+    )
+
+    assert calls[0] == [
+        "tmux",
+        "new-window",
+        "-t",
+        launch_inference.SESSION_NAME,
+        "-n",
+        "yoloe_log",
+    ]
+    assert calls[1][:4] == [
+        "tmux",
+        "send-keys",
+        "-t",
+        f"{launch_inference.SESSION_NAME}:yoloe_log",
+    ]
+    assert calls[1][4] == (
+        "cd /workspace/sonic && .venv_inference/bin/python "
+        "gear_sonic/scripts/follow_base_pose_servo_events.py "
+        "--output-root 'outputs/custom base pose'"
+    )
+    assert calls[1][5] == "C-m"
+
+
+def test_non_raw_mode_does_not_launch_live_event_log_window(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[list[str]] = []
+    monkeypatch.setattr(
+        launch_inference.subprocess,
+        "run",
+        lambda command, **_kwargs: calls.append(command),
+    )
+
+    launch_inference._launch_base_pose_event_log_window(
+        InferenceLaunchConfig(planner_input="base_pose", base_pose_mode="rgb"),
+        Path("/workspace/sonic"),
+    )
+
+    assert calls == []
+
+
 def test_main_routes_raw_yoloe_keyboard_to_visible_pane_five(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -134,3 +194,15 @@ def test_main_routes_raw_yoloe_keyboard_to_visible_pane_five(
         for command in subprocess_calls
         for argument in command
     )
+
+    publisher_pane, publisher_command, _ = next(
+        call for call in pane_calls if "base64.b64decode" in call[1]
+    )
+    encoded = publisher_command.split("base64.b64decode('", 1)[1].split("')", 1)[0]
+    publisher_script = base64.b64decode(encoded).decode()
+    compile(publisher_script, "<keyboard_publisher>", "exec")
+
+    assert publisher_pane == "%1"
+    assert "m=next motion mode (4 selected styles)" in publisher_script
+    assert "Current planner motion mode:" in publisher_script
+    assert "describe_walking_style(motion_mode)" in publisher_script

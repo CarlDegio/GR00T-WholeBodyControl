@@ -164,7 +164,11 @@ class InferenceLaunchConfig:
     """SONIC planner command source used in pane 3."""
 
     base_pose_mode: Literal[
-        "rgb", "rgbd", "rgb_depth_query", "raw_yoloe_servo"
+        "rgb",
+        "rgbd",
+        "rgb_depth_query",
+        "raw_yoloe_servo",
+        "dual_raw_yoloe_servo",
     ] = "rgb"
     """Head-vision input experiment used by the base-pose planner."""
 
@@ -218,6 +222,39 @@ class InferenceLaunchConfig:
     base_pose_camera_yaw_deg: float = 0.0
     """Approximate head-camera yaw relative to the robot body."""
 
+    base_pose_dual_head_camera_stream: str = "ego_view"
+    """Head RGB-D stream used by dual raw YOLOE."""
+
+    base_pose_dual_chest_camera_stream: str = "chest_view"
+    """Chest RGB-D stream used by dual raw YOLOE."""
+
+    base_pose_dual_chest_camera_height_m: float = 1.0
+    """Chest camera optical-center height above the ground (m)."""
+
+    base_pose_dual_chest_camera_pitch_deg: float = -3.0
+    """Chest camera pitch under the positive-upward convention."""
+
+    base_pose_dual_chest_camera_roll_deg: float = 0.0
+    """Chest camera roll relative to the robot body."""
+
+    base_pose_dual_chest_camera_yaw_deg: float = 0.0
+    """Chest camera yaw relative to the robot body."""
+
+    base_pose_dual_chest_camera_forward_offset_m: float = 0.0
+    """Chest optical-center forward offset from the base."""
+
+    base_pose_dual_chest_camera_lateral_offset_m: float = 0.0
+    """Chest optical-center lateral offset from the base."""
+
+    base_pose_dual_match_tolerance_frames: int = 30
+    """Consecutive invalid YOLOE frames allowed per dual-camera attempt."""
+
+    base_pose_dual_initialization_grace_s: float = 30.0
+    """Wait for the second dual-camera grounding result after one succeeds."""
+
+    base_pose_dual_qwenvl_fallback_model: str = "qwen3-vl-8b-instruct"
+    """Qwen model used to re-ground a failed camera's current frame."""
+
     base_pose_raw_yoloe_model_path: str = (
         "tools/yoloe26m/weights/yoloe-26m-seg.pt"
     )
@@ -232,8 +269,29 @@ class InferenceLaunchConfig:
     base_pose_raw_lateral_tolerance_m: float = 0.10
     """Raw-servo lateral completion tolerance in meters."""
 
-    base_pose_raw_max_lateral_speed_m_s: float = 0.16
+    base_pose_raw_min_linear_speed_m_s: float = 0.40
+    """Minimum nonzero raw-servo translation speed in m/s."""
+
+    base_pose_raw_max_lateral_speed_m_s: float = 0.40
     """Maximum raw-servo request and final relay lateral speed in m/s."""
+
+    base_pose_raw_min_yaw_speed_rad_s: float = 0.10
+    """Minimum nonzero closed-loop raw-servo yaw speed in rad/s."""
+
+    base_pose_raw_yaw_tolerance_deg: float = 8.0
+    """Shared yaw tolerance for trim, global alignment, and final completion."""
+
+    base_pose_raw_yaw_coarse_speed_rad_s: float = 0.30
+    """Maximum raw-servo coarse yaw speed in rad/s."""
+
+    base_pose_raw_yaw_trim_speed_rad_s: float = 0.20
+    """Maximum raw-servo trim/global-correction yaw speed in rad/s."""
+
+    base_pose_raw_forward_recenter_yaw_speed_rad_s: float = 0.30
+    """Chest forward-recenter yaw speed magnitude in rad/s."""
+
+    base_pose_raw_live_camera_viewer: bool = True
+    """Open a head/chest RGB window while an N-triggered raw run is active."""
 
     base_pose_raw_horizontal_guard_fraction: float = 0.25
     """Raw-servo side protection margin; 0.25 means enter outside 25--75%."""
@@ -241,11 +299,20 @@ class InferenceLaunchConfig:
     base_pose_raw_horizontal_recovery_fraction: float = 0.30
     """Raw-servo recovery margin; 0.30 means resume inside 30--70%."""
 
+    base_pose_raw_max_run_s: float = 180.0
+    """Maximum raw-servo runtime after YOLOE detection begins."""
+
+    base_pose_raw_post_stop_sample_s: float = 3.0
+    """Zero-command heading and visual-error sampling after alignment."""
+
+    base_pose_raw_allow_missing_table: Literal[0, 1] = 0
+    """Set to 1 to make table detection optional after raw-servo initialization."""
+
     base_pose_orientation_telemetry_port: int = 5565
     """Local relay-to-raw-servo measured-yaw telemetry port."""
 
     base_pose_manual_keyboard_port: int = 5566
-    """Exclusive raw-YOLOE manual keyboard publisher port."""
+    """Key-triggered raw-YOLOE manual keyboard publisher port."""
 
     base_pose_depth_port: int = 5564
     """Local pure LingBot RGB-D stream used by the two depth modes."""
@@ -400,7 +467,16 @@ def uses_reasan_avoidance(config: InferenceLaunchConfig) -> bool:
 def uses_base_pose_manual_keyboard(config: InferenceLaunchConfig) -> bool:
     return (
         config.planner_input == "base_pose"
-        and config.base_pose_mode == "raw_yoloe_servo"
+        and config.base_pose_mode
+        in {"raw_yoloe_servo", "dual_raw_yoloe_servo"}
+    )
+
+
+def uses_base_pose_event_log_window(config: InferenceLaunchConfig) -> bool:
+    return (
+        config.planner_input == "base_pose"
+        and config.base_pose_mode
+        in {"raw_yoloe_servo", "dual_raw_yoloe_servo"}
     )
 
 
@@ -418,6 +494,18 @@ def build_base_pose_manual_keyboard_command(
     )
 
 
+def build_base_pose_event_log_command(
+    config: InferenceLaunchConfig,
+    repo_root: Path,
+) -> str:
+    return (
+        f"cd {shlex.quote(str(repo_root))} && "
+        ".venv_inference/bin/python "
+        "gear_sonic/scripts/follow_base_pose_servo_events.py "
+        f"--output-root {shlex.quote(config.base_pose_output_root)}"
+    )
+
+
 def _base_pose_planner_command(config: InferenceLaunchConfig, repo_root: Path) -> str:
     task = config.base_pose_task.strip() or config.prompt.strip()
     quoted_root = shlex.quote(str(repo_root))
@@ -430,6 +518,36 @@ def _base_pose_planner_command(config: InferenceLaunchConfig, repo_root: Path) -
             f"{config.base_pose_qwenvl_thinking_budget} "
         )
     codex_fast = "" if config.base_pose_codex_fast else "--no-codex-fast "
+    live_camera_viewer = (
+        "" if config.base_pose_raw_live_camera_viewer
+        else "--no-raw-live-camera-viewer "
+    )
+    dual_camera = ""
+    if config.base_pose_mode == "dual_raw_yoloe_servo":
+        dual_camera = (
+            f"--dual-head-camera-stream "
+            f"{shlex.quote(config.base_pose_dual_head_camera_stream)} "
+            f"--dual-chest-camera-stream "
+            f"{shlex.quote(config.base_pose_dual_chest_camera_stream)} "
+            f"--dual-chest-camera-height-m "
+            f"{config.base_pose_dual_chest_camera_height_m} "
+            f"--dual-chest-camera-pitch-deg "
+            f"{config.base_pose_dual_chest_camera_pitch_deg} "
+            f"--dual-chest-camera-roll-deg "
+            f"{config.base_pose_dual_chest_camera_roll_deg} "
+            f"--dual-chest-camera-yaw-deg "
+            f"{config.base_pose_dual_chest_camera_yaw_deg} "
+            f"--dual-chest-camera-forward-offset-m "
+            f"{config.base_pose_dual_chest_camera_forward_offset_m} "
+            f"--dual-chest-camera-lateral-offset-m "
+            f"{config.base_pose_dual_chest_camera_lateral_offset_m} "
+            f"--dual-match-tolerance-frames "
+            f"{config.base_pose_dual_match_tolerance_frames} "
+            f"--dual-initialization-grace-s "
+            f"{config.base_pose_dual_initialization_grace_s} "
+            f"--dual-qwenvl-fallback-model "
+            f"{shlex.quote(config.base_pose_dual_qwenvl_fallback_model)} "
+        )
     planner = (
         ".venv_inference/bin/python gear_sonic/scripts/base_pose_planner.py "
         f"--task {shlex.quote(task)} "
@@ -456,6 +574,7 @@ def _base_pose_planner_command(config: InferenceLaunchConfig, repo_root: Path) -
         f"--vertical-fov-deg {config.base_pose_vertical_fov_deg} "
         f"--camera-forward-offset-m {config.base_pose_camera_forward_offset_m} "
         f"--camera-lateral-offset-m {config.base_pose_camera_lateral_offset_m} "
+        f"{dual_camera}"
         f"--depth-visual-max-m {config.base_pose_depth_visual_max_m} "
         f"--codex-timeout-seconds {config.base_pose_codex_timeout_seconds} "
         f"--output-root {shlex.quote(config.base_pose_output_root)} "
@@ -466,16 +585,37 @@ def _base_pose_planner_command(config: InferenceLaunchConfig, repo_root: Path) -
         f"{config.base_pose_raw_forward_tolerance_m} "
         f"--raw-lateral-tolerance-m "
         f"{config.base_pose_raw_lateral_tolerance_m} "
+        f"--raw-min-linear-speed-m-s "
+        f"{config.base_pose_raw_min_linear_speed_m_s} "
         f"--raw-max-lateral-speed-m-s "
         f"{config.base_pose_raw_max_lateral_speed_m_s} "
+        f"--raw-min-yaw-speed-rad-s "
+        f"{config.base_pose_raw_min_yaw_speed_rad_s} "
+        f"--raw-yaw-tolerance-deg "
+        f"{config.base_pose_raw_yaw_tolerance_deg} "
+        f"--raw-yaw-coarse-speed-rad-s "
+        f"{config.base_pose_raw_yaw_coarse_speed_rad_s} "
+        f"--raw-yaw-trim-speed-rad-s "
+        f"{config.base_pose_raw_yaw_trim_speed_rad_s} "
+        f"--raw-forward-recenter-yaw-speed-rad-s "
+        f"{config.base_pose_raw_forward_recenter_yaw_speed_rad_s} "
+        f"{live_camera_viewer}"
         f"--raw-horizontal-guard-fraction "
         f"{config.base_pose_raw_horizontal_guard_fraction} "
         f"--raw-horizontal-recovery-fraction "
         f"{config.base_pose_raw_horizontal_recovery_fraction} "
+        f"--raw-max-run-s {config.base_pose_raw_max_run_s} "
+        f"--raw-post-stop-sample-s {config.base_pose_raw_post_stop_sample_s} "
+        f"--raw-allow-missing-table "
+        f"{config.base_pose_raw_allow_missing_table} "
         f"--raw-orientation-telemetry-source "
         f"tcp://127.0.0.1:{config.base_pose_orientation_telemetry_port}"
     )
-    if config.base_pose_mode in {"rgb", "raw_yoloe_servo"}:
+    if config.base_pose_mode in {
+        "rgb",
+        "raw_yoloe_servo",
+        "dual_raw_yoloe_servo",
+    }:
         return (
             f"cd {quoted_root} && "
             f"{planner} --camera-host {shlex.quote(config.camera_host)} "
@@ -575,7 +715,8 @@ def build_reasan_planner_command(config: InferenceLaunchConfig, repo_root: Path)
         orientation_telemetry = (
             f" --orientation-telemetry-output "
             f"'tcp://*:{config.base_pose_orientation_telemetry_port}'"
-            if config.base_pose_mode == "raw_yoloe_servo"
+            if config.base_pose_mode
+            in {"raw_yoloe_servo", "dual_raw_yoloe_servo"}
             else ""
         )
         manual_source = (
@@ -651,7 +792,8 @@ def _check_prerequisites(config: InferenceLaunchConfig):
                 "--base-pose-task or --prompt is required when --planner-input base_pose"
             )
         if (
-            config.base_pose_mode not in {"rgb", "raw_yoloe_servo"}
+            config.base_pose_mode
+            not in {"rgb", "raw_yoloe_servo", "dual_raw_yoloe_servo"}
             and not (repo_root / ".venv_lingbot_depth" / "bin" / "python").exists()
         ):
             errors.append(
@@ -838,6 +980,30 @@ def _launch_base_pose_manual_keyboard_pane(
     )
 
 
+def _launch_base_pose_event_log_window(
+    config: InferenceLaunchConfig,
+    repo_root: Path,
+) -> None:
+    if not uses_base_pose_event_log_window(config):
+        return
+    subprocess.run(
+        ["tmux", "new-window", "-t", SESSION_NAME, "-n", "yoloe_log"],
+        check=True,
+    )
+    subprocess.run(
+        [
+            "tmux",
+            "send-keys",
+            "-t",
+            f"{SESSION_NAME}:yoloe_log",
+            build_base_pose_event_log_command(config, repo_root),
+            "C-m",
+        ],
+        check=True,
+    )
+    print("Starting live YOLOE servo event log (window: yoloe_log)...")
+
+
 def main(config: InferenceLaunchConfig):
     repo_root = Path(__file__).resolve().parent.parent.parent
 
@@ -942,11 +1108,22 @@ def main(config: InferenceLaunchConfig):
     keyboard_script = textwrap.dedent(
         """\
         import zmq, time
+        from gear_sonic.utils.teleop.zmq.zmq_planner_sender import (
+            DEFAULT_WALKING_STYLE,
+            describe_walking_style,
+            next_walking_style,
+        )
         ctx = zmq.Context()
         pub = ctx.socket(zmq.PUB)
         pub.bind('tcp://localhost:5580')
         time.sleep(0.5)
-        print('Keyboard publisher ready. Keys: p=pause, k=start/stop, i=pose mode, o=planner mode, [/]=toggle hands, t=prompt')
+        motion_mode = DEFAULT_WALKING_STYLE
+        print(
+            'Keyboard publisher ready. Keys: p=pause, k=start/stop, '
+            'm=next motion mode (4 selected styles), i=pose mode, o=planner mode, '
+            '[/]=toggle hands, t=prompt'
+        )
+        print('Current planner motion mode: ' + describe_walking_style(motion_mode))
         while True:
             key = input()
             if key.startswith('t '):
@@ -954,7 +1131,14 @@ def main(config: InferenceLaunchConfig):
                 print('Sent prompt: ' + key[2:])
             else:
                 pub.send_string(key)
-                print('Sent: ' + key)
+                if key == 'm':
+                    motion_mode = next_walking_style(motion_mode)
+                    print(
+                        'Sent: m | Current planner motion mode: '
+                        + describe_walking_style(motion_mode)
+                    )
+                else:
+                    print('Sent: ' + key)
     """
     )
     encoded = base64.b64encode(keyboard_script.encode()).decode()
@@ -997,12 +1181,18 @@ def main(config: InferenceLaunchConfig):
         if uses_reasan_avoidance(config):
             print("Starting MID-360 ActorRay publisher (pane 5)...")
             _send_to_pane(pane_ids[5], radar_cmd, wait=2.0)
+        elif uses_base_pose_manual_keyboard(config):
+            _launch_base_pose_manual_keyboard_pane(
+                config,
+                repo_root,
+                pane_ids[5],
+            )
         elif config.planner_input == "base_pose":
             print("Base-pose direct relay selected; MID-360 pane left idle.")
         else:
             print("REASEN avoidance disabled; MID-360 pane left idle.")
 
-    _launch_base_pose_manual_keyboard_window(config, repo_root)
+    _launch_base_pose_event_log_window(config, repo_root)
 
     if config.data_exporter:
         subprocess.run(
@@ -1037,6 +1227,11 @@ def main(config: InferenceLaunchConfig):
             ["tmux", "select-window", "-t", f"{SESSION_NAME}:inference"],
         )
 
+    if uses_base_pose_event_log_window(config) and not config.data_exporter:
+        subprocess.run(
+            ["tmux", "select-window", "-t", f"{SESSION_NAME}:inference"],
+        )
+
     print()
     print("=" * 60)
     print("  All components launched!")
@@ -1065,22 +1260,26 @@ def main(config: InferenceLaunchConfig):
     if uses_reasan_avoidance(config):
         print("    Pane 4: REASEN Rule-Based Safety Planner")
         print("    Pane 5: MID-360 ActorRay/IMU")
+    elif uses_base_pose_manual_keyboard(config):
+        print("    Pane 4: Stateless Base-Pose-to-SONIC Relay")
+        print("    Pane 5: Key-triggered BasePose Keyboard")
+        print(
+            "            W/S forward/back | A/D lateral | Q/E yaw | "
+            "Space stop | 0.5 s override | X exit"
+        )
     elif config.planner_input == "base_pose":
         print("    Pane 4: Stateless Base-Pose-to-SONIC Relay")
         print("    Pane 5: Idle (base_pose does not use MID-360/REASAN)")
     else:
         print("    Pane 4: Direct LaViRA-to-SONIC Relay")
         print("    Pane 5: Idle (REASEN/MID-360 disabled)")
-    if uses_base_pose_manual_keyboard(config):
-        print()
-        print("  Window 'base_keyboard':")
-        print(
-            "    W/S forward/back | A/D lateral | Q/E yaw | "
-            "Space stop | keys override YOLOE for 0.5 s | X exit"
-        )
     if config.data_exporter:
         print("    Window 'data_exporter':")
         print("      Data Exporter (.venv_data_collection)")
+        print()
+    if uses_base_pose_event_log_window(config):
+        print("  Window 'yoloe_log':")
+        print("    Live raw_servo_events.jsonl (automatically follows each run)")
         print()
     print()
     print("  ** deploy.sh (pane 0) is waiting for confirmation --")
@@ -1090,7 +1289,7 @@ def main(config: InferenceLaunchConfig):
     if uses_base_pose_manual_keyboard(config):
         print("    1. In pane 1: k starts the C++ loop in PLANNER mode")
         print("    2. In pane 3: N starts raw YOLOE")
-        print("    3. base_keyboard stays idle until you press W/S/A/D/Q/E")
+        print("    3. Pane 5 stays idle until you press W/S/A/D/Q/E")
         print("    4. Each key overrides YOLOE for 0.5 s, then YOLOE resumes")
         print("    5. Space stops for 0.5 s; X exits the keyboard source")
     elif config.planner_input == "base_pose":
@@ -1108,6 +1307,7 @@ def main(config: InferenceLaunchConfig):
     print("  Keyboard controls (type in pane 1):")
     print("    p        - Pause / resume inference")
     print("    k        - Start / stop C++ control loop")
+    print("    m        - Cycle SLOW_WALK/WALK/CAREFUL/OBJECT_CARRYING")
     print("    i        - Send initial pose")
     print("    [        - Toggle left hand open/closed (initial pose)")
     print("    ]        - Toggle right hand open/closed (initial pose)")
@@ -1119,7 +1319,7 @@ def main(config: InferenceLaunchConfig):
     print()
     print("  Navigation:")
     print("    Ctrl+b, arrow keys  - Switch between panes")
-    if config.sim or config.data_exporter or uses_base_pose_manual_keyboard(config):
+    if config.sim or config.data_exporter or uses_base_pose_event_log_window(config):
         print("    Ctrl+b, n / p       - Next / previous window")
     print("    Ctrl+b, d           - Detach from session")
     print("    Ctrl+\\              - Kill entire session")

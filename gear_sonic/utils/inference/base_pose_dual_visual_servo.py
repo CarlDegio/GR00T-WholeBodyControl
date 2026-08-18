@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 import math
 import multiprocessing
@@ -33,6 +33,9 @@ from gear_sonic.utils.inference.base_pose_visual_servo import (
     RawServoCalibration,
     TrackedInstance,
     YoloePersistentTracker,
+    YoloeTargetReferenceEncoder,
+    bbox_iou,
+    normalized_bbox_to_pixels,
     _diagnostic_frame,
     _observation,
     _publish_worker_event,
@@ -43,6 +46,9 @@ from gear_sonic.utils.inference.base_pose_visual_servo import (
 from gear_sonic.utils.inference.base_pose_visual_servo_diagnostics import (
     AsyncFrameDiagnosticsWriter,
 )
+
+
+DEFAULT_DUAL_QWEN_FALLBACK_MODEL = "qwen3-vl-8b-instruct"
 
 
 def _reference_bbox(
@@ -94,8 +100,8 @@ class DualCameraReference:
         if not math.isfinite(timestamp):
             raise ValueError("reference camera_timestamp must be finite")
         kind = str(self.kind)
-        if kind not in {"initial", "latest"}:
-            raise ValueError("reference kind must be initial or latest")
+        if kind not in {"initial", "latest", "qwen"}:
+            raise ValueError("reference kind must be initial, latest, or qwen")
         object.__setattr__(self, "stream_name", stream_name)
         object.__setattr__(self, "rgb", rgb.copy())
         object.__setattr__(self, "target_prompt", target_prompt)
@@ -133,7 +139,6 @@ class DualCameraFailoverCoordinator:
                 raise ValueError("initial reference bank only accepts initial references")
         self.stream_names = names
         self.initial_references = initial
-        self.latest_references: dict[str, DualCameraReference] = {}
         self._next_attempt_id = 1
         self._active_attempt_id: int | None = None
 
@@ -168,13 +173,6 @@ class DualCameraFailoverCoordinator:
                 )
         raise RuntimeError("neither camera has a valid initial reference")
 
-    def save_latest(self, reference: DualCameraReference) -> None:
-        if reference.stream_name not in self.stream_names:
-            raise ValueError("latest reference belongs to an unknown stream")
-        if reference.kind != "latest":
-            raise ValueError("latest reference bank only accepts latest references")
-        self.latest_references[reference.stream_name] = reference
-
     def mark_success(self, attempt: DualCameraAttempt) -> None:
         if attempt.live_stream not in self.stream_names:
             raise ValueError("successful attempt belongs to an unknown stream")
@@ -187,38 +185,54 @@ class DualCameraFailoverCoordinator:
             return self.stream_names[0]
         raise ValueError("attempt belongs to an unknown stream")
 
+    def _initial_reference(self, stream_name: str) -> DualCameraReference:
+        other = self._other(stream_name)
+        reference = self.initial_references.get(stream_name)
+        if reference is None:
+            reference = self.initial_references.get(other)
+        if reference is None:
+            raise RuntimeError("neither camera has an initial reference")
+        return reference
+
     def advance_after_failure(
         self,
         attempt: DualCameraAttempt,
     ) -> DualCameraAttempt | None:
         if self._active_attempt_id == attempt.attempt_id or attempt.stage == "initial":
             origin = attempt.live_stream
-            alternate = self._other(origin)
-            reference = self.initial_references.get(alternate)
-            if reference is None:
-                reference = self.initial_references.get(origin)
-            if reference is None:
-                return None
-            return self._attempt(
-                alternate,
-                reference,
-                stage="alternate_initial",
-                origin_stream=origin,
-            )
-        if attempt.stage == "alternate_initial":
-            origin = attempt.origin_stream
-            reference = self.latest_references.get(origin)
-            if reference is None:
-                reference = self.initial_references.get(origin)
-            if reference is None:
-                return None
             return self._attempt(
                 origin,
-                reference,
-                stage="origin_latest",
+                self._initial_reference(origin),
+                stage="origin_text",
                 origin_stream=origin,
             )
-        if attempt.stage == "origin_latest":
+        if attempt.stage == "origin_text":
+            origin = attempt.origin_stream
+            return self._attempt(
+                origin,
+                self._initial_reference(origin),
+                stage="origin_qwen",
+                origin_stream=origin,
+            )
+        if attempt.stage == "origin_qwen":
+            origin = attempt.origin_stream
+            alternate = self._other(origin)
+            return self._attempt(
+                alternate,
+                self._initial_reference(alternate),
+                stage="alternate_text",
+                origin_stream=origin,
+            )
+        if attempt.stage == "alternate_text":
+            origin = attempt.origin_stream
+            alternate = self._other(origin)
+            return self._attempt(
+                alternate,
+                self._initial_reference(alternate),
+                stage="alternate_qwen",
+                origin_stream=origin,
+            )
+        if attempt.stage == "alternate_qwen":
             return None
         raise ValueError(f"unsupported failover stage: {attempt.stage}")
 
@@ -595,6 +609,69 @@ def _ground_dual_in_processes(
     return references, errors
 
 
+def ground_qwen_fallback_reference(
+    config: Any,
+    stream_name: str,
+    snapshot: AlignedRGBDSnapshot,
+    calibration: RawServoCalibration,
+    output_dir: str | Path,
+    *,
+    client_factory: Callable[[], Any] | None = None,
+) -> DualCameraReference:
+    """Re-ground one current camera frame with the fixed Qwen fallback model."""
+
+    calibration.validate_snapshot(snapshot)
+    workdir = Path(output_dir).resolve()
+    workdir.mkdir(parents=True, exist_ok=False)
+    rgb_path = workdir / "qwen_reference_rgb.png"
+    _save_png(rgb_path, snapshot.rgb, rgb=True)
+    qwen_model = str(
+        getattr(
+            config,
+            "dual_qwenvl_fallback_model",
+            DEFAULT_DUAL_QWEN_FALLBACK_MODEL,
+        )
+    ).strip()
+    if not qwen_model:
+        raise ValueError("dual Qwen fallback model must be non-empty")
+    qwen_config = SimpleNamespace(
+        task=config.task,
+        vision_backend="qwenvl",
+        qwenvl_model=qwen_model,
+        qwenvl_base_url=config.qwenvl_base_url,
+        qwenvl_thinking_budget=config.qwenvl_thinking_budget,
+        codex_timeout_seconds=config.codex_timeout_seconds,
+    )
+    spec, table_bboxes = ground_raw_servo_references(
+        qwen_config,
+        rgb_path,
+        workdir,
+        client_factory=client_factory,
+        calibration=calibration,
+    )
+    reference = DualCameraReference(
+        stream_name=stream_name,
+        rgb=snapshot.rgb,
+        target_prompt=spec.target_prompt,
+        target_bbox=spec.target_bbox,
+        table_bboxes=table_bboxes,
+        camera_timestamp=snapshot.timestamp,
+        kind="qwen",
+    )
+    _write_json(
+        workdir / "qwen_reference_summary.json",
+        {
+            "model": qwen_model,
+            "stream_name": stream_name,
+            "camera_timestamp": snapshot.timestamp,
+            "target_prompt": reference.target_prompt,
+            "target_bbox": reference.target_bbox,
+            "table_bboxes": reference.table_bboxes,
+        },
+    )
+    return reference
+
+
 def _pixel_bbox_to_normalized(
     bbox_xyxy: Sequence[float],
     *,
@@ -625,8 +702,6 @@ class LatestReferenceGate:
         *,
         interval_frames: int = 5,
         min_confidence: float = 0.35,
-        freeze_y2_px: float = 75.0,
-        resume_y2_px: float = 110.0,
     ):
         if interval_frames <= 0:
             raise ValueError("latest reference interval must be positive")
@@ -635,11 +710,6 @@ class LatestReferenceGate:
             raise ValueError("latest reference confidence must be in [0,1]")
         self.interval_frames = int(interval_frames)
         self.min_confidence = confidence
-        self.freeze_y2_px = float(freeze_y2_px)
-        self.resume_y2_px = float(resume_y2_px)
-        if self.freeze_y2_px >= self.resume_y2_px:
-            raise ValueError("latest reference resume boundary must exceed freeze")
-        self.frozen = False
 
     def consider(
         self,
@@ -663,18 +733,6 @@ class LatestReferenceGate:
             return None, "invalid_target_geometry"
         if not table_geometry_valid:
             return None, "invalid_table_geometry"
-        y2 = float(target_bbox_xyxy[3])
-        if y2 < self.freeze_y2_px:
-            self.frozen = True
-            return None, "vertical_danger"
-        if self.frozen:
-            if y2 < self.resume_y2_px:
-                return None, "vertical_recovery_pending"
-            if float(target_confidence) < self.min_confidence:
-                return None, "low_confidence"
-            self.frozen = False
-        elif y2 < self.resume_y2_px:
-            return None, "reference_near_top"
         if float(target_confidence) < self.min_confidence:
             return None, "low_confidence"
         image = np.asarray(rgb)
@@ -700,12 +758,330 @@ class LatestReferenceGate:
         return reference, "accepted"
 
 
+@dataclass(frozen=True)
+class DualReferenceUpdateRequest:
+    generation: int
+    frame_index: int
+    reference: DualCameraReference
+    require_target_embedding: bool = True
+
+
+@dataclass(frozen=True)
+class EncodedDualReference:
+    target_embedding: Any
+    surface_embedding: Any
+    target_confidence: float
+    target_iou: float
+    surface_confidence: float
+    surface_iou: float
+
+
+@dataclass(frozen=True)
+class DualReferenceUpdateResult:
+    generation: int
+    frame_index: int
+    stream_name: str
+    accepted: bool
+    target_validated: bool
+    reference: DualCameraReference
+    target_embedding: Any | None
+    surface_embedding: Any | None
+    target_confidence: float | None
+    target_iou: float | None
+    surface_confidence: float | None
+    surface_iou: float | None
+    reason: str
+
+
+class YoloeDualReferenceEncoder(YoloeTargetReferenceEncoder):
+    """Independent YOLOE model that encodes one coherent target/desk frame."""
+
+    @staticmethod
+    def _best_detection(
+        result: Any,
+        *,
+        class_index: int,
+        expected_boxes: Sequence[tuple[float, float, float, float]],
+    ) -> tuple[float, float]:
+        if result.boxes is None or len(result.boxes) == 0:
+            return 0.0, 0.0
+        boxes = [
+            tuple(float(value) for value in row)
+            for row in result.boxes.xyxy.detach().cpu().numpy()
+        ]
+        classes = result.boxes.cls.detach().cpu().numpy().astype(int)
+        confidences = result.boxes.conf.detach().cpu().numpy()
+        candidates = [
+            index for index, value in enumerate(classes) if value == class_index
+        ]
+        if not candidates:
+            return 0.0, 0.0
+        best_index = max(
+            candidates,
+            key=lambda index: (
+                max(bbox_iou(boxes[index], expected) for expected in expected_boxes),
+                float(confidences[index]),
+            ),
+        )
+        overlap = max(
+            bbox_iou(boxes[best_index], expected) for expected in expected_boxes
+        )
+        return float(confidences[best_index]), float(overlap)
+
+    def extract(
+        self,
+        request: DualReferenceUpdateRequest,
+    ) -> EncodedDualReference:
+        from ultralytics.models.yolo.yoloe import YOLOEVPSegPredictor
+
+        reference = request.reference
+        rgb = reference.rgb
+        height, width = rgb.shape[:2]
+        target_box = normalized_bbox_to_pixels(
+            reference.target_bbox,
+            width,
+            height,
+        )
+        surface_boxes = tuple(
+            normalized_bbox_to_pixels(bbox, width, height)
+            for bbox in reference.table_bboxes
+        )
+        prompt_boxes = np.asarray(
+            (target_box, *surface_boxes),
+            dtype=np.float32,
+        )
+        prompt_classes = np.asarray(
+            (0, *([1] * len(surface_boxes))),
+            dtype=np.int32,
+        )
+        bgr = np.ascontiguousarray(rgb[..., ::-1])
+        self.model.predictor = None
+        try:
+            results = self.model.predict(
+                source=bgr,
+                refer_image=bgr,
+                visual_prompts={
+                    "bboxes": prompt_boxes,
+                    "cls": prompt_classes,
+                },
+                predictor=YOLOEVPSegPredictor,
+                device=self.device,
+                imgsz=self.imgsz,
+                conf=self.confidence,
+                half=True,
+                quantize=16,
+                verbose=False,
+                save=False,
+            )
+        finally:
+            self.model.predictor = None
+        if len(results) != 1:
+            raise RuntimeError(
+                f"YOLOE dual reference returned {len(results)} results"
+            )
+        embeddings = getattr(self.model.model, "pe", None)
+        if embeddings is None:
+            raise RuntimeError("YOLOE did not produce dual visual embeddings")
+        if embeddings.ndim != 3 or embeddings.shape[1] != 2:
+            raise RuntimeError(
+                "YOLOE expected two visual embeddings, got "
+                f"{tuple(embeddings.shape)}"
+            )
+        result = results[0]
+        target_confidence, target_iou = self._best_detection(
+            result,
+            class_index=0,
+            expected_boxes=(target_box,),
+        )
+        surface_confidence, surface_iou = self._best_detection(
+            result,
+            class_index=1,
+            expected_boxes=surface_boxes,
+        )
+        return EncodedDualReference(
+            target_embedding=embeddings[:, :1].detach().clone(),
+            surface_embedding=embeddings[:, 1:2].detach().clone(),
+            target_confidence=target_confidence,
+            target_iou=target_iou,
+            surface_confidence=surface_confidence,
+            surface_iou=surface_iou,
+        )
+
+
+class AsyncDualReferenceUpdater:
+    """Encode the newest coherent target/desk reference off the servo thread."""
+
+    _STOP = object()
+
+    def __init__(
+        self,
+        encoder_factory: Callable[[], Any],
+        *,
+        min_confidence: float,
+        min_iou: float,
+    ) -> None:
+        self._encoder_factory = encoder_factory
+        self._min_confidence = float(min_confidence)
+        self._min_iou = float(min_iou)
+        self._requests: queue.Queue[Any] = queue.Queue(maxsize=1)
+        self._results: queue.Queue[DualReferenceUpdateResult] = queue.Queue(
+            maxsize=1
+        )
+        self._closed = threading.Event()
+        self._thread = threading.Thread(
+            target=self._run,
+            name="yoloe-dual-reference-updater",
+            daemon=True,
+        )
+        self._thread.start()
+
+    @staticmethod
+    def _put_latest(destination: queue.Queue[Any], item: Any) -> None:
+        while True:
+            try:
+                destination.put_nowait(item)
+                return
+            except queue.Full:
+                try:
+                    destination.get_nowait()
+                except queue.Empty:
+                    pass
+
+    def submit(self, request: DualReferenceUpdateRequest) -> None:
+        if not self._closed.is_set():
+            self._put_latest(self._requests, request)
+
+    def poll_latest(self) -> DualReferenceUpdateResult | None:
+        latest = None
+        while True:
+            try:
+                latest = self._results.get_nowait()
+            except queue.Empty:
+                return latest
+
+    def close(self) -> None:
+        if self._closed.is_set():
+            return
+        self._closed.set()
+        self._put_latest(self._requests, self._STOP)
+        self._thread.join(timeout=10.0)
+
+    def _result(
+        self,
+        request: DualReferenceUpdateRequest,
+        *,
+        accepted: bool,
+        reason: str,
+        encoded: EncodedDualReference | None = None,
+    ) -> DualReferenceUpdateResult:
+        return DualReferenceUpdateResult(
+            generation=request.generation,
+            frame_index=request.frame_index,
+            stream_name=request.reference.stream_name,
+            accepted=accepted,
+            target_validated=request.require_target_embedding,
+            reference=request.reference,
+            target_embedding=(
+                None if encoded is None else encoded.target_embedding
+            ),
+            surface_embedding=(
+                None if encoded is None else encoded.surface_embedding
+            ),
+            target_confidence=(
+                None if encoded is None else encoded.target_confidence
+            ),
+            target_iou=None if encoded is None else encoded.target_iou,
+            surface_confidence=(
+                None if encoded is None else encoded.surface_confidence
+            ),
+            surface_iou=None if encoded is None else encoded.surface_iou,
+            reason=reason,
+        )
+
+    def _validate(
+        self,
+        request: DualReferenceUpdateRequest,
+        encoded: EncodedDualReference,
+    ) -> DualReferenceUpdateResult:
+        checks = [
+            ("surface", encoded.surface_confidence, encoded.surface_iou)
+        ]
+        if request.require_target_embedding:
+            checks.insert(
+                0, ("target", encoded.target_confidence, encoded.target_iou)
+            )
+        for role, confidence, overlap in checks:
+            if confidence < self._min_confidence:
+                return self._result(
+                    request,
+                    accepted=False,
+                    reason=f"{role}_confidence_below_threshold",
+                    encoded=encoded,
+                )
+            if overlap < self._min_iou:
+                return self._result(
+                    request,
+                    accepted=False,
+                    reason=f"{role}_iou_below_threshold",
+                    encoded=encoded,
+                )
+        return self._result(
+            request,
+            accepted=True,
+            reason="accepted",
+            encoded=encoded,
+        )
+
+    def _run(self) -> None:
+        encoder = None
+        try:
+            encoder = self._encoder_factory()
+        except Exception:
+            pass
+        while True:
+            item = self._requests.get()
+            if item is self._STOP:
+                return
+            if not isinstance(item, DualReferenceUpdateRequest):
+                continue
+            request = item
+            try:
+                if encoder is None:
+                    encoder = self._encoder_factory()
+                result = self._validate(request, encoder.extract(request))
+            except Exception as exc:
+                result = self._result(
+                    request,
+                    accepted=False,
+                    reason=f"error:{type(exc).__name__}:{exc}",
+                )
+            if self._closed.is_set():
+                return
+            self._put_latest(self._results, result)
+
+
 def _best_instance(
     instances: Sequence[TrackedInstance],
     class_index: int,
 ) -> TrackedInstance | None:
     candidates = [item for item in instances if item.class_index == class_index]
     return max(candidates, key=lambda item: item.confidence, default=None)
+
+
+def _attempt_prompt_mode(attempt: DualCameraAttempt) -> str:
+    if attempt.stage == "origin_text":
+        return "target_text_surface_visual"
+    if attempt.stage == "alternate_text":
+        return "target_text_surface_text"
+    return "visual"
+
+
+def _attempt_uses_target_text(attempt: DualCameraAttempt) -> bool:
+    return attempt.stage in {"origin_text", "alternate_text"}
+
+
+def _attempt_uses_surface_text(attempt: DualCameraAttempt) -> bool:
+    return attempt.stage == "alternate_text"
 
 
 def _attempt_details(
@@ -719,6 +1095,7 @@ def _attempt_details(
         "origin_stream": attempt.origin_stream,
         "reference_source_stream": attempt.reference.stream_name,
         "reference_kind": attempt.reference.kind,
+        "prompt_mode": _attempt_prompt_mode(attempt),
         **extra,
     }
 
@@ -730,6 +1107,7 @@ def _attempt_frame_details(attempt: DualCameraAttempt) -> dict[str, Any]:
         "failover_stage": attempt.stage,
         "reference_source_stream": attempt.reference.stream_name,
         "reference_kind": attempt.reference.kind,
+        "prompt_mode": _attempt_prompt_mode(attempt),
     }
 
 
@@ -783,6 +1161,8 @@ def run_dual_raw_servo_worker(
     camera_factory: Callable[[], Any] | None = None,
     client_factory: Callable[[], Any] | None = None,
     tracker_factory: Callable[[], Any] | None = None,
+    latest_reference_updater_factory: Callable[[], Any] | None = None,
+    qwen_reference_factory: Callable[..., DualCameraReference] | None = None,
     calibration_factory: (
         Callable[[Any], Mapping[str, RawServoCalibration]] | None
     ) = None,
@@ -807,6 +1187,7 @@ def run_dual_raw_servo_worker(
         raise ValueError("dual match tolerance must be positive")
     camera: Any | None = None
     tracker: Any | None = None
+    reference_updater: Any | None = None
     try:
         while not stop_event.is_set():
             try:
@@ -904,16 +1285,6 @@ def run_dual_raw_servo_worker(
                         min_confidence=(
                             config.raw_reference_update_min_confidence
                         ),
-                        freeze_y2_px=getattr(
-                            config,
-                            "raw_reference_update_freeze_y2_px",
-                            75.0,
-                        ),
-                        resume_y2_px=getattr(
-                            config,
-                            "raw_reference_update_resume_y2_px",
-                            110.0,
-                        ),
                     )
                     for stream_name in stream_names
                 }
@@ -928,21 +1299,96 @@ def run_dual_raw_servo_worker(
                             device=config.raw_yoloe_device,
                         )
                     )
+                if reference_updater is None:
+                    if latest_reference_updater_factory is not None:
+                        reference_updater = latest_reference_updater_factory()
+                    elif (
+                        tracker_factory is None
+                        and config.raw_reference_update_interval_frames > 0
+                    ):
+                        reference_updater = AsyncDualReferenceUpdater(
+                            lambda: YoloeDualReferenceEncoder(
+                                config.raw_yoloe_model_path,
+                                confidence=config.raw_yoloe_confidence,
+                                imgsz=config.raw_yoloe_imgsz,
+                                device=config.raw_yoloe_device,
+                            ),
+                            min_confidence=(
+                                config.raw_reference_update_min_confidence
+                            ),
+                            min_iou=getattr(
+                                config, "raw_reference_update_min_iou", 0.5
+                            ),
+                        )
                 attempt = coordinator.start()
                 frame_index = -1
                 next_frame_at = time.monotonic()
                 generation_finished = False
                 while gate.is_active(generation) and not stop_event.is_set():
                     try:
-                        tracker.start(
-                            attempt.reference.rgb,
-                            target_prompt=attempt.reference.target_prompt,
-                            target_bbox=attempt.reference.target_bbox,
-                            surface_prompt="table",
-                            surface_bboxes=attempt.reference.table_bboxes,
-                        )
+                        if attempt.stage in {"origin_qwen", "alternate_qwen"}:
+                            qwen_snapshot = camera.capture().require(
+                                attempt.live_stream
+                            )
+                            qwen_calibration = calibrations[attempt.live_stream]
+                            qwen_output_dir = (
+                                output_dir
+                                / f"{attempt.stage}_{attempt.attempt_id:02d}"
+                            )
+                            qwen_reference = (
+                                qwen_reference_factory(
+                                    config,
+                                    attempt.live_stream,
+                                    qwen_snapshot,
+                                    qwen_calibration,
+                                    qwen_output_dir,
+                                )
+                                if qwen_reference_factory is not None
+                                else ground_qwen_fallback_reference(
+                                    config,
+                                    attempt.live_stream,
+                                    qwen_snapshot,
+                                    qwen_calibration,
+                                    qwen_output_dir,
+                                )
+                            )
+                            if (
+                                qwen_reference.stream_name != attempt.live_stream
+                                or qwen_reference.kind != "qwen"
+                            ):
+                                raise ValueError(
+                                    "Qwen fallback reference must use the active "
+                                    "camera and kind=qwen"
+                                )
+                            attempt = replace(
+                                attempt,
+                                reference=qwen_reference,
+                            )
+                        if _attempt_uses_surface_text(attempt):
+                            tracker.start_all_text(
+                                target_prompt=attempt.reference.target_prompt,
+                                surface_prompt="desk",
+                            )
+                        elif _attempt_uses_target_text(attempt):
+                            tracker.start_text(
+                                attempt.reference.rgb,
+                                target_prompt=attempt.reference.target_prompt,
+                                target_bbox=attempt.reference.target_bbox,
+                                surface_prompt="desk",
+                                surface_bboxes=attempt.reference.table_bboxes,
+                            )
+                        else:
+                            tracker.start(
+                                attempt.reference.rgb,
+                                target_prompt=attempt.reference.target_prompt,
+                                target_bbox=attempt.reference.target_bbox,
+                                surface_prompt="desk",
+                                surface_bboxes=attempt.reference.table_bboxes,
+                            )
                     except Exception as exc:
-                        failure_reason = f"YOLOE initialization failed: {exc}"
+                        failure_reason = (
+                            f"{attempt.stage} initialization failed: {exc}"
+                        )
                     else:
                         failure_reason = ""
                     if stop_event.is_set() or not gate.is_active(generation):
@@ -1099,19 +1545,155 @@ def run_dual_raw_servo_worker(
                         target_id = target.track_id
                         if surface is not None:
                             surface_id = surface.track_id
+                        refresh_details: dict[str, Any] = {}
+                        if reference_updater is not None:
+                            update_result = reference_updater.poll_latest()
+                            if update_result is not None:
+                                if update_result.generation != generation:
+                                    refresh_details[
+                                        "latest_reference_refresh"
+                                    ] = {
+                                        "status": "discarded",
+                                        "reason": "generation",
+                                        "source_generation": (
+                                            update_result.generation
+                                        ),
+                                        "source_frame": update_result.frame_index,
+                                    }
+                                elif (
+                                    update_result.stream_name
+                                    != attempt.live_stream
+                                ):
+                                    refresh_details[
+                                        "latest_reference_refresh"
+                                    ] = {
+                                        "status": "discarded",
+                                        "reason": "stream",
+                                        "source_stream": (
+                                            update_result.stream_name
+                                        ),
+                                        "source_frame": update_result.frame_index,
+                                    }
+                                elif frame_index - update_result.frame_index > max(
+                                    5,
+                                    2
+                                    * config.raw_reference_update_interval_frames,
+                                ):
+                                    refresh_details[
+                                        "latest_reference_refresh"
+                                    ] = {
+                                        "status": "discarded",
+                                        "reason": "stale",
+                                        "source_frame": update_result.frame_index,
+                                        "age_frames": (
+                                            frame_index
+                                            - update_result.frame_index
+                                        ),
+                                    }
+                                elif _attempt_uses_surface_text(attempt):
+                                    refresh_details[
+                                        "latest_reference_refresh"
+                                    ] = {
+                                        "status": "discarded",
+                                        "reason": "surface_text_prompt",
+                                        "source_frame": update_result.frame_index,
+                                    }
+                                elif (
+                                    not _attempt_uses_target_text(attempt)
+                                    and not update_result.target_validated
+                                ):
+                                    refresh_details[
+                                        "latest_reference_refresh"
+                                    ] = {
+                                        "status": "discarded",
+                                        "reason": "prompt_mode",
+                                        "source_frame": update_result.frame_index,
+                                        "source_mode": "target_text",
+                                    }
+                                elif not update_result.accepted:
+                                    refresh_details[
+                                        "latest_reference_refresh"
+                                    ] = {
+                                        "status": "rejected",
+                                        "reason": update_result.reason,
+                                        "source_frame": update_result.frame_index,
+                                        "target_confidence": (
+                                            update_result.target_confidence
+                                        ),
+                                        "target_iou": update_result.target_iou,
+                                        "surface_confidence": (
+                                            update_result.surface_confidence
+                                        ),
+                                        "surface_iou": update_result.surface_iou,
+                                    }
+                                else:
+                                    try:
+                                        if update_result.surface_embedding is None:
+                                            raise RuntimeError(
+                                                "accepted refresh has no desk PE"
+                                            )
+                                        if _attempt_uses_target_text(attempt):
+                                            tracker.install_surface_embedding(
+                                                update_result.surface_embedding
+                                            )
+                                        else:
+                                            if update_result.target_embedding is None:
+                                                raise RuntimeError(
+                                                    "accepted refresh has no target PE"
+                                                )
+                                            tracker.install_reference_embeddings(
+                                                target_embedding=(
+                                                    update_result.target_embedding
+                                                ),
+                                                surface_embedding=(
+                                                    update_result.surface_embedding
+                                                ),
+                                            )
+                                    except Exception as exc:
+                                        refresh_details[
+                                            "latest_reference_refresh"
+                                        ] = {
+                                            "status": "error",
+                                            "source_frame": (
+                                                update_result.frame_index
+                                            ),
+                                            "error": str(exc),
+                                        }
+                                    else:
+                                        attempt = replace(
+                                            attempt,
+                                            reference=update_result.reference,
+                                        )
+                                        refresh_details[
+                                            "latest_reference_refresh"
+                                        ] = {
+                                            "status": "applied",
+                                            "source_frame": (
+                                                update_result.frame_index
+                                            ),
+                                            "source_stream": (
+                                                update_result.stream_name
+                                            ),
+                                            "target_confidence": (
+                                                update_result.target_confidence
+                                            ),
+                                            "target_iou": update_result.target_iou,
+                                            "surface_confidence": (
+                                                update_result.surface_confidence
+                                            ),
+                                            "surface_iou": update_result.surface_iou,
+                                        }
                         latest, latest_reason = latest_gates[
                             attempt.live_stream
                         ].consider(
-                            frame_index=frame_index + 1,
+                            frame_index=frame_index,
                             stream_name=attempt.live_stream,
                             rgb=snapshot.rgb,
                             camera_timestamp=snapshot.timestamp,
                             target_prompt=attempt.reference.target_prompt,
                             target_bbox_xyxy=target.bbox_xyxy,
                             table_bboxes_xyxy=(
-                                ()
-                                if surface is None
-                                else (surface.bbox_xyxy,)
+                                () if surface is None else (surface.bbox_xyxy,)
                             ),
                             target_confidence=target.confidence,
                             target_geometry_valid=True,
@@ -1125,9 +1707,29 @@ def run_dual_raw_servo_worker(
                                 None if surface is None else surface.track_id
                             ),
                             latest_reference_update=latest_reason,
+                            **refresh_details,
                         )
                         if latest is not None:
-                            coordinator.save_latest(latest)
+                            if (
+                                reference_updater is not None
+                                and not _attempt_uses_surface_text(attempt)
+                            ):
+                                reference_updater.submit(
+                                    DualReferenceUpdateRequest(
+                                        generation=generation,
+                                        frame_index=frame_index,
+                                        reference=latest,
+                                        require_target_embedding=(
+                                            not _attempt_uses_target_text(attempt)
+                                        ),
+                                    )
+                                )
+                                details[
+                                    "latest_reference_refresh_scheduled"
+                                ] = {
+                                    "source_frame": frame_index,
+                                    "source_stream": attempt.live_stream,
+                                }
                         if target_reacquired:
                             details.update(
                                 {
@@ -1176,7 +1778,7 @@ def run_dual_raw_servo_worker(
                                 "error",
                                 output_dir=str(output_dir),
                                 error=(
-                                    "three-stage failover exhausted: "
+                                    "both-camera Qwen failover exhausted: "
                                     f"{failure_reason or 'perception failed'}"
                                 ),
                                 hard=True,
@@ -1219,5 +1821,7 @@ def run_dual_raw_servo_worker(
                 )
                 gate.cancel(generation)
     finally:
+        if reference_updater is not None:
+            reference_updater.close()
         if camera is not None:
             camera.close()

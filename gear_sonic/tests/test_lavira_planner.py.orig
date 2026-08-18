@@ -276,35 +276,19 @@ def test_raw_base_pose_launch_passes_safety_and_orientation_parameters() -> None
     config = InferenceLaunchConfig(
         planner_input="base_pose",
         base_pose_mode="raw_yoloe_servo",
-        base_pose_raw_min_linear_speed_m_s=0.13,
         base_pose_raw_max_lateral_speed_m_s=0.14,
-        base_pose_raw_min_yaw_speed_rad_s=0.11,
-        base_pose_raw_yaw_tolerance_deg=6.5,
-        base_pose_raw_yaw_coarse_speed_rad_s=0.27,
-        base_pose_raw_yaw_trim_speed_rad_s=0.18,
-        base_pose_raw_forward_recenter_yaw_speed_rad_s=0.17,
-        base_pose_raw_post_stop_sample_s=2.5,
         base_pose_raw_horizontal_guard_fraction=0.22,
         base_pose_raw_horizontal_recovery_fraction=0.31,
-        base_pose_raw_allow_missing_table=1,
         base_pose_orientation_telemetry_port=6001,
     )
 
     planner = build_planner_input_command(config, Path("/workspace/sonic"))
     relay = build_reasan_planner_command(config, Path("/workspace/sonic"))
 
-    assert "--raw-min-linear-speed-m-s 0.13" in planner
     assert "--raw-max-lateral-speed-m-s 0.14" in planner
-    assert "--raw-min-yaw-speed-rad-s 0.11" in planner
-    assert "--raw-yaw-tolerance-deg 6.5" in planner
-    assert "--raw-yaw-coarse-speed-rad-s 0.27" in planner
-    assert "--raw-yaw-trim-speed-rad-s 0.18" in planner
-    assert "--raw-forward-recenter-yaw-speed-rad-s 0.17" in planner
-    assert "--raw-post-stop-sample-s 2.5" in planner
     assert "--max-lateral-speed-m-s 0.14" in relay
     assert "--raw-horizontal-guard-fraction 0.22" in planner
     assert "--raw-horizontal-recovery-fraction 0.31" in planner
-    assert "--raw-allow-missing-table 1" in planner
     assert "--raw-orientation-telemetry-source tcp://127.0.0.1:6001" in planner
     assert "--orientation-telemetry-output 'tcp://*:6001'" in relay
 
@@ -316,7 +300,7 @@ def test_base_pose_relay_uses_default_lateral_limit() -> None:
 
     relay = build_reasan_planner_command(config, Path("/workspace/sonic"))
 
-    assert "--max-lateral-speed-m-s 0.4" in relay
+    assert "--max-lateral-speed-m-s 0.16" in relay
 
 
 def test_orientation_telemetry_relay_is_raw_base_pose_only() -> None:
@@ -757,9 +741,9 @@ def test_runtime_starts_in_listen_wasd_and_republishes_held_key_at_20_hz() -> No
     assert runtime.phase == "listen_wasd"
     assert runtime.handle_key("w", now=1.0) == "manual"
     assert published == []
-    assert runtime.publish_due(1.0).velocity == (0.4, 0.0, 0.0)
+    assert runtime.publish_due(1.0).velocity == (0.3, 0.0, 0.0)
     assert runtime.publish_due(1.049) is None
-    assert runtime.publish_due(1.05).velocity == (0.4, 0.0, 0.0)
+    assert runtime.publish_due(1.05).velocity == (0.3, 0.0, 0.0)
 
 
 def test_listen_wasd_releases_to_stop_after_keyboard_hold_window() -> None:
@@ -771,7 +755,7 @@ def test_listen_wasd_releases_to_stop_after_keyboard_hold_window() -> None:
     )
 
     runtime.handle_key("w", now=2.0)
-    assert runtime.publish_due(2.50).velocity == (0.4, 0.0, 0.0)
+    assert runtime.publish_due(2.50).velocity == (0.3, 0.0, 0.0)
     assert runtime.publish_due(2.55).velocity == (0.0, 0.0, 0.0)
     assert runtime.phase == "listen_wasd"
 
@@ -842,10 +826,10 @@ def test_listen_wasd_manual_keys_reuse_keyboard_defaults(key: str) -> None:
     assert "[LaViRA] STATE FINAL_STOP" not in logs
     runtime.publish_due(1.1)
     expected_action, expected_velocity = {
-        "w": ("forward", (0.4, 0.0, 0.0)),
-        "s": ("backward", (-0.4, 0.0, 0.0)),
-        "a": ("move_left", (0.0, 0.4, 0.0)),
-        "d": ("move_right", (0.0, -0.4, 0.0)),
+        "w": ("forward", (0.3, 0.0, 0.0)),
+        "s": ("backward", (-0.3, 0.0, 0.0)),
+        "a": ("move_left", (0.0, 0.15, 0.0)),
+        "d": ("move_right", (0.0, -0.15, 0.0)),
         "q": ("turn_left", (0.0, 0.0, 0.5)),
         "e": ("turn_right", (0.0, 0.0, -0.5)),
     }[key]

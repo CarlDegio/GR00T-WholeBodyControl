@@ -94,7 +94,7 @@ def test_lavira_messages_decode_for_turn_translation_and_stop() -> None:
 @pytest.mark.parametrize(
     ("argv", "expected_limit"),
     [
-        (["lavira_sonic_relay.py"], 0.16),
+        (["lavira_sonic_relay.py"], 0.40),
         (["lavira_sonic_relay.py", "--max-lateral-speed-m-s", "0.11"], 0.11),
     ],
 )
@@ -167,7 +167,7 @@ def test_direct_relay_decodes_lavira_command_without_reasan() -> None:
 
 @pytest.mark.parametrize(
     ("requested_vy", "expected_vy"),
-    [(0.40, 0.16), (-0.40, -0.16)],
+    [(0.60, 0.40), (-0.60, -0.40)],
 )
 def test_direct_relay_caps_lateral_velocity_at_configured_default(
     requested_vy: float, expected_vy: float
@@ -186,14 +186,14 @@ def test_direct_relay_caps_lateral_velocity_at_configured_default(
 def test_direct_relay_scales_both_linear_axes_to_preserve_ratio() -> None:
     decoded = decode_direct_velocity_command(
         build_reasan_velocity_message(
-            VelocityCommand(0.30, 0.20, 0.50, 1.0), action="move"
+            VelocityCommand(0.30, 0.50, 0.50, 1.0), action="move"
         )
     )
 
     vx, vy, wz = map(float, decoded["velocity"])
-    assert (vx, vy, wz) == pytest.approx((0.24, 0.16, 0.50))
-    assert vx / vy == pytest.approx(0.30 / 0.20)
-    assert np.hypot(vx, vy) < 0.30
+    assert (vx, vy, wz) == pytest.approx((0.24, 0.40, 0.50))
+    assert vx / vy == pytest.approx(0.30 / 0.50)
+    assert np.hypot(vx, vy) < np.hypot(0.30, 0.50)
 
 
 def test_direct_relay_accepts_configurable_lateral_limit() -> None:
@@ -229,7 +229,7 @@ def test_direct_relay_uses_most_restrictive_linear_scale_for_both_axes() -> None
     )
 
     vx, vy, _ = map(float, decoded["velocity"])
-    assert (vx, vy) == pytest.approx((0.80, 0.16))
+    assert (vx, vy) == pytest.approx((1.00, 0.20))
     assert vx / vy == pytest.approx(2.0 / 0.40)
 
 

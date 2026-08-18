@@ -11,7 +11,13 @@ import numpy as np
 sys.modules.setdefault("tyro", types.ModuleType("tyro"))
 
 from gear_sonic.camera.sensor_server import ImageMessageSchema
-from gear_sonic.scripts.run_camera_viewer import _rgb_camera_names
+from gear_sonic.scripts.run_camera_viewer import (
+    _rgb_camera_names,
+    camera_label_color,
+    format_velocity_label,
+    parse_base_pose_viewer_status,
+    select_rgb_camera_names,
+)
 from gear_sonic.scripts.run_depth_camera_viewer import colorize_depth
 
 
@@ -38,6 +44,43 @@ def test_rgb_viewer_ignores_depth_from_schema_v2_message() -> None:
     decoded = ImageMessageSchema.deserialize(message.serialize())
 
     assert _rgb_camera_names(decoded.images) == ["chest_view"]
+
+
+def test_rgb_viewer_selects_requested_streams_in_requested_order() -> None:
+    images = {
+        "ego_view": np.zeros((2, 3, 3), dtype=np.uint8),
+        "chest_view": np.zeros((2, 3, 3), dtype=np.uint8),
+        "chest_view_depth": np.zeros((2, 3), dtype=np.uint16),
+        "left_wrist": np.zeros((2, 3, 3), dtype=np.uint8),
+    }
+
+    assert select_rgb_camera_names(
+        images, "chest_view,ego_view,missing"
+    ) == ["chest_view", "ego_view"]
+
+
+def test_base_pose_viewer_status_exposes_active_camera_and_velocity() -> None:
+    status = parse_base_pose_viewer_status(
+        b'{"type":"navila_reasan_velocity_command","source":"base_pose",'
+        b'"camera_stream":"chest_view",'
+        b'"velocity":{"vx":0.4,"vy":-0.2,"wz":0.1}}'
+    )
+
+    assert status.active_camera_stream == "chest_view"
+    assert status.velocity == (0.4, -0.2, 0.1)
+    assert camera_label_color("chest_view", status.active_camera_stream) == (
+        0,
+        0,
+        255,
+    )
+    assert camera_label_color("ego_view", status.active_camera_stream) == (
+        0,
+        255,
+        0,
+    )
+    assert format_velocity_label(status.velocity) == (
+        "CMD vx=+0.400  vy=-0.200  wz=+0.100"
+    )
 
 
 def test_colorize_depth_uses_fixed_range_and_marks_invalid_pixels() -> None:

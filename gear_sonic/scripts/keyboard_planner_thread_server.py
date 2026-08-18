@@ -28,9 +28,9 @@ class KeyboardPlannerConfig:
     hz: float = 20.0
     """Compatibility option retained for launch_inference; commands remain key-triggered."""
     duration: float = 0.5
-    forward_speed: float = 0.3
-    backward_speed: float = 0.3
-    lateral_speed: float = 0.15
+    forward_speed: float = 0.4
+    backward_speed: float = 0.4
+    lateral_speed: float = 0.4
     yaw_speed: float = 0.5
 
 
@@ -86,6 +86,11 @@ def main(config: KeyboardPlannerConfig) -> None:
 
     print(f"[REASEN Keyboard] PUB bound to {endpoint}; command duration={config.duration:g}s")
     print("[REASEN Keyboard] W/S forward/back | A/D lateral | Q/E yaw | Space stop | X exit")
+    print(
+        "[REASEN Keyboard] Translation speed: "
+        f"W={config.forward_speed:g}, S={config.backward_speed:g}, "
+        f"A/D={config.lateral_speed:g} m/s"
+    )
     print("[REASEN Keyboard] JSON type: navila_reasan_velocity_command")
     time.sleep(0.3)
     try:

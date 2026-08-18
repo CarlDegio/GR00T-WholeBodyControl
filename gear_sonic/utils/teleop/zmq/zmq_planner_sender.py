@@ -5,6 +5,7 @@ The header describes field names, dtypes, and shapes so the receiver can
 deserialize without out-of-band schema knowledge.
 """
 
+from enum import IntEnum
 import json
 import struct
 from typing import Sequence
@@ -12,6 +13,149 @@ from typing import Sequence
 import numpy as np
 
 HEADER_SIZE = 1280
+
+
+class WalkingStyle(IntEnum):
+    """Selectable SONIC V2 planner modes, ordered by the documented sets."""
+
+    SLOW_WALK = 1
+    WALK = 2
+    RUN = 3
+    HAPPY = 17
+    STEALTH_WALK = 18
+    INJURED_WALK = 19
+
+    SQUAT = 4
+    KNEEL_TWO_LEGS = 5
+    KNEEL_ONE_LEG = 6
+    HAND_CRAWLING = 8
+    ELBOW_CRAWLING = 14
+
+    IDLE_BOXING = 9
+    WALK_BOXING = 10
+    LEFT_JAB = 11
+    RIGHT_JAB = 12
+    RANDOM_PUNCHES = 13
+    LEFT_HOOK = 15
+    RIGHT_HOOK = 16
+
+    CAREFUL = 20
+    OBJECT_CARRYING = 21
+    CROUCH = 22
+    HAPPY_DANCE = 23
+    ZOMBIE = 24
+    POINT = 25
+    SCARED = 26
+
+    # Backwards-compatible aliases for the names used by the C++ enum and by
+    # the original 11-style VLA sidecar implementation.
+    FORWARD_JUMP = HAPPY
+    LEDGE_WALKING = CAREFUL
+    STEALTH_WALK_2 = CROUCH
+    HAPPY_DANCE_WALK = HAPPY_DANCE
+    ZOMBIE_WALK = ZOMBIE
+    GUN_WALK = POINT
+    SCARE_WALK = SCARED
+
+
+MOTION_MODE_SETS = (
+    (
+        "Locomotion (Standing)",
+        (
+            WalkingStyle.SLOW_WALK,
+            WalkingStyle.WALK,
+            WalkingStyle.RUN,
+            WalkingStyle.HAPPY,
+            WalkingStyle.STEALTH_WALK,
+            WalkingStyle.INJURED_WALK,
+        ),
+    ),
+    (
+        "Squat / Ground",
+        (
+            WalkingStyle.SQUAT,
+            WalkingStyle.KNEEL_TWO_LEGS,
+            WalkingStyle.KNEEL_ONE_LEG,
+            WalkingStyle.HAND_CRAWLING,
+            WalkingStyle.ELBOW_CRAWLING,
+        ),
+    ),
+    (
+        "Boxing",
+        (
+            WalkingStyle.IDLE_BOXING,
+            WalkingStyle.WALK_BOXING,
+            WalkingStyle.LEFT_JAB,
+            WalkingStyle.RIGHT_JAB,
+            WalkingStyle.RANDOM_PUNCHES,
+            WalkingStyle.LEFT_HOOK,
+            WalkingStyle.RIGHT_HOOK,
+        ),
+    ),
+    (
+        "Additional Styled Walking",
+        (
+            WalkingStyle.CAREFUL,
+            WalkingStyle.OBJECT_CARRYING,
+            WalkingStyle.CROUCH,
+            WalkingStyle.HAPPY_DANCE,
+            WalkingStyle.ZOMBIE,
+            WalkingStyle.POINT,
+            WalkingStyle.SCARED,
+        ),
+    ),
+)
+
+WALKING_STYLE_CYCLE = (
+    WalkingStyle.SLOW_WALK,
+    WalkingStyle.WALK,
+    WalkingStyle.CAREFUL,
+    WalkingStyle.OBJECT_CARRYING,
+)
+DEFAULT_WALKING_STYLE = WalkingStyle.SLOW_WALK
+
+
+def next_walking_style(current: WalkingStyle | int) -> WalkingStyle:
+    """Return the next selectable motion mode, wrapping back to slow walk."""
+    normalized = WalkingStyle(int(current))
+    index = WALKING_STYLE_CYCLE.index(normalized)
+    return WALKING_STYLE_CYCLE[(index + 1) % len(WALKING_STYLE_CYCLE)]
+
+
+def describe_walking_style(style: WalkingStyle | int) -> str:
+    """Return a concise tmux-friendly description of a planner motion mode."""
+    normalized = WalkingStyle(int(style))
+    cycle_index = WALKING_STYLE_CYCLE.index(normalized)
+    for set_index, (set_name, modes) in enumerate(MOTION_MODE_SETS):
+        if normalized in modes:
+            return (
+                f"Set {set_index} {set_name} | "
+                f"cycle={cycle_index + 1}/{len(WALKING_STYLE_CYCLE)} | "
+                f"mode={int(normalized)} {normalized.name}"
+            )
+    raise ValueError(f"unsupported planner motion mode: {int(normalized)}")
+
+
+def override_planner_walking_style(
+    message: bytes,
+    walking_style: WalkingStyle | int,
+) -> bytes:
+    """Override a moving planner packet while preserving explicit IDLE stops."""
+    topic = b"planner"
+    payload_offset = len(topic) + HEADER_SIZE
+    if not message.startswith(topic) or len(message) < payload_offset + 4:
+        raise ValueError("invalid planner message")
+    current_mode = struct.unpack_from("<i", message, payload_offset)[0]
+    if current_mode == 0:
+        return message
+    updated = bytearray(message)
+    struct.pack_into(
+        "<i",
+        updated,
+        payload_offset,
+        int(WalkingStyle(int(walking_style))),
+    )
+    return bytes(updated)
 
 
 def _build_header(fields: list, version: int = 1, count: int = 1) -> bytes:

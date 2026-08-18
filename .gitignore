@@ -170,6 +170,7 @@ outputs/
 huggingface/
 
 # Model checkpoints (download via download_from_hf.py)
+mobileclip2_b.ts
 *.onnx
 *.pt
 *.pth

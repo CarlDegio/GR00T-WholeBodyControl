@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 import json
 import math
 import threading
@@ -109,6 +110,8 @@ def test_writer_records_complete_jsonl_without_online_annotation(tmp_path) -> No
             "line_length_m": 0.8,
             "inlier_count": 120,
             "residual_m": 0.006,
+            "line_endpoints_xy_m": [[0.9, -0.3], [0.9, 0.3]],
+            "line_endpoints_px": [[4.0, 24.0], [59.0, 24.0]],
         },
         perception_kind="observation",
         perception_error=None,
@@ -136,6 +139,10 @@ def test_writer_records_complete_jsonl_without_online_annotation(tmp_path) -> No
     assert record["controller"]["phase"] == "yaw_align"
     assert record["detections"]["target"]["track_id"] == 11
     assert record["geometry"]["target"]["valid_depth_pixels"] == 300
+    assert record["geometry"]["table"]["line_endpoints_px"] == [
+        [4.0, 24.0],
+        [59.0, 24.0],
+    ]
     assert record["command"]["wz"] == 0.05
     assert record["orientation"] == orientation_diagnostics()
     assert record["annotated_image"] is None
@@ -205,6 +212,7 @@ def test_writer_saves_lossless_review_artifacts_every_five_frames(tmp_path) -> N
         "raw_rgb": None,
         "target_mask": None,
         "table_mask": None,
+        "table_edge_overlay": None,
     }
     assert (tmp_path / "review_samples/raw/000000.png").is_file()
     assert (tmp_path / "review_samples/raw/000005.png").is_file()
@@ -224,6 +232,43 @@ def test_writer_saves_lossless_review_artifacts_every_five_frames(tmp_path) -> N
     np.testing.assert_array_equal(restored_mask, expected.astype(np.uint8) * 255)
 
 
+def test_writer_draws_recorded_table_edge_in_separate_mask_overlay(tmp_path) -> None:
+    frame = replace(
+        diagnostic_frame(5, include_table=True),
+        table_geometry={
+            "line_endpoints_xy_m": [[0.8, -0.2], [0.8, 0.2]],
+            "line_endpoints_px": [[4.0, 24.0], [59.0, 24.0]],
+        },
+    )
+    writer = AsyncFrameDiagnosticsWriter(logger=lambda _message: None)
+    writer.submit_frame(1, tmp_path, frame)
+    writer.submit_decision(
+        1,
+        5,
+        control_applied=True,
+        controller_state={"phase": "yaw_align"},
+        command={"vx": 0.0, "vy": 0.0, "wz": 0.0, "duration_s": 0.15},
+    )
+    writer.close(drain=True)
+
+    row = json.loads((tmp_path / "raw_servo_frames.jsonl").read_text())
+    review = row["review_artifacts"]
+    assert review["table_edge_overlay"] == (
+        "review_samples/masks/000005_table_edge.png"
+    )
+    binary = cv2.imread(
+        str(tmp_path / review["table_mask"]), cv2.IMREAD_UNCHANGED
+    )
+    overlay = cv2.imread(
+        str(tmp_path / review["table_edge_overlay"]), cv2.IMREAD_COLOR
+    )
+    expected = frame.surface_mask
+    assert expected is not None
+    np.testing.assert_array_equal(binary, expected.astype(np.uint8) * 255)
+    assert tuple(overlay[24, 32]) == (0, 0, 255)
+    assert tuple(overlay[24, 4]) == (0, 255, 255)
+
+
 def test_sampled_frame_records_null_for_missing_table_mask(tmp_path) -> None:
     writer = FrameDiagnosticsWriter(tmp_path)
     writer.write(
@@ -236,6 +281,7 @@ def test_sampled_frame_records_null_for_missing_table_mask(tmp_path) -> None:
     assert review["raw_rgb"] == "review_samples/raw/000005.png"
     assert review["target_mask"] == "review_samples/masks/000005_target.png"
     assert review["table_mask"] is None
+    assert review["table_edge_overlay"] is None
 
 
 def test_async_writer_drains_rows_in_frame_order(tmp_path) -> None:

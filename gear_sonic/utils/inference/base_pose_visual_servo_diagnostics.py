@@ -25,6 +25,7 @@ class DetectionFrameData:
     failover_stage: str | None = None
     reference_source_stream: str | None = None
     reference_kind: str | None = None
+    prompt_mode: str | None = None
     target_bbox_xyxy: tuple[float, float, float, float] | None = None
     target_mask: np.ndarray | None = field(default=None, repr=False)
     target_track_id: int | None = None
@@ -73,12 +74,42 @@ class FrameDiagnosticsWriter:
             raise OSError(f"failed to encode {name}")
         return encoded.tobytes()
 
+    @staticmethod
+    def _table_edge_overlay(
+        mask: np.ndarray | None,
+        table_geometry: Mapping[str, Any] | None,
+    ) -> np.ndarray | None:
+        if mask is None or table_geometry is None:
+            return None
+        edge_endpoints = table_geometry.get("line_endpoints_px")
+        if edge_endpoints is None:
+            return None
+        try:
+            raw_endpoints = np.asarray(edge_endpoints, dtype=np.float64)
+        except (TypeError, ValueError):
+            return None
+        if raw_endpoints.shape != (2, 2) or not np.all(np.isfinite(raw_endpoints)):
+            return None
+        height, width = mask.shape
+        endpoints = np.rint(raw_endpoints).astype(int)
+        endpoints[:, 0] = np.clip(endpoints[:, 0], 0, width - 1)
+        endpoints[:, 1] = np.clip(endpoints[:, 1], 0, height - 1)
+        start = tuple(int(item) for item in endpoints[0])
+        end = tuple(int(item) for item in endpoints[1])
+        binary = mask.astype(bool).astype(np.uint8) * 255
+        overlay = cv2.cvtColor(binary, cv2.COLOR_GRAY2BGR)
+        cv2.line(overlay, start, end, (0, 0, 255), 3, cv2.LINE_AA)
+        cv2.circle(overlay, start, 5, (0, 255, 255), -1, cv2.LINE_AA)
+        cv2.circle(overlay, end, 5, (0, 255, 255), -1, cv2.LINE_AA)
+        return overlay
+
     def _write_review_artifacts(self, frame: DetectionFrameData) -> dict[str, Any]:
         result: dict[str, Any] = {
             "sampled": False,
             "raw_rgb": None,
             "target_mask": None,
             "table_mask": None,
+            "table_edge_overlay": None,
         }
         if frame.frame_index % self.review_stride:
             return result
@@ -107,6 +138,22 @@ class FrameDiagnosticsWriter:
                 self._encode_png(binary, name=f"review {suffix} mask {stem}"),
             )
             result[key] = relative.as_posix()
+        edge_overlay = self._table_edge_overlay(
+            frame.surface_mask, frame.table_geometry
+        )
+        if edge_overlay is not None:
+            relative = (
+                Path("review_samples")
+                / "masks"
+                / f"{stem}_table_edge.png"
+            )
+            _atomic_write_bytes(
+                self.output_dir / relative,
+                self._encode_png(
+                    edge_overlay, name=f"review table edge overlay {stem}"
+                ),
+            )
+            result["table_edge_overlay"] = relative.as_posix()
         return result
 
     @staticmethod
@@ -128,18 +175,22 @@ class FrameDiagnosticsWriter:
         return {
             "phase": _phase_name(value.get("phase")),
             "resume_phase": _phase_name(value.get("resume_phase")),
-            "vertical_resume_phase": _phase_name(
-                value.get("vertical_resume_phase")
-            ),
             "transition_reason": value.get("transition_reason"),
             "filtered_errors": value.get("filtered_errors"),
+            "visual_yaw_error_rad": value.get("visual_yaw_error_rad"),
+            "desired_heading_rad": value.get("desired_heading_rad"),
+            "heading_setpoint_error_rad": value.get("heading_setpoint_error_rad"),
+            "yaw_error_source": value.get("yaw_error_source"),
+            "yaw_error_trusted": value.get("yaw_error_trusted"),
+            "post_stop_duration_s": value.get("post_stop_duration_s"),
+            "post_stop_elapsed_s": value.get("post_stop_elapsed_s"),
+            "post_stop_sample_count": value.get("post_stop_sample_count"),
+            "post_stop_valid_sample_count": value.get("post_stop_valid_sample_count"),
+            "post_stop_invalid_sample_count": value.get("post_stop_invalid_sample_count"),
             "invalid_frames": value.get("invalid_frames"),
             "stable_frames": value.get("stable_frames"),
             "yaw_stable_frames": value.get("yaw_stable_frames"),
             "recenter_stable_frames": value.get("recenter_stable_frames"),
-            "vertical_recenter_stable_frames": value.get(
-                "vertical_recenter_stable_frames"
-            ),
         }
 
     @staticmethod
@@ -176,6 +227,7 @@ class FrameDiagnosticsWriter:
             "failover_stage": frame.failover_stage,
             "reference_source_stream": frame.reference_source_stream,
             "reference_kind": frame.reference_kind,
+            "prompt_mode": frame.prompt_mode,
             "perception_kind": frame.perception_kind,
             "perception_error": frame.perception_error,
             "control_applied": applied,

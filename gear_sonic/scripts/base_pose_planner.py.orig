@@ -89,9 +89,10 @@ class BasePosePlannerConfig:
     raw_reference_update_interval_frames: int = 5
     raw_reference_update_min_confidence: float = 0.35
     raw_reference_update_min_iou: float = 0.50
+    raw_reference_update_freeze_y2_px: float = 75.0
+    raw_reference_update_resume_y2_px: float = 110.0
     raw_servo_hz: float = 10.0
-    raw_head_target_distance_m: float = 0.90
-    raw_chest_target_distance_m: float = 0.80
+    raw_target_distance_m: float = 0.80
     raw_forward_tolerance_m: float = 0.10
     raw_lateral_tolerance_m: float = 0.10
     raw_min_linear_speed_m_s: float = 0.40
@@ -673,17 +674,7 @@ def build_raw_servo_camera_viewer_command(
         streams,
         "--window-name",
         "Base Pose Cameras",
-        "--status-endpoint",
-        _raw_servo_viewer_status_endpoint(config),
     ]
-
-
-def _raw_servo_viewer_status_endpoint(config: BasePosePlannerConfig) -> str:
-    """Return a local subscriber endpoint for the planner's PUB socket."""
-    host = str(config.host).strip()
-    if host in {"", "*", "0.0.0.0", "::", "[::]"}:
-        host = "127.0.0.1"
-    return f"tcp://{host}:{int(config.port)}"
 
 
 class RawServoCameraViewer:
@@ -820,9 +811,7 @@ def _raw_servo_main(
         print(
             f"[RawServo] PUB bound to {endpoint}; YOLOE={config.raw_yoloe_model_path}; "
             f"visual_hz={config.raw_servo_hz}; "
-            f"head_standoff={config.raw_head_target_distance_m:.3f}m; "
-            f"chest_standoff={config.raw_chest_target_distance_m:.3f}m; "
-            f"task={config.task!r}"
+            f"standoff={config.raw_target_distance_m:.3f}m; task={config.task!r}"
         )
         print(
             "[RawServo] N initialize+align | Space cancel-and-stop | X stop-and-exit"
