@@ -54,7 +54,6 @@ from tools.yoloe26m.reference_pipeline import (
 RAW_YOLOE_SERVO_MODE = "raw_yoloe_servo"
 DEFAULT_YOLOE_MODEL = "tools/yoloe26m/weights/yoloe-26m-seg.pt"
 SINGLE_CAMERA_TEXT_RECOVERY_FRAMES = 30
-SINGLE_CAMERA_TEXT_TARGET_PROMPT = "blue basket"
 SINGLE_CAMERA_TEXT_SURFACE_PROMPT = "desk"
 TARGET_KEYS = {"text_prompt", "bbox_2d"}
 TARGET_OUTPUT_KEYS = {
@@ -122,6 +121,10 @@ class RawServoCalibration:
     def validate_snapshot(self, snapshot: AlignedRGBDSnapshot) -> None:
         if snapshot.depth_raw is None or snapshot.depth_scale_m is None:
             raise BasePoseCameraError("raw YOLOE servo requires aligned raw depth")
+        if snapshot.depth_raw.dtype != np.uint16:
+            raise BasePoseCameraError("raw YOLOE servo depth must be uint16")
+        if not math.isfinite(snapshot.depth_scale_m) or snapshot.depth_scale_m <= 0.0:
+            raise BasePoseCameraError("raw YOLOE servo depth scale must be positive")
         if snapshot.rgb.shape[:2] != (self.height, self.width):
             raise BasePoseCameraError(
                 f"expected {self.width}x{self.height} RGB-D, got "
@@ -2612,7 +2615,7 @@ def run_raw_servo_worker(
                     nonlocal visual_missing_frames
                     nonlocal target_id, surface_id
                     text_artifact = tracker.start_all_text(
-                        target_prompt=SINGLE_CAMERA_TEXT_TARGET_PROMPT,
+                        target_prompt=spec.target_prompt,
                         surface_prompt=SINGLE_CAMERA_TEXT_SURFACE_PROMPT,
                     )
                     _write_json(
@@ -2748,7 +2751,7 @@ def run_raw_servo_worker(
                                             "target_text_surface_text"
                                         ),
                                         "target_prompt": (
-                                            SINGLE_CAMERA_TEXT_TARGET_PROMPT
+                                            spec.target_prompt
                                         ),
                                         "surface_prompt": (
                                             SINGLE_CAMERA_TEXT_SURFACE_PROMPT
@@ -2828,7 +2831,7 @@ def run_raw_servo_worker(
                                             "target_text_surface_text"
                                         ),
                                         "target_prompt": (
-                                            SINGLE_CAMERA_TEXT_TARGET_PROMPT
+                                            spec.target_prompt
                                         ),
                                         "surface_prompt": (
                                             SINGLE_CAMERA_TEXT_SURFACE_PROMPT
@@ -2919,7 +2922,7 @@ def run_raw_servo_worker(
                             {
                                 "text_recovery_succeeded": True,
                                 "text_target_prompt": (
-                                    SINGLE_CAMERA_TEXT_TARGET_PROMPT
+                                    spec.target_prompt
                                 ),
                                 "text_surface_prompt": (
                                     SINGLE_CAMERA_TEXT_SURFACE_PROMPT
@@ -3329,7 +3332,7 @@ class RawServoRuntime:
         self._stop_sequence()
         self._stop_navigation_auxiliary()
         self.next_publish_at = float(now) + 1.0 / self.config.planner_hz
-        self.logger(f"[RawServo] STOP {reason}; press N for a new target")
+        self.logger(f"[RawServo] STOP {reason}; press B for a new target")
 
     def handle_key(self, key: str, *, now: float) -> str:
         normalized = str(key).lower()

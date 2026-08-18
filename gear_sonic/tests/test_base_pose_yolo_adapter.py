@@ -1,9 +1,13 @@
 from __future__ import annotations
 
+import numpy as np
+import pytest
+
 from gear_sonic.scripts.base_pose_agent import BasePoseAgentConfig
 from gear_sonic.scripts.base_pose_yolo_agent import GatewayRawServoAdapter
 from gear_sonic.utils.inference.base_pose_visual_servo import RawServoEvent
 from gear_sonic.utils.inference.base_pose_visual_servo import (
+    RawServoCalibration,
     RawServoObservation,
     ServoPhase,
     TableGeometry,
@@ -11,6 +15,7 @@ from gear_sonic.utils.inference.base_pose_visual_servo import (
     VisualServoController,
     validate_raw_servo_target,
 )
+from gear_sonic.utils.inference.base_pose import AlignedRGBDSnapshot, BasePoseCameraError
 
 
 def test_yolo_adapter_rebases_internal_worker_to_gateway_generation(tmp_path) -> None:
@@ -94,3 +99,22 @@ def test_yolo_servo_outputs_only_bounded_yaw_during_initial_alignment() -> None:
     assert command.vx == 0.0
     assert command.vy == 0.0
     assert 0.0 < abs(command.wz) <= 0.3
+
+
+def test_yolo_calibration_rejects_non_metric_raw_depth() -> None:
+    calibration = RawServoCalibration(2, 2, 100.0, 100.0, 1.0, 1.0)
+    snapshot = AlignedRGBDSnapshot(
+        rgb=np.zeros((2, 2, 3), dtype=np.uint8),
+        depth_raw=np.ones((2, 2), dtype=np.uint16),
+        fx=100.0,
+        fy=100.0,
+        cx=1.0,
+        cy=1.0,
+        depth_scale_m=0.0,
+        depth_aligned_to="ego_view",
+        depth_source="realsense",
+        timestamp=1.0,
+    )
+
+    with pytest.raises(BasePoseCameraError, match="depth scale"):
+        calibration.validate_snapshot(snapshot)
