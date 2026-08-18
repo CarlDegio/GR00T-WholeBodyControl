@@ -13,8 +13,8 @@ import numpy as np
 
 from gear_sonic.runtime.client import MaterializedSnapshot, SensorGatewayClient
 from gear_sonic.runtime.contracts import SharedMemoryFrame
+from gear_sonic.runtime.cpp_state import decode_cpp_state_array
 from gear_sonic.runtime.snapshot import SnapshotRequest
-from gear_sonic.runtime.vla_sensor_gateway import decode_cpp_state_array
 
 DATA_EXPORTER_STATE_STREAM = "cpp/state_msgpack"
 DATA_EXPORTER_ROBOT_CONFIG_STREAM = "cpp/robot_config_msgpack"

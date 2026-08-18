@@ -3,6 +3,7 @@ from __future__ import annotations
 import math
 from types import SimpleNamespace
 
+import msgpack
 import numpy as np
 import pytest
 
@@ -15,6 +16,7 @@ from gear_sonic.planner_control import (
     decode_planner_velocity_message,
 )
 from gear_sonic.scripts.planner_velocity_executor import PlannerSafetySensorMonitor
+from gear_sonic.utils.teleop.sonic_orientation_telemetry import OrientationTracker
 
 
 def navigation(
@@ -46,6 +48,12 @@ class FakeSafetySensorClient:
         self.depth_frame = SimpleNamespace(
             attributes={"camera_info": {"depth_scale_m": 0.001}},
         )
+        self.state_frame = SimpleNamespace(
+            metadata=SimpleNamespace(
+                sequence=9,
+                timestamp_ns=12_350_000_000,
+            ),
+        )
 
     def request_snapshot(self, _request):
         return SimpleNamespace(
@@ -55,12 +63,22 @@ class FakeSafetySensorClient:
 
     def read_snapshot(self, _request, *, retries: int):
         assert retries == 0
-        if self.depth_error is not None:
-            raise self.depth_error
-        stream = PlannerSafetySensorMonitor.DEPTH_STREAM
+        stream = _request.streams[0]
+        if stream == PlannerSafetySensorMonitor.DEPTH_STREAM:
+            if self.depth_error is not None:
+                raise self.depth_error
+            return SimpleNamespace(
+                arrays={stream: np.full((2, 3), 750, dtype=np.uint16)},
+                snapshot=SimpleNamespace(frames={stream: self.depth_frame}),
+            )
+        assert stream == PlannerSafetySensorMonitor.ROBOT_STATE_STREAM
+        payload = msgpack.packb(
+            {"base_quat": [1.0, 0.0, 0.0, 0.0]},
+            use_bin_type=True,
+        )
         return SimpleNamespace(
-            arrays={stream: np.full((2, 3), 750, dtype=np.uint16)},
-            snapshot=SimpleNamespace(frames={stream: self.depth_frame}),
+            arrays={stream: np.frombuffer(payload, dtype=np.uint8)},
+            snapshot=SimpleNamespace(frames={stream: self.state_frame}),
         )
 
 
@@ -119,6 +137,29 @@ def test_safety_monitor_preserves_fresh_radar_when_depth_is_unavailable() -> Non
     monitor.close()
 
 
+def test_sensor_monitor_decodes_latest_g1_debug_base_quaternion() -> None:
+    monitor = PlannerSafetySensorMonitor(
+        "inproc://unused",
+        poll_hz=20.0,
+        request_timeout_ms=100,
+        max_age_ms=1000.0,
+        include_robot_state=True,
+        client=FakeSafetySensorClient(),
+    )
+
+    monitor.poll_once()
+    orientation = monitor.orientation_snapshot()
+
+    assert orientation.sequence == 9
+    assert orientation.received_at_s == pytest.approx(12.35)
+    assert orientation.state is not None
+    np.testing.assert_allclose(
+        orientation.state["base_quat"],
+        [1.0, 0.0, 0.0, 0.0],
+    )
+    monitor.close()
+
+
 def test_wasd_and_base_pose_share_the_same_manual_execution_path() -> None:
     core = PlannerVelocityExecutorCore()
     assert core.accept_navigation(
@@ -145,6 +186,27 @@ def test_wasd_and_base_pose_share_the_same_manual_execution_path() -> None:
     base_pose = core.decide(now=11.1, safety=fresh_safety(11.1))
     assert base_pose.velocity == pytest.approx((0.3, 0.0, 0.0))
     assert base_pose.source == "base_pose_agent"
+
+
+def test_orientation_sample_uses_executor_post_integration_heading() -> None:
+    core = PlannerVelocityExecutorCore(control_hz=20.0)
+    tracker = OrientationTracker()
+    tracker.update_state(
+        {"base_quat": [1.0, 0.0, 0.0, 0.0]},
+        received_at_monotonic_s=10.0,
+        heading_setpoint_rad=core.sonic.heading,
+    )
+    core.accept_navigation(
+        navigation("manual_velocity", velocity=(0.0, 0.0, 0.4)),
+        now=10.0,
+    )
+
+    core.decide(now=10.05, safety=fresh_safety(10.05))
+    sample = tracker.sample(10.05, core.sonic.heading)
+
+    assert sample.actual_heading_rad == pytest.approx(0.0)
+    assert sample.heading_setpoint_rad == pytest.approx(0.02)
+    assert sample.heading_lag_rad == pytest.approx(0.02)
 
 
 def test_common_radar_and_depth_safety_apply_to_every_source() -> None:

@@ -457,12 +457,14 @@ def test_base_pose_qwenvl_command_loads_local_key_without_persisting_by_default(
 
 
 def test_base_pose_yoloe_command_uses_aligned_raw_depth_and_local_model() -> None:
-    command = build_base_pose_agent_command(
-        InferenceLaunchConfig(
-            base_pose_enabled=True,
-            base_pose_task="align",
-            base_pose_mode="raw_yoloe_servo",
-        ),
+    config = InferenceLaunchConfig(
+        base_pose_enabled=True,
+        base_pose_task="align",
+        base_pose_mode="raw_yoloe_servo",
+    )
+    command = build_base_pose_agent_command(config, Path("/workspace/sonic"))
+    executor = build_planner_velocity_executor_command(
+        config,
         Path("/workspace/sonic"),
     )
 
@@ -470,6 +472,17 @@ def test_base_pose_yoloe_command_uses_aligned_raw_depth_and_local_model() -> Non
     assert "--depth-stream camera/ego_view_depth" in command
     assert "--raw-yoloe-model-path tools/yoloe26m/weights/yoloe-26m-seg.pt" in command
     assert "--raw-head-target-distance-m 0.9" in command
+    assert "--raw-orientation-telemetry-source tcp://127.0.0.1:5569" in command
+    assert "--orientation-output-endpoint 'tcp://*:5569'" in executor
+
+
+def test_orientation_telemetry_is_disabled_outside_raw_yoloe_mode() -> None:
+    executor = build_planner_velocity_executor_command(
+        InferenceLaunchConfig(base_pose_enabled=True, base_pose_mode="rgb"),
+        Path("/workspace/sonic"),
+    )
+
+    assert "--orientation-output-endpoint" not in executor
 
 
 def test_runtime_sidecars_are_read_only_and_navdp_uses_gateway_by_default() -> None:

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import math
+
 import numpy as np
 import pytest
 
@@ -9,6 +11,7 @@ from gear_sonic.utils.inference.base_pose_visual_servo import RawServoEvent
 from gear_sonic.utils.inference.base_pose_visual_servo import (
     RawServoCalibration,
     RawServoObservation,
+    ServoCommand,
     ServoPhase,
     TableGeometry,
     TargetGeometry,
@@ -16,6 +19,41 @@ from gear_sonic.utils.inference.base_pose_visual_servo import (
     validate_raw_servo_target,
 )
 from gear_sonic.utils.inference.base_pose import AlignedRGBDSnapshot, BasePoseCameraError
+
+
+def _servo_observation(
+    *,
+    yaw_rad: float = 0.0,
+    include_table: bool = True,
+) -> RawServoObservation:
+    return RawServoObservation(
+        target=TargetGeometry(1.2, 0.0, (1.2, 0.0, 0.5), 100, 0.9, 1.2),
+        table=(
+            TableGeometry(yaw_rad, 1.0, 100, 0.01, (1.0, 0.0))
+            if include_table
+            else None
+        ),
+        camera_timestamp=1.0,
+        target_track_id=1,
+        surface_track_id=2 if include_table else None,
+        target_bbox_xyxy=(240.0, 120.0, 400.0, 360.0),
+    )
+
+
+def _orientation(
+    actual_heading_rad: float,
+    heading_setpoint_rad: float | None = None,
+) -> dict[str, float]:
+    return {
+        "actual_heading_rad": actual_heading_rad,
+        "heading_setpoint_rad": (
+            actual_heading_rad
+            if heading_setpoint_rad is None
+            else heading_setpoint_rad
+        ),
+        "state_age_s": 0.01,
+        "telemetry_age_s": 0.01,
+    }
 
 
 def test_yolo_adapter_rebases_internal_worker_to_gateway_generation(tmp_path) -> None:
@@ -36,6 +74,27 @@ def test_yolo_adapter_rebases_internal_worker_to_gateway_generation(tmp_path) ->
     assert intents[-1][1]["generation"] == 7
     assert intents[-1][1]["motion_profile"] == "yoloe_servo"
     assert intents[-1][1]["velocity"] == [0.0, 0.0, 0.0]
+
+
+def test_yolo_adapter_injects_agent_near_orientation_provider(tmp_path) -> None:
+    provider = lambda _now: {
+        "actual_heading_rad": 0.1,
+        "heading_setpoint_rad": 0.2,
+        "state_age_s": 0.01,
+        "telemetry_age_s": 0.01,
+    }
+
+    adapter = GatewayRawServoAdapter(
+        BasePoseAgentConfig(
+            task="align to the basket",
+            mode="raw_yoloe_servo",
+            output_root=str(tmp_path),
+        ),
+        submit_intent=lambda _name, _values: None,
+        orientation_provider=provider,
+    )
+
+    assert adapter.runtime.orientation_provider is provider
 
 
 def test_yolo_adapter_reports_terminal_worker_failure_once(tmp_path) -> None:
@@ -99,6 +158,52 @@ def test_yolo_servo_outputs_only_bounded_yaw_during_initial_alignment() -> None:
     assert command.vx == 0.0
     assert command.vy == 0.0
     assert 0.0 < abs(command.wz) <= 0.3
+
+
+@pytest.mark.parametrize("phase", [ServoPhase.YAW_ALIGN, ServoPhase.YAW_TRIM])
+@pytest.mark.parametrize(
+    ("actual_heading_deg", "expected_error_deg", "expected_wz"),
+    [(15.0, 15.0, 0.10), (45.0, -15.0, -0.10)],
+)
+def test_yolo_optional_table_yaw_closes_against_agent_near_actual_heading(
+    phase: ServoPhase,
+    actual_heading_deg: float,
+    expected_error_deg: float,
+    expected_wz: float,
+) -> None:
+    controller = VisualServoController(
+        ema_alpha=1.0,
+        allow_missing_table=True,
+    )
+    controller.reset(1.0)
+    controller.phase = phase
+
+    controller.update(
+        _servo_observation(yaw_rad=math.radians(20.0)),
+        now=1.1,
+        orientation=_orientation(math.radians(10.0)),
+    )
+    target_heading = math.radians(30.0)
+    assert controller.desired_heading_rad == pytest.approx(target_heading)
+
+    # The integrated SONIC setpoint may reach the target before the physical
+    # base; agent-near closes this fallback against measured g1_debug yaw.
+    controller.current = ServoCommand(0.0, 0.0, 0.0, 0.15)
+    command = controller.update(
+        _servo_observation(include_table=False),
+        now=1.2,
+        orientation=_orientation(
+            math.radians(actual_heading_deg),
+            target_heading,
+        ),
+    )
+
+    assert controller.last_errors[2] == pytest.approx(
+        math.radians(expected_error_deg)
+    )
+    assert controller.heading_setpoint_error_rad is None
+    assert controller.yaw_error_source == "propagated_actual_heading"
+    assert command.wz == pytest.approx(expected_wz)
 
 
 def test_yolo_calibration_rejects_non_metric_raw_depth() -> None:

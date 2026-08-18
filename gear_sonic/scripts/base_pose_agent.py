@@ -85,6 +85,7 @@ class BasePoseAgentConfig:
     raw_forward_recenter_yaw_speed_rad_s: float = 0.30
     raw_horizontal_guard_fraction: float = 0.25
     raw_horizontal_recovery_fraction: float = 0.30
+    raw_orientation_telemetry_source: str = "tcp://127.0.0.1:5569"
     raw_command_ttl_s: float = 0.15
     raw_camera_stale_s: float = 0.4
     raw_max_run_s: float = 180.0

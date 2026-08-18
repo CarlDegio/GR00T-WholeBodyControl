@@ -195,6 +195,14 @@ def _build_endpoints() -> Mapping[str, EndpointSpec]:
             ("planner_velocity_executor",),
             purpose="Generation-scoped NavDP body velocity and heading targets",
         ),
+        EndpointSpec(
+            "orientation_telemetry",
+            5569,
+            Transport.ZMQ,
+            "planner_velocity_executor",
+            ("base_pose_yolo_agent",),
+            purpose="SONIC heading setpoint and measured g1_debug base yaw",
+        ),
     )
     by_name = {endpoint.name: endpoint for endpoint in endpoints}
     if len(by_name) != len(endpoints):

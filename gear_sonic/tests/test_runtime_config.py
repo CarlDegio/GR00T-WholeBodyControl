@@ -114,6 +114,7 @@ def test_profile_parameters_match_current_process_defaults() -> None:
         executor_profile["navdp_velocity_timeout_s"]
         == executor.navdp_velocity_timeout_s
     )
+    assert executor.orientation_output_endpoint == ""
 
     lingbot_profile = profile.component("lingbot_depth")
     assert lingbot_profile["model"] == lingbot.model

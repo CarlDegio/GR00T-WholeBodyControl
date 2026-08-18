@@ -671,6 +671,8 @@ def build_base_pose_agent_command(
             f"--raw-yaw-trim-speed-rad-s {config.base_pose_raw_yaw_trim_speed_rad_s} "
             f"--raw-camera-stale-s {config.base_pose_raw_camera_stale_s} "
             f"--raw-max-run-s {config.base_pose_raw_max_run_s} "
+            "--raw-orientation-telemetry-source "
+            f"{shlex.quote(_runtime_profile(config).endpoint_uri('orientation_telemetry'))} "
         )
     return (
         f"cd {quoted_root} && {local_env}"
@@ -766,6 +768,13 @@ def build_planner_velocity_executor_command(
     profile = _runtime_profile(config)
     settings = profile.component("planner_executor")
     planner_relay = profile.endpoint("planner_relay")
+    orientation_telemetry = profile.endpoint("orientation_telemetry")
+    orientation_output = (
+        "--orientation-output-endpoint "
+        f"{shlex.quote(f'tcp://*:{orientation_telemetry.port}')} "
+        if config.base_pose_enabled and config.base_pose_mode == "raw_yoloe_servo"
+        else ""
+    )
     return (
         f"cd {shlex.quote(str(repo_root))} && source .venv_teleop/bin/activate && "
         "python gear_sonic/scripts/planner_velocity_executor.py "
@@ -779,7 +788,8 @@ def build_planner_velocity_executor_command(
         f"--radar-timeout-s {settings['radar_timeout_s']} "
         f"--sensor-gateway-poll-hz {settings['sensor_gateway_poll_hz']} "
         f"--sensor-gateway-request-timeout-ms {settings['sensor_gateway_request_timeout_ms']} "
-        f"--sensor-gateway-max-age-ms {settings['sensor_gateway_max_age_ms']}"
+        f"--sensor-gateway-max-age-ms {settings['sensor_gateway_max_age_ms']} "
+        f"{orientation_output}"
     )
 
 

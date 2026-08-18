@@ -7,7 +7,7 @@ from dataclasses import dataclass
 import signal
 import threading
 import time
-from typing import Any, Callable
+from typing import Any, Callable, Mapping
 
 import numpy as np
 import zmq
@@ -20,7 +20,12 @@ from gear_sonic.planner_control import (
 )
 from gear_sonic.runtime.client import SensorGatewayClient
 from gear_sonic.runtime.config import load_runtime_profile
+from gear_sonic.runtime.cpp_state import decode_cpp_state_array
 from gear_sonic.runtime.snapshot import SnapshotRequest
+from gear_sonic.utils.teleop.sonic_orientation_telemetry import (
+    OrientationTracker,
+    encode_orientation_telemetry,
+)
 
 _PROFILE = load_runtime_profile()
 _DEFAULTS = _PROFILE.component("planner_executor")
@@ -49,6 +54,14 @@ class PlannerVelocityExecutorConfig:
     sensor_gateway_max_age_ms: float = float(
         _DEFAULTS["sensor_gateway_max_age_ms"]
     )
+    orientation_output_endpoint: str = ""
+
+
+@dataclass(frozen=True)
+class RobotOrientationSnapshot:
+    sequence: int = -1
+    received_at_s: float = 0.0
+    state: Mapping[str, Any] | None = None
 
 
 class PlannerSafetySensorMonitor:
@@ -56,6 +69,7 @@ class PlannerSafetySensorMonitor:
 
     LIDAR_STREAM = "ros/livox_lidar_xyz"
     DEPTH_STREAM = "camera/ego_view_depth"
+    ROBOT_STATE_STREAM = "cpp/state_msgpack"
 
     def __init__(
         self,
@@ -64,6 +78,7 @@ class PlannerSafetySensorMonitor:
         poll_hz: float,
         request_timeout_ms: int,
         max_age_ms: float,
+        include_robot_state: bool = False,
         client: SensorGatewayClient | None = None,
         monotonic: Callable[[], float] = time.monotonic,
     ) -> None:
@@ -71,6 +86,7 @@ class PlannerSafetySensorMonitor:
             raise ValueError("safety sensor poll_hz must be positive")
         self.poll_hz = float(poll_hz)
         self.max_age_ms = float(max_age_ms)
+        self.include_robot_state = bool(include_robot_state)
         self.client = client or SensorGatewayClient(
             endpoint, request_timeout_ms=int(request_timeout_ms)
         )
@@ -84,6 +100,7 @@ class PlannerSafetySensorMonitor:
             daemon=True,
         )
         self._snapshot = SafetySnapshot()
+        self._orientation = RobotOrientationSnapshot()
         self._last_error = ""
         self._last_error_time = 0.0
 
@@ -97,7 +114,7 @@ class PlannerSafetySensorMonitor:
             retries=0,
         )
 
-    def poll_once(self) -> None:
+    def _poll_lidar(self) -> None:
         lidar = self.client.request_snapshot(
             SnapshotRequest(
                 streams=(self.LIDAR_STREAM,),
@@ -114,6 +131,8 @@ class PlannerSafetySensorMonitor:
                 radar_time,
                 self._snapshot.depth_m,
             )
+
+    def _poll_depth(self) -> None:
         depth = self._request(self.DEPTH_STREAM)
         depth_raw = np.asarray(depth.arrays[self.DEPTH_STREAM])
         if depth_raw.ndim != 2:
@@ -130,6 +149,31 @@ class PlannerSafetySensorMonitor:
                 depth_m,
             )
 
+    def _poll_robot_state(self) -> None:
+        snapshot = self._request(self.ROBOT_STATE_STREAM)
+        frame = snapshot.snapshot.frames[self.ROBOT_STATE_STREAM]
+        sequence = int(frame.metadata.sequence)
+        with self._lock:
+            if sequence == self._orientation.sequence:
+                return
+        state = decode_cpp_state_array(snapshot.arrays[self.ROBOT_STATE_STREAM])
+        try:
+            base_quat = tuple(state["base_quat"])
+        except (KeyError, TypeError) as exc:
+            raise ValueError("g1_debug state is missing base_quat") from exc
+        with self._lock:
+            self._orientation = RobotOrientationSnapshot(
+                sequence=sequence,
+                received_at_s=float(frame.metadata.timestamp_ns) * 1.0e-9,
+                state={"base_quat": base_quat},
+            )
+
+    def poll_once(self) -> None:
+        self._poll_lidar()
+        self._poll_depth()
+        if self.include_robot_state:
+            self._poll_robot_state()
+
     def _report(self, exc: Exception) -> None:
         message = str(exc)
         now = self._monotonic()
@@ -140,12 +184,18 @@ class PlannerSafetySensorMonitor:
 
     def _run(self) -> None:
         period = 1.0 / self.poll_hz
+        pollers = [self._poll_lidar, self._poll_depth]
+        if self.include_robot_state:
+            pollers.append(self._poll_robot_state)
         while not self._stop.is_set():
             started = self._monotonic()
-            try:
-                self.poll_once()
-            except Exception as exc:
-                self._report(exc)
+            for poll in pollers:
+                if self._stop.is_set():
+                    break
+                try:
+                    poll()
+                except Exception as exc:
+                    self._report(exc)
             self._stop.wait(max(0.0, period - (self._monotonic() - started)))
 
     def start(self) -> None:
@@ -160,6 +210,15 @@ class PlannerSafetySensorMonitor:
                     if self._snapshot.depth_m is None
                     else self._snapshot.depth_m.copy()
                 ),
+            )
+
+    def orientation_snapshot(self) -> RobotOrientationSnapshot:
+        with self._lock:
+            value = self._orientation
+            return RobotOrientationSnapshot(
+                sequence=value.sequence,
+                received_at_s=value.received_at_s,
+                state=None if value.state is None else dict(value.state),
             )
 
     def close(self) -> None:
@@ -182,11 +241,19 @@ def main(config: PlannerVelocityExecutorConfig) -> None:
     navigation.connect(config.command_endpoint)
     navdp.connect(config.navdp_velocity_endpoint)
     output.bind(config.output_endpoint)
+    orientation_output = None
+    orientation_tracker = None
+    if config.orientation_output_endpoint:
+        orientation_output = context.socket(zmq.PUB)
+        orientation_output.setsockopt(zmq.LINGER, 0)
+        orientation_output.bind(config.orientation_output_endpoint)
+        orientation_tracker = OrientationTracker()
     sensors = PlannerSafetySensorMonitor(
         config.sensor_gateway_endpoint,
         poll_hz=config.sensor_gateway_poll_hz,
         request_timeout_ms=config.sensor_gateway_request_timeout_ms,
         max_age_ms=config.sensor_gateway_max_age_ms,
+        include_robot_state=orientation_tracker is not None,
     )
     sensors.start()
     core = PlannerVelocityExecutorCore(
@@ -207,8 +274,14 @@ def main(config: PlannerVelocityExecutorConfig) -> None:
         f"[PlannerExecutor] command={config.command_endpoint} "
         f"navdp={config.navdp_velocity_endpoint} output={config.output_endpoint}"
     )
+    if config.orientation_output_endpoint:
+        print(
+            "[PlannerExecutor] orientation telemetry="
+            f"{config.orientation_output_endpoint}"
+        )
     period = 1.0 / config.control_hz
     last_reason = ""
+    last_orientation_sequence = -1
     try:
         while running:
             started = time.monotonic()
@@ -228,8 +301,34 @@ def main(config: PlannerVelocityExecutorConfig) -> None:
                     )
                 except (KeyError, TypeError, ValueError) as exc:
                     print(f"[PlannerExecutor] rejected planner velocity: {exc}")
-            decision = core.decide(now=time.monotonic(), safety=sensors.snapshot())
+            now = time.monotonic()
+            if orientation_tracker is not None:
+                orientation = sensors.orientation_snapshot()
+                if (
+                    orientation.state is not None
+                    and orientation.sequence != last_orientation_sequence
+                ):
+                    last_orientation_sequence = orientation.sequence
+                    try:
+                        orientation_tracker.update_state(
+                            orientation.state,
+                            received_at_monotonic_s=orientation.received_at_s,
+                            heading_setpoint_rad=core.sonic.heading,
+                        )
+                    except ValueError as exc:
+                        print(
+                            "[PlannerExecutor] ignored robot orientation: "
+                            f"{exc}",
+                            flush=True,
+                        )
+            decision = core.decide(now=now, safety=sensors.snapshot())
             output.send(decision.message)
+            if orientation_output is not None and orientation_tracker is not None:
+                orientation_output.send_string(
+                    encode_orientation_telemetry(
+                        orientation_tracker.sample(now, core.sonic.heading)
+                    )
+                )
             if decision.reason != last_reason:
                 print(
                     f"[PlannerExecutor] generation={decision.generation} "
@@ -248,6 +347,8 @@ def main(config: PlannerVelocityExecutorConfig) -> None:
         navigation.close(0)
         navdp.close(0)
         output.close(0)
+        if orientation_output is not None:
+            orientation_output.close(0)
 
 
 if __name__ == "__main__":

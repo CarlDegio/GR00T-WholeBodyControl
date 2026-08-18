@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import json
+import math
 import threading
 import time
 from typing import Any, Callable, Mapping
@@ -20,6 +21,9 @@ from gear_sonic.utils.inference.base_pose_visual_servo import (
     run_raw_servo_worker,
     validate_raw_servo_dependencies,
 )
+from gear_sonic.utils.teleop.sonic_orientation_telemetry import (
+    LatestOrientationTelemetry,
+)
 
 
 class GatewayRawServoAdapter:
@@ -32,6 +36,9 @@ class GatewayRawServoAdapter:
         submit_intent: Callable[[str, Mapping[str, object]], None],
         logger: Callable[[str], None] = print,
         monotonic: Callable[[], float] = time.monotonic,
+        orientation_provider: (
+            Callable[[float], Mapping[str, Any] | None] | None
+        ) = None,
     ) -> None:
         self.submit_intent = submit_intent
         self.logger = logger
@@ -44,6 +51,7 @@ class GatewayRawServoAdapter:
             publish=self._publish,
             logger=logger,
             monotonic=monotonic,
+            orientation_provider=orientation_provider,
         )
 
     def _publish(self, message: str) -> None:
@@ -120,9 +128,42 @@ def run_base_pose_yolo_agent(config: Any) -> None:
         context=context,
         ttl_ms=max(100, int(3000.0 / config.planner_hz)),
     )
+    orientation_socket = None
+    orientation_provider = None
+    if config.raw_orientation_telemetry_source:
+        orientation_socket = context.socket(zmq.SUB)
+        orientation_socket.setsockopt(zmq.SUBSCRIBE, b"")
+        orientation_socket.setsockopt(zmq.CONFLATE, 1)
+        orientation_socket.setsockopt(zmq.LINGER, 0)
+        orientation_socket.connect(config.raw_orientation_telemetry_source)
+        latest_orientation = LatestOrientationTelemetry()
+        last_warning_at = -math.inf
+
+        def read_orientation(now: float) -> dict[str, float | None] | None:
+            nonlocal last_warning_at
+            assert orientation_socket is not None
+            while True:
+                try:
+                    raw = orientation_socket.recv(zmq.NOBLOCK)
+                except zmq.Again:
+                    break
+                try:
+                    latest_orientation.update(raw)
+                except ValueError as exc:
+                    if now - last_warning_at >= 1.0:
+                        print(
+                            "[BasePose/YOLOE] ignored orientation telemetry: "
+                            f"{exc}",
+                            flush=True,
+                        )
+                        last_warning_at = now
+            return latest_orientation.diagnostics(now)
+
+        orientation_provider = read_orientation
     adapter = GatewayRawServoAdapter(
         config,
         submit_intent=lambda name, parameters: intent.send(name, parameters),
+        orientation_provider=orientation_provider,
     )
     control = ControlGatewaySubscriber(
         config.control_gateway_endpoint,
@@ -181,4 +222,5 @@ def run_base_pose_yolo_agent(config: Any) -> None:
         adapter.runtime.flush_diagnostics()
         control.close()
         intent.close()
-
+        if orientation_socket is not None:
+            orientation_socket.close(0)
