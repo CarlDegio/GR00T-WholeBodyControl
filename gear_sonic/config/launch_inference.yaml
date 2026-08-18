@@ -18,6 +18,7 @@ endpoints:
   vla_timing_ingress: {host: 127.0.0.1, port: 5567}
   navdp_velocity: {host: 127.0.0.1, port: 5568}
   orientation_telemetry: {host: 127.0.0.1, port: 5569}
+  navigation_runtime_status: {host: 127.0.0.1, port: 5570}
   xnavdp_http: {host: 127.0.0.1, port: 19999}
 ros_topics:
   lidar: /livox/lidar

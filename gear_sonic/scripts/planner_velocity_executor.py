@@ -15,6 +15,7 @@ import zmq
 from gear_sonic.planner_control import (
     PlannerVelocityExecutorCore,
     SafetySnapshot,
+    build_navigation_runtime_status_message,
     decode_navigation_message,
     decode_planner_velocity_message,
 )
@@ -55,6 +56,7 @@ class PlannerVelocityExecutorConfig:
         _DEFAULTS["sensor_gateway_max_age_ms"]
     )
     orientation_output_endpoint: str = ""
+    runtime_status_endpoint: str = _bind_endpoint("navigation_runtime_status")
 
 
 @dataclass(frozen=True)
@@ -234,13 +236,16 @@ def main(config: PlannerVelocityExecutorConfig) -> None:
     navigation = context.socket(zmq.SUB)
     navdp = context.socket(zmq.SUB)
     output = context.socket(zmq.PUB)
-    for socket in (navigation, navdp, output):
+    runtime_status = context.socket(zmq.PUB)
+    for socket in (navigation, navdp, output, runtime_status):
         socket.setsockopt(zmq.LINGER, 0)
+    runtime_status.setsockopt(zmq.SNDHWM, 1)
     navigation.setsockopt_string(zmq.SUBSCRIBE, "")
     navdp.setsockopt_string(zmq.SUBSCRIBE, "")
     navigation.connect(config.command_endpoint)
     navdp.connect(config.navdp_velocity_endpoint)
     output.bind(config.output_endpoint)
+    runtime_status.bind(config.runtime_status_endpoint)
     orientation_output = None
     orientation_tracker = None
     if config.orientation_output_endpoint:
@@ -272,7 +277,8 @@ def main(config: PlannerVelocityExecutorConfig) -> None:
         signal.signal(signum, stop)
     print(
         f"[PlannerExecutor] command={config.command_endpoint} "
-        f"navdp={config.navdp_velocity_endpoint} output={config.output_endpoint}"
+        f"navdp={config.navdp_velocity_endpoint} output={config.output_endpoint} "
+        f"status={config.runtime_status_endpoint}"
     )
     if config.orientation_output_endpoint:
         print(
@@ -323,6 +329,20 @@ def main(config: PlannerVelocityExecutorConfig) -> None:
                         )
             decision = core.decide(now=now, safety=sensors.snapshot())
             output.send(decision.message)
+            try:
+                runtime_status.send_string(
+                    build_navigation_runtime_status_message(
+                        generation=decision.generation,
+                        mode=core.mode,
+                        source=decision.source,
+                        requested_velocity=decision.requested_velocity,
+                        velocity=decision.velocity,
+                        reason=decision.reason,
+                    ),
+                    flags=zmq.DONTWAIT,
+                )
+            except zmq.Again:
+                pass
             if orientation_output is not None and orientation_tracker is not None:
                 orientation_output.send_string(
                     encode_orientation_telemetry(
@@ -347,6 +367,7 @@ def main(config: PlannerVelocityExecutorConfig) -> None:
         navigation.close(0)
         navdp.close(0)
         output.close(0)
+        runtime_status.close(0)
         if orientation_output is not None:
             orientation_output.close(0)
 

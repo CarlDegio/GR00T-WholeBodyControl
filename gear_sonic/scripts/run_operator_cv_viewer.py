@@ -10,7 +10,12 @@ from typing import Mapping
 
 import cv2
 import numpy as np
+import zmq
 
+from gear_sonic.planner_control import (
+    NavigationRuntimeStatus,
+    decode_navigation_runtime_status_message,
+)
 from gear_sonic.runtime.client import SensorGatewayClient
 from gear_sonic.runtime.contracts import OperatorCommand
 from gear_sonic.runtime.control_client import ControlGatewaySubscriber
@@ -44,7 +49,20 @@ DISPLAY_STREAMS = (
     CHEST_RGB_STREAM,
 )
 BASE_POSE_ACTIVE_COLOR = (0, 0, 255)
-BASE_POSE_TERMINAL_STATES = frozenset({"reached", "failed", "stopped"})
+NAVIGATION_TERMINAL_STATES = frozenset({"reached", "failed", "stopped"})
+NAVIGATION_OWNER_COLORS = {
+    "wasd": (255, 210, 40),
+    "navdp": (40, 230, 255),
+    "basepose": BASE_POSE_ACTIVE_COLOR,
+}
+WASD_VELOCITY_KEYS = {
+    (0.3, 0.0, 0.0): "W",
+    (-0.3, 0.0, 0.0): "S",
+    (0.0, 0.15, 0.0): "A",
+    (0.0, -0.15, 0.0): "D",
+    (0.0, 0.0, 0.5): "Q",
+    (0.0, 0.0, -0.5): "E",
+}
 
 
 def _camera_stream_name(value: object) -> str | None:
@@ -55,24 +73,34 @@ def _camera_stream_name(value: object) -> str | None:
 
 
 @dataclass
-class BasePoseViewerState:
-    """Latest read-only BasePose state mirrored by ControlGateway."""
+class NavigationViewerState:
+    """Merge control lifecycle events with final executor velocity telemetry."""
 
+    owner: str = "idle"
     active: bool = False
     generation: int = 0
     state: str = "idle"
     camera_stream: str | None = None
     action: str = ""
+    requested_velocity: tuple[float, float, float] = (0.0, 0.0, 0.0)
     velocity: tuple[float, float, float] = (0.0, 0.0, 0.0)
     reason: str = ""
+    safety_reason: str = "stopped"
     updated_at: float = 0.0
 
-    def accept(self, command: OperatorCommand, *, now: float | None = None) -> bool:
-        """Apply one typed observer event, ignoring unrelated or stale commands."""
+    def accept_control(
+        self,
+        command: OperatorCommand,
+        *,
+        now: float | None = None,
+    ) -> bool:
+        """Apply lifecycle/camera metadata mirrored by ControlGateway."""
 
         if command.name not in {
+            "start_navigation",
             "start_base_pose",
             "cancel_navigation",
+            "navigation_status",
             BASE_POSE_RUNTIME_STATUS_COMMAND,
         }:
             return False
@@ -84,45 +112,63 @@ class BasePoseViewerState:
         if generation < self.generation:
             return False
         timestamp = time.monotonic() if now is None else float(now)
+        if command.name == "start_navigation":
+            self.owner = "navdp"
+            self.active = True
+            self.generation = generation
+            self.state = "pending"
+            self.camera_stream = None
+            self.action = "target_detection"
+            self.requested_velocity = (0.0, 0.0, 0.0)
+            self.velocity = (0.0, 0.0, 0.0)
+            self.reason = ""
+            self.safety_reason = "stopped"
+            self.updated_at = timestamp
+            return True
         if command.name == "start_base_pose":
+            self.owner = "basepose"
             self.active = True
             self.generation = generation
             self.state = "inference"
             self.camera_stream = None
             self.action = "detecting"
+            self.requested_velocity = (0.0, 0.0, 0.0)
             self.velocity = (0.0, 0.0, 0.0)
             self.reason = ""
+            self.safety_reason = "stopped"
             self.updated_at = timestamp
             return True
         if command.name == "cancel_navigation":
-            if not self.active:
+            if self.owner == "idle":
                 return False
             self.active = False
             self.generation = generation
             self.state = "stopped"
             self.action = "stop"
+            self.requested_velocity = (0.0, 0.0, 0.0)
             self.velocity = (0.0, 0.0, 0.0)
             self.reason = str(parameters.get("reason", "cancelled"))
+            self.safety_reason = "stopped"
             self.updated_at = timestamp
             return True
 
-        raw_velocity = parameters.get("velocity", (0.0, 0.0, 0.0))
-        try:
-            if isinstance(raw_velocity, Mapping):
-                velocity = tuple(
-                    float(raw_velocity[name]) for name in ("vx", "vy", "wz")
-                )
-            elif isinstance(raw_velocity, (list, tuple)):
-                velocity = tuple(float(value) for value in raw_velocity)
-            else:
-                return False
-            if len(velocity) != 3:
-                return False
-        except (KeyError, TypeError, ValueError):
-            return False
+        if command.name == "navigation_status":
+            self.owner = "navdp"
+            self.generation = generation
+            self.state = str(parameters.get("state", "active"))
+            self.active = self.state not in NAVIGATION_TERMINAL_STATES
+            self.action = "navigate" if self.active else "stop"
+            self.reason = str(parameters.get("reason", ""))
+            if not self.active:
+                self.requested_velocity = (0.0, 0.0, 0.0)
+                self.velocity = (0.0, 0.0, 0.0)
+            self.updated_at = timestamp
+            return True
+
         state = str(parameters.get("state", "motion"))
         camera_stream = _camera_stream_name(parameters.get("camera_stream"))
-        self.active = state not in BASE_POSE_TERMINAL_STATES
+        self.owner = "basepose"
+        self.active = state not in NAVIGATION_TERMINAL_STATES
         self.generation = generation
         self.state = state
         if camera_stream is not None:
@@ -130,34 +176,116 @@ class BasePoseViewerState:
         self.action = str(
             parameters.get(
                 "action",
-                "stop" if state in BASE_POSE_TERMINAL_STATES else self.action,
+                "stop" if state in NAVIGATION_TERMINAL_STATES else self.action,
             )
         )
-        self.velocity = (velocity[0], velocity[1], velocity[2])
+        if not self.active:
+            self.requested_velocity = (0.0, 0.0, 0.0)
+            self.velocity = (0.0, 0.0, 0.0)
         self.reason = str(parameters.get("reason", ""))
         self.updated_at = timestamp
         return True
 
+    def accept_runtime(
+        self,
+        status: NavigationRuntimeStatus,
+        *,
+        now: float | None = None,
+    ) -> bool:
+        """Apply the final command emitted by PlannerExecutor."""
+
+        if status.generation < self.generation:
+            return False
+        timestamp = time.monotonic() if now is None else float(now)
+        owner = "idle"
+        if status.mode == "nav_goal":
+            owner = "navdp"
+        elif status.mode == "manual_velocity":
+            owner = "basepose" if status.source == "base_pose_agent" else "wasd"
+        terminal_same_generation = (
+            status.generation == self.generation
+            and not self.active
+            and self.state in NAVIGATION_TERMINAL_STATES
+        )
+        protected_terminal = terminal_same_generation and owner == self.owner
+        if protected_terminal and status.mode != "stop":
+            return False
+
+        if owner != "idle" and not protected_terminal:
+            if owner != self.owner or status.generation > self.generation:
+                self.camera_stream = None
+                self.reason = ""
+            self.owner = owner
+            self.active = True
+            self.generation = status.generation
+            if owner == "wasd":
+                self.action = self._wasd_key(status.requested_velocity)
+                self.active = self.action != "RELEASED"
+                self.state = "active" if self.action != "RELEASED" else "released"
+            elif owner == "navdp":
+                self.action = "navigate"
+                self.state = "active"
+            elif self.state in {"idle", "stopped"}:
+                self.state = "motion"
+        elif status.generation > self.generation:
+            self.generation = status.generation
+            if self.owner != "idle":
+                self.active = False
+                self.state = "stopped"
+                self.action = "stop"
+                self.reason = ""
+
+        self.requested_velocity = status.requested_velocity
+        self.velocity = status.velocity
+        self.safety_reason = status.reason
+        self.updated_at = timestamp
+        return True
+
+    @staticmethod
+    def _wasd_key(velocity: tuple[float, float, float]) -> str:
+        for expected, key in WASD_VELOCITY_KEYS.items():
+            if all(
+                abs(actual - target) <= 1.0e-6
+                for actual, target in zip(velocity, expected)
+            ):
+                return key
+        return (
+            "RELEASED"
+            if all(abs(value) <= 1.0e-6 for value in velocity)
+            else "MANUAL"
+        )
+
     def is_active_camera(self, stream: str) -> bool:
-        return self.active and self.camera_stream == stream
+        return self.owner == "basepose" and self.active and self.camera_stream == stream
 
     def status_text(self) -> str:
-        camera = (
-            "HEAD"
-            if self.camera_stream == HEAD_RGB_STREAM
-            else "CHEST"
-            if self.camera_stream == CHEST_RGB_STREAM
-            else "WAITING CAMERA"
-        )
+        if self.owner == "idle":
+            return ""
         vx, vy, wz = self.velocity
         parts = [
-            f"BASEPOSE G{self.generation}",
+            f"{self.owner.upper()} G{self.generation}",
             self.state.upper(),
-            camera,
         ]
+        if self.owner == "basepose":
+            camera = (
+                "HEAD"
+                if self.camera_stream == HEAD_RGB_STREAM
+                else "CHEST"
+                if self.camera_stream == CHEST_RGB_STREAM
+                else "WAITING CAMERA"
+            )
+            parts.append(camera)
         if self.action:
             parts.append(self.action)
-        parts.append(f"vx {vx:+.2f}  vy {vy:+.2f}  wz {wz:+.2f}")
+        parts.append(f"OUT vx {vx:+.2f}  vy {vy:+.2f}  wz {wz:+.2f}")
+        if any(
+            abs(requested - final) > 1.0e-6
+            for requested, final in zip(self.requested_velocity, self.velocity)
+        ):
+            rvx, rvy, rwz = self.requested_velocity
+            parts.append(f"REQ {rvx:+.2f}/{rvy:+.2f}/{rwz:+.2f}")
+        if self.active and self.safety_reason not in {"clear", "stopped"}:
+            parts.append(self.safety_reason)
         if self.reason:
             parts.append(self.reason)
         return " | ".join(parts)
@@ -221,11 +349,11 @@ def _labeled_letterbox(
     return output
 
 
-def _draw_base_pose_status(
+def _draw_navigation_status(
     canvas: np.ndarray,
-    state: BasePoseViewerState | None,
+    state: NavigationViewerState | None,
 ) -> None:
-    if state is None or state.state == "idle":
+    if state is None or state.owner == "idle":
         return
     bar_height = min(34, canvas.shape[0])
     status_area = canvas[-bar_height:]
@@ -239,7 +367,11 @@ def _draw_base_pose_status(
         0.0,
         status_area,
     )
-    color = BASE_POSE_ACTIVE_COLOR if state.active else (110, 190, 110)
+    color = (
+        NAVIGATION_OWNER_COLORS.get(state.owner, (235, 240, 248))
+        if state.active
+        else (110, 190, 110)
+    )
     cv2.putText(
         status_area,
         state.status_text(),
@@ -257,7 +389,7 @@ def compose_visualization_canvas(
     *,
     width: int = 1600,
     height: int = 900,
-    base_pose: BasePoseViewerState | None = None,
+    navigation: NavigationViewerState | None = None,
 ) -> np.ndarray:
     """Compose four navigation/manipulation panels above two body cameras."""
 
@@ -297,8 +429,8 @@ def compose_visualization_canvas(
         bottom_height,
         "HEAD RGB",
         active=(
-            base_pose is not None
-            and base_pose.is_active_camera(HEAD_RGB_STREAM)
+            navigation is not None
+            and navigation.is_active_camera(HEAD_RGB_STREAM)
         ),
     )
     chest = _labeled_letterbox(
@@ -307,8 +439,8 @@ def compose_visualization_canvas(
         bottom_height,
         "CHEST RGB",
         active=(
-            base_pose is not None
-            and base_pose.is_active_camera(CHEST_RGB_STREAM)
+            navigation is not None
+            and navigation.is_active_camera(CHEST_RGB_STREAM)
         ),
     )
     canvas = np.vstack(
@@ -317,7 +449,7 @@ def compose_visualization_canvas(
             np.hstack((head_rgb, chest)),
         )
     )
-    _draw_base_pose_status(canvas, base_pose)
+    _draw_navigation_status(canvas, navigation)
     return canvas
 
 
@@ -382,6 +514,9 @@ def build_argument_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--control-gateway-endpoint", default="tcp://127.0.0.1:5565"
     )
+    parser.add_argument(
+        "--navigation-runtime-status-endpoint", default="tcp://127.0.0.1:5570"
+    )
     parser.add_argument("--width", type=int, default=1600)
     parser.add_argument("--height", type=int, default=900)
     parser.add_argument("--display-hz", type=float, default=10.0)
@@ -400,13 +535,27 @@ def main() -> None:
 
     client = None
     control_subscriber = None
-    base_pose = BasePoseViewerState()
+    navigation_status_subscriber = None
+    navigation_context = None
+    navigation_state = NavigationViewerState()
     if not args.mock:
         client = SensorGatewayClient(
             args.sensor_gateway_endpoint,
             request_timeout_ms=100,
         )
-        control_subscriber = ControlGatewaySubscriber(args.control_gateway_endpoint)
+        navigation_context = zmq.Context()
+        control_subscriber = ControlGatewaySubscriber(
+            args.control_gateway_endpoint,
+            context=navigation_context,
+        )
+        navigation_status_subscriber = navigation_context.socket(zmq.SUB)
+        navigation_status_subscriber.setsockopt_string(zmq.SUBSCRIBE, "")
+        navigation_status_subscriber.setsockopt(zmq.RCVHWM, 1)
+        navigation_status_subscriber.setsockopt(zmq.CONFLATE, 1)
+        navigation_status_subscriber.setsockopt(zmq.LINGER, 0)
+        navigation_status_subscriber.connect(
+            args.navigation_runtime_status_endpoint
+        )
     latest: dict[str, np.ndarray] = {}
     frame_index = 0
     cv2.namedWindow(args.window_name, cv2.WINDOW_NORMAL)
@@ -420,11 +569,23 @@ def main() -> None:
             else:
                 assert client is not None
                 assert control_subscriber is not None
+                assert navigation_status_subscriber is not None
                 while True:
                     command = control_subscriber.read_command()
                     if command is None:
                         break
-                    base_pose.accept(command)
+                    navigation_state.accept_control(command)
+                while True:
+                    try:
+                        payload = navigation_status_subscriber.recv(zmq.NOBLOCK)
+                    except zmq.Again:
+                        break
+                    try:
+                        navigation_state.accept_runtime(
+                            decode_navigation_runtime_status_message(payload)
+                        )
+                    except (KeyError, TypeError, ValueError):
+                        continue
                 for stream in DISPLAY_STREAMS:
                     try:
                         snapshot = client.read_snapshot(
@@ -447,7 +608,7 @@ def main() -> None:
                 latest,
                 width=args.width,
                 height=args.height,
-                base_pose=base_pose,
+                navigation=navigation_state,
             )
             cv2.imshow(args.window_name, canvas)
             key = cv2.waitKey(max(1, int(1000.0 * max(0.0, period - (time.monotonic() - started)))))
@@ -461,6 +622,10 @@ def main() -> None:
             client.close()
         if control_subscriber is not None:
             control_subscriber.close()
+        if navigation_status_subscriber is not None:
+            navigation_status_subscriber.close(0)
+        if navigation_context is not None:
+            navigation_context.term()
         cv2.destroyWindow(args.window_name)
 
 

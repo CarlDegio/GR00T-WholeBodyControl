@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import numpy as np
 
+from gear_sonic.planner_control import NavigationRuntimeStatus
 from gear_sonic.runtime.contracts import MessageMetadata, OperatorCommand
 from gear_sonic.scripts.run_operator_cv_viewer import (
     ACTOR_RAY_STREAM,
@@ -11,7 +12,7 @@ from gear_sonic.scripts.run_operator_cv_viewer import (
     LEFT_WRIST_RGB_STREAM,
     RIGHT_WRIST_RGB_STREAM,
     SLAM_2D_STREAM,
-    BasePoseViewerState,
+    NavigationViewerState,
     compose_visualization_canvas,
     gateway_frame_to_bgr,
 )
@@ -64,14 +65,14 @@ def test_composer_leaves_missing_views_black() -> None:
 
 
 def test_base_pose_status_selects_camera_and_tracks_safe_velocity() -> None:
-    state = BasePoseViewerState()
+    state = NavigationViewerState()
 
-    assert state.accept(
+    assert state.accept_control(
         _command("start_base_pose", {"generation": 4}, sequence=0), now=1.0
     )
     assert state.active
     assert state.state == "inference"
-    assert state.accept(
+    assert state.accept_control(
         _command(
             "base_pose_runtime_status",
             {
@@ -89,10 +90,23 @@ def test_base_pose_status_selects_camera_and_tracks_safe_velocity() -> None:
     assert state.camera_stream == HEAD_RGB_STREAM
     assert state.is_active_camera(HEAD_RGB_STREAM)
     assert not state.is_active_camera(CHEST_RGB_STREAM)
-    assert state.velocity == (0.0, 0.0, 0.2)
     assert "turn_left" in state.status_text()
 
-    assert state.accept(
+    state.accept_runtime(
+        NavigationRuntimeStatus(
+            generation=4,
+            timestamp=10.0,
+            mode="manual_velocity",
+            source="base_pose_agent",
+            requested_velocity=(0.0, 0.0, 0.2),
+            velocity=(0.0, 0.0, 0.2),
+            reason="clear",
+        ),
+        now=1.15,
+    )
+    assert state.velocity == (0.0, 0.0, 0.2)
+
+    assert state.accept_control(
         _command(
             "base_pose_runtime_status",
             {
@@ -111,7 +125,8 @@ def test_base_pose_status_selects_camera_and_tracks_safe_velocity() -> None:
 
 
 def test_composer_highlights_only_the_active_base_pose_camera() -> None:
-    state = BasePoseViewerState(
+    state = NavigationViewerState(
+        owner="basepose",
         active=True,
         generation=2,
         state="motion",
@@ -126,11 +141,98 @@ def test_composer_highlights_only_the_active_base_pose_camera() -> None:
         frames,
         width=400,
         height=300,
-        base_pose=state,
+        navigation=state,
     )
 
     np.testing.assert_array_equal(canvas[151, 1], BASE_POSE_ACTIVE_COLOR)
     assert not np.array_equal(canvas[151, 201], BASE_POSE_ACTIVE_COLOR)
+
+
+def test_wasd_status_reports_key_and_final_safety_filtered_velocity() -> None:
+    state = NavigationViewerState()
+
+    assert state.accept_runtime(
+        NavigationRuntimeStatus(
+            generation=2,
+            timestamp=10.0,
+            mode="manual_velocity",
+            source="operator_console",
+            requested_velocity=(0.3, 0.0, 0.0),
+            velocity=(0.0, 0.0, 0.0),
+            reason="depth_hard_stop",
+        ),
+        now=2.0,
+    )
+
+    assert state.owner == "wasd"
+    assert state.action == "W"
+    assert state.velocity == (0.0, 0.0, 0.0)
+    assert "REQ +0.30/+0.00/+0.00" in state.status_text()
+    assert "depth_hard_stop" in state.status_text()
+
+
+def test_navdp_runtime_status_preserves_planner_lifecycle() -> None:
+    state = NavigationViewerState()
+    state.accept_control(
+        _command("start_navigation", {"generation": 5}, sequence=0),
+        now=1.0,
+    )
+
+    state.accept_runtime(
+        NavigationRuntimeStatus(
+            generation=5,
+            timestamp=10.0,
+            mode="nav_goal",
+            source="navdp",
+            requested_velocity=(0.2, 0.0, -0.1),
+            velocity=(0.2, 0.0, -0.1),
+            reason="clear",
+        ),
+        now=1.1,
+    )
+
+    assert state.owner == "navdp"
+    assert state.state == "active"
+    assert "NAVDP G5" in state.status_text()
+    assert "OUT vx +0.20" in state.status_text()
+
+    state.accept_control(
+        _command(
+            "navigation_status",
+            {"generation": 5, "state": "reached", "reason": "goal_reached"},
+            sequence=1,
+        ),
+        now=1.2,
+    )
+    assert not state.accept_runtime(
+        NavigationRuntimeStatus(
+            generation=5,
+            timestamp=10.1,
+            mode="nav_goal",
+            source="navdp",
+            requested_velocity=(0.2, 0.0, -0.1),
+            velocity=(0.2, 0.0, -0.1),
+            reason="clear",
+        ),
+        now=1.3,
+    )
+    assert state.state == "reached"
+    assert state.velocity == (0.0, 0.0, 0.0)
+
+    assert state.accept_runtime(
+        NavigationRuntimeStatus(
+            generation=5,
+            timestamp=10.2,
+            mode="manual_velocity",
+            source="operator_console",
+            requested_velocity=(0.3, 0.0, 0.0),
+            velocity=(0.3, 0.0, 0.0),
+            reason="clear",
+        ),
+        now=1.4,
+    )
+    assert state.owner == "wasd"
+    assert state.action == "W"
 
 
 def test_non_right_wrist_camera_is_converted_to_bgr_without_rotation() -> None:

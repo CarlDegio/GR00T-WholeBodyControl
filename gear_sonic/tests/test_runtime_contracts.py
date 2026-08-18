@@ -27,6 +27,7 @@ def test_current_inference_profile_has_unique_ports() -> None:
     assert get_endpoint("navigation_status").port == 5559
     assert get_endpoint("planner_relay").port == 5563
     assert get_endpoint("lingbot_depth").port == 5564
+    assert get_endpoint("navigation_runtime_status").port == 5570
     assert get_endpoint("xnavdp_http").port == 19999
 
 
@@ -39,6 +40,7 @@ def test_endpoint_uri_and_reserved_gateway_channels() -> None:
     assert get_endpoint("control_gateway_status").active
     assert get_endpoint("control_gateway_dispatch").active
     assert get_endpoint("sensor_gateway_visualization_ingress").port == 5566
+    assert get_endpoint("navigation_runtime_status").active
 
 
 def test_ros_topic_inventory_uses_absolute_names() -> None:

@@ -203,6 +203,14 @@ def _build_endpoints() -> Mapping[str, EndpointSpec]:
             ("base_pose_yolo_agent",),
             purpose="SONIC heading setpoint and measured g1_debug base yaw",
         ),
+        EndpointSpec(
+            "navigation_runtime_status",
+            5570,
+            Transport.ZMQ,
+            "planner_velocity_executor",
+            ("operator OpenCV viewer",),
+            purpose="Final safety-filtered navigation command telemetry",
+        ),
     )
     by_name = {endpoint.name: endpoint for endpoint in endpoints}
     if len(by_name) != len(endpoints):

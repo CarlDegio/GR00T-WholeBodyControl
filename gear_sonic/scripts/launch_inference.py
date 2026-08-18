@@ -829,6 +829,7 @@ def build_planner_velocity_executor_command(
     settings = profile.component("planner_executor")
     planner_relay = profile.endpoint("planner_relay")
     orientation_telemetry = profile.endpoint("orientation_telemetry")
+    navigation_runtime_status = profile.endpoint("navigation_runtime_status")
     orientation_output = (
         "--orientation-output-endpoint "
         f"{shlex.quote(f'tcp://*:{orientation_telemetry.port}')} "
@@ -843,6 +844,8 @@ def build_planner_velocity_executor_command(
         f"--command-endpoint {shlex.quote(profile.endpoint_uri('navigation_command'))} "
         f"--navdp-velocity-endpoint {shlex.quote(profile.endpoint_uri('navdp_velocity'))} "
         f"--output-endpoint {shlex.quote(f'tcp://*:{planner_relay.port}')} "
+        "--runtime-status-endpoint "
+        f"{shlex.quote(f'tcp://*:{navigation_runtime_status.port}')} "
         f"--sensor-gateway-endpoint {shlex.quote(profile.endpoint_uri('sensor_gateway_metadata'))} "
         f"--control-hz {settings['control_hz']} "
         f"--manual-velocity-timeout-s {settings['manual_velocity_timeout_s']} "
@@ -905,6 +908,7 @@ def build_slam_debug_command(config: InferenceLaunchConfig) -> str:
 
 
 def build_sensor_gateway_command(config: InferenceLaunchConfig, repo_root: Path) -> str:
+    profile = _runtime_profile(config)
     ros_mode = "" if config.keyboard_planner and not config.sim else "--no-enable-ros "
     setup = (
         "unset COLCON_CURRENT_PREFIX AMENT_PREFIX_PATH CMAKE_PREFIX_PATH; "
@@ -969,7 +973,9 @@ def build_sensor_gateway_command(config: InferenceLaunchConfig, repo_root: Path)
                 "python gear_sonic/scripts/run_operator_cv_viewer.py "
                 f"--sensor-gateway-endpoint tcp://127.0.0.1:{config.sensor_gateway_port} "
                 "--control-gateway-endpoint "
-                f"tcp://127.0.0.1:{config.control_gateway_dispatch_port}",
+                f"tcp://127.0.0.1:{config.control_gateway_dispatch_port} "
+                "--navigation-runtime-status-endpoint "
+                f"{shlex.quote(profile.endpoint_uri('navigation_runtime_status'))}",
                 "/tmp/sonic_opencv_viewer.log",
             )
         )

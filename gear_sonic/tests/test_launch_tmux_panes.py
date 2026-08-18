@@ -502,6 +502,7 @@ def test_runtime_sidecars_are_read_only_and_navdp_uses_gateway_by_default() -> N
     assert "run_sensor_gateway.py" in gateway
     assert "run_operator_cv_viewer.py" in gateway
     assert "--control-gateway-endpoint tcp://127.0.0.1:5565" in gateway
+    assert "--navigation-runtime-status-endpoint tcp://127.0.0.1:5570" in gateway
     assert "/tmp/sonic_opencv_viewer.log" in gateway
     assert "run_lingbot_depth_viewer.py" in gateway
     assert "/tmp/sonic_lingbot.log" in gateway
@@ -523,6 +524,7 @@ def test_runtime_sidecars_are_read_only_and_navdp_uses_gateway_by_default() -> N
     assert "planner_velocity_executor.py" in executor
     assert "--navdp-velocity-endpoint tcp://127.0.0.1:5568" in executor
     assert "--output-endpoint 'tcp://*:5563'" in executor
+    assert "--runtime-status-endpoint 'tcp://*:5570'" in executor
 
 
 def test_slam_debug_records_raw_inputs_and_fastlio_outputs_per_run() -> None:

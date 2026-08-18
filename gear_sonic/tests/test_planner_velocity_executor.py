@@ -12,7 +12,9 @@ from gear_sonic.planner_control import (
     PlannerVelocityCommand,
     PlannerVelocityExecutorCore,
     SafetySnapshot,
+    build_navigation_runtime_status_message,
     build_planner_velocity_message,
+    decode_navigation_runtime_status_message,
     decode_planner_velocity_message,
 )
 from gear_sonic.scripts.planner_velocity_executor import PlannerSafetySensorMonitor
@@ -101,6 +103,26 @@ def test_navdp_velocity_protocol_preserves_generation_and_heading_frame() -> Non
         heading_reference_rad=0.2,
     )
 
+
+def test_navigation_runtime_status_preserves_requested_and_final_velocity() -> None:
+    message = build_navigation_runtime_status_message(
+        generation=3,
+        timestamp=12.5,
+        mode="manual_velocity",
+        source="operator_console",
+        requested_velocity=(0.3, 0.0, 0.0),
+        velocity=(0.0, 0.0, 0.0),
+        reason="depth_hard_stop",
+    )
+
+    status = decode_navigation_runtime_status_message(message)
+
+    assert status.generation == 3
+    assert status.mode == "manual_velocity"
+    assert status.source == "operator_console"
+    assert status.requested_velocity == (0.3, 0.0, 0.0)
+    assert status.velocity == (0.0, 0.0, 0.0)
+    assert status.reason == "depth_hard_stop"
 
 def test_safety_monitor_uses_sensor_receive_times_and_scales_raw_depth() -> None:
     monitor = PlannerSafetySensorMonitor(

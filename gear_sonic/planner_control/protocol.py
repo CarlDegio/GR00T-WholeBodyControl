@@ -6,11 +6,12 @@ from dataclasses import dataclass
 import json
 import math
 import time
-from typing import Any, Literal, Mapping, Sequence
+from typing import Any, Literal, Mapping, Sequence, cast
 
 COMMAND_TYPE = "sonic_navigation_command"
 STATUS_TYPE = "sonic_navigation_status"
 VELOCITY_TYPE = "sonic_planner_velocity"
+RUNTIME_STATUS_TYPE = "sonic_navigation_runtime_status"
 
 
 def _generation(value: int) -> int:
@@ -224,4 +225,105 @@ def decode_planner_velocity_message(
         velocity=velocity,
         heading_target_rad=target,
         heading_reference_rad=reference,
+    )
+
+
+@dataclass(frozen=True)
+class NavigationRuntimeStatus:
+    """Final planner command after the shared executor safety boundary."""
+
+    generation: int
+    timestamp: float
+    mode: Literal["manual_velocity", "nav_goal", "stop"]
+    source: str
+    requested_velocity: tuple[float, float, float]
+    velocity: tuple[float, float, float]
+    reason: str
+
+    def __post_init__(self) -> None:
+        _generation(self.generation)
+        _finite_scalar(self.timestamp, field="runtime status timestamp")
+        if self.mode not in {"manual_velocity", "nav_goal", "stop"}:
+            raise ValueError("invalid runtime navigation mode")
+        if not self.source:
+            raise ValueError("runtime status source cannot be empty")
+        _finite_tuple(self.requested_velocity, field="requested velocity")
+        _finite_tuple(self.velocity, field="final velocity")
+        if not self.reason:
+            raise ValueError("runtime status reason cannot be empty")
+
+
+def build_navigation_runtime_status_message(
+    *,
+    generation: int,
+    mode: str,
+    source: str,
+    requested_velocity: Sequence[float],
+    velocity: Sequence[float],
+    reason: str,
+    timestamp: float | None = None,
+) -> str:
+    if mode not in {"manual_velocity", "nav_goal", "stop"}:
+        raise ValueError("invalid runtime navigation mode")
+    status = NavigationRuntimeStatus(
+        generation=_generation(generation),
+        timestamp=_finite_scalar(
+            time.time() if timestamp is None else timestamp,
+            field="runtime status timestamp",
+        ),
+        mode=cast(Literal["manual_velocity", "nav_goal", "stop"], mode),
+        source=str(source),
+        requested_velocity=_finite_tuple(
+            requested_velocity,
+            field="requested velocity",
+        ),
+        velocity=_finite_tuple(velocity, field="final velocity"),
+        reason=str(reason),
+    )
+    return json.dumps(
+        {
+            "type": RUNTIME_STATUS_TYPE,
+            "version": 1,
+            "generation": status.generation,
+            "timestamp": status.timestamp,
+            "mode": status.mode,
+            "source": status.source,
+            "requested_velocity": dict(
+                zip(("vx", "vy", "wz"), status.requested_velocity)
+            ),
+            "velocity": dict(zip(("vx", "vy", "wz"), status.velocity)),
+            "reason": status.reason,
+        },
+        separators=(",", ":"),
+        allow_nan=False,
+    )
+
+
+def decode_navigation_runtime_status_message(
+    message: str | bytes | Mapping[str, Any],
+) -> NavigationRuntimeStatus:
+    payload = json.loads(message) if isinstance(message, (str, bytes)) else dict(message)
+    if payload.get("type") != RUNTIME_STATUS_TYPE or payload.get("version") != 1:
+        raise ValueError("unsupported navigation runtime status")
+    requested = payload.get("requested_velocity")
+    velocity = payload.get("velocity")
+    if not isinstance(requested, Mapping) or not isinstance(velocity, Mapping):
+        raise ValueError("runtime status velocity objects are missing")
+    mode = payload.get("mode")
+    if mode not in {"manual_velocity", "nav_goal", "stop"}:
+        raise ValueError("invalid runtime navigation mode")
+    return NavigationRuntimeStatus(
+        generation=int(payload["generation"]),
+        timestamp=float(payload["timestamp"]),
+        mode=mode,
+        source=str(payload.get("source", "")),
+        requested_velocity=_finite_tuple(
+            tuple(float(requested[name]) for name in ("vx", "vy", "wz")),
+            field="requested velocity",
+        ),
+        velocity=_finite_tuple(
+            tuple(float(velocity[name]) for name in ("vx", "vy", "wz")),
+            field="final velocity",
+        ),
+        reason=str(payload.get("reason", "")),
     )
