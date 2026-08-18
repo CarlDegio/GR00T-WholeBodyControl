@@ -158,9 +158,16 @@ original-image pixels and passed in `visual_prompts`, with the primary target
 assigned class `0` and every desk box assigned class `1`. The resulting visual
 embeddings, rather than text-only class embeddings, are installed in YOLOE-26M
 before persistent BoT-SORT tracking begins at `10 Hz`. The primary box controls
-target centering and the eroded target mask provides robust raw-depth range; a
-RANSAC line fitted to valid table-mask contour depth controls yaw perpendicular
-to the near table edge.
+target centering and the eroded target mask provides robust raw-depth range.
+For the table, the per-column upper envelope is expressed as height above the
+image bottom. Points below 85% of its 90th-percentile height are rejected and
+interior gaps are linearly rebuilt. Retained runs no wider than 2% of the image
+inside either outer 10% are removed without interpolation. All rebuilt envelope
+pixels, including interpolated pixels, form the image-space RANSAC candidates.
+The selected pixel line gates real contour depths in the 0.15--4.0 m range;
+those points are deprojected and refitted in body XY. The final physical line
+must be at least 0.35 m long and controls yaw perpendicular to the table edge.
+Candidate ranking does not use distance from the robot.
 
 The bounded controller publishes at `20 Hz` through the existing direct 5558
 relay. Its visual state machine is:

@@ -198,13 +198,18 @@ class TableGeometry:
     inlier_count: int
     residual_m: float
     line_center_xy_m: tuple[float, float]
+    line_endpoints_xy_m: (
+        tuple[tuple[float, float], tuple[float, float]] | None
+    ) = None
+    line_endpoints_px: (
+        tuple[tuple[float, float], tuple[float, float]] | None
+    ) = None
 
 
 class ServoPhase(str, Enum):
     FORWARD_APPROACH = "forward_approach"
     FORWARD_RECENTER = "forward_recenter"
     YAW_ALIGN = "yaw_align"
-    VERTICAL_RECENTER = "vertical_recenter"
     RECENTER = "recenter"
     YAW_TRIM = "yaw_trim"
     GLOBAL_YAW_ALIGN = "global_yaw_align"
@@ -461,41 +466,18 @@ class TargetReferenceUpdateGate:
         *,
         interval_frames: int,
         min_confidence: float,
-        freeze_y2_px: float,
-        resume_y2_px: float,
     ) -> None:
         if interval_frames <= 0:
             raise ValueError("reference update interval must be positive")
-        if freeze_y2_px >= resume_y2_px:
-            raise ValueError(
-                "reference update resume boundary must exceed freeze boundary"
-            )
         self.interval_frames = int(interval_frames)
         self.min_confidence = float(min_confidence)
-        self.freeze_y2_px = float(freeze_y2_px)
-        self.resume_y2_px = float(resume_y2_px)
-        self.frozen = False
 
     def consider(
         self,
         frame_index: int,
         *,
         confidence: float,
-        bbox_xyxy: tuple[float, float, float, float],
     ) -> tuple[bool, str]:
-        y2 = float(bbox_xyxy[3])
-        if y2 < self.freeze_y2_px:
-            self.frozen = True
-            return False, "vertical_danger"
-        if self.frozen:
-            if y2 < self.resume_y2_px:
-                return False, "vertical_recovery_pending"
-            if confidence < self.min_confidence:
-                return False, "low_confidence"
-            self.frozen = False
-            return True, "vertical_recovered"
-        if y2 < self.resume_y2_px:
-            return False, "reference_near_top"
         if confidence < self.min_confidence:
             return False, "low_confidence"
         if frame_index % self.interval_frames:
@@ -1240,7 +1222,13 @@ def _ransac_line(
         (inlier_points[:, 0] - center[0]) * direction[1]
         - (inlier_points[:, 1] - center[1]) * direction[0]
     )
-    return center, direction, inlier_points, float(np.median(residual))
+    return (
+        center,
+        direction,
+        inlier_points,
+        float(np.median(residual)),
+        inlier_indices,
+    )
 
 
 def estimate_table_geometry(
@@ -1262,7 +1250,9 @@ def estimate_table_geometry(
         raise ValueError("table contour has fewer than 50 valid depth points")
     z = depth_m[v, u]
     body = calibration.camera_to_body(_deproject(u, v, z, calibration))
-    center, direction, inliers, residual = _ransac_line(body[:, :2])
+    center, direction, inliers, residual, inlier_indices = _ransac_line(
+        body[:, :2]
+    )
     projection = (inliers - center) @ direction
     length = float(np.max(projection) - np.min(projection))
     if length < 0.20:
@@ -1275,12 +1265,32 @@ def estimate_table_geometry(
     if float(normal @ center) < 0.0:
         normal = -normal
     yaw = math.atan2(float(normal[1]), float(normal[0]))
+    endpoint_indices = (int(np.argmin(projection)), int(np.argmax(projection)))
+    line_endpoints_xy_m = tuple(
+        tuple(float(item) for item in center + projection[index] * direction)
+        for index in endpoint_indices
+    )
+    line_endpoints_px = tuple(
+        (
+            float(u[inlier_indices[index]]),
+            float(v[inlier_indices[index]]),
+        )
+        for index in endpoint_indices
+    )
+    if line_endpoints_px[1] < line_endpoints_px[0]:
+        line_endpoints_px = (line_endpoints_px[1], line_endpoints_px[0])
+        line_endpoints_xy_m = (
+            line_endpoints_xy_m[1],
+            line_endpoints_xy_m[0],
+        )
     return TableGeometry(
         yaw_error_rad=yaw,
         line_length_m=length,
         inlier_count=int(len(inliers)),
         residual_m=residual,
         line_center_xy_m=(float(center[0]), float(center[1])),
+        line_endpoints_xy_m=line_endpoints_xy_m,
+        line_endpoints_px=line_endpoints_px,
     )
 
 
@@ -1389,9 +1399,6 @@ class VisualServoController:
         self.recenter_frames_required = 3
         self.forward_recenter_interval_s = 0.5
         self.forward_recenter_yaw_speed_rad_s = forward_recenter_yaw_speed
-        self.vertical_guard_px = 75.0
-        self.vertical_recovery_px = 110.0
-        self.vertical_recenter_frames_required = 3
         self.yaw_lock_frames_required = 3
         self.orientation_stale_s = 0.25
         self.heading_setpoint_gain = 2.0
@@ -1416,7 +1423,6 @@ class VisualServoController:
         self.current = ServoCommand(0.0, 0.0, 0.0, self.command_ttl_s)
         self.phase = initial_phase
         self.resume_phase: ServoPhase | None = None
-        self.vertical_resume_phase: ServoPhase | None = None
         self.yaw_resume_phase: ServoPhase | None = None
         self.yaw_correction_context: str | None = None
         self.last_transition_reason: str | None = "reset"
@@ -1425,7 +1431,6 @@ class VisualServoController:
         self.forward_recenter_next_calibration_at: float | None = None
         self.yaw_stable_frames = 0
         self.recenter_stable_frames = 0
-        self.vertical_recenter_stable_frames = 0
         self.desired_heading_rad: float | None = None
         self.heading_setpoint_error_rad: float | None = None
         self.last_visual_yaw_error_rad: float | None = None
@@ -1459,13 +1464,6 @@ class VisualServoController:
             return True
         if self.phase is ServoPhase.RECENTER:
             return self.resume_phase in visual_yaw_phases
-        if self.phase is ServoPhase.VERTICAL_RECENTER:
-            if self.vertical_resume_phase in visual_yaw_phases:
-                return True
-            return (
-                self.vertical_resume_phase is ServoPhase.RECENTER
-                and self.resume_phase in visual_yaw_phases
-            )
         return False
 
     def _zero(self) -> ServoCommand:
@@ -1478,8 +1476,6 @@ class VisualServoController:
         self.stable_frames = 0
         if phase is not ServoPhase.RECENTER:
             self.recenter_stable_frames = 0
-        if phase is not ServoPhase.VERTICAL_RECENTER:
-            self.vertical_recenter_stable_frames = 0
         if phase is not ServoPhase.FORWARD_APPROACH:
             self.forward_approach_stable_frames = 0
         if phase is not ServoPhase.FORWARD_RECENTER:
@@ -1807,20 +1803,6 @@ class VisualServoController:
         )
         return self.current
 
-    def _vertical_visibility_guarded(self, observation: RawServoObservation) -> bool:
-        height = float(observation.image_height)
-        if height <= 0.0:
-            return True
-        _, _, _, y2 = observation.target_bbox_xyxy
-        return y2 < self.vertical_guard_px
-
-    def _target_vertical_recovered(self, observation: RawServoObservation) -> bool:
-        height = float(observation.image_height)
-        if height <= 0.0:
-            return False
-        _, _, _, y2 = observation.target_bbox_xyxy
-        return y2 >= self.vertical_recovery_px
-
     def _update_filter(self, observation: RawServoObservation) -> tuple[float, float, float]:
         raw_target = (observation.target.forward_m, observation.target.right_m)
         yaw_sample = (
@@ -1908,57 +1890,6 @@ class VisualServoController:
                     orientation=orientation,
                 )
             return self._yaw_command(speed_limit=self.yaw_trim_speed_rad_s)
-
-        if (
-            self.phase is not ServoPhase.VERTICAL_RECENTER
-            and self._vertical_visibility_guarded(observation)
-        ):
-            self.vertical_resume_phase = self.phase
-            self.invalid_frames = 0
-            return self._transition(
-                ServoPhase.VERTICAL_RECENTER, "target top visibility guard"
-            )
-
-        if self.phase is ServoPhase.VERTICAL_RECENTER:
-            self.invalid_frames = 0
-            recovered = self._target_vertical_recovered(observation)
-            self.vertical_recenter_stable_frames = (
-                self.vertical_recenter_stable_frames + 1 if recovered else 0
-            )
-            if recovered:
-                self.current = self._zero()
-                if (
-                    self.vertical_recenter_stable_frames
-                    < self.vertical_recenter_frames_required
-                ):
-                    return self.current
-                resume = self.vertical_resume_phase or ServoPhase.YAW_ALIGN
-                self.vertical_resume_phase = None
-                if resume is ServoPhase.RECENTER:
-                    return self._transition(
-                        ServoPhase.RECENTER, "target vertically recentered"
-                    )
-                if resume in {
-                    ServoPhase.FORWARD_APPROACH,
-                    ServoPhase.FORWARD_RECENTER,
-                }:
-                    self._transition(
-                        ServoPhase.FORWARD_RECENTER,
-                        "target vertically recentered during forward approach",
-                    )
-                    return self._update_forward_recenter(
-                        observation, now=now
-                    )
-                if self._visibility_guarded(observation):
-                    self.resume_phase = resume
-                    return self._transition(
-                        ServoPhase.RECENTER,
-                        "target vertically recentered; horizontal guard",
-                    )
-                return self._transition(resume, "target vertically recentered")
-            vx, _ = self._enforce_min_linear_speed(0.30, 0.0)
-            self.current = ServoCommand(vx, 0.0, 0.0, self.command_ttl_s)
-            return self.current
 
         if self.phase is ServoPhase.FORWARD_APPROACH:
             if self._visibility_guarded(observation):
@@ -2150,7 +2081,6 @@ class VisualServoController:
         self.forward_approach_stable_frames = 0
         self.forward_recenter_next_calibration_at = None
         self.yaw_stable_frames = 0
-        self.vertical_recenter_stable_frames = 0
         self.current = self._zero()
         if hard:
             return self._stop(reason)
@@ -2474,6 +2404,21 @@ def _diagnostic_frame(
                 "inlier_count": observation.table.inlier_count,
                 "residual_m": observation.table.residual_m,
                 "line_center_xy_m": list(observation.table.line_center_xy_m),
+                "line_endpoints_xy_m": (
+                    None
+                    if observation.table.line_endpoints_xy_m is None
+                    else [
+                        list(point)
+                        for point in observation.table.line_endpoints_xy_m
+                    ]
+                ),
+                "line_endpoints_px": (
+                    None
+                    if observation.table.line_endpoints_px is None
+                    else [
+                        list(point) for point in observation.table.line_endpoints_px
+                    ]
+                ),
             }
     return DetectionFrameData(
         frame_index=frame_index,
@@ -2598,8 +2543,6 @@ def run_raw_servo_worker(
                     TargetReferenceUpdateGate(
                         interval_frames=config.raw_reference_update_interval_frames,
                         min_confidence=config.raw_reference_update_min_confidence,
-                        freeze_y2_px=config.raw_reference_update_freeze_y2_px,
-                        resume_y2_px=config.raw_reference_update_resume_y2_px,
                     )
                     if reference_updater is not None
                     else None
@@ -2971,12 +2914,6 @@ def run_raw_servo_worker(
                                 min_confidence=(
                                     config.raw_reference_update_min_confidence
                                 ),
-                                freeze_y2_px=(
-                                    config.raw_reference_update_freeze_y2_px
-                                ),
-                                resume_y2_px=(
-                                    config.raw_reference_update_resume_y2_px
-                                ),
                             )
                             if reference_updater is not None
                             else None
@@ -3027,14 +2964,11 @@ def run_raw_servo_worker(
                             reference_update_gate.consider(
                                 frame_index,
                                 confidence=target.confidence,
-                                bbox_xyxy=target.bbox_xyxy,
                             )
                         )
                     if (
                         reference_updater is not None
                         and not recovered_from_text
-                        and target.bbox_xyxy[3]
-                        >= config.raw_reference_update_resume_y2_px
                         and target.confidence
                         >= config.raw_reference_update_min_confidence
                     ):
@@ -3078,12 +3012,7 @@ def run_raw_servo_worker(
                                     "confidence": update_result.confidence,
                                     "iou": update_result.iou,
                                 }
-                    elif reference_trigger in {
-                        "vertical_danger",
-                        "vertical_recovery_pending",
-                        "reference_near_top",
-                        "low_confidence",
-                    }:
+                    elif reference_trigger == "low_confidence":
                         event_details["target_reference_update_paused"] = (
                             reference_trigger
                         )
@@ -3320,7 +3249,6 @@ class RawServoRuntime:
         return {
             "phase": self.controller.phase,
             "resume_phase": self.controller.resume_phase,
-            "vertical_resume_phase": self.controller.vertical_resume_phase,
             "yaw_resume_phase": self.controller.yaw_resume_phase,
             "yaw_correction_context": self.controller.yaw_correction_context,
             "transition_reason": self.controller.last_transition_reason,
@@ -3345,9 +3273,6 @@ class RawServoRuntime:
             "stable_frames": self.controller.stable_frames,
             "yaw_stable_frames": self.controller.yaw_stable_frames,
             "recenter_stable_frames": self.controller.recenter_stable_frames,
-            "vertical_recenter_stable_frames": (
-                self.controller.vertical_recenter_stable_frames
-            ),
         }
 
     def _orientation_diagnostics(
@@ -3561,7 +3486,6 @@ class RawServoRuntime:
             self.controller.forward_recenter_next_calibration_at = None
             self.controller.yaw_stable_frames = 0
             self.controller.recenter_stable_frames = 0
-            self.controller.vertical_recenter_stable_frames = 0
             command = self._zero()
             self.controller.current = command
             self._publish(command, "hold")
@@ -3717,14 +3641,6 @@ class RawServoRuntime:
                 None
                 if self.controller.resume_phase is None
                 else self.controller.resume_phase.value
-            ),
-            vertical_resume_phase=(
-                None
-                if self.controller.vertical_resume_phase is None
-                else self.controller.vertical_resume_phase.value
-            ),
-            vertical_recenter_stable_frames=(
-                self.controller.vertical_recenter_stable_frames
             ),
             forward_approach_stable_frames=(
                 self.controller.forward_approach_stable_frames

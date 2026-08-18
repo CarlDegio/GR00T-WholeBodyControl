@@ -639,6 +639,7 @@ def ground_qwen_fallback_reference(
         vision_backend="qwenvl",
         qwenvl_model=qwen_model,
         qwenvl_base_url=config.qwenvl_base_url,
+        qwenvl_enable_thinking=False,
         qwenvl_thinking_budget=config.qwenvl_thinking_budget,
         codex_timeout_seconds=config.codex_timeout_seconds,
     )

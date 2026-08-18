@@ -1389,6 +1389,7 @@ class QwenVLStructuredVisionClient:
         base_url: str = DEFAULT_QWENVL_BASE_URL,
         timeout_seconds: float = 600.0,
         thinking_budget: int = 500,
+        enable_thinking: bool = True,
         api_key: str | None = None,
         env_file: str | Path | None = None,
         client: Any | None = None,
@@ -1397,9 +1398,10 @@ class QwenVLStructuredVisionClient:
         self.base_url = base_url
         self.timeout_seconds = float(timeout_seconds)
         self.thinking_budget = int(thinking_budget)
+        self.enable_thinking = bool(enable_thinking)
         self.last_reasoning_content = ""
         self.last_answer_content = ""
-        if self.thinking_budget <= 0:
+        if self.enable_thinking and self.thinking_budget <= 0:
             raise ValueError("Qwen-VL thinking_budget must be positive")
         if client is not None:
             self.client = client
@@ -1489,15 +1491,17 @@ class QwenVLStructuredVisionClient:
                 ),
             }
         )
+        extra_body: dict[str, bool | int] = {
+            "enable_thinking": self.enable_thinking,
+        }
+        if self.enable_thinking:
+            extra_body["thinking_budget"] = self.thinking_budget
         completion = self.client.chat.completions.create(
             model=self.model,
             messages=[{"role": "user", "content": content}],
             stream=True,
             timeout=self.timeout_seconds,
-            extra_body={
-                "enable_thinking": True,
-                "thinking_budget": self.thinking_budget,
-            },
+            extra_body=extra_body,
         )
         reasoning_parts: list[str] = []
         answer_parts: list[str] = []

@@ -780,6 +780,49 @@ def test_qwenvl_plus_client_streams_images_schema_and_json(tmp_path: Path) -> No
     assert json.loads((tmp_path / "plan.schema.json").read_text()) == schema
 
 
+def test_qwenvl_client_disables_thinking_without_budget(tmp_path: Path) -> None:
+    calls: list[dict[str, object]] = []
+    expected = {"status": "READY"}
+
+    class FakeCompletions:
+        def create(self, **kwargs: object):
+            calls.append(kwargs)
+            return iter(
+                [
+                    SimpleNamespace(
+                        choices=[
+                            SimpleNamespace(
+                                delta=SimpleNamespace(
+                                    reasoning_content=None,
+                                    content=json.dumps(expected),
+                                )
+                            )
+                        ]
+                    )
+                ]
+            )
+
+    client = SimpleNamespace(chat=SimpleNamespace(completions=FakeCompletions()))
+    image_path = tmp_path / "rgb.png"
+    image_path.write_bytes(b"png bytes")
+    qwen = QwenVLStructuredVisionClient(
+        model="qwen3-vl-8b-instruct",
+        enable_thinking=False,
+        client=client,
+    )
+
+    result = qwen.run(
+        prompt="locate target",
+        image_paths=[image_path],
+        schema={"type": "object", "required": ["status"]},
+        schema_filename="target.schema.json",
+        cwd=tmp_path,
+    )
+
+    assert result == expected
+    assert calls[0]["extra_body"] == {"enable_thinking": False}
+
+
 def test_runner_selects_qwenvl_plus_backend(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

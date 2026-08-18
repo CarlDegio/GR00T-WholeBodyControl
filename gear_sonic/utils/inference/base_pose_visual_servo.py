@@ -1175,6 +1175,119 @@ def estimate_target_geometry(
     )
 
 
+def _contiguous_column_runs(columns: np.ndarray) -> list[np.ndarray]:
+    if not len(columns):
+        return []
+    split_at = np.flatnonzero(np.diff(columns) > 1) + 1
+    return list(np.split(columns, split_at))
+
+
+def _rebuilt_mask_upper_envelope(
+    mask: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Build the filtered table-mask envelope used by pixel RANSAC."""
+
+    foreground = np.asarray(mask, dtype=bool)
+    if foreground.ndim != 2:
+        raise ValueError("table mask must be two-dimensional")
+    height, width = foreground.shape
+    populated = np.any(foreground, axis=0)
+    original_columns = np.flatnonzero(populated)
+    if not len(original_columns):
+        raise ValueError("table mask has no populated columns")
+    original_rows = np.full(width, np.inf, dtype=np.float64)
+    original_rows[populated] = np.argmax(foreground[:, populated], axis=0)
+
+    pixel_heights = height - original_rows[original_columns]
+    reference_height = float(np.percentile(pixel_heights, 90.0))
+    minimum_height = 0.85 * reference_height
+    retained = original_columns[pixel_heights >= minimum_height]
+
+    side_width = 0.10 * width
+    maximum_speck_columns = int(np.floor(0.02 * width))
+    dropped: list[np.ndarray] = []
+    for run in _contiguous_column_runs(retained):
+        entirely_left = float(run[-1]) < side_width
+        entirely_right = float(run[0]) >= width - side_width
+        if (
+            (entirely_left or entirely_right)
+            and len(run) <= maximum_speck_columns
+        ):
+            dropped.append(run)
+    dropped_columns = (
+        np.concatenate(dropped) if dropped else np.empty(0, dtype=int)
+    )
+    retained = np.setdiff1d(retained, dropped_columns, assume_unique=True)
+    if not len(retained):
+        raise ValueError("table upper envelope is empty after filtering")
+
+    # Interpolate only between the outermost retained points. Removed side
+    # specks stay absent and are not recreated as RANSAC candidates.
+    span = original_columns[
+        (original_columns >= retained[0]) & (original_columns <= retained[-1])
+    ]
+    candidate_columns = np.setdiff1d(
+        span, dropped_columns, assume_unique=True
+    )
+    rebuilt_rows = np.full(width, np.inf, dtype=np.float64)
+    rebuilt_rows[candidate_columns] = np.interp(
+        candidate_columns,
+        retained,
+        original_rows[retained],
+    )
+    return candidate_columns, rebuilt_rows
+
+
+def _ransac_pixel_line(
+    points: np.ndarray,
+    *,
+    threshold_px: float = 3.0,
+    iterations: int = 500,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, float]:
+    if len(points) < 50:
+        raise ValueError("rebuilt table envelope has fewer than 50 pixels")
+    rng = np.random.default_rng(0)
+    best: tuple[tuple[float, ...], np.ndarray] | None = None
+    for _ in range(iterations):
+        a, b = points[rng.choice(len(points), size=2, replace=False)]
+        direction = b - a
+        norm = float(np.linalg.norm(direction))
+        if norm < 30.0:
+            continue
+        direction /= norm
+        distances = np.abs(
+            (points[:, 0] - a[0]) * direction[1]
+            - (points[:, 1] - a[1]) * direction[0]
+        )
+        inliers = distances <= threshold_px
+        count = int(np.count_nonzero(inliers))
+        if count < 50:
+            continue
+        inlier_points = points[inliers]
+        projection = (inlier_points - a) @ direction
+        length = float(np.max(projection) - np.min(projection))
+        rank = (
+            float(length >= 50.0),
+            float(count),
+            length,
+            -float(np.median(distances[inliers])),
+        )
+        if best is None or rank > best[0]:
+            best = (rank, inliers)
+    if best is None:
+        raise ValueError("no stable rebuilt-envelope pixel line found")
+
+    inlier_points = points[best[1]]
+    center = np.mean(inlier_points, axis=0)
+    _, _, vh = np.linalg.svd(inlier_points - center, full_matrices=False)
+    direction = vh[0]
+    residual = np.abs(
+        (inlier_points[:, 0] - center[0]) * direction[1]
+        - (inlier_points[:, 1] - center[1]) * direction[0]
+    )
+    return center, direction, inlier_points, float(np.median(residual))
+
+
 def _ransac_line(
     points: np.ndarray,
     *,
@@ -1189,7 +1302,7 @@ def _ransac_line(
         points = points[indices]
         source_indices = source_indices[indices]
     rng = np.random.default_rng(0)
-    best: tuple[float, np.ndarray, np.ndarray] | None = None
+    best: tuple[tuple[float, ...], np.ndarray] | None = None
     for _ in range(iterations):
         a, b = points[rng.choice(len(points), size=2, replace=False)]
         direction = b - a
@@ -1205,10 +1318,17 @@ def _ransac_line(
         count = int(np.count_nonzero(inliers))
         if count < 50:
             continue
-        center_range = float(np.linalg.norm(np.median(points[inliers], axis=0)))
-        score = count / max(0.25, center_range)
-        if best is None or score > best[0]:
-            best = (score, inliers, direction.copy())
+        inlier_points = points[inliers]
+        projection = (inlier_points - a) @ direction
+        candidate_length = float(np.max(projection) - np.min(projection))
+        rank = (
+            float(candidate_length >= 0.35),
+            float(count),
+            candidate_length,
+            -float(np.median(distance[inliers])),
+        )
+        if best is None or rank > best[0]:
+            best = (rank, inliers)
     if best is None:
         raise ValueError("no stable table-edge line found")
     inlier_points = points[best[1]]
@@ -1217,7 +1337,6 @@ def _ransac_line(
     _, _, vh = np.linalg.svd(inlier_points - center, full_matrices=False)
     direction = vh[0]
     projection = (inlier_points - center) @ direction
-    length = float(np.max(projection) - np.min(projection))
     residual = np.abs(
         (inlier_points[:, 0] - center[0]) * direction[1]
         - (inlier_points[:, 1] - center[1]) * direction[0]
@@ -1242,12 +1361,55 @@ def estimate_table_geometry(
     binary = np.asarray(mask, dtype=np.uint8)
     if binary.shape != snapshot.depth_raw.shape:
         raise ValueError("table mask is not aligned to RGB-D")
-    contour = binary - cv2.erode(binary, np.ones((7, 7), np.uint8), iterations=1)
+
+    candidate_columns, rebuilt_rows = _rebuilt_mask_upper_envelope(binary)
+    envelope_points = np.column_stack(
+        (candidate_columns, rebuilt_rows[candidate_columns])
+    ).astype(np.float64)
+    pixel_center, pixel_direction, pixel_inliers, pixel_residual = (
+        _ransac_pixel_line(envelope_points)
+    )
+    if pixel_residual > 3.0:
+        raise ValueError(
+            f"table envelope residual is too high: {pixel_residual:.3f}px"
+        )
+    pixel_projection = (pixel_inliers - pixel_center) @ pixel_direction
+    projection_min = float(np.min(pixel_projection)) - 6.0
+    projection_max = float(np.max(pixel_projection)) + 6.0
+
+    contour = binary - cv2.erode(
+        binary, np.ones((7, 7), np.uint8), iterations=1
+    )
     depth_m = snapshot.depth_raw.astype(np.float64) * snapshot.depth_scale_m
-    valid = (contour > 0) & np.isfinite(depth_m) & (depth_m >= 0.15) & (depth_m <= 4.0)
+    valid = (
+        (contour > 0)
+        & np.isfinite(depth_m)
+        & (depth_m >= 0.15)
+        & (depth_m <= 4.0)
+    )
     v, u = np.nonzero(valid)
     if len(u) < 50:
         raise ValueError("table contour has fewer than 50 valid depth points")
+
+    contour_pixels = np.column_stack((u, v)).astype(np.float64)
+    relative_pixels = contour_pixels - pixel_center
+    pixel_distance = np.abs(
+        relative_pixels[:, 0] * pixel_direction[1]
+        - relative_pixels[:, 1] * pixel_direction[0]
+    )
+    contour_projection = relative_pixels @ pixel_direction
+    selected = (
+        (pixel_distance <= 6.0)
+        & (contour_projection >= projection_min)
+        & (contour_projection <= projection_max)
+    )
+    u = u[selected]
+    v = v[selected]
+    if len(u) < 50:
+        raise ValueError(
+            "selected table envelope has fewer than 50 valid depth points"
+        )
+
     z = depth_m[v, u]
     body = calibration.camera_to_body(_deproject(u, v, z, calibration))
     center, direction, inliers, residual, inlier_indices = _ransac_line(
@@ -1255,7 +1417,7 @@ def estimate_table_geometry(
     )
     projection = (inliers - center) @ direction
     length = float(np.max(projection) - np.min(projection))
-    if length < 0.20:
+    if length < 0.35:
         raise ValueError(f"table edge is too short: {length:.3f}m")
     if len(inliers) < 50:
         raise ValueError("table edge has fewer than 50 RANSAC inliers")
@@ -2223,6 +2385,9 @@ def _client_from_config(config: Any) -> Any:
             model=config.qwenvl_model,
             base_url=config.qwenvl_base_url,
             thinking_budget=config.qwenvl_thinking_budget,
+            enable_thinking=bool(
+                getattr(config, "qwenvl_enable_thinking", True)
+            ),
             timeout_seconds=config.codex_timeout_seconds,
         )
     return CodexStructuredVisionClient(

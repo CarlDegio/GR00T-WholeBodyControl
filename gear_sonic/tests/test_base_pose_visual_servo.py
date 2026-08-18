@@ -577,7 +577,7 @@ def test_table_mask_depth_recovers_front_facing_horizontal_edge() -> None:
 
     geometry = estimate_table_geometry(snapshot(), mask, calibration)
 
-    assert geometry.line_length_m > 0.20
+    assert geometry.line_length_m >= 0.35
     assert geometry.inlier_count >= 50
     assert geometry.residual_m <= 0.02
     assert geometry.yaw_error_rad == pytest.approx(0.0, abs=0.03)
@@ -588,6 +588,79 @@ def test_table_mask_depth_recovers_front_facing_horizontal_edge() -> None:
         0.0 <= x < 640.0 and 0.0 <= y < 480.0
         for x, y in geometry.line_endpoints_px
     )
+
+
+def test_rebuilt_upper_envelope_bridges_low_height_occlusion() -> None:
+    mask = np.zeros((200, 200), dtype=bool)
+    mask[80:180, 20:180] = True
+    mask[80:130, 70:120] = False
+
+    columns, rows = raw_servo._rebuilt_mask_upper_envelope(mask)
+
+    assert columns[0] == 20
+    assert columns[-1] == 179
+    assert np.allclose(rows[columns], 80.0)
+
+
+def test_rebuilt_upper_envelope_removes_short_side_speck() -> None:
+    mask = np.zeros((200, 200), dtype=bool)
+    mask[80:180, 30:180] = True
+    mask[60:100, 2:4] = True
+
+    columns, _ = raw_servo._rebuilt_mask_upper_envelope(mask)
+
+    assert columns[0] == 30
+    assert columns[-1] == 179
+    assert 2 not in columns
+    assert 3 not in columns
+
+
+def test_table_edge_uses_rebuilt_envelope_across_occlusion() -> None:
+    mask = np.zeros((480, 640), dtype=bool)
+    mask[120:360, 100:540] = True
+    mask[120:250, 250:400] = False
+    calibration = fixed_calibration(camera_height_m=0.0, camera_pitch_deg=0.0)
+
+    geometry = estimate_table_geometry(snapshot(), mask, calibration)
+
+    assert geometry.line_length_m >= 0.35
+    assert geometry.line_endpoints_px is not None
+    assert all(y < 130.0 for _, y in geometry.line_endpoints_px)
+
+
+def test_table_edge_rejects_line_shorter_than_point_three_five_meters() -> None:
+    mask = np.zeros((480, 640), dtype=bool)
+    mask[120:360, 230:410] = True
+    calibration = fixed_calibration(camera_height_m=0.0, camera_pitch_deg=0.0)
+
+    with pytest.raises(ValueError, match="table edge is too short"):
+        estimate_table_geometry(snapshot(), mask, calibration)
+
+
+def test_table_edge_prefers_mask_upper_boundary_over_nearer_lower_edge() -> None:
+    depth = np.full((480, 640), 1000, dtype=np.uint16)
+    mask = np.zeros((480, 640), dtype=bool)
+    mask[120:360, 100:540] = True
+    depth[120:123, 100:540] = 2000
+    calibration = fixed_calibration(camera_height_m=0.0, camera_pitch_deg=-30.0)
+
+    geometry = estimate_table_geometry(snapshot(depth), mask, calibration)
+    assert geometry.line_endpoints_px is not None
+    assert all(y < 130.0 for _, y in geometry.line_endpoints_px)
+
+
+def test_table_edge_requires_valid_depth_near_rebuilt_envelope() -> None:
+    depth = np.full((480, 640), 1000, dtype=np.uint16)
+    mask = np.zeros((480, 640), dtype=bool)
+    mask[120:360, 100:540] = True
+    depth[120:123, 100:540] = 0
+    calibration = fixed_calibration(camera_height_m=0.0, camera_pitch_deg=-30.0)
+
+    with pytest.raises(
+        ValueError,
+        match="selected table envelope has fewer than 50 valid depth points",
+    ):
+        estimate_table_geometry(snapshot(depth), mask, calibration)
 
 
 def test_controller_coarse_yaw_keeps_translation_zero() -> None:

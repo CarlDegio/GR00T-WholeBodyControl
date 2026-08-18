@@ -673,7 +673,6 @@ def test_qwen_fallback_forces_8b_model_and_uses_current_camera_frame(
     qwen_config = captured["config"]
     assert qwen_config.vision_backend == "qwenvl"
     assert qwen_config.qwenvl_model == "qwen3-vl-8b-instruct"
-    assert qwen_config.qwenvl_enable_thinking is False
     assert captured["calibration"] is calibration
     assert captured["rgb_path"] == tmp_path / "origin_qwen_03/qwen_reference_rgb.png"
     assert result.stream_name == HEAD
