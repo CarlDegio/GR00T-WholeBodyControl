@@ -1,11 +1,11 @@
 from __future__ import annotations
 
-from gear_sonic.base_pose import BasePoseResult
 from gear_sonic.scripts.base_pose_agent import (
     BasePoseAgentConfig,
     BasePoseAgentRuntime,
     WorkerResult,
 )
+from gear_sonic.utils.inference.base_pose import BasePoseResult
 
 
 def plan() -> dict[str, object]:

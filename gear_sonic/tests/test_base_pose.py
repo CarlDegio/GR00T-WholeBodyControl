@@ -7,20 +7,21 @@ import numpy as np
 import pytest
 
 from gear_sonic.base_pose import (
+    BasePoseSequenceController,
+    plan_to_segments,
+)
+from gear_sonic.utils.inference.base_pose import (
     BASE_POSE_OUTPUT_SCHEMA,
+    DEPTH_QUERY_SCHEMA,
     BasePoseCameraError,
     BasePoseConfig,
     BasePoseObservation,
     BasePosePlanner,
-    BasePoseResult,
-    BasePoseSequenceController,
     BasePoseValidationError,
-    SensorGatewayBasePoseCamera,
     build_base_pose_prompt,
-    plan_to_segments,
     validate_base_pose_plan,
 )
-from gear_sonic.base_pose.policy import DEPTH_QUERY_SCHEMA
+from gear_sonic.utils.inference.base_pose_sensor import SensorGatewayBasePoseCamera
 
 
 def command(step: int, action: str, value: float) -> dict[str, object]:
@@ -251,8 +252,7 @@ def test_plan_to_segments_and_controller_preserve_order_and_pause() -> None:
     assert segments[1].command.duration == pytest.approx(1.0)
 
     controller = BasePoseSequenceController(transition_pause=0.5)
-    assert controller.start(BasePoseResult(value, None, {}), now=0.0)
+    assert controller.start(value, now=0.0)
     assert controller.step(0.0)[0] == "ROTATE_RIGHT"
     assert controller.step(segments[0].command.duration)[0] == "hold"
     assert controller.step(segments[0].command.duration + 0.5)[0] == "MOVE_FORWARD"
-

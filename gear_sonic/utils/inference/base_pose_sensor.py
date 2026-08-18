@@ -6,7 +6,10 @@ import time
 
 import numpy as np
 
-from gear_sonic.base_pose.policy import BasePoseCameraError, BasePoseObservation
+from gear_sonic.utils.inference.base_pose import (
+    BasePoseCameraError,
+    BasePoseObservation,
+)
 from gear_sonic.runtime.client import SensorGatewayClient, SensorGatewayClientError
 from gear_sonic.runtime.snapshot import SnapshotRequest, TimestampBasis
 

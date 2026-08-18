@@ -12,16 +12,18 @@ from typing import Any, Callable, Literal, Mapping
 import zmq
 
 from gear_sonic.base_pose import (
-    BasePoseConfig,
-    BasePosePlanner,
-    BasePoseResult,
     BasePoseSequenceController,
-    SensorGatewayBasePoseCamera,
 )
 from gear_sonic.runtime.control_client import (
     ControlGatewayIntentClient,
     ControlGatewaySubscriber,
 )
+from gear_sonic.utils.inference.base_pose import (
+    BasePoseConfig,
+    BasePosePlanner,
+    BasePoseResult,
+)
+from gear_sonic.utils.inference.base_pose_sensor import SensorGatewayBasePoseCamera
 
 
 @dataclass
@@ -158,7 +160,7 @@ class BasePoseAgentRuntime:
             return True
         status = str(item.result.plan["status"])
         if status == "ADJUST":
-            if not self.controller.start(item.result, now):
+            if not self.controller.start(item.result.plan, now):
                 self._terminal("failed", "empty_adjustment")
             else:
                 self.state = "motion"

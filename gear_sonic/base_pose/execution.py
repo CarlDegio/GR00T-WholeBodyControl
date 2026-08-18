@@ -6,10 +6,14 @@ from dataclasses import dataclass
 import math
 from typing import Any
 
-from gear_sonic.base_pose.policy import BasePoseResult, validate_base_pose_plan
-
-
 STOP_VELOCITY = (0.0, 0.0, 0.0)
+ALLOWED_ACTIONS = {
+    "ROTATE_LEFT",
+    "ROTATE_RIGHT",
+    "MOVE_FORWARD",
+    "MOVE_BACKWARD",
+}
+COMMAND_KEYS = {"step", "action", "value", "unit", "purpose"}
 
 
 @dataclass(frozen=True)
@@ -30,6 +34,58 @@ class MotionSegment:
     command: VelocityCommand
 
 
+def _validated_motion_commands(plan: dict[str, Any]) -> list[dict[str, Any]]:
+    """Defensively validate the executable subset without importing an agent policy."""
+
+    if not isinstance(plan, dict):
+        raise ValueError("base-pose plan must be an object")
+    status = plan.get("status")
+    if status not in {"READY", "ADJUST", "UNSURE", "UNSAFE"}:
+        raise ValueError("base-pose status is invalid")
+    commands = plan.get("command_sequence")
+    if not isinstance(commands, list):
+        raise ValueError("command_sequence must be an array")
+    if status == "ADJUST" and not commands:
+        raise ValueError("ADJUST requires at least one command")
+    if status != "ADJUST" and commands:
+        raise ValueError(f"{status} requires an empty command_sequence")
+    if len(commands) > 8:
+        raise ValueError("command_sequence exceeds 8 steps")
+    validated: list[dict[str, Any]] = []
+    total_rotation = 0.0
+    total_translation = 0.0
+    for index, raw in enumerate(commands, start=1):
+        if not isinstance(raw, dict) or set(raw) != COMMAND_KEYS:
+            raise ValueError(f"command_sequence[{index - 1}] has an invalid schema")
+        if raw["step"] != index or isinstance(raw["step"], bool):
+            raise ValueError("step numbers must be consecutive and start at 1")
+        action = raw["action"]
+        if action not in ALLOWED_ACTIONS:
+            raise ValueError("base-pose action is invalid")
+        value = raw["value"]
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise ValueError("base-pose command value must be numeric")
+        value = float(value)
+        if not math.isfinite(value) or value <= 0.0:
+            raise ValueError("base-pose command value must be finite and positive")
+        if not isinstance(raw["purpose"], str):
+            raise ValueError("base-pose command purpose must be a string")
+        if action.startswith("ROTATE_"):
+            if raw["unit"] != "degrees" or not 2.0 <= value <= 90.0:
+                raise ValueError("rotation command must use 2-90 degrees")
+            total_rotation += value
+        else:
+            if raw["unit"] != "meters" or not 0.1 <= value <= 1.5:
+                raise ValueError("translation command must use 0.1-1.5 meters")
+            total_translation += value
+        validated.append(raw)
+    if total_rotation > 180.0:
+        raise ValueError("total rotation exceeds 180 degrees")
+    if total_translation > 3.0:
+        raise ValueError("total translation exceeds 3 meters")
+    return validated
+
+
 def plan_to_segments(
     plan: dict[str, Any],
     *,
@@ -48,11 +104,11 @@ def plan_to_segments(
     )
     if not all(math.isfinite(value) and value > 0.0 for value in values):
         raise ValueError("base-pose speeds and scales must be finite and positive")
-    validated = validate_base_pose_plan(plan)
-    if validated["status"] != "ADJUST":
+    commands = _validated_motion_commands(plan)
+    if plan["status"] != "ADJUST":
         return ()
     segments: list[MotionSegment] = []
-    for item in validated["command_sequence"]:
+    for item in commands:
         action = str(item["action"])
         scale = rotation_scale if action.startswith("ROTATE_") else translation_scale
         value = float(item["value"]) * scale
@@ -127,11 +183,11 @@ class BasePoseSequenceController:
             raise ValueError("now must be finite")
         return value
 
-    def start(self, result: BasePoseResult, now: float) -> bool:
+    def start(self, plan: dict[str, Any], now: float) -> bool:
         if self.active:
             raise RuntimeError("base-pose sequence is already active")
         segments = plan_to_segments(
-            result.plan,
+            plan,
             rotation_speed=self.rotation_speed,
             translation_speed=self.translation_speed,
             rotation_scale=self.rotation_scale,
