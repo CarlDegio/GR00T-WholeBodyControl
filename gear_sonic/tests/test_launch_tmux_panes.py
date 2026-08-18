@@ -14,6 +14,7 @@ from gear_sonic.runtime.config import load_runtime_profile
 from gear_sonic.runtime.endpoints import get_endpoint
 from gear_sonic.scripts.launch_inference import (
     InferenceLaunchConfig,
+    _clear_stale_fastlio_processes,
     _dotenv_has_nonempty_value,
     _parse_pane_ids,
     build_fastlio_command,
@@ -36,6 +37,25 @@ from gear_sonic.scripts.launch_inference import (
     resolve_deploy_policy,
     run_readiness_gate,
 )
+
+
+def test_startup_clears_only_stale_fastlio_processes(monkeypatch) -> None:
+    commands: list[list[str]] = []
+    monkeypatch.setattr(
+        "gear_sonic.scripts.launch_inference.subprocess.run",
+        lambda command, **_kwargs: commands.append(command),
+    )
+    monkeypatch.setattr("gear_sonic.scripts.launch_inference.time.sleep", lambda _s: None)
+
+    _clear_stale_fastlio_processes()
+
+    assert [command[:3] for command in commands] == [
+        ["pkill", "-TERM", "-f"],
+        ["pkill", "-TERM", "-f"],
+        ["pkill", "-KILL", "-f"],
+        ["pkill", "-KILL", "-f"],
+    ]
+    assert all("fast_lio" in command[-1] or "fastlio_mapping" in command[-1] for command in commands)
 
 
 def _write_deploy_policy_files(

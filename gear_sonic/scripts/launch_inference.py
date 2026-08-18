@@ -927,6 +927,19 @@ def _kill_existing_session():
     )
 
 
+def _clear_stale_fastlio_processes() -> None:
+    """Remove orphaned FAST-LIO launch and mapping processes from older runs."""
+    patterns = (
+        r"(^|/)ros2 launch fast_lio mapping\.launch\.py( |$)",
+        r"(^|/)fastlio_mapping( |$)",
+    )
+    for pattern in patterns:
+        subprocess.run(["pkill", "-TERM", "-f", pattern], capture_output=True)
+    time.sleep(0.5)
+    for pattern in patterns:
+        subprocess.run(["pkill", "-KILL", "-f", pattern], capture_output=True)
+
+
 def _parse_pane_ids(output: str, expected_count: int = 6) -> list[str]:
     indexed = {}
     for line in output.splitlines():
@@ -1045,6 +1058,7 @@ def main(config: InferenceLaunchConfig):
 
     _check_prerequisites(config)
     _kill_existing_session()
+    _clear_stale_fastlio_processes()
 
     exporter_prompt = config.task_prompt if config.task_prompt else config.prompt
 
