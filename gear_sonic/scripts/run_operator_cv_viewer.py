@@ -49,6 +49,7 @@ DISPLAY_STREAMS = (
     CHEST_RGB_STREAM,
 )
 BASE_POSE_ACTIVE_COLOR = (0, 0, 255)
+NAVIGATION_STATUS_BAR_HEIGHT = 38
 NAVIGATION_TERMINAL_STATES = frozenset({"reached", "failed", "stopped"})
 NAVIGATION_OWNER_COLORS = {
     "wasd": (255, 210, 40),
@@ -355,7 +356,7 @@ def _draw_navigation_status(
 ) -> None:
     if state is None or state.owner == "idle":
         return
-    bar_height = min(34, canvas.shape[0])
+    bar_height = min(NAVIGATION_STATUS_BAR_HEIGHT, canvas.shape[0])
     status_area = canvas[-bar_height:]
     overlay = status_area.copy()
     overlay[:] = (22, 28, 36)
@@ -395,8 +396,10 @@ def compose_visualization_canvas(
 
     if width < 2 or height < 2:
         raise ValueError("viewer dimensions must be at least 2x2")
-    top_height = height // 2
-    bottom_height = height - top_height
+    status_height = min(NAVIGATION_STATUS_BAR_HEIGHT, max(0, height - 2))
+    content_height = height - status_height
+    top_height = content_height // 2
+    bottom_height = content_height - top_height
     top_widths = [width // 4] * 3
     top_widths.append(width - sum(top_widths))
     bottom_widths = [width // 2, width - width // 2]
@@ -443,12 +446,14 @@ def compose_visualization_canvas(
             and navigation.is_active_camera(CHEST_RGB_STREAM)
         ),
     )
-    canvas = np.vstack(
+    content = np.vstack(
         (
             np.hstack((actor_ray, slam_2d, left_wrist, right_wrist)),
             np.hstack((head_rgb, chest)),
         )
     )
+    canvas = np.zeros((height, width, 3), dtype=np.uint8)
+    canvas[:content_height] = content
     _draw_navigation_status(canvas, navigation)
     return canvas
 

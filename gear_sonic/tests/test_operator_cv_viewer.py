@@ -54,8 +54,8 @@ def test_composer_places_four_panels_above_two_aligned_body_cameras() -> None:
     np.testing.assert_array_equal(canvas[80, 150], (40, 50, 60))
     np.testing.assert_array_equal(canvas[80, 250], (44, 55, 66))
     np.testing.assert_array_equal(canvas[80, 350], (77, 88, 99))
-    np.testing.assert_array_equal(canvas[230, 100], (101, 112, 123))
-    np.testing.assert_array_equal(canvas[230, 300], (11, 22, 33))
+    np.testing.assert_array_equal(canvas[220, 100], (101, 112, 123))
+    np.testing.assert_array_equal(canvas[220, 300], (11, 22, 33))
 
 
 def test_composer_leaves_missing_views_black() -> None:
@@ -144,8 +144,8 @@ def test_composer_highlights_only_the_active_base_pose_camera() -> None:
         navigation=state,
     )
 
-    np.testing.assert_array_equal(canvas[151, 1], BASE_POSE_ACTIVE_COLOR)
-    assert not np.array_equal(canvas[151, 201], BASE_POSE_ACTIVE_COLOR)
+    np.testing.assert_array_equal(canvas[132, 1], BASE_POSE_ACTIVE_COLOR)
+    assert not np.array_equal(canvas[132, 201], BASE_POSE_ACTIVE_COLOR)
 
 
 def test_wasd_status_reports_key_and_final_safety_filtered_velocity() -> None:
