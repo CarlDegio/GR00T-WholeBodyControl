@@ -20,7 +20,7 @@ def _free_tcp_port() -> int:
     return port
 
 
-def test_mock_camera_publishes_changing_ego_view_in_production_camera_schema() -> None:
+def test_mock_camera_publishes_changing_pico_views_in_production_camera_schema() -> None:
     port = _free_tcp_port()
     publisher = MockCameraPublisher(
         MockCameraSettings(port=port, width=640, height=480, fps=30, jpeg_quality=95)
@@ -47,9 +47,11 @@ def test_mock_camera_publishes_changing_ego_view_in_production_camera_schema() -
     assert not thread.is_alive()
     assert first_wire["schema_version"] == 2
     assert isinstance(first_wire["images"]["ego_view"], bytes)
-    assert set(first.images) == {"ego_view"}
-    assert first.images["ego_view"].shape == (480, 640, 3)
-    assert first.image_shapes["ego_view"] == [480, 640, 3]
+    assert set(first.images) == {"ego_view", "left_wrist", "right_wrist"}
+    for name in first.images:
+        assert first.images[name].shape == (480, 640, 3)
+        assert first.image_shapes[name] == [480, 640, 3]
+        assert first.timestamps[name] == first.timestamps["ego_view"]
     assert first.timestamps["ego_view"] < second.timestamps["ego_view"]
     assert not np.array_equal(first.images["ego_view"], second.images["ego_view"])
 

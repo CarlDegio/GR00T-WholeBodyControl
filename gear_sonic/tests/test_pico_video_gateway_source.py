@@ -47,47 +47,65 @@ def _materialized(
     array_shape: tuple[int, ...] | None = None,
     encoding: str = "jpeg_bytes",
     image_shape: list[int] | None = None,
+    left_wrist_jpeg: bytes | None = None,
+    right_wrist_jpeg: bytes | None = None,
+    left_wrist_sequence: int | None = None,
+    right_wrist_sequence: int | None = None,
 ) -> MaterializedSnapshot:
-    stream = "camera_encoded/ego_view"
-    metadata = MessageMetadata(
-        source="camera_zmq",
-        sequence=sequence,
-        timestamp_ns=10_000_000_000,
-        ttl_ms=1000,
-        generation=generation,
-    )
-    array = np.frombuffer(jpeg, dtype=np.uint8).astype(dtype)
-    if array_shape is not None:
-        array = array.reshape(array_shape)
-    frame = SharedMemoryFrame(
-        metadata=metadata,
-        stream=stream,
-        shared_memory="test-ring",
-        shape=array.shape,
-        dtype=array.dtype.str,
-        offset_bytes=0,
-        size_bytes=array.nbytes,
-        source_timestamp_ns=9_900_000_000,
-        source_clock="camera_unix",
-        attributes={
-            "encoding": encoding,
-            "decoded_color_order": "RGB",
-            "image_shape": image_shape or [480, 640, 3],
-            "camera_info": {},
-        },
-    )
+    stream_payloads = {
+        "camera_encoded/ego_view": (jpeg, sequence),
+        "camera_encoded/left_wrist": (
+            left_wrist_jpeg or jpeg,
+            sequence if left_wrist_sequence is None else left_wrist_sequence,
+        ),
+        "camera_encoded/right_wrist": (
+            right_wrist_jpeg or jpeg,
+            sequence if right_wrist_sequence is None else right_wrist_sequence,
+        ),
+    }
+    frames: dict[str, SharedMemoryFrame] = {}
+    arrays: dict[str, np.ndarray] = {}
+    for stream, (payload, stream_sequence) in stream_payloads.items():
+        metadata = MessageMetadata(
+            source="camera_zmq",
+            sequence=stream_sequence,
+            timestamp_ns=10_000_000_000,
+            ttl_ms=1000,
+            generation=generation,
+        )
+        array = np.frombuffer(payload, dtype=np.uint8).astype(dtype)
+        if array_shape is not None:
+            array = array.reshape(array_shape)
+        arrays[stream] = array
+        frames[stream] = SharedMemoryFrame(
+            metadata=metadata,
+            stream=stream,
+            shared_memory=f"test-ring-{stream.rsplit('/', 1)[-1]}",
+            shape=array.shape,
+            dtype=array.dtype.str,
+            offset_bytes=0,
+            size_bytes=array.nbytes,
+            source_timestamp_ns=9_900_000_000,
+            source_clock="camera_unix",
+            attributes={
+                "encoding": encoding,
+                "decoded_color_order": "RGB",
+                "image_shape": image_shape or [480, 640, 3],
+                "camera_info": {},
+            },
+        )
     snapshot = SensorSnapshot(
         complete=True,
         reason="",
-        anchor_timestamp_ns=metadata.timestamp_ns,
+        anchor_timestamp_ns=10_000_000_000,
         timestamp_basis=TimestampBasis.RECEIVE,
-        frames=MappingProxyType({stream: frame}),
+        frames=MappingProxyType(frames),
         skew_ms=0.0,
-        ages_ms=MappingProxyType({stream: 1.0}),
+        ages_ms=MappingProxyType({stream: 1.0 for stream in frames}),
     )
     return MaterializedSnapshot(
         snapshot=snapshot,
-        arrays=MappingProxyType({stream: array}),
+        arrays=MappingProxyType(arrays),
         attempts=1,
     )
 
@@ -105,19 +123,27 @@ def test_source_returns_valid_jpeg_once_and_deduplicates_generation_sequence() -
         received_timestamp_ns=10_000_000_000,
         source_timestamp_ns=9_900_000_000,
         source_shape=(480, 640, 3),
+        left_wrist_jpeg=b"\xff\xd8data\xff\xd9",
+        right_wrist_jpeg=b"\xff\xd8data\xff\xd9",
+        left_wrist_source_shape=(480, 640, 3),
+        right_wrist_source_shape=(480, 640, 3),
     )
     assert source.poll() is None
     assert source.status == "READY"
 
 
-def test_source_requests_only_the_encoded_ego_stream_without_internal_retries() -> None:
+def test_source_requests_synchronized_encoded_pico_views_without_internal_retries() -> None:
     client = SequenceClient([_materialized(b"\xff\xd8x\xff\xd9", sequence=1)])
     source = SensorGatewayVideoSource(client, max_age_ms=250.0)
 
     source.poll()
 
     request, retries = client.requests[0]
-    assert request.streams == ("camera_encoded/ego_view",)
+    assert request.streams == (
+        "camera_encoded/ego_view",
+        "camera_encoded/left_wrist",
+        "camera_encoded/right_wrist",
+    )
     assert request.max_age_ms == 250.0
     assert request.max_skew_ms == 0.0
     assert retries == 0
@@ -138,7 +164,50 @@ def test_source_accepts_same_sequence_after_gateway_generation_changes() -> None
         received_timestamp_ns=10_000_000_000,
         source_timestamp_ns=9_900_000_000,
         source_shape=(480, 640, 3),
+        left_wrist_jpeg=b"\xff\xd8second\xff\xd9",
+        right_wrist_jpeg=b"\xff\xd8second\xff\xd9",
+        left_wrist_source_shape=(480, 640, 3),
+        right_wrist_source_shape=(480, 640, 3),
     )
+
+
+def test_source_publishes_when_only_a_wrist_camera_sequence_changes() -> None:
+    first = _materialized(b"\xff\xd8ego\xff\xd9", sequence=4)
+    wrist_update = _materialized(
+        b"\xff\xd8ego\xff\xd9",
+        sequence=4,
+        left_wrist_jpeg=b"\xff\xd8left-new\xff\xd9",
+        left_wrist_sequence=5,
+    )
+    source = SensorGatewayVideoSource(
+        SequenceClient([first, wrist_update]),
+        max_age_ms=250.0,
+    )
+
+    assert source.poll() is not None
+    updated = source.poll()
+
+    assert updated is not None
+    assert updated.sequence == 4
+    assert updated.left_wrist_jpeg == b"\xff\xd8left-new\xff\xd9"
+
+
+def test_source_rejects_an_invalid_wrist_camera_frame() -> None:
+    source = SensorGatewayVideoSource(
+        SequenceClient(
+            [
+                _materialized(
+                    b"\xff\xd8ego\xff\xd9",
+                    sequence=1,
+                    left_wrist_jpeg=b"not-a-jpeg",
+                )
+            ]
+        ),
+        max_age_ms=250.0,
+    )
+
+    assert source.poll() is None
+    assert source.status == "INVALID CAMERA FRAME"
 
 
 @pytest.mark.parametrize(

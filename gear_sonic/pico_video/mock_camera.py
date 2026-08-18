@@ -31,7 +31,7 @@ class MockCameraSettings:
 
 
 class MockCameraPublisher:
-    """Continuously publish an animated ``ego_view`` test card."""
+    """Continuously publish animated ego and wrist camera test cards."""
 
     def __init__(self, settings: MockCameraSettings) -> None:
         self.settings = settings
@@ -45,16 +45,24 @@ class MockCameraPublisher:
 
     def publish_once(self) -> None:
         wall_time = datetime.now(timezone.utc)
-        rgb = render_test_card(
-            self.settings.width,
-            self.settings.height,
-            frame_number=self._frame_number,
-            wall_time=wall_time,
-        )
+        names = ("ego_view", "left_wrist", "right_wrist")
+        images = {
+            name: render_test_card(
+                self.settings.width,
+                self.settings.height,
+                frame_number=self._frame_number + offset,
+                wall_time=wall_time,
+            )
+            for name, offset in zip(names, (0, 1_000_000, 2_000_000), strict=True)
+        }
+        timestamp = time.time()
         schema = ImageMessageSchema(
-            timestamps={"ego_view": time.time()},
-            images={"ego_view": rgb},
-            image_shapes={"ego_view": [self.settings.height, self.settings.width, 3]},
+            timestamps={name: timestamp for name in names},
+            images=images,
+            image_shapes={
+                name: [self.settings.height, self.settings.width, 3]
+                for name in names
+            },
         )
         self._server.send_message(
             schema.serialize(jpeg_quality=self.settings.jpeg_quality)

@@ -60,6 +60,10 @@ class RepeatingSource:
             received_timestamp_ns=time.monotonic_ns(),
             source_timestamp_ns=time.time_ns(),
             source_shape=(480, 640, 3),
+            left_wrist_jpeg=self.jpeg,
+            right_wrist_jpeg=self.jpeg,
+            left_wrist_source_shape=(480, 640, 3),
+            right_wrist_source_shape=(480, 640, 3),
         )
 
 

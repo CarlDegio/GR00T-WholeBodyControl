@@ -38,6 +38,60 @@ def decode_jpeg_rgb(jpeg: bytes) -> np.ndarray:
     return np.ascontiguousarray(cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB))
 
 
+def _resize_to_width(image: np.ndarray, width: int) -> np.ndarray:
+    """Resize one RGB image to an exact width without changing its aspect ratio."""
+
+    if width <= 0:
+        raise ValueError("resized image width must be positive")
+    source_height, source_width = image.shape[:2]
+    scale = width / source_width
+    height = max(1, round(source_height * scale))
+    interpolation = cv2.INTER_AREA if scale < 1.0 else cv2.INTER_LINEAR
+    return cv2.resize(image, (width, height), interpolation=interpolation)
+
+
+def compose_ego_with_wrist_views(
+    ego_view: np.ndarray,
+    left_wrist: np.ndarray,
+    right_wrist: np.ndarray,
+) -> np.ndarray:
+    """Place two smaller wrist views side-by-side above the full-width ego view.
+
+    Both wrist images are aspect-fitted to half of the ego-view width.  The
+    right-wrist camera is rotated 180 degrees for its physical mounting.  If
+    the wrist cameras have different aspect ratios, the shorter image is
+    centered vertically in a black top row.  No source image is stretched or
+    cropped.
+    """
+
+    _validate_rgb(ego_view)
+    _validate_rgb(left_wrist)
+    _validate_rgb(right_wrist)
+    ego_width = ego_view.shape[1]
+    if ego_width < 2:
+        raise FrameError("ego-view width must be at least two pixels")
+
+    left_width = ego_width // 2
+    right_width = ego_width - left_width
+    left_resized = _resize_to_width(left_wrist, left_width)
+    right_upright = cv2.rotate(right_wrist, cv2.ROTATE_180)
+    right_resized = _resize_to_width(right_upright, right_width)
+    wrist_row_height = max(left_resized.shape[0], right_resized.shape[0])
+    wrist_row = np.zeros((wrist_row_height, ego_width, 3), dtype=np.uint8)
+
+    left_y = (wrist_row_height - left_resized.shape[0]) // 2
+    right_y = (wrist_row_height - right_resized.shape[0]) // 2
+    wrist_row[
+        left_y : left_y + left_resized.shape[0],
+        :left_width,
+    ] = left_resized
+    wrist_row[
+        right_y : right_y + right_resized.shape[0],
+        left_width:,
+    ] = right_resized
+    return np.ascontiguousarray(np.concatenate((wrist_row, ego_view), axis=0))
+
+
 def compose_mono_sbs(image: np.ndarray, *, eye_width: int, height: int) -> np.ndarray:
     """Aspect-fit one RGB image and copy it into identical left/right eyes."""
 

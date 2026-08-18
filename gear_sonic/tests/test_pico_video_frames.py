@@ -8,11 +8,52 @@ import pytest
 
 from gear_sonic.pico_video.frames import (
     FrameError,
+    compose_ego_with_wrist_views,
     compose_mono_sbs,
     decode_jpeg_rgb,
     render_status_card,
     render_test_card,
 )
+
+
+def test_wrist_views_are_aspect_preserved_side_by_side_above_ego_view() -> None:
+    ego = np.full((48, 64, 3), (255, 0, 0), dtype=np.uint8)
+    left = np.full((48, 64, 3), (0, 255, 0), dtype=np.uint8)
+    right = np.full((48, 64, 3), (0, 0, 255), dtype=np.uint8)
+
+    output = compose_ego_with_wrist_views(ego, left, right)
+
+    assert output.shape == (72, 64, 3)
+    assert np.all(output[:24, :32] == (0, 255, 0))
+    assert np.all(output[:24, 32:] == (0, 0, 255))
+    assert np.all(output[24:] == (255, 0, 0))
+
+
+def test_wrist_row_centers_views_with_different_aspect_ratios() -> None:
+    ego = np.full((20, 40, 3), 30, dtype=np.uint8)
+    left = np.full((20, 20, 3), 100, dtype=np.uint8)
+    right = np.full((10, 20, 3), 200, dtype=np.uint8)
+
+    output = compose_ego_with_wrist_views(ego, left, right)
+
+    assert output.shape == (40, 40, 3)
+    assert np.all(output[:20, :20] == 100)
+    assert np.all(output[:5, 20:] == 0)
+    assert np.all(output[5:15, 20:] == 200)
+    assert np.all(output[15:20, 20:] == 0)
+    assert np.all(output[20:] == 30)
+
+
+def test_right_wrist_view_is_rotated_180_degrees_for_pico() -> None:
+    ego = np.full((2, 4, 3), 10, dtype=np.uint8)
+    left = np.full((2, 2, 3), 20, dtype=np.uint8)
+    right = np.arange(12, dtype=np.uint8).reshape(2, 2, 3)
+
+    output = compose_ego_with_wrist_views(ego, left, right)
+
+    np.testing.assert_array_equal(output[:2, :2], left)
+    np.testing.assert_array_equal(output[:2, 2:], right[::-1, ::-1])
+    np.testing.assert_array_equal(output[2:], ego)
 
 
 def test_mono_sbs_has_identical_left_and_right_eyes() -> None:

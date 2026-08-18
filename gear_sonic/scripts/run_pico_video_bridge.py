@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Stream SensorGateway head-camera frames to XRoboToolkit Remote Vision."""
+"""Stream SensorGateway ego and wrist cameras to XRoboToolkit Remote Vision."""
 
 from __future__ import annotations
 

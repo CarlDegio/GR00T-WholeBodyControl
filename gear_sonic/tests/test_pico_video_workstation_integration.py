@@ -167,7 +167,11 @@ def test_mock_camera_to_sensor_gateway_to_fake_pico_loop(
                 time.sleep(0.02)
         assert initial_frame is not None, f"source_status={source.status}"
         health = client.health()
-        assert "camera_encoded/ego_view" in health["streams"]
+        assert {
+            "camera_encoded/ego_view",
+            "camera_encoded/left_wrist",
+            "camera_encoded/right_wrist",
+        } <= set(health["streams"])
 
         bridge_thread.start()
         bridge_started = True

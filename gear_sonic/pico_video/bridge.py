@@ -15,6 +15,7 @@ import numpy as np
 from gear_sonic.pico_video.encoder import EncoderSettings, FfmpegH264Encoder
 from gear_sonic.pico_video.frames import (
     FrameError,
+    compose_ego_with_wrist_views,
     compose_mono_sbs,
     decode_jpeg_rgb,
     render_status_card,
@@ -419,9 +420,16 @@ class PicoVideoBridge:
                 source_frame = self._source.poll()
                 status = self._source.status
                 if source_frame is not None:
-                    rgb = decode_jpeg_rgb(source_frame.jpeg)
+                    ego_rgb = decode_jpeg_rgb(source_frame.jpeg)
+                    left_wrist_rgb = decode_jpeg_rgb(source_frame.left_wrist_jpeg)
+                    right_wrist_rgb = decode_jpeg_rgb(source_frame.right_wrist_jpeg)
+                    mosaic = compose_ego_with_wrist_views(
+                        ego_rgb,
+                        left_wrist_rgb,
+                        right_wrist_rgb,
+                    )
                     composed = compose_mono_sbs(
-                        rgb,
+                        mosaic,
                         eye_width=self.settings.width // 2,
                         height=self.settings.height,
                     )

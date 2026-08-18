@@ -33,11 +33,13 @@ components:
     navigation_ready_timeout_s: 60.0
   vla:
     embodiment_tag: unitree_g1_sonic
+    #prompt: &vla_task_prompt >-
+    #  Approach the tabletop if necessary, then use the right hand to pick up the
+    #  paper ball and place it into the blue plastic basket, use the left hand to
+    #  place another paper ball into the same basket, and finally return both arms
+    #  to the sides of the body.
     prompt: &vla_task_prompt >-
-      Approach the tabletop if necessary, then use the right hand to pick up the
-      paper ball and place it into the blue plastic basket, use the left hand to
-      place another paper ball into the same basket, and finally return both arms
-      to the sides of the body.
+      Move in front of the table, grasp the medicine bottle, and place it into the blue basket.
     inference_hz: 2.0
     action_publish_hz: 50
     action_horizon: 50

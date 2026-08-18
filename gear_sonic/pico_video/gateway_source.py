@@ -22,7 +22,7 @@ class InvalidGatewayFrameError(ValueError):
 
 @dataclass(frozen=True)
 class GatewayFrame:
-    """Immutable JPEG and ordering metadata copied out of shared memory."""
+    """Synchronized JPEG views and ego-view metadata copied out of shared memory."""
 
     jpeg: bytes
     generation: int
@@ -30,12 +30,18 @@ class GatewayFrame:
     received_timestamp_ns: int
     source_timestamp_ns: int
     source_shape: tuple[int, int, int]
+    left_wrist_jpeg: bytes = b""
+    right_wrist_jpeg: bytes = b""
+    left_wrist_source_shape: tuple[int, int, int] = (0, 0, 0)
+    right_wrist_source_shape: tuple[int, int, int] = (0, 0, 0)
 
 
 class SensorGatewayVideoSource:
-    """Read fresh JPEG head-camera frames exclusively through SensorGateway."""
+    """Read synchronized ego and wrist JPEGs exclusively through SensorGateway."""
 
     STREAM = "camera_encoded/ego_view"
+    LEFT_WRIST_STREAM = "camera_encoded/left_wrist"
+    RIGHT_WRIST_STREAM = "camera_encoded/right_wrist"
 
     def __init__(
         self,
@@ -47,13 +53,18 @@ class SensorGatewayVideoSource:
         if stream != self.STREAM:
             raise ValueError(f"unsupported PICO video stream: {stream}")
         self._client = client
+        self._streams = (
+            stream,
+            self.LEFT_WRIST_STREAM,
+            self.RIGHT_WRIST_STREAM,
+        )
         self._request = SnapshotRequest(
-            streams=(stream,),
+            streams=self._streams,
             max_age_ms=max_age_ms,
             max_skew_ms=0.0,
         )
         self._stream = stream
-        self._last_key: tuple[int, int] | None = None
+        self._last_key: tuple[tuple[int, int], ...] | None = None
         self.status = "WAITING FOR SENSORGATEWAY"
 
     @staticmethod
@@ -73,13 +84,17 @@ class SensorGatewayVideoSource:
             )
         return shape
 
-    def _materialize_frame(self, materialized: Any) -> GatewayFrame | None:
+    def _encoded_camera(
+        self,
+        materialized: Any,
+        stream: str,
+    ) -> tuple[bytes, tuple[int, int, int], Any]:
         try:
-            reference = materialized.snapshot.frames[self._stream]
-            encoded = materialized.arrays[self._stream]
+            reference = materialized.snapshot.frames[stream]
+            encoded = materialized.arrays[stream]
         except (AttributeError, KeyError, TypeError) as exc:
             raise InvalidGatewayFrameError(
-                "materialized snapshot omitted the encoded camera stream"
+                f"materialized snapshot omitted encoded camera stream {stream!r}"
             ) from exc
 
         if not isinstance(encoded, np.ndarray):
@@ -107,20 +122,37 @@ class SensorGatewayVideoSource:
         ):
             raise InvalidGatewayFrameError("encoded frame is not a complete JPEG")
         source_shape = self._image_shape(reference.attributes)
+        return jpeg, source_shape, reference
 
-        key = (reference.metadata.generation, reference.metadata.sequence)
+    def _materialize_frame(self, materialized: Any) -> GatewayFrame | None:
+        cameras = {
+            stream: self._encoded_camera(materialized, stream)
+            for stream in self._streams
+        }
+
+        key = tuple(
+            (reference.metadata.generation, reference.metadata.sequence)
+            for _, _, reference in cameras.values()
+        )
         if key == self._last_key:
             self.status = "READY"
             return None
         self._last_key = key
         self.status = "READY"
+        jpeg, source_shape, reference = cameras[self._stream]
+        left_jpeg, left_shape, _ = cameras[self.LEFT_WRIST_STREAM]
+        right_jpeg, right_shape, _ = cameras[self.RIGHT_WRIST_STREAM]
         return GatewayFrame(
             jpeg=jpeg,
-            generation=key[0],
-            sequence=key[1],
+            generation=reference.metadata.generation,
+            sequence=reference.metadata.sequence,
             received_timestamp_ns=reference.metadata.timestamp_ns,
             source_timestamp_ns=reference.source_timestamp_ns,
             source_shape=source_shape,
+            left_wrist_jpeg=left_jpeg,
+            right_wrist_jpeg=right_jpeg,
+            left_wrist_source_shape=left_shape,
+            right_wrist_source_shape=right_shape,
         )
 
     def poll(self) -> GatewayFrame | None:
