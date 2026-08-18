@@ -6,6 +6,7 @@ import sys
 import types
 
 import numpy as np
+import pytest
 
 
 sys.modules.setdefault("tyro", types.ModuleType("tyro"))
@@ -14,6 +15,7 @@ from gear_sonic.camera.sensor_server import ImageMessageSchema
 from gear_sonic.scripts.run_camera_viewer import (
     _rgb_camera_names,
     camera_label_color,
+    draw_base_pose_overlays,
     format_velocity_label,
     parse_base_pose_viewer_status,
     select_rgb_camera_names,
@@ -68,6 +70,10 @@ def test_base_pose_viewer_status_exposes_active_camera_and_velocity() -> None:
 
     assert status.active_camera_stream == "chest_view"
     assert status.velocity == (0.4, -0.2, 0.1)
+    assert status.target_bbox_xyxy is None
+    assert status.target_lateral_anchor_px is None
+    assert status.table_edge_endpoints_px is None
+    assert status.overlay_image_size is None
     assert camera_label_color("chest_view", status.active_camera_stream) == (
         0,
         0,
@@ -81,6 +87,48 @@ def test_base_pose_viewer_status_exposes_active_camera_and_velocity() -> None:
     assert format_velocity_label(status.velocity) == (
         "CMD vx=+0.400  vy=-0.200  wz=+0.100"
     )
+
+
+def test_base_pose_viewer_draws_scaled_target_box_and_table_edge() -> None:
+    status = parse_base_pose_viewer_status(
+        b'{"type":"navila_reasan_velocity_command","source":"base_pose",'
+        b'"camera_stream":"chest_view",'
+        b'"velocity":{"vx":0.0,"vy":0.0,"wz":0.0},'
+        b'"viewer_overlay":{"target_bbox_xyxy":[40,20,160,80],'
+        b'"target_lateral_anchor_px":[100,30],'
+        b'"table_edge_endpoints_px":[[0,60],[200,60]],'
+        b'"image_size":[200,100]}}'
+    )
+    active = np.zeros((50, 100, 3), dtype=np.uint8)
+    inactive = np.zeros_like(active)
+
+    assert status.target_bbox_xyxy == (40.0, 20.0, 160.0, 80.0)
+    assert status.target_lateral_anchor_px == (100.0, 30.0)
+    assert status.table_edge_endpoints_px == (
+        (0.0, 60.0),
+        (200.0, 60.0),
+    )
+    assert status.overlay_image_size == (200, 100)
+
+    draw_base_pose_overlays(active, "chest_view", status)
+    draw_base_pose_overlays(inactive, "ego_view", status)
+
+    assert active[15, 50, 1] > 0
+    assert active[15, 50, 0] == 0
+    assert active[15, 50, 2] == 0
+    assert not np.any(active[25, 50])
+    assert np.array_equal(active[30, 50], np.array([0, 0, 255]))
+    assert np.count_nonzero(active) > 0
+    assert not np.any(inactive)
+
+
+def test_base_pose_viewer_overlay_requires_valid_bbox_corner_order() -> None:
+    with pytest.raises(ValueError, match="invalid corner order"):
+        parse_base_pose_viewer_status(
+            b'{"type":"navila_reasan_velocity_command","source":"base_pose",'
+            b'"velocity":{"vx":0.0,"vy":0.0,"wz":0.0},'
+            b'"viewer_overlay":{"target_bbox_xyxy":[20,10,5,30]}}'
+        )
 
 
 def test_colorize_depth_uses_fixed_range_and_marks_invalid_pixels() -> None:

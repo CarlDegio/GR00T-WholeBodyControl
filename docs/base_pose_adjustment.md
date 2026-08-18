@@ -229,26 +229,45 @@ for that entire attempt. BoT-SORT state and controller state are kept, and a
 successful installation changes the attempt's diagnostic `reference_kind` to
 `latest`.
 
-Each YOLOE detection stage tolerates 30 consecutive invalid frames. On the
+While the chest camera is active, a second independent YOLOE tracker also
+checks every available head-camera RGB frame. It uses two text classes: the
+target prompt stored by initial grounding (for example `blue basket`) and
+`desk`. The target counter resets on any missing target,
+missing head frame, or monitor error. On the tenth consecutive target frame
+(the configurable default in `base_pose_dual_head_reacquire_frames`), the
+worker preempts chest tracking and publishes a zero-velocity `switching`
+event:
+
+1. If `desk` is present on that frame, the detected target and desk boxes from
+   the same head image become a coherent visual reference and head tracking
+   starts immediately.
+2. If `desk` is absent, that exact head image is sent to the Qwen fallback
+   while zero velocity is held. Qwen uses the original `config.task` and the
+   same target/desk grounding pipeline as initialization; the target name is
+   not hard-coded. If both boxes validate, they become the head visual
+   reference.
+3. If Qwen, validation, or the resulting first head YOLOE acquisition fails,
+   the worker skips the normal head text/Qwen recovery stages and returns
+   directly to chest `origin_text`, followed by chest `origin_qwen` if
+   needed.
+
+Each YOLOE recovery stage tolerates 30 consecutive invalid frames. On the
 30th, the runtime immediately publishes zero velocity, remains in Planner
 mode, resets YOLOE and the controller, and advances without changing the
-navigation generation. Camera A is the camera used by the attempt that just
-failed; camera B is the other camera. The bounded order is:
+navigation generation. Regardless of which camera lost detection, recovery
+normally checks the head camera's two stages before the chest camera's two
+stages:
 
-1. Stay on A for `origin_text`: class `0` uses the target text embedding and
-   class `1` uses A's visual desk embedding.
-2. If that fails, stay on A for `origin_qwen`. Capture one new A frame and run
-   the exact same target and desk grounding prompts used at initial setup with
-   `qwen3-vl-8b-instruct`. The returned target and desk boxes become a new
-   two-class YOLOE visual prompt, followed by another 30-frame detection window.
-3. If the Qwen call fails, or the resulting YOLOE attempt fails, switch to B
-   for `alternate_text`. Both the target and `desk` use YOLOE text embeddings;
-   no visual desk box is installed during this stage.
-4. If that fails, stay on B for `alternate_qwen`. Capture one new B frame,
-   re-run the same Qwen grounding round, install its boxes as the two visual
-   prompts, and allow the final 30-frame detection window.
-5. If the Qwen call or YOLOE detection fails again, terminate the current
-   navigation.
+1. Head text recovery. When head was the failed origin this is
+   `origin_text` (text target plus head visual desk); when chest was the
+   origin this is `alternate_text` (target and desk both text-only).
+2. Head Qwen recovery, using a fresh head frame and the same initialization
+   grounding semantics with `qwen3-vl-8b-instruct` by default.
+3. Chest text recovery. When chest was the failed origin this is
+   `origin_text`; otherwise it is the two-class `alternate_text` mode.
+4. Chest Qwen recovery with a fresh chest frame.
+5. If the final Qwen call or YOLOE detection stage fails, terminate the
+   current navigation at zero velocity.
 
 A Qwen API/validation failure advances immediately rather than consuming a
 30-frame YOLOE window. The fallback model is configurable through
@@ -257,11 +276,16 @@ default is `qwen3-vl-8b-instruct`. Credentials continue to come from
 `DASHSCOPE_API_KEY` in the environment or `.venv_inference/.env` and are never
 written to run artifacts.
 
-The same four-stage recovery cycle starts from whichever camera most recently
-produced a successful complete frame. Old or future-attempt events cannot
-resume motion. The navigation-wide timeout starts when the first YOLOE
-detection attempt begins, defaults to 180 seconds, and is not extended by
-camera switches.
+The monitor-Qwen shortcut above is the exception: because the head monitor and
+Qwen have already attempted the head view while chest was active, failure
+before the first complete head observation resumes directly at the two chest
+stages. Once head has produced a complete observation, any later loss starts a
+normal head-first recovery cycle.
+
+A successful head-monitor, text, or Qwen attempt resets the cycle from its
+live camera. Old or future-attempt events cannot resume motion. The
+navigation-wide timeout starts when the first YOLOE detection attempt begins,
+defaults to 180 seconds, and is not extended by camera switches.
 
 The symmetric horizontal intervals are launch parameters. Set
 `base_pose_raw_horizontal_guard_fraction` for entry and

@@ -75,6 +75,12 @@ class BasePoseViewerStatus:
 
     active_camera_stream: str | None
     velocity: tuple[float, float, float]
+    target_bbox_xyxy: tuple[float, float, float, float] | None = None
+    target_lateral_anchor_px: tuple[float, float] | None = None
+    table_edge_endpoints_px: (
+        tuple[tuple[float, float], tuple[float, float]] | None
+    ) = None
+    overlay_image_size: tuple[int, int] | None = None
 
 
 def _is_rgb_image(image: Any) -> bool:
@@ -101,6 +107,95 @@ def select_rgb_camera_names(
     if not requested:
         return sorted(available)
     return [name for name in requested if name in available]
+
+
+def _finite_tuple(
+    value: Any,
+    *,
+    length: int,
+    description: str,
+) -> tuple[float, ...]:
+    if not isinstance(value, (list, tuple)) or len(value) != length:
+        raise ValueError(f"Base Pose {description} must contain {length} values")
+    try:
+        result = tuple(float(item) for item in value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            f"Base Pose {description} contains invalid values"
+        ) from exc
+    if not all(math.isfinite(item) for item in result):
+        raise ValueError(f"Base Pose {description} must be finite")
+    return result
+
+
+def _parse_viewer_overlay(
+    payload: Mapping[str, Any],
+) -> tuple[
+    tuple[float, float, float, float] | None,
+    tuple[float, float] | None,
+    tuple[tuple[float, float], tuple[float, float]] | None,
+    tuple[int, int] | None,
+]:
+    raw_overlay = payload.get("viewer_overlay")
+    if raw_overlay is None:
+        return None, None, None, None
+    if not isinstance(raw_overlay, dict):
+        raise ValueError("Base Pose viewer overlay must be an object")
+    raw_bbox = _finite_tuple(
+        raw_overlay.get("target_bbox_xyxy"),
+        length=4,
+        description="viewer target bbox",
+    )
+    target_bbox = (
+        raw_bbox[0], raw_bbox[1], raw_bbox[2], raw_bbox[3]
+    )
+    if target_bbox[2] < target_bbox[0] or target_bbox[3] < target_bbox[1]:
+        raise ValueError("Base Pose viewer target bbox has invalid corner order")
+
+    target_lateral_anchor = None
+    raw_anchor = raw_overlay.get("target_lateral_anchor_px")
+    if raw_anchor is not None:
+        anchor = _finite_tuple(
+            raw_anchor,
+            length=2,
+            description="viewer target lateral anchor",
+        )
+        target_lateral_anchor = (anchor[0], anchor[1])
+
+    table_edge = None
+    raw_edge = raw_overlay.get("table_edge_endpoints_px")
+    if raw_edge is not None:
+        if not isinstance(raw_edge, (list, tuple)) or len(raw_edge) != 2:
+            raise ValueError(
+                "Base Pose viewer table edge must contain two endpoints"
+            )
+        start = _finite_tuple(
+            raw_edge[0],
+            length=2,
+            description="viewer table edge start",
+        )
+        end = _finite_tuple(
+            raw_edge[1],
+            length=2,
+            description="viewer table edge end",
+        )
+        table_edge = ((start[0], start[1]), (end[0], end[1]))
+
+    image_size = None
+    raw_size = raw_overlay.get("image_size")
+    if raw_size is not None:
+        size = _finite_tuple(
+            raw_size,
+            length=2,
+            description="viewer image size",
+        )
+        width, height = int(size[0]), int(size[1])
+        if width <= 0 or height <= 0 or (width, height) != size:
+            raise ValueError(
+                "Base Pose viewer image size must contain positive integers"
+            )
+        image_size = (width, height)
+    return target_bbox, target_lateral_anchor, table_edge, image_size
 
 
 def parse_base_pose_viewer_status(raw: bytes | str) -> BasePoseViewerStatus:
@@ -130,9 +225,16 @@ def parse_base_pose_viewer_status(raw: bytes | str) -> BasePoseViewerStatus:
         if raw_camera_stream is None or not str(raw_camera_stream).strip()
         else str(raw_camera_stream).strip()
     )
+    target_bbox, target_lateral_anchor, table_edge, image_size = (
+        _parse_viewer_overlay(payload)
+    )
     return BasePoseViewerStatus(
         active_camera_stream=active_camera_stream,
         velocity=(values[0], values[1], values[2]),
+        target_bbox_xyxy=target_bbox,
+        target_lateral_anchor_px=target_lateral_anchor,
+        table_edge_endpoints_px=table_edge,
+        overlay_image_size=image_size,
     )
 
 
@@ -167,6 +269,121 @@ def format_velocity_label(velocity: tuple[float, float, float]) -> str:
     """Format the exact Base Pose velocity command for the display overlay."""
     vx, vy, wz = velocity
     return f"CMD vx={vx:+.3f}  vy={vy:+.3f}  wz={wz:+.3f}"
+
+
+def _outlined_text(
+    image: np.ndarray,
+    text: str,
+    origin: tuple[int, int],
+    color: tuple[int, int, int],
+) -> None:
+    cv2.putText(
+        image,
+        text,
+        origin,
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.55,
+        (0, 0, 0),
+        4,
+        cv2.LINE_AA,
+    )
+    cv2.putText(
+        image,
+        text,
+        origin,
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.55,
+        color,
+        2,
+        cv2.LINE_AA,
+    )
+
+
+def draw_base_pose_overlays(
+    image_bgr: np.ndarray,
+    camera_stream: str,
+    status: BasePoseViewerStatus,
+) -> np.ndarray:
+    """Draw the exact target box and table edge consumed by Base Pose."""
+    if (
+        not _is_rgb_image(image_bgr)
+        or camera_stream != status.active_camera_stream
+        or status.target_bbox_xyxy is None
+    ):
+        return image_bgr
+    height, width = image_bgr.shape[:2]
+    source_width, source_height = status.overlay_image_size or (width, height)
+    scale_x = width / source_width
+    scale_y = height / source_height
+
+    def point(x: float, y: float) -> tuple[int, int]:
+        return (
+            min(width - 1, max(0, int(round(x * scale_x)))),
+            min(height - 1, max(0, int(round(y * scale_y)))),
+        )
+
+    x1, y1, x2, y2 = status.target_bbox_xyxy
+    target_start = point(x1, y1)
+    target_end = point(x2, y2)
+    target_color = (0, 255, 0)
+    cv2.rectangle(
+        image_bgr,
+        target_start,
+        target_end,
+        target_color,
+        3,
+        cv2.LINE_AA,
+    )
+    if status.target_lateral_anchor_px is not None:
+        lateral_anchor = point(*status.target_lateral_anchor_px)
+        cv2.drawMarker(
+            image_bgr,
+            lateral_anchor,
+            target_color,
+            cv2.MARKER_CROSS,
+            16,
+            2,
+            cv2.LINE_AA,
+        )
+    _outlined_text(
+        image_bgr,
+        "TARGET (F/R)",
+        (target_start[0], max(18, target_start[1] - 7)),
+        target_color,
+    )
+
+    if status.table_edge_endpoints_px is not None:
+        edge_start = point(*status.table_edge_endpoints_px[0])
+        edge_end = point(*status.table_edge_endpoints_px[1])
+        edge_color = (0, 0, 255)
+        cv2.line(
+            image_bgr,
+            edge_start,
+            edge_end,
+            edge_color,
+            3,
+            cv2.LINE_AA,
+        )
+        for endpoint in (edge_start, edge_end):
+            cv2.circle(
+                image_bgr,
+                endpoint,
+                5,
+                (0, 255, 255),
+                -1,
+                cv2.LINE_AA,
+            )
+        edge_center = (
+            (edge_start[0] + edge_end[0]) // 2,
+            (edge_start[1] + edge_end[1]) // 2,
+        )
+        _outlined_text(
+            image_bgr,
+            "TABLE EDGE (YAW)",
+            (max(0, edge_center[0] - 75), max(18, edge_center[1] - 8)),
+            edge_color,
+        )
+    return image_bgr
 
 
 def main(config: CameraViewerConfig):
@@ -247,6 +464,8 @@ def main(config: CameraViewerConfig):
 
                 if is_recording and name in video_writers:
                     video_writers[name].write(img_bgr)
+
+                draw_base_pose_overlays(img_bgr, name, viewer_status)
 
                 h, w = img_bgr.shape[:2]
                 if w > config.max_display_width:

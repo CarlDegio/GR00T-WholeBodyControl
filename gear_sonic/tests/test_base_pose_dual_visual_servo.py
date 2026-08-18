@@ -29,6 +29,7 @@ from gear_sonic.utils.inference.base_pose import (
 from gear_sonic.utils.inference.base_pose_dual_visual_servo import (
     DualCameraFailoverCoordinator,
     DualCameraReference,
+    HeadCameraTextMonitor,
     LatestReferenceGate,
     dual_calibrations_from_config,
     ground_dual_raw_servo_references,
@@ -141,7 +142,7 @@ def test_coordinator_starts_only_camera_with_an_initial_reference() -> None:
     assert attempt.reference.stream_name == CHEST
 
 
-def test_coordinator_runs_alternate_text_qwen_before_origin_text_qwen() -> None:
+def test_coordinator_runs_head_recovery_before_chest_after_head_loss() -> None:
     head_initial = reference(HEAD, marker=1)
     chest_initial = reference(CHEST, marker=2)
     coordinator = DualCameraFailoverCoordinator(
@@ -151,21 +152,7 @@ def test_coordinator_runs_alternate_text_qwen_before_origin_text_qwen() -> None:
     first = coordinator.start()
     coordinator.mark_success(first)
 
-    alternate_text = coordinator.advance_after_failure(first)
-    assert alternate_text is not None
-    assert alternate_text.live_stream == CHEST
-    assert alternate_text.reference is chest_initial
-    assert alternate_text.stage == "alternate_text"
-    assert alternate_text.origin_stream == HEAD
-
-    alternate_qwen = coordinator.advance_after_failure(alternate_text)
-    assert alternate_qwen is not None
-    assert alternate_qwen.live_stream == CHEST
-    assert alternate_qwen.reference is chest_initial
-    assert alternate_qwen.stage == "alternate_qwen"
-    assert alternate_qwen.origin_stream == HEAD
-
-    origin_text = coordinator.advance_after_failure(alternate_qwen)
+    origin_text = coordinator.advance_after_failure(first)
     assert origin_text is not None
     assert origin_text.live_stream == HEAD
     assert origin_text.reference is head_initial
@@ -179,10 +166,24 @@ def test_coordinator_runs_alternate_text_qwen_before_origin_text_qwen() -> None:
     assert origin_qwen.stage == "origin_qwen"
     assert origin_qwen.origin_stream == HEAD
 
-    assert coordinator.advance_after_failure(origin_qwen) is None
+    alternate_text = coordinator.advance_after_failure(origin_qwen)
+    assert alternate_text is not None
+    assert alternate_text.live_stream == CHEST
+    assert alternate_text.reference is chest_initial
+    assert alternate_text.stage == "alternate_text"
+    assert alternate_text.origin_stream == HEAD
+
+    alternate_qwen = coordinator.advance_after_failure(alternate_text)
+    assert alternate_qwen is not None
+    assert alternate_qwen.live_stream == CHEST
+    assert alternate_qwen.reference is chest_initial
+    assert alternate_qwen.stage == "alternate_qwen"
+    assert alternate_qwen.origin_stream == HEAD
+
+    assert coordinator.advance_after_failure(alternate_qwen) is None
 
 
-def test_coordinator_uses_cross_camera_prompt_when_alternate_has_no_initial() -> None:
+def test_coordinator_uses_cross_camera_prompt_when_chest_has_no_initial() -> None:
     head_initial = reference(HEAD, marker=1)
     coordinator = DualCameraFailoverCoordinator(
         (HEAD, CHEST),
@@ -191,7 +192,11 @@ def test_coordinator_uses_cross_camera_prompt_when_alternate_has_no_initial() ->
     first = coordinator.start()
     coordinator.mark_success(first)
 
-    alternate_text = coordinator.advance_after_failure(first)
+    origin_text = coordinator.advance_after_failure(first)
+    assert origin_text is not None
+    origin_qwen = coordinator.advance_after_failure(origin_text)
+    assert origin_qwen is not None
+    alternate_text = coordinator.advance_after_failure(origin_qwen)
     assert alternate_text is not None
     assert alternate_text.live_stream == CHEST
     assert alternate_text.reference is head_initial
@@ -204,7 +209,7 @@ def test_coordinator_uses_cross_camera_prompt_when_alternate_has_no_initial() ->
     assert alternate_qwen.stage == "alternate_qwen"
 
 
-def test_coordinator_success_resets_cycle_for_repeated_switching() -> None:
+def test_coordinator_keeps_head_first_recovery_after_chest_loss() -> None:
     head_initial = reference(HEAD, marker=1)
     chest_initial = reference(CHEST, marker=2)
     coordinator = DualCameraFailoverCoordinator(
@@ -213,19 +218,64 @@ def test_coordinator_success_resets_cycle_for_repeated_switching() -> None:
     )
     head = coordinator.start()
     coordinator.mark_success(head)
-    chest = coordinator.advance_after_failure(head)
+    head_text = coordinator.advance_after_failure(head)
+    assert head_text is not None
+    head_qwen = coordinator.advance_after_failure(head_text)
+    assert head_qwen is not None
+    chest = coordinator.advance_after_failure(head_qwen)
     assert chest is not None and chest.live_stream == CHEST
 
     coordinator.mark_success(chest)
-    chest_text = coordinator.advance_after_failure(chest)
+    head_after_chest_loss = coordinator.advance_after_failure(chest)
 
+    assert head_after_chest_loss is not None
+    assert head_after_chest_loss.live_stream == HEAD
+    assert head_after_chest_loss.reference is head_initial
+    assert head_after_chest_loss.stage == "alternate_text"
+    assert head_after_chest_loss.origin_stream == CHEST
+    assert head_after_chest_loss.attempt_id == 5
+
+
+
+def test_coordinator_skips_head_stages_after_monitor_qwen_failure() -> None:
+    head_initial = reference(HEAD, marker=1)
+    chest_initial = reference(CHEST, marker=2)
+    coordinator = DualCameraFailoverCoordinator(
+        (HEAD, CHEST),
+        {HEAD: head_initial, CHEST: chest_initial},
+    )
+
+    monitor_qwen = coordinator.begin_head_monitor_reacquisition(use_qwen=True)
+    chest_text = coordinator.advance_after_failure(monitor_qwen)
     assert chest_text is not None
-    assert chest_text.live_stream == HEAD
-    assert chest_text.reference is head_initial
-    assert chest_text.stage == "alternate_text"
-    assert chest_text.origin_stream == CHEST
-    assert chest_text.attempt_id == 3
+    chest_qwen = coordinator.advance_after_failure(chest_text)
 
+    assert monitor_qwen.live_stream == HEAD
+    assert monitor_qwen.stage == "head_monitor_qwen"
+    assert chest_text.live_stream == CHEST
+    assert chest_text.stage == "origin_text"
+    assert chest_text.origin_stream == CHEST
+    assert chest_text.reference is chest_initial
+    assert chest_qwen is not None
+    assert chest_qwen.live_stream == CHEST
+    assert chest_qwen.stage == "origin_qwen"
+
+
+def test_successful_monitor_qwen_then_later_head_loss_uses_normal_head_flow() -> None:
+    head_initial = reference(HEAD, marker=1)
+    coordinator = DualCameraFailoverCoordinator(
+        (HEAD, CHEST),
+        {HEAD: head_initial, CHEST: reference(CHEST, marker=2)},
+    )
+    monitor_qwen = coordinator.begin_head_monitor_reacquisition(use_qwen=True)
+    coordinator.mark_success(monitor_qwen)
+
+    head_text = coordinator.advance_after_failure(monitor_qwen)
+
+    assert head_text is not None
+    assert head_text.live_stream == HEAD
+    assert head_text.stage == "origin_text"
+    assert head_text.reference is head_initial
 
 def test_dual_calibrations_use_each_saved_stream_and_chest_minus_three_pitch(
     monkeypatch: pytest.MonkeyPatch,
@@ -645,7 +695,7 @@ def test_qwen_fallback_forces_8b_model_and_uses_current_camera_frame(
         fake_ground,
     )
     config = SimpleNamespace(
-        task="align",
+        task="align to the object selected by initial QwenVL Plus",
         dual_qwenvl_fallback_model="qwen3-vl-8b-instruct",
         qwenvl_base_url="https://example.invalid/v1",
         qwenvl_thinking_budget=500,
@@ -660,6 +710,7 @@ def test_qwen_fallback_forces_8b_model_and_uses_current_camera_frame(
 
     qwen_config = captured["config"]
     assert qwen_config.vision_backend == "qwenvl"
+    assert qwen_config.task == config.task
     assert qwen_config.qwenvl_model == "qwen3-vl-8b-instruct"
     assert qwen_config.qwenvl_enable_thinking is False
     assert captured["calibration"] is calibration
@@ -772,6 +823,8 @@ def run_worker_with_tracker(
     *,
     stop_event: threading.Event | None = None,
     diagnostics: AsyncFrameDiagnosticsWriter | None = None,
+    head_monitor_tracker: object | None = None,
+    initial_references: dict[str, DualCameraReference] | None = None,
     table_required: Callable[[], bool] | None = None,
     latest_reference_updater_factory: Callable[[], object] | None = None,
     qwen_reference_factory: Callable[..., DualCameraReference] = (
@@ -798,10 +851,22 @@ def run_worker_with_tracker(
         diagnostics=diagnostics,
         camera_factory=lambda: camera,
         tracker_factory=lambda: tracker,
+        head_monitor_tracker_factory=(
+            None
+            if head_monitor_tracker is None
+            else lambda: head_monitor_tracker
+        ),
         latest_reference_updater_factory=latest_reference_updater_factory,
         qwen_reference_factory=qwen_reference_factory,
         calibration_factory=lambda _config: calibrations,
-        reference_factory=lambda *_args, **_kwargs: (worker_references(), {}),
+        reference_factory=lambda *_args, **_kwargs: (
+            (
+                worker_references()
+                if initial_references is None
+                else initial_references
+            ),
+            {},
+        ),
         table_required=table_required,
     )
     emitted: list[RawServoEvent] = []
@@ -845,13 +910,13 @@ def test_worker_gives_each_attempt_thirty_frames_before_failover_exit(
     ] == [29, 29, 29, 29, 29]
     assert len(switching) == 4
     assert [event.details["live_stream"] for event in switching] == [
-        CHEST, CHEST, HEAD, HEAD
+        HEAD, HEAD, CHEST, CHEST
     ]
     assert tracker.starts == [
         1,
-        "all_text:blue basket:desk",
-        62,
         "hybrid:blue basket",
+        62,
+        "all_text:blue basket:desk",
         123,
     ]
     assert len(errors) == 1
@@ -932,6 +997,220 @@ def _valid_instances() -> list[TrackedInstance]:
     ]
 
 
+def test_head_monitor_uses_initial_prompt_and_ten_consecutive_frames() -> None:
+    class MonitorTracker:
+        def __init__(self) -> None:
+            self.calls = 0
+            self.prompts: tuple[str, str] | None = None
+
+        def start_all_text(self, *, target_prompt, surface_prompt):
+            self.prompts = (target_prompt, surface_prompt)
+
+        def track(self, _rgb):
+            self.calls += 1
+            if self.calls == 6:
+                return []
+            return _valid_instances()
+
+    tracker = MonitorTracker()
+    monitor = HeadCameraTextMonitor(
+        tracker,
+        "blue plastic basket",
+        required_target_frames=10,
+    )
+    monitor.start()
+
+    results = [
+        monitor.inspect(
+            large_snapshot(HEAD, marker=index, timestamp=float(index))
+        )
+        for index in range(1, 17)
+    ]
+
+    assert tracker.prompts == ("blue plastic basket", "desk")
+    assert [result.triggered for result in results] == [False] * 15 + [True]
+    assert results[4].target_streak == 5
+    assert results[5].target_streak == 0
+    assert results[-1].target_streak == 10
+    assert results[-1].reference is not None
+    assert results[-1].reference.kind == "head_monitor"
+    assert results[-1].reference.stream_name == HEAD
+    assert results[-1].reference.target_prompt == "blue plastic basket"
+    assert results[-1].reference.target_bbox == pytest.approx(
+        (343.75, 375.0, 687.5, 708.333333)
+    )
+
+
+def test_head_monitor_requests_qwen_when_trigger_frame_has_no_desk() -> None:
+    class TargetOnlyTracker:
+        def start_all_text(self, **_kwargs):
+            pass
+
+        def track(self, _rgb):
+            return [_valid_instances()[0]]
+
+    monitor = HeadCameraTextMonitor(
+        TargetOnlyTracker(),
+        "blue basket",
+        required_target_frames=2,
+    )
+    monitor.start()
+    first = monitor.inspect(large_snapshot(HEAD, marker=1, timestamp=1.0))
+    second = monitor.inspect(large_snapshot(HEAD, marker=2, timestamp=2.0))
+
+    assert not first.triggered
+    assert second.triggered
+    assert second.target_streak == 2
+    assert second.reference is None
+    assert second.target is not None
+    assert second.surface is None
+
+
+def test_worker_preempts_chest_after_ten_head_frames_with_both_boxes(
+    tmp_path: Path,
+) -> None:
+    stop_event = threading.Event()
+
+    class MainTracker:
+        def __init__(self) -> None:
+            self.attempt = 0
+            self.starts: list[int] = []
+
+        def start(self, reference_rgb, **_kwargs):
+            self.attempt += 1
+            self.starts.append(int(reference_rgb[0, 0, 0]))
+
+        def start_text(self, _reference_rgb, **_kwargs):
+            raise AssertionError("text fallback should not run")
+
+        def start_all_text(self, **_kwargs):
+            raise AssertionError("text fallback should not run")
+
+        def track(self, _rgb):
+            if self.attempt == 2:
+                stop_event.set()
+            return _valid_instances()
+
+    class MonitorTracker:
+        def __init__(self) -> None:
+            self.calls = 0
+            self.prompts: tuple[str, str] | None = None
+
+        def start_all_text(self, *, target_prompt, surface_prompt):
+            self.prompts = (target_prompt, surface_prompt)
+
+        def track(self, _rgb):
+            self.calls += 1
+            return _valid_instances()
+
+    main = MainTracker()
+    monitor = MonitorTracker()
+    emitted, _camera = run_worker_with_tracker(
+        tmp_path,
+        main,
+        stop_event=stop_event,
+        head_monitor_tracker=monitor,
+        initial_references={CHEST: worker_references()[CHEST]},
+    )
+
+    switching = [event for event in emitted if event.kind == "switching"]
+    initialized = [event for event in emitted if event.kind == "initialized"]
+    assert monitor.prompts == ("blue basket", "desk")
+    assert monitor.calls == 10
+    assert main.starts == [2, 11]
+    assert len(switching) == 1
+    assert switching[0].details["live_stream"] == HEAD
+    assert switching[0].details["failover_stage"] == "head_monitor"
+    assert switching[0].details["reference_kind"] == "head_monitor"
+    assert switching[0].details["head_monitor"] == {
+        "status": "triggered",
+        "target_streak": 10,
+        "required_target_frames": 10,
+        "desk_detected": True,
+    }
+    assert [event.details["live_stream"] for event in initialized] == [
+        CHEST,
+        HEAD,
+    ]
+
+
+def test_worker_uses_trigger_head_photo_for_qwen_when_desk_is_missing(
+    tmp_path: Path,
+) -> None:
+    stop_event = threading.Event()
+    qwen_markers: list[int] = []
+
+    class MainTracker:
+        def __init__(self) -> None:
+            self.attempt = 0
+            self.starts: list[int] = []
+
+        def start(self, reference_rgb, **_kwargs):
+            self.attempt += 1
+            self.starts.append(int(reference_rgb[0, 0, 0]))
+
+        def start_text(self, _reference_rgb, **_kwargs):
+            raise AssertionError("text fallback should not run")
+
+        def start_all_text(self, **_kwargs):
+            raise AssertionError("text fallback should not run")
+
+        def track(self, _rgb):
+            if self.attempt == 2:
+                stop_event.set()
+            return _valid_instances()
+
+    class TargetOnlyMonitor:
+        def __init__(self) -> None:
+            self.markers: list[int] = []
+
+        def start_all_text(self, **_kwargs):
+            pass
+
+        def track(self, rgb):
+            self.markers.append(int(rgb[0, 0, 0]))
+            return [_valid_instances()[0]]
+
+    monitor = TargetOnlyMonitor()
+
+    def qwen_reference(
+        config,
+        stream_name,
+        snapshot,
+        calibration,
+        output_dir,
+    ):
+        qwen_markers.append(int(snapshot.rgb[0, 0, 0]))
+        return worker_qwen_reference(
+            config,
+            stream_name,
+            snapshot,
+            calibration,
+            output_dir,
+        )
+
+    main = MainTracker()
+    emitted, _camera = run_worker_with_tracker(
+        tmp_path,
+        main,
+        stop_event=stop_event,
+        head_monitor_tracker=monitor,
+        initial_references={CHEST: worker_references()[CHEST]},
+        qwen_reference_factory=qwen_reference,
+    )
+
+    switching = [event for event in emitted if event.kind == "switching"]
+    initialized = [event for event in emitted if event.kind == "initialized"]
+    assert len(monitor.markers) == 10
+    assert qwen_markers == [monitor.markers[-1]]
+    assert main.starts == [2, monitor.markers[-1]]
+    assert len(switching) == 1
+    assert switching[0].details["failover_stage"] == "head_monitor_qwen"
+    assert switching[0].details["head_monitor"]["desk_detected"] is False
+    assert initialized[-1].details["live_stream"] == HEAD
+    assert initialized[-1].details["reference_kind"] == "qwen"
+
+
 def test_worker_allows_table_loss_after_required_visual_phases(
     tmp_path: Path,
 ) -> None:
@@ -999,7 +1278,7 @@ def test_worker_still_requires_table_during_initialization(
 
 
 
-def test_worker_alternate_qwen_uses_fresh_other_camera_frame(
+def test_worker_origin_qwen_uses_fresh_head_camera_frame(
     tmp_path: Path,
 ) -> None:
     stop_event = threading.Event()
@@ -1046,15 +1325,15 @@ def test_worker_alternate_qwen_uses_fresh_other_camera_frame(
     switching = [event for event in emitted if event.kind == "switching"]
     assert len(initialized) == 2
     assert len(switching) == 2
-    assert tracker.starts == [1, "all_text", 68]
+    assert tracker.starts == [1, "hybrid", 68]
     assert switching[0].details["reference_kind"] == "initial"
-    assert switching[0].details["reference_source_stream"] == CHEST
-    assert switching[0].details["prompt_mode"] == "target_text_surface_text"
-    assert switching[1].details["failover_stage"] == "alternate_qwen"
+    assert switching[0].details["reference_source_stream"] == HEAD
+    assert switching[0].details["prompt_mode"] == "target_text_surface_visual"
+    assert switching[1].details["failover_stage"] == "origin_qwen"
     qwen_initialized = initialized[-1]
-    assert qwen_initialized.details["live_stream"] == CHEST
+    assert qwen_initialized.details["live_stream"] == HEAD
     assert qwen_initialized.details["reference_kind"] == "qwen"
-    assert qwen_initialized.details["reference_source_stream"] == CHEST
+    assert qwen_initialized.details["reference_source_stream"] == HEAD
     assert qwen_initialized.details["prompt_mode"] == "visual"
 
 
@@ -1125,7 +1404,7 @@ def test_worker_applies_saved_reference_before_and_during_origin_text(
             self.calls += 1
             if self.attempt == 1 and self.calls > 7:
                 return []
-            if self.attempt in {2, 3}:
+            if self.attempt >= 3:
                 return []
             return _valid_instances()
 
@@ -1153,17 +1432,15 @@ def test_worker_applies_saved_reference_before_and_during_origin_text(
         latest_reference_updater_factory=lambda: updater,
     )
 
-    assert updater.submitted == [(HEAD, 5), (HEAD, 100)]
+    assert updater.submitted == [(HEAD, 5), (HEAD, 40)]
     assert updater.closed
-    assert tracker.starts[:4] == [
-        ("visual", "desk"),
-        ("all_text", "desk"),
+    assert tracker.starts[:2] == [
         ("visual", "desk"),
         ("text", "desk"),
     ]
     assert tracker.installed == [
         ("visual", f"target:{HEAD}:5", f"desk:{HEAD}:5"),
-        ("text", None, f"desk:{HEAD}:100"),
+        ("text", None, f"desk:{HEAD}:40"),
     ]
     applied = [
         event
@@ -1179,7 +1456,7 @@ def test_worker_applies_saved_reference_before_and_during_origin_text(
     assert [
         event.details["latest_reference_refresh"]["source_frame"]
         for event in applied
-    ] == [5, 100]
+    ] == [5, 40]
 
 
 def servo_observation() -> RawServoObservation:
@@ -1397,6 +1674,7 @@ def test_dual_raw_yoloe_mode_has_expected_defaults() -> None:
     assert planner.dual_chest_camera_stream == CHEST
     assert planner.dual_chest_camera_pitch_deg == -3.0
     assert planner.dual_match_tolerance_frames == 30
+    assert planner.dual_head_reacquire_frames == 10
     assert planner.dual_initialization_grace_s == pytest.approx(30.0)
     assert planner.dual_qwenvl_fallback_model == "qwen3-vl-8b-instruct"
     assert planner.raw_head_target_distance_m == pytest.approx(0.9)
@@ -1407,6 +1685,7 @@ def test_dual_raw_yoloe_mode_has_expected_defaults() -> None:
     assert launch.base_pose_dual_head_camera_stream == HEAD
     assert launch.base_pose_dual_chest_camera_stream == CHEST
     assert launch.base_pose_dual_chest_camera_pitch_deg == -3.0
+    assert launch.base_pose_dual_head_reacquire_frames == 10
     assert launch.base_pose_dual_initialization_grace_s == pytest.approx(30.0)
     assert launch.base_pose_dual_qwenvl_fallback_model == "qwen3-vl-8b-instruct"
     assert launch.base_pose_raw_head_target_distance_m == pytest.approx(0.9)
@@ -1440,6 +1719,7 @@ def test_dual_raw_yoloe_launch_uses_direct_dual_rgbd_and_raw_relay() -> None:
     assert "--camera-height-m" not in planner_command
     assert "--dual-chest-camera-pitch-deg -3.0" in planner_command
     assert "--dual-match-tolerance-frames 30" in planner_command
+    assert "--dual-head-reacquire-frames 10" in planner_command
     assert "--dual-initialization-grace-s 30.0" in planner_command
     assert "--dual-qwenvl-fallback-model " in planner_command
     assert "qwen3-vl-8b-instruct" in planner_command

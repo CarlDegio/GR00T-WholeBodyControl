@@ -180,6 +180,7 @@ class TargetGeometry:
     valid_depth_pixels: int
     valid_ratio: float
     median_depth_m: float
+    lateral_anchor_px: tuple[float, float] | None = None
 
 
 @dataclass(frozen=True)
@@ -200,6 +201,7 @@ class TableGeometry:
 class ServoPhase(str, Enum):
     FORWARD_APPROACH = "forward_approach"
     FORWARD_RECENTER = "forward_recenter"
+    VERTICAL_RECENTER = "vertical_recenter"
     YAW_ALIGN = "yaw_align"
     RECENTER = "recenter"
     YAW_TRIM = "yaw_trim"
@@ -1143,6 +1145,7 @@ def estimate_target_geometry(
     body = calibration.camera_to_body(_deproject(u, v, z, calibration))
     median = np.median(body, axis=0)
     right_m = float(-median[1])
+    lateral_anchor_px = None
     if bbox_xyxy is not None:
         # The lateral loop follows the requested box center; mask depth supplies
         # a robust range rather than a fragile center pixel.
@@ -1156,6 +1159,7 @@ def estimate_target_geometry(
             calibration,
         )
         right_m = float(-calibration.camera_to_body(center_camera)[0, 1])
+        lateral_anchor_px = (float(u_center), float(v_center))
     return TargetGeometry(
         forward_m=float(median[0]),
         right_m=right_m,
@@ -1163,6 +1167,7 @@ def estimate_target_geometry(
         valid_depth_pixels=int(z.size),
         valid_ratio=float(valid_ratio),
         median_depth_m=float(np.median(z)),
+        lateral_anchor_px=lateral_anchor_px,
     )
 
 
@@ -1403,10 +1408,12 @@ class VisualServoController:
     ) -> None:
         if initial_phase not in {
             ServoPhase.FORWARD_APPROACH,
+            ServoPhase.VERTICAL_RECENTER,
             ServoPhase.YAW_ALIGN,
         }:
             raise ValueError(
-                "initial servo phase must be forward_approach or yaw_align"
+                "initial servo phase must be forward_approach, "
+                "vertical_recenter, or yaw_align"
             )
         self.start_time = float(now)
         self.last_update_time = float(now)
@@ -1420,6 +1427,9 @@ class VisualServoController:
         self.stable_frames = 0
         self.forward_approach_stable_frames = 0
         self.forward_recenter_next_calibration_at: float | None = None
+        self.vertical_recenter_started_at: float | None = None
+        self.vertical_recenter_elapsed_s = 0.0
+        self.vertical_recenter_stable_frames = 0
         self.yaw_stable_frames = 0
         self.recenter_stable_frames = 0
         self.desired_heading_rad: float | None = None
@@ -1713,6 +1723,9 @@ class VisualServoController:
         if self.phase is ServoPhase.POST_STOP_SAMPLING:
             self._post_stop_sampling_complete(now)
             return self.terminal
+        if self.phase is ServoPhase.VERTICAL_RECENTER:
+            self._vertical_recenter_timed_out(now)
+            return self.terminal
         self._check_limits(now)
         return self.terminal
 
@@ -1741,6 +1754,80 @@ class VisualServoController:
         x1, _, x2, _ = observation.target_bbox_xyxy
         center = 0.5 * (x1 + x2)
         return self.recovery_low_fraction * width <= center <= self.recovery_high_fraction * width
+
+    @staticmethod
+    def _vertical_height_from_bottom(
+        observation: RawServoObservation,
+    ) -> float | None:
+        height = float(observation.image_height)
+        if height <= 0.0:
+            return None
+        _, y1, _, y2 = observation.target_bbox_xyxy
+        center_y = 0.5 * (y1 + y2)
+        return 1.0 - center_y / height
+
+    def _vertical_recenter_timed_out(self, now: float) -> bool:
+        started_at = self.vertical_recenter_started_at
+        if started_at is None:
+            return False
+        self.vertical_recenter_elapsed_s = max(
+            0.0, float(now) - started_at
+        )
+        if self.vertical_recenter_elapsed_s < 1.0:
+            return False
+        self._transition(
+            ServoPhase.YAW_ALIGN,
+            "vertical recenter completed after one second",
+        )
+        return True
+
+    def _vertical_recenter_command(self) -> ServoCommand:
+        return ServoCommand(
+            self.min_linear_speed_m_s,
+            0.0,
+            0.0,
+            self.command_ttl_s,
+        )
+
+    def _update_vertical_recenter(
+        self,
+        observation: RawServoObservation,
+        *,
+        now: float,
+    ) -> ServoCommand:
+        height_from_bottom = self._vertical_height_from_bottom(observation)
+        if self.vertical_recenter_started_at is None:
+            if (
+                height_from_bottom is None
+                or height_from_bottom <= 0.90
+            ):
+                return self._transition(
+                    ServoPhase.YAW_ALIGN,
+                    "vertical recenter not required after chest-to-head switch",
+                )
+            self.vertical_recenter_started_at = float(now)
+            self.vertical_recenter_elapsed_s = 0.0
+        elif self._vertical_recenter_timed_out(now):
+            return self.current
+
+        below_exit_height = (
+            height_from_bottom is not None
+            and height_from_bottom < 0.80
+        )
+        self.vertical_recenter_stable_frames = (
+            self.vertical_recenter_stable_frames + 1
+            if below_exit_height
+            else 0
+        )
+        if self.vertical_recenter_stable_frames >= 3:
+            return self._transition(
+                ServoPhase.YAW_ALIGN,
+                "target remained below 80 percent image height for three frames",
+            )
+
+        self.invalid_frames = 0
+        self.current = self._vertical_recenter_command()
+        return self.current
 
     def _forward_approach_vx(self, forward_error: float) -> float:
         if forward_error <= self.forward_tolerance_m + 1.0e-12:
@@ -1836,6 +1923,8 @@ class VisualServoController:
         limited = self._check_limits(now)
         if limited is not None:
             return limited
+        if self.phase is ServoPhase.VERTICAL_RECENTER:
+            return self._update_vertical_recenter(observation, now=now)
         forward_error, right_error, visual_yaw_error = self._update_filter(
             observation
         )
@@ -2068,6 +2157,13 @@ class VisualServoController:
         limited = self._check_limits(now)
         if limited is not None:
             return limited
+        if self.phase is ServoPhase.VERTICAL_RECENTER:
+            self.vertical_recenter_stable_frames = 0
+            self.invalid_frames = 0
+            if self._vertical_recenter_timed_out(now):
+                return self.current
+            self.current = self._vertical_recenter_command()
+            return self.current
         self.stable_frames = 0
         self.forward_approach_stable_frames = 0
         self.forward_recenter_next_calibration_at = None
@@ -2085,6 +2181,10 @@ def build_servo_velocity_message(
     *,
     action: str,
     camera_stream: str | None = None,
+    viewer_target_bbox_xyxy: Sequence[float] | None = None,
+    viewer_target_lateral_anchor_px: Sequence[float] | None = None,
+    viewer_table_edge_endpoints_px: Sequence[Sequence[float]] | None = None,
+    viewer_image_size: tuple[int, int] | None = None,
 ) -> str:
     payload = {
         "action": action,
@@ -2108,6 +2208,27 @@ def build_servo_velocity_message(
     }
     if camera_stream:
         payload["camera_stream"] = str(camera_stream)
+    if viewer_target_bbox_xyxy is not None:
+        overlay: dict[str, Any] = {
+            "target_bbox_xyxy": [
+                float(value) for value in viewer_target_bbox_xyxy
+            ],
+        }
+        if viewer_target_lateral_anchor_px is not None:
+            overlay["target_lateral_anchor_px"] = [
+                float(value) for value in viewer_target_lateral_anchor_px
+            ]
+        if viewer_table_edge_endpoints_px is not None:
+            overlay["table_edge_endpoints_px"] = [
+                [float(value) for value in point]
+                for point in viewer_table_edge_endpoints_px
+            ]
+        if viewer_image_size is not None:
+            overlay["image_size"] = [
+                int(viewer_image_size[0]),
+                int(viewer_image_size[1]),
+            ]
+        payload["viewer_overlay"] = overlay
     return json.dumps(payload, separators=(",", ":"))
 
 
@@ -2389,6 +2510,11 @@ def _diagnostic_frame(
             "valid_depth_pixels": observation.target.valid_depth_pixels,
             "valid_ratio": observation.target.valid_ratio,
             "median_depth_m": observation.target.median_depth_m,
+            "lateral_anchor_px": (
+                None
+                if observation.target.lateral_anchor_px is None
+                else list(observation.target.lateral_anchor_px)
+            ),
         }
         if observation.table is not None:
             table_geometry = {
@@ -3129,6 +3255,15 @@ class RawServoRuntime:
         self.last_applied_frame_index: int | None = None
         self.current_attempt_id = 0
         self.active_camera_stream: str | None = None
+        self.vertical_recenter_armed = False
+        self.viewer_target_bbox_xyxy: (
+            tuple[float, float, float, float] | None
+        ) = None
+        self.viewer_target_lateral_anchor_px: tuple[float, float] | None = None
+        self.viewer_table_edge_endpoints_px: (
+            tuple[tuple[float, float], tuple[float, float]] | None
+        ) = None
+        self.viewer_image_size: tuple[int, int] | None = None
         self.navigation_started_at: float | None = None
         self.soft_stale = False
         self.next_publish_at: float | None = None
@@ -3144,6 +3279,28 @@ class RawServoRuntime:
             return None
         stream = str(value).strip()
         return stream or None
+
+    def _is_vertical_recenter_switch(
+        self,
+        *,
+        previous_stream: str | None,
+        next_stream: str | None,
+        details: Mapping[str, Any],
+    ) -> bool:
+        if self.config.mode != "dual_raw_yoloe_servo":
+            return False
+        chest_stream = str(
+            getattr(self.config, "dual_chest_camera_stream", "chest_view")
+        )
+        head_stream = str(
+            getattr(self.config, "dual_head_camera_stream", "ego_view")
+        )
+        stage = str(details.get("failover_stage") or "")
+        return (
+            previous_stream == chest_stream
+            and next_stream == head_stream
+            and stage in {"head_monitor", "head_monitor_qwen"}
+        )
 
     def _reset_controller(self, now: float) -> None:
         chest_stream = str(
@@ -3166,8 +3323,41 @@ class RawServoRuntime:
             initial_phase=(
                 ServoPhase.FORWARD_APPROACH
                 if chest_camera_active
+                else ServoPhase.VERTICAL_RECENTER
+                if self.vertical_recenter_armed
                 else ServoPhase.YAW_ALIGN
             ),
+        )
+
+    def _clear_viewer_overlay(self) -> None:
+        self.viewer_target_bbox_xyxy = None
+        self.viewer_target_lateral_anchor_px = None
+        self.viewer_table_edge_endpoints_px = None
+        self.viewer_image_size = None
+
+    def _set_viewer_overlay(self, observation: RawServoObservation) -> None:
+        self.viewer_target_bbox_xyxy = tuple(
+            float(value) for value in observation.target_bbox_xyxy
+        )
+        self.viewer_target_lateral_anchor_px = (
+            None
+            if observation.target.lateral_anchor_px is None
+            else tuple(
+                float(value) for value in observation.target.lateral_anchor_px
+            )
+        )
+        self.viewer_table_edge_endpoints_px = (
+            None
+            if observation.table is None
+            or observation.table.line_endpoints_px is None
+            else tuple(
+                tuple(float(value) for value in point)
+                for point in observation.table.line_endpoints_px
+            )
+        )
+        self.viewer_image_size = (
+            int(observation.image_width),
+            int(observation.image_height),
         )
 
     def _publish(self, command: ServoCommand, action: str) -> None:
@@ -3182,6 +3372,14 @@ class RawServoRuntime:
                 command,
                 action=action,
                 camera_stream=active_camera_stream,
+                viewer_target_bbox_xyxy=self.viewer_target_bbox_xyxy,
+                viewer_target_lateral_anchor_px=(
+                    self.viewer_target_lateral_anchor_px
+                ),
+                viewer_table_edge_endpoints_px=(
+                    self.viewer_table_edge_endpoints_px
+                ),
+                viewer_image_size=self.viewer_image_size,
             )
         )
 
@@ -3263,6 +3461,13 @@ class RawServoRuntime:
             "forward_approach_stable_frames": (
                 self.controller.forward_approach_stable_frames
             ),
+            "vertical_recenter_armed": self.vertical_recenter_armed,
+            "vertical_recenter_elapsed_s": (
+                self.controller.vertical_recenter_elapsed_s
+            ),
+            "vertical_recenter_stable_frames": (
+                self.controller.vertical_recenter_stable_frames
+            ),
             "stable_frames": self.controller.stable_frames,
             "yaw_stable_frames": self.controller.yaw_stable_frames,
             "recenter_stable_frames": self.controller.recenter_stable_frames,
@@ -3326,6 +3531,8 @@ class RawServoRuntime:
         self.phase = "idle"
         self.navigation_started_at = None
         self.current_attempt_id = 0
+        self._clear_viewer_overlay()
+        self.vertical_recenter_armed = False
         self.active_camera_stream = None
         self.last_observation_at = None
         self.soft_stale = False
@@ -3358,6 +3565,8 @@ class RawServoRuntime:
         self.phase = "inference"
         self.navigation_started_at = None
         self.current_attempt_id = 0
+        self._clear_viewer_overlay()
+        self.vertical_recenter_armed = False
         self.active_camera_stream = None
         self.output_dir = None
         self.soft_stale = False
@@ -3377,6 +3586,8 @@ class RawServoRuntime:
         self.phase = "idle"
         self.navigation_started_at = None
         self.current_attempt_id = 0
+        self._clear_viewer_overlay()
+        self.vertical_recenter_armed = False
         self.active_camera_stream = None
         self.last_observation_at = None
         self.soft_stale = False
@@ -3458,6 +3669,7 @@ class RawServoRuntime:
             and event.kind in {"recovering", "switching", "error"}
         ):
             self.controller.current = self._zero()
+            self._clear_viewer_overlay()
             self._record(
                 "post_stop_sampling_worker_event_ignored",
                 worker_event=event.kind,
@@ -3481,6 +3693,7 @@ class RawServoRuntime:
             self.controller.recenter_stable_frames = 0
             command = self._zero()
             self.controller.current = command
+            self._clear_viewer_overlay()
             self._publish(command, "hold")
             self.next_publish_at = float(now) + 1.0 / self.config.planner_hz
             self._record(
@@ -3510,7 +3723,15 @@ class RawServoRuntime:
                 return False
             self._drain_waiting_observations()
             self.current_attempt_id = attempt_id
-            self.active_camera_stream = self._event_camera_stream(details)
+            previous_stream = self.active_camera_stream
+            next_stream = self._event_camera_stream(details)
+            self.vertical_recenter_armed = self._is_vertical_recenter_switch(
+                previous_stream=previous_stream,
+                next_stream=next_stream,
+                details=details,
+            )
+            self._clear_viewer_overlay()
+            self.active_camera_stream = next_stream
             self.phase = "switching"
             self._reset_controller(now)
             self.last_observation_at = None
@@ -3546,6 +3767,7 @@ class RawServoRuntime:
             event_camera_stream = self._event_camera_stream(details)
             if event_camera_stream is not None:
                 self.active_camera_stream = event_camera_stream
+            self._clear_viewer_overlay()
             if self.navigation_started_at is None:
                 self.navigation_started_at = produced_at
                 self._record(
@@ -3578,6 +3800,7 @@ class RawServoRuntime:
             self.phase = "aligning"
             self._reset_controller(now)
             self.last_observation_at = float(now)
+            self._set_viewer_overlay(event.observation)
             command = self.controller.update(
                 event.observation, now=now, orientation=orientation
             )
@@ -3593,6 +3816,7 @@ class RawServoRuntime:
                 recovered_from_soft_stale = True
                 self._record("camera_soft_recovered")
                 self.logger("[RawServo] RESUME camera stream recovered")
+            self._set_viewer_overlay(event.observation)
             command = self.controller.update(
                 event.observation, now=now, orientation=orientation
             )
@@ -3601,6 +3825,7 @@ class RawServoRuntime:
                 self._discard_event_diagnostic(event)
                 return False
             self.last_observation_at = produced_at
+            self._clear_viewer_overlay()
             command = self.controller.note_invalid(
                 event.error or "invalid perception",
                 hard=event.hard,
@@ -3610,6 +3835,11 @@ class RawServoRuntime:
         else:
             self._discard_event_diagnostic(event)
             return False
+        if (
+            previous_phase is ServoPhase.VERTICAL_RECENTER
+            and self.controller.phase is not ServoPhase.VERTICAL_RECENTER
+        ):
+            self.vertical_recenter_armed = False
         _submit_diagnostic_decision(
             self._diagnostics,
             event,
@@ -3637,6 +3867,12 @@ class RawServoRuntime:
             ),
             forward_approach_stable_frames=(
                 self.controller.forward_approach_stable_frames
+            ),
+            vertical_recenter_elapsed_s=(
+                self.controller.vertical_recenter_elapsed_s
+            ),
+            vertical_recenter_stable_frames=(
+                self.controller.vertical_recenter_stable_frames
             ),
             transition_reason=self.controller.last_transition_reason,
             visual_yaw_error_rad=self.controller.last_visual_yaw_error_rad,
@@ -3738,13 +3974,20 @@ class RawServoRuntime:
         ):
             self._finish("maximum run time reached", timestamp)
             return self._zero()
-        if self.phase == "aligning" and self.controller.stop_if_timed_out(
-            now=timestamp
-        ):
-            self._finish(
-                self.controller.terminal_reason or "maximum run time reached", timestamp
-            )
-            return self._zero()
+        if self.phase == "aligning":
+            terminal = self.controller.stop_if_timed_out(now=timestamp)
+            if (
+                self.vertical_recenter_armed
+                and self.controller.phase is not ServoPhase.VERTICAL_RECENTER
+            ):
+                self.vertical_recenter_armed = False
+            if terminal:
+                self._finish(
+                    self.controller.terminal_reason
+                    or "maximum run time reached",
+                    timestamp,
+                )
+                return self._zero()
         if timestamp + 1.0e-12 < self.next_publish_at:
             return None
         if (
@@ -3756,6 +3999,7 @@ class RawServoRuntime:
                 self.soft_stale = True
                 self.controller._integrate(timestamp)
                 self.controller.current = self._zero()
+                self._clear_viewer_overlay()
                 self._record("camera_soft_stale")
                 self.logger("[RawServo] HOLD camera stream soft stale")
         command = (

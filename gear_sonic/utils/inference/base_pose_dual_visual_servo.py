@@ -49,6 +49,7 @@ from gear_sonic.utils.inference.base_pose_visual_servo_diagnostics import (
 
 
 DEFAULT_DUAL_QWEN_FALLBACK_MODEL = "qwen3-vl-8b-instruct"
+DUAL_TEXT_SURFACE_PROMPT = "desk"
 
 
 def _reference_bbox(
@@ -100,8 +101,8 @@ class DualCameraReference:
         if not math.isfinite(timestamp):
             raise ValueError("reference camera_timestamp must be finite")
         kind = str(self.kind)
-        if kind not in {"initial", "latest", "qwen"}:
-            raise ValueError("reference kind must be initial, latest, or qwen")
+        if kind not in {"initial", "latest", "qwen", "head_monitor"}:
+            raise ValueError("unsupported dual-camera reference kind")
         object.__setattr__(self, "stream_name", stream_name)
         object.__setattr__(self, "rgb", rgb.copy())
         object.__setattr__(self, "target_prompt", target_prompt)
@@ -194,47 +195,100 @@ class DualCameraFailoverCoordinator:
             raise RuntimeError("neither camera has an initial reference")
         return reference
 
+    def begin_head_monitor_reacquisition(
+        self,
+        reference: DualCameraReference | None = None,
+        *,
+        use_qwen: bool = False,
+    ) -> DualCameraAttempt:
+        """Preempt chest tracking after the background head monitor fires."""
+
+        head_stream = self.stream_names[0]
+        if reference is not None:
+            if reference.stream_name != head_stream:
+                raise ValueError(
+                    "head monitor reference must come from the head stream"
+                )
+            if reference.kind != "head_monitor":
+                raise ValueError(
+                    "head monitor reference must use kind=head_monitor"
+                )
+        elif not use_qwen:
+            raise ValueError(
+                "direct head reacquisition requires a monitor reference"
+            )
+        selected = reference or self._initial_reference(head_stream)
+        return self._attempt(
+            head_stream,
+            selected,
+            stage="head_monitor_qwen" if use_qwen else "head_monitor",
+            origin_stream=head_stream,
+        )
+
+    def _recovery_sequence(
+        self,
+        origin_stream: str,
+    ) -> tuple[tuple[str, str], ...]:
+        head_stream, chest_stream = self.stream_names
+        if origin_stream == head_stream:
+            return (
+                (head_stream, "origin_text"),
+                (head_stream, "origin_qwen"),
+                (chest_stream, "alternate_text"),
+                (chest_stream, "alternate_qwen"),
+            )
+        if origin_stream == chest_stream:
+            return (
+                (head_stream, "alternate_text"),
+                (head_stream, "alternate_qwen"),
+                (chest_stream, "origin_text"),
+                (chest_stream, "origin_qwen"),
+            )
+        raise ValueError("recovery origin belongs to an unknown stream")
+
     def advance_after_failure(
         self,
         attempt: DualCameraAttempt,
     ) -> DualCameraAttempt | None:
-        if self._active_attempt_id == attempt.attempt_id or attempt.stage == "initial":
-            origin = attempt.live_stream
-            alternate = self._other(origin)
+        if (
+            attempt.stage == "head_monitor_qwen"
+            and self._active_attempt_id != attempt.attempt_id
+        ):
+            chest_stream = self.stream_names[1]
             return self._attempt(
-                alternate,
-                self._initial_reference(alternate),
-                stage="alternate_text",
-                origin_stream=origin,
-            )
-        if attempt.stage == "alternate_text":
-            origin = attempt.origin_stream
-            alternate = self._other(origin)
-            return self._attempt(
-                alternate,
-                self._initial_reference(alternate),
-                stage="alternate_qwen",
-                origin_stream=origin,
-            )
-        if attempt.stage == "alternate_qwen":
-            origin = attempt.origin_stream
-            return self._attempt(
-                origin,
-                self._initial_reference(origin),
+                chest_stream,
+                self._initial_reference(chest_stream),
                 stage="origin_text",
-                origin_stream=origin,
+                origin_stream=chest_stream,
             )
-        if attempt.stage == "origin_text":
-            origin = attempt.origin_stream
-            return self._attempt(
-                origin,
-                self._initial_reference(origin),
-                stage="origin_qwen",
-                origin_stream=origin,
-            )
-        if attempt.stage == "origin_qwen":
+
+        starts_new_cycle = (
+            self._active_attempt_id == attempt.attempt_id
+            or attempt.stage in {"initial", "head_monitor", "head_monitor_qwen"}
+        )
+        origin = attempt.live_stream if starts_new_cycle else attempt.origin_stream
+        sequence = self._recovery_sequence(origin)
+        if starts_new_cycle:
+            next_index = 0
+        else:
+            try:
+                current_index = sequence.index(
+                    (attempt.live_stream, attempt.stage)
+                )
+            except ValueError as exc:
+                raise ValueError(
+                    f"unsupported failover stage: {attempt.stage}"
+                ) from exc
+            next_index = current_index + 1
+        if next_index >= len(sequence):
             return None
-        raise ValueError(f"unsupported failover stage: {attempt.stage}")
+        live_stream, stage = sequence[next_index]
+        return self._attempt(
+            live_stream,
+            self._initial_reference(live_stream),
+            stage=stage,
+            origin_stream=origin,
+        )
 
 
 def dual_calibrations_from_config(
@@ -1067,6 +1121,85 @@ def _best_instance(
     return max(candidates, key=lambda item: item.confidence, default=None)
 
 
+@dataclass(frozen=True)
+class HeadCameraMonitorResult:
+    """One result from the text-only head-camera monitor."""
+
+    target_streak: int
+    triggered: bool
+    reference: DualCameraReference | None
+    target: TrackedInstance | None
+    surface: TrackedInstance | None
+
+
+class HeadCameraTextMonitor:
+    """Track the head stream with the initial target prompt while chest is active."""
+
+    def __init__(
+        self,
+        tracker: Any,
+        target_prompt: str,
+        *,
+        required_target_frames: int = 10,
+    ):
+        required = int(required_target_frames)
+        target = str(target_prompt).strip()
+        if not target:
+            raise ValueError("head monitor target prompt must be non-empty")
+        self.target_prompt = target
+        if required <= 0:
+            raise ValueError("head reacquisition frame count must be positive")
+        self.tracker = tracker
+        self.required_target_frames = required
+        self.target_streak = 0
+
+    def start(self) -> None:
+        self.target_streak = 0
+        self.tracker.start_all_text(
+            target_prompt=self.target_prompt,
+            surface_prompt=DUAL_TEXT_SURFACE_PROMPT,
+        )
+
+    def note_missing_frame(self) -> None:
+        self.target_streak = 0
+
+    def inspect(
+        self,
+        snapshot: AlignedRGBDSnapshot,
+    ) -> HeadCameraMonitorResult:
+        instances = list(self.tracker.track(snapshot.rgb))
+        target = _best_instance(instances, 0)
+        surface = _best_instance(instances, 1)
+        if target is None:
+            self.target_streak = 0
+            return HeadCameraMonitorResult(0, False, None, None, surface)
+        self.target_streak += 1
+        streak = self.target_streak
+        if streak < self.required_target_frames:
+            return HeadCameraMonitorResult(streak, False, None, target, surface)
+
+        self.target_streak = 0
+        reference = None
+        if surface is not None:
+            height, width = snapshot.rgb.shape[:2]
+            reference = DualCameraReference(
+                stream_name=snapshot.depth_aligned_to,
+                rgb=snapshot.rgb,
+                target_prompt=self.target_prompt,
+                target_bbox=_pixel_bbox_to_normalized(
+                    target.bbox_xyxy, width=width, height=height
+                ),
+                table_bboxes=(
+                    _pixel_bbox_to_normalized(
+                        surface.bbox_xyxy, width=width, height=height
+                    ),
+                ),
+                camera_timestamp=snapshot.timestamp,
+                kind="head_monitor",
+            )
+        return HeadCameraMonitorResult(streak, True, reference, target, surface)
+
+
 def _attempt_prompt_mode(attempt: DualCameraAttempt) -> str:
     if attempt.stage == "origin_text":
         return "target_text_surface_visual"
@@ -1160,6 +1293,7 @@ def run_dual_raw_servo_worker(
     camera_factory: Callable[[], Any] | None = None,
     client_factory: Callable[[], Any] | None = None,
     tracker_factory: Callable[[], Any] | None = None,
+    head_monitor_tracker_factory: Callable[[], Any] | None = None,
     latest_reference_updater_factory: Callable[[], Any] | None = None,
     qwen_reference_factory: Callable[..., DualCameraReference] | None = None,
     calibration_factory: (
@@ -1184,9 +1318,14 @@ def run_dual_raw_servo_worker(
     tolerance = int(config.dual_match_tolerance_frames)
     if tolerance <= 0:
         raise ValueError("dual match tolerance must be positive")
+    head_reacquire_frames = int(getattr(config, "dual_head_reacquire_frames", 10))
+    if head_reacquire_frames <= 0:
+        raise ValueError("dual head reacquisition frame count must be positive")
+
     camera: Any | None = None
     tracker: Any | None = None
     reference_updater: Any | None = None
+    head_monitor_tracker: Any | None = None
     try:
         while not stop_event.is_set():
             try:
@@ -1276,6 +1415,13 @@ def run_dual_raw_servo_worker(
                     stream_names,
                     initial_references,
                 )
+                monitor_reference = initial_references.get(stream_names[0])
+                if monitor_reference is None:
+                    monitor_reference = initial_references[selected_initial_stream]
+                head_monitor_target_prompt = monitor_reference.target_prompt
+                head_monitor: HeadCameraTextMonitor | None = None
+                pending_head_qwen: dict[int, AlignedRGBDSnapshot] = {}
+
                 latest_gates = {
                     stream_name: LatestReferenceGate(
                         interval_frames=(
@@ -1325,10 +1471,18 @@ def run_dual_raw_servo_worker(
                 generation_finished = False
                 while gate.is_active(generation) and not stop_event.is_set():
                     try:
-                        if attempt.stage in {"origin_qwen", "alternate_qwen"}:
-                            qwen_snapshot = camera.capture().require(
-                                attempt.live_stream
+                        if attempt.stage in {
+                            "origin_qwen",
+                            "alternate_qwen",
+                            "head_monitor_qwen",
+                        }:
+                            qwen_snapshot = pending_head_qwen.pop(
+                                attempt.attempt_id, None
                             )
+                            if qwen_snapshot is None:
+                                qwen_snapshot = camera.capture().require(
+                                    attempt.live_stream
+                                )
                             qwen_calibration = calibrations[attempt.live_stream]
                             qwen_output_dir = (
                                 output_dir
@@ -1366,14 +1520,14 @@ def run_dual_raw_servo_worker(
                         if _attempt_uses_surface_text(attempt):
                             tracker.start_all_text(
                                 target_prompt=attempt.reference.target_prompt,
-                                surface_prompt="desk",
+                                surface_prompt=DUAL_TEXT_SURFACE_PROMPT,
                             )
                         elif _attempt_uses_target_text(attempt):
                             tracker.start_text(
                                 attempt.reference.rgb,
                                 target_prompt=attempt.reference.target_prompt,
                                 target_bbox=attempt.reference.target_bbox,
-                                surface_prompt="desk",
+                                surface_prompt=DUAL_TEXT_SURFACE_PROMPT,
                                 surface_bboxes=attempt.reference.table_bboxes,
                             )
                         else:
@@ -1381,9 +1535,31 @@ def run_dual_raw_servo_worker(
                                 attempt.reference.rgb,
                                 target_prompt=attempt.reference.target_prompt,
                                 target_bbox=attempt.reference.target_bbox,
-                                surface_prompt="desk",
+                                surface_prompt=DUAL_TEXT_SURFACE_PROMPT,
                                 surface_bboxes=attempt.reference.table_bboxes,
                             )
+                        if attempt.live_stream == stream_names[1]:
+                            if head_monitor_tracker is None:
+                                if head_monitor_tracker_factory is not None:
+                                    head_monitor_tracker = (
+                                        head_monitor_tracker_factory()
+                                    )
+                                elif tracker_factory is None:
+                                    head_monitor_tracker = YoloePersistentTracker(
+                                        config.raw_yoloe_model_path,
+                                        confidence=config.raw_yoloe_confidence,
+                                        imgsz=config.raw_yoloe_imgsz,
+                                        device=config.raw_yoloe_device,
+                                    )
+                            if head_monitor_tracker is not None:
+                                head_monitor = HeadCameraTextMonitor(
+                                    head_monitor_tracker,
+                                    head_monitor_target_prompt,
+                                    required_target_frames=head_reacquire_frames,
+                                )
+                                head_monitor.start()
+                        else:
+                            head_monitor = None
                     except Exception as exc:
                         failure_reason = (
                             f"{attempt.stage} initialization failed: {exc}"
@@ -1409,6 +1585,8 @@ def run_dual_raw_servo_worker(
                     target_id: int | None = None
                     surface_id: int | None = None
                     failure_frame = None
+                    preempt_attempt: DualCameraAttempt | None = None
+                    switch_details: dict[str, Any] = {}
                     while (
                         not failure_reason
                         and gate.is_active(generation)
@@ -1428,10 +1606,89 @@ def run_dual_raw_servo_worker(
                         surface_reacquired = False
                         previous_target_id = target_id
                         previous_surface_id = surface_id
+                        monitor_details: dict[str, Any] = {}
                         try:
                             capture = camera.capture()
                             snapshot = capture.require(attempt.live_stream)
                             frame_index += 1
+                            if (
+                                attempt.live_stream == stream_names[1]
+                                and head_monitor is not None
+                            ):
+                                try:
+                                    head_snapshot = capture.require(stream_names[0])
+                                    calibrations[stream_names[0]].validate_snapshot(
+                                        head_snapshot
+                                    )
+                                    monitor_result = head_monitor.inspect(
+                                        head_snapshot
+                                    )
+                                except Exception as exc:
+                                    head_monitor.note_missing_frame()
+                                    monitor_details["head_monitor"] = {
+                                        "status": "error",
+                                        "target_streak": 0,
+                                        "error": str(exc),
+                                    }
+                                else:
+                                    monitor_details["head_monitor"] = {
+                                        "status": (
+                                            "triggered"
+                                            if monitor_result.triggered
+                                            else "tracking"
+                                        ),
+                                        "target_streak": (
+                                            monitor_result.target_streak
+                                        ),
+                                        "required_target_frames": (
+                                            head_reacquire_frames
+                                        ),
+                                        "desk_detected": (
+                                            monitor_result.surface is not None
+                                        ),
+                                    }
+                                    if monitor_result.triggered:
+                                        if monitor_result.reference is not None:
+                                            preempt_attempt = (
+                                                coordinator
+                                                .begin_head_monitor_reacquisition(
+                                                    monitor_result.reference
+                                                )
+                                            )
+                                            failure_reason = (
+                                                "head target reacquired for "
+                                                f"{head_reacquire_frames} consecutive "
+                                                "frames with desk"
+                                            )
+                                        else:
+                                            preempt_attempt = (
+                                                coordinator
+                                                .begin_head_monitor_reacquisition(
+                                                    use_qwen=True
+                                                )
+                                            )
+                                            pending_head_qwen[
+                                                preempt_attempt.attempt_id
+                                            ] = head_snapshot
+                                            failure_reason = (
+                                                "head target reacquired for "
+                                                f"{head_reacquire_frames} consecutive "
+                                                "frames without desk; requesting Qwen"
+                                            )
+                                        switch_details = monitor_details
+                                        failure_frame = _diagnostic_frame(
+                                            frame_index,
+                                            head_snapshot,
+                                            monitor_result.target,
+                                            monitor_result.surface,
+                                            None,
+                                            kind="switching",
+                                            error=failure_reason,
+                                            **_attempt_frame_details(
+                                                preempt_attempt
+                                            ),
+                                        )
+                                        break
                             calibration = calibrations[attempt.live_stream]
                             calibration.validate_snapshot(snapshot)
                             instances = list(tracker.track(snapshot.rgb))
@@ -1525,6 +1782,7 @@ def run_dual_raw_servo_worker(
                                         details=_attempt_details(
                                             attempt,
                                             match_invalid_frames=invalid_frames,
+                                            **monitor_details,
                                         ),
                                         frame=diagnostic_frame,
                                     ),
@@ -1707,6 +1965,7 @@ def run_dual_raw_servo_worker(
                             ),
                             latest_reference_update=latest_reason,
                             **refresh_details,
+                            **monitor_details,
                         )
                         if latest is not None:
                             if (
@@ -1766,7 +2025,10 @@ def run_dual_raw_servo_worker(
                         )
                     if stop_event.is_set() or not gate.is_active(generation):
                         break
-                    next_attempt = coordinator.advance_after_failure(attempt)
+                    next_attempt = (
+                        preempt_attempt
+                        or coordinator.advance_after_failure(attempt)
+                    )
                     if next_attempt is None:
                         _publish_worker_event(
                             events,
@@ -1799,7 +2061,7 @@ def run_dual_raw_servo_worker(
                             output_dir=str(output_dir),
                             error=failure_reason or "perception failed",
                             hard=False,
-                            details=_attempt_details(attempt),
+                            details=_attempt_details(attempt, **switch_details),
                             frame=failure_frame,
                         ),
                     )

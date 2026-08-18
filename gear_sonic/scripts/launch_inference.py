@@ -237,6 +237,9 @@ class InferenceLaunchConfig:
     base_pose_dual_match_tolerance_frames: int = 30
     """Consecutive invalid YOLOE frames allowed per dual-camera attempt."""
 
+    base_pose_dual_head_reacquire_frames: int = 10
+    """Consecutive head target frames required to preempt chest tracking."""
+
     base_pose_dual_initialization_grace_s: float = 30.0
     """Wait for the second dual-camera grounding result after one succeeds."""
 
@@ -505,6 +508,8 @@ def _base_pose_planner_command(config: InferenceLaunchConfig, repo_root: Path) -
             f"{config.base_pose_dual_chest_camera_lateral_offset_m} "
             f"--dual-match-tolerance-frames "
             f"{config.base_pose_dual_match_tolerance_frames} "
+            f"--dual-head-reacquire-frames "
+            f"{config.base_pose_dual_head_reacquire_frames} "
             f"--dual-initialization-grace-s "
             f"{config.base_pose_dual_initialization_grace_s} "
             f"--dual-qwenvl-fallback-model "

@@ -558,7 +558,7 @@ def test_target_uses_eroded_mask_depth_and_bbox_center_for_lateral_error() -> No
         snapshot(depth),
         mask,
         calibration,
-        bbox_xyxy=(300.0, 180.0, 460.0, 340.0),
+        bbox_xyxy=(300.0, 80.0, 460.0, 160.0),
     )
 
     assert geometry.median_depth_m == pytest.approx(1.0)
@@ -566,6 +566,7 @@ def test_target_uses_eroded_mask_depth_and_bbox_center_for_lateral_error() -> No
     assert geometry.right_m == pytest.approx(
         (380.0 - calibration.cx) / calibration.fx, abs=1e-5
     )
+    assert geometry.lateral_anchor_px == pytest.approx((380.0, 261.0))
 
 
 def test_table_mask_depth_recovers_front_facing_horizontal_edge() -> None:
@@ -1353,6 +1354,47 @@ def test_runtime_velocity_status_reports_active_camera_stream(tmp_path) -> None:
     payload = json.loads(messages[-1])
     assert payload["camera_stream"] == "chest_view"
     assert payload["velocity"] == {"vx": 0.4, "vy": -0.2, "wz": 0.1}
+    assert "viewer_overlay" not in payload
+
+
+def test_runtime_velocity_status_reports_control_geometry(tmp_path) -> None:
+    messages: list[str] = []
+    runtime = RawServoRuntime(
+        BasePosePlannerConfig(
+            task="align",
+            mode="dual_raw_yoloe_servo",
+            output_root=str(tmp_path),
+        ),
+        publish=messages.append,
+        logger=lambda _message: None,
+    )
+    runtime.active_camera_stream = "ego_view"
+    value = observation(bbox=(120.0, 80.0, 360.0, 280.0))
+    assert value.table is not None
+    value = replace(
+        value,
+        target=replace(value.target, lateral_anchor_px=(240.0, 210.0)),
+        table=replace(
+            value.table,
+            line_endpoints_px=((20.0, 300.0), (620.0, 310.0)),
+        ),
+    )
+
+    runtime._set_viewer_overlay(value)
+    runtime._publish(ServoCommand(0.0, 0.0, 0.0), "visual_servo")
+
+    payload = json.loads(messages[-1])
+    assert payload["camera_stream"] == "ego_view"
+    assert payload["viewer_overlay"] == {
+        "target_bbox_xyxy": [120.0, 80.0, 360.0, 280.0],
+        "target_lateral_anchor_px": [240.0, 210.0],
+        "table_edge_endpoints_px": [[20.0, 300.0], [620.0, 310.0]],
+        "image_size": [640, 480],
+    }
+
+    runtime._clear_viewer_overlay()
+    runtime._publish(ServoCommand(0.0, 0.0, 0.0), "hold")
+    assert "viewer_overlay" not in json.loads(messages[-1])
 
 
 def test_raw_camera_viewer_process_is_singleton_and_stops() -> None:
@@ -1858,7 +1900,125 @@ def test_runtime_writes_each_initialized_frame_after_command_update(tmp_path) ->
 
 
 
-def test_runtime_frame_ignores_vertical_target_position(tmp_path) -> None:
+@pytest.mark.parametrize("stage", ["head_monitor", "head_monitor_qwen"])
+def test_runtime_vertical_recenter_only_uses_chest_to_head_monitor_switch(
+    tmp_path,
+    stage: str,
+) -> None:
+    runtime = RawServoRuntime(
+        BasePosePlannerConfig(
+            task="align",
+            mode="dual_raw_yoloe_servo",
+            output_root=str(tmp_path),
+            raw_min_linear_speed_m_s=0.23,
+        ),
+        publish=lambda _message: None,
+        logger=lambda _message: None,
+    )
+    assert runtime.handle_key("n", now=1.0) == "started"
+    runtime.active_camera_stream = "chest_view"
+    details = {
+        "attempt_id": 1,
+        "live_stream": "ego_view",
+        "failover_stage": stage,
+    }
+
+    assert runtime.accept_event(
+        RawServoEvent(
+            generation=1,
+            kind="switching",
+            details=details,
+        ),
+        now=1.1,
+    )
+    assert runtime.vertical_recenter_armed
+    assert runtime.controller.phase is ServoPhase.VERTICAL_RECENTER
+
+    assert runtime.accept_event(
+        RawServoEvent(
+            generation=1,
+            kind="initialized",
+            observation=observation(
+                bbox=(260.0, 0.0, 380.0, 20.0)
+            ),
+            details=details,
+        ),
+        now=1.2,
+    )
+    assert runtime.phase == "aligning"
+    assert runtime.vertical_recenter_armed
+    assert runtime.controller.phase is ServoPhase.VERTICAL_RECENTER
+    assert runtime.controller.current.velocity == pytest.approx(
+        (0.23, 0.0, 0.0)
+    )
+
+    below_eighty = observation(bbox=(260.0, 100.0, 380.0, 140.0))
+    for index in range(3):
+        assert runtime.accept_event(
+            RawServoEvent(
+                generation=1,
+                kind="observation",
+                observation=below_eighty,
+                details=details,
+            ),
+            now=1.3 + index * 0.1,
+        )
+
+    assert not runtime.vertical_recenter_armed
+    assert runtime.controller.phase is ServoPhase.YAW_ALIGN
+    assert runtime.controller.current.velocity == (0.0, 0.0, 0.0)
+
+
+@pytest.mark.parametrize(
+    ("previous_stream", "next_stream", "stage", "expected_phase"),
+    [
+        ("ego_view", "ego_view", "head_monitor", ServoPhase.YAW_ALIGN),
+        ("chest_view", "ego_view", "origin_text", ServoPhase.YAW_ALIGN),
+        (
+            "ego_view",
+            "chest_view",
+            "head_monitor",
+            ServoPhase.FORWARD_APPROACH,
+        ),
+    ],
+)
+def test_runtime_other_camera_switches_never_arm_vertical_recenter(
+    tmp_path,
+    previous_stream: str,
+    next_stream: str,
+    stage: str,
+    expected_phase: ServoPhase,
+) -> None:
+    runtime = RawServoRuntime(
+        BasePosePlannerConfig(
+            task="align",
+            mode="dual_raw_yoloe_servo",
+            output_root=str(tmp_path),
+        ),
+        publish=lambda _message: None,
+        logger=lambda _message: None,
+    )
+    assert runtime.handle_key("n", now=1.0) == "started"
+    runtime.active_camera_stream = previous_stream
+
+    assert runtime.accept_event(
+        RawServoEvent(
+            generation=1,
+            kind="switching",
+            details={
+                "attempt_id": 1,
+                "live_stream": next_stream,
+                "failover_stage": stage,
+            },
+        ),
+        now=1.1,
+    )
+
+    assert not runtime.vertical_recenter_armed
+    assert runtime.controller.phase is expected_phase
+
+
+def test_normal_head_runtime_ignores_vertical_target_position(tmp_path) -> None:
     runtime = RawServoRuntime(
         BasePosePlannerConfig(task="align", output_root=str(tmp_path)),
         publish=lambda _message: None,
@@ -1890,13 +2050,16 @@ def test_runtime_frame_ignores_vertical_target_position(tmp_path) -> None:
 
     record = json.loads((output_dir / "raw_servo_frames.jsonl").read_text())
     assert record["controller"]["phase"] == "yaw_trim"
+    assert record["controller"]["vertical_recenter_armed"] is False
+    assert record["controller"]["vertical_recenter_elapsed_s"] == 0.0
+    assert record["controller"]["vertical_recenter_stable_frames"] == 0
     assert "vertical_resume_phase" not in record["controller"]
-    assert "vertical_recenter_stable_frames" not in record["controller"]
     event = json.loads(
         (output_dir / "raw_servo_events.jsonl").read_text().splitlines()[-1]
     )
     assert "vertical_resume_phase" not in event
-    assert "vertical_recenter_stable_frames" not in event
+    assert event["vertical_recenter_elapsed_s"] == 0.0
+    assert event["vertical_recenter_stable_frames"] == 0
 
 
 def test_runtime_cancel_marks_waiting_observation_not_applied(tmp_path) -> None:
@@ -3103,16 +3266,102 @@ def test_recenter_uses_only_vy_and_resumes_after_three_centered_frames() -> None
     assert controller.current.velocity == (0.0, 0.0, 0.0)
 
 
-def test_vertical_target_position_does_not_change_controller_behavior() -> None:
-    reference = VisualServoController()
-    reference.reset(1.0)
-    reference_command = reference.update(
-        observation(yaw=math.radians(20.0)), now=1.1
+def test_vertical_recenter_uses_global_linear_speed_and_only_vx() -> None:
+    controller = VisualServoController(min_linear_speed_m_s=0.22)
+    controller.reset(1.0, initial_phase=ServoPhase.VERTICAL_RECENTER)
+
+    command = controller.update(
+        observation(bbox=(260.0, 0.0, 380.0, 20.0)),
+        now=1.1,
     )
 
-    near_top = VisualServoController()
-    near_top.reset(1.0)
-    near_top_command = near_top.update(
+    assert controller.phase is ServoPhase.VERTICAL_RECENTER
+    assert controller.vertical_recenter_started_at == pytest.approx(1.1)
+    assert command.velocity == pytest.approx((0.22, 0.0, 0.0))
+
+
+def test_vertical_recenter_exits_after_three_frames_below_eighty_percent() -> None:
+    controller = VisualServoController()
+    controller.reset(1.0, initial_phase=ServoPhase.VERTICAL_RECENTER)
+    controller.update(
+        observation(bbox=(260.0, 0.0, 380.0, 20.0)), now=1.1
+    )
+
+    below_eighty = observation(bbox=(260.0, 100.0, 380.0, 140.0))
+    for index in range(2):
+        command = controller.update(
+            below_eighty,
+            now=1.2 + index * 0.1,
+        )
+        assert command.velocity == pytest.approx((0.40, 0.0, 0.0))
+        assert controller.phase is ServoPhase.VERTICAL_RECENTER
+
+    command = controller.update(below_eighty, now=1.4)
+
+    assert command.velocity == (0.0, 0.0, 0.0)
+    assert controller.phase is ServoPhase.YAW_ALIGN
+    assert controller.vertical_recenter_stable_frames == 3
+    assert controller.last_transition_reason == (
+        "target remained below 80 percent image height for three frames"
+    )
+
+
+def test_vertical_recenter_exits_after_one_second() -> None:
+    controller = VisualServoController()
+    controller.reset(1.0, initial_phase=ServoPhase.VERTICAL_RECENTER)
+    controller.update(
+        observation(bbox=(260.0, 0.0, 380.0, 20.0)), now=1.1
+    )
+
+    assert not controller.stop_if_timed_out(now=2.099)
+    assert controller.phase is ServoPhase.VERTICAL_RECENTER
+    assert controller.current.velocity == pytest.approx((0.40, 0.0, 0.0))
+
+    assert not controller.stop_if_timed_out(now=2.1)
+    assert controller.phase is ServoPhase.YAW_ALIGN
+    assert controller.current.velocity == (0.0, 0.0, 0.0)
+    assert controller.vertical_recenter_elapsed_s == pytest.approx(1.0)
+
+
+def test_vertical_recenter_keeps_vx_during_invalid_detection() -> None:
+    controller = VisualServoController(min_linear_speed_m_s=0.24)
+    controller.reset(1.0, initial_phase=ServoPhase.VERTICAL_RECENTER)
+    controller.update(
+        observation(bbox=(260.0, 0.0, 380.0, 20.0)), now=1.1
+    )
+    controller.vertical_recenter_stable_frames = 2
+
+    command = controller.note_invalid(
+        "missing tracked target",
+        hard=False,
+        now=1.2,
+    )
+
+    assert command.velocity == pytest.approx((0.24, 0.0, 0.0))
+    assert controller.phase is ServoPhase.VERTICAL_RECENTER
+    assert controller.vertical_recenter_stable_frames == 0
+    assert controller.invalid_frames == 0
+
+
+def test_vertical_recenter_skips_forward_motion_when_entry_threshold_not_met() -> None:
+    controller = VisualServoController()
+    controller.reset(1.0, initial_phase=ServoPhase.VERTICAL_RECENTER)
+
+    command = controller.update(
+        observation(bbox=(260.0, 80.0, 380.0, 120.0)),
+        now=1.1,
+    )
+
+    assert command.velocity == (0.0, 0.0, 0.0)
+    assert controller.phase is ServoPhase.YAW_ALIGN
+    assert controller.vertical_recenter_started_at is None
+
+
+def test_vertical_target_position_does_not_recenter_normal_head_flow() -> None:
+    controller = VisualServoController()
+    controller.reset(1.0)
+
+    command = controller.update(
         observation(
             yaw=math.radians(20.0),
             bbox=(260.0, 0.0, 380.0, 20.0),
@@ -3120,9 +3369,10 @@ def test_vertical_target_position_does_not_change_controller_behavior() -> None:
         now=1.1,
     )
 
-    assert not hasattr(ServoPhase, "VERTICAL_RECENTER")
-    assert near_top.phase is ServoPhase.YAW_ALIGN
-    assert near_top_command.velocity == pytest.approx(reference_command.velocity)
+    assert controller.phase is ServoPhase.YAW_ALIGN
+    assert command.vx == 0.0
+    assert command.vy == 0.0
+    assert command.wz > 0.0
 
 
 def test_translate_target_near_image_top_does_not_recenter() -> None:
