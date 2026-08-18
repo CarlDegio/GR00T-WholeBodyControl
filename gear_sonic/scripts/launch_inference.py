@@ -967,7 +967,9 @@ def build_sensor_gateway_command(config: InferenceLaunchConfig, repo_root: Path)
             (
                 "viewer_pid",
                 "python gear_sonic/scripts/run_operator_cv_viewer.py "
-                f"--sensor-gateway-endpoint tcp://127.0.0.1:{config.sensor_gateway_port}",
+                f"--sensor-gateway-endpoint tcp://127.0.0.1:{config.sensor_gateway_port} "
+                "--control-gateway-endpoint "
+                f"tcp://127.0.0.1:{config.control_gateway_dispatch_port}",
                 "/tmp/sonic_opencv_viewer.log",
             )
         )

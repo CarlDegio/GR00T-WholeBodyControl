@@ -18,6 +18,7 @@ from gear_sonic.runtime.contracts import (
     OperatorCommand,
 )
 from gear_sonic.runtime.control_gateway import (
+    BASE_POSE_RUNTIME_STATUS_COMMAND,
     ControlGatewayCore,
     ControlGatewayRouter,
     NavigationControlAction,
@@ -194,9 +195,14 @@ def run_control_gateway(settings: ControlGatewaySettings) -> None:
             )
         )
         if action.agent_event is not None:
+            event_parameters: dict[str, object] = {
+                "generation": action.generation,
+            }
+            if action.reason:
+                event_parameters["reason"] = action.reason
             dispatch_navigation_event(
                 action.agent_event,
-                {"generation": action.generation},
+                event_parameters,
             )
         agent_destinations: tuple[str, ...] = ()
         if action.agent_event == "start_navigation":
@@ -316,6 +322,22 @@ def run_control_gateway(settings: ControlGatewaySettings) -> None:
                                 action,
                                 source=command.metadata.source,
                             )
+                            dispatch_navigation_event(
+                                BASE_POSE_RUNTIME_STATUS_COMMAND,
+                                {
+                                    "generation": action.generation,
+                                    "state": "motion",
+                                    "velocity": list(
+                                        action.velocity or (0.0, 0.0, 0.0)
+                                    ),
+                                    "action": str(
+                                        command.parameters.get("action", "visual_servo")
+                                    ),
+                                    "camera_stream": str(
+                                        command.parameters.get("camera_stream", "")
+                                    ),
+                                },
+                            )
                         elif command.name == "base_pose_status":
                             if command.metadata.source != "base_pose_agent":
                                 raise ValueError("base-pose status requires base_pose_agent source")
@@ -329,6 +351,19 @@ def run_control_gateway(settings: ControlGatewaySettings) -> None:
                                     mode="stop",
                                     generation=generation,
                                 )
+                            )
+                            dispatch_navigation_event(
+                                BASE_POSE_RUNTIME_STATUS_COMMAND,
+                                {
+                                    "generation": generation,
+                                    "state": str(
+                                        command.parameters.get("state", "failed")
+                                    ),
+                                    "reason": str(
+                                        command.parameters.get("reason", "")
+                                    ),
+                                    "velocity": [0.0, 0.0, 0.0],
+                                },
                             )
                             log_control_route(
                                 command.metadata.source,

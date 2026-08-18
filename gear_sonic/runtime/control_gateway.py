@@ -29,6 +29,7 @@ MANUAL_NAVIGATION_VELOCITIES = {
     "q": (0.0, 0.0, 0.5),
     "e": (0.0, 0.0, -0.5),
 }
+BASE_POSE_RUNTIME_STATUS_COMMAND = "base_pose_runtime_status"
 RECORDING_ALIASES = {
     "record-start": "c",
     "record-success": "e",

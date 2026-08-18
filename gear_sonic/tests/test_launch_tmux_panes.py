@@ -501,6 +501,7 @@ def test_runtime_sidecars_are_read_only_and_navdp_uses_gateway_by_default() -> N
 
     assert "run_sensor_gateway.py" in gateway
     assert "run_operator_cv_viewer.py" in gateway
+    assert "--control-gateway-endpoint tcp://127.0.0.1:5565" in gateway
     assert "/tmp/sonic_opencv_viewer.log" in gateway
     assert "run_lingbot_depth_viewer.py" in gateway
     assert "/tmp/sonic_lingbot.log" in gateway
