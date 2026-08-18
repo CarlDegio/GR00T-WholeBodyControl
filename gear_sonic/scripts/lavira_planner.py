@@ -8,7 +8,7 @@ import math
 import queue
 import threading
 import time
-from typing import Any, Callable, Literal, Mapping
+from typing import Any, Callable, Mapping
 
 import zmq
 
@@ -28,8 +28,6 @@ from gear_sonic.utils.inference.object_nav import (
 class LaviraPlannerConfig:
     mission: str
     global_target: str
-    model: str = "gpt-5.6-luna"
-    vision_backend: Literal["codex", "qwenvl"] = "codex"
     qwenvl_model: str = "qwen3-vl-32b-instruct"
     qwenvl_base_url: str = "https://dashscope-intl.aliyuncs.com/compatible-mode/v1"
     warmup: bool = True
@@ -39,7 +37,7 @@ class LaviraPlannerConfig:
     sensor_gateway_request_timeout_ms: int = 100
     sensor_gateway_max_age_ms: float = 1000.0
     sensor_gateway_max_skew_ms: float = 5.0
-    codex_timeout_seconds: float = 180.0
+    qwenvl_timeout_seconds: float = 180.0
     min_confidence: float = 0.6
     output_root: str = "outputs/object_nav"
     control_gateway_endpoint: str = "tcp://127.0.0.1:5565"
@@ -232,18 +230,20 @@ def _runner(config: LaviraPlannerConfig) -> ObjectNavRunner:
         max_age_ms=config.sensor_gateway_max_age_ms,
         max_skew_ms=config.sensor_gateway_max_skew_ms,
     )
-    return ObjectNavRunner(ObjectNavConfig(
-        mission=config.mission,
-        global_target=config.global_target,
-        vision_backend=config.vision_backend,
-        model=config.model,
-        qwenvl_model=config.qwenvl_model,
-        qwenvl_base_url=config.qwenvl_base_url,
-        camera_timeout_ms=config.camera_timeout_ms,
-        codex_timeout_seconds=config.codex_timeout_seconds,
-        min_confidence=config.min_confidence,
-        output_root=config.output_root,
-    ), camera=camera, own_camera=True)
+    return ObjectNavRunner(
+        ObjectNavConfig(
+            mission=config.mission,
+            global_target=config.global_target,
+            qwenvl_model=config.qwenvl_model,
+            qwenvl_base_url=config.qwenvl_base_url,
+            camera_timeout_ms=config.camera_timeout_ms,
+            qwenvl_timeout_seconds=config.qwenvl_timeout_seconds,
+            min_confidence=config.min_confidence,
+            output_root=config.output_root,
+        ),
+        camera=camera,
+        own_camera=True,
+    )
 
 
 def main(config: LaviraPlannerConfig) -> None:

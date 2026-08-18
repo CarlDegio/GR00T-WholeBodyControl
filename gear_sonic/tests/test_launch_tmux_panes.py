@@ -238,7 +238,7 @@ def test_yaml_contains_every_launch_parameter() -> None:
     assert loaded.prompt.startswith("Approach the tabletop")
     assert loaded.lavira_mission == "blue basket"
     assert loaded.lavira_global_target == "blue basket"
-    assert loaded.lavira_vision_backend == "qwenvl"
+    assert loaded.lavira_qwenvl_model == "qwen3-vl-32b-instruct"
     assert loaded.slam_debug is False
 
 
@@ -413,6 +413,11 @@ def test_lavira_uses_only_control_and_sensor_gateways() -> None:
     assert "--sensor-gateway-endpoint tcp://127.0.0.1:5560" in command
     assert "--control-gateway-endpoint tcp://127.0.0.1:5565" in command
     assert "--control-gateway-intent-endpoint tcp://127.0.0.1:5561" in command
+    assert "--qwenvl-model qwen3-vl-32b-instruct" in command
+    assert "--qwenvl-timeout-seconds 180.0" in command
+    assert "--vision-backend" not in command
+    assert "--model gpt-" not in command
+    assert "codex" not in command.lower()
     assert "--host" not in command
     assert "--port 5558" not in command
     assert "--status-port 5559" not in command

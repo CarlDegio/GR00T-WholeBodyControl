@@ -1,4 +1,4 @@
-"""Single-cycle RGB-D perception, Codex policy, and navigation diagnostics."""
+"""Single-cycle RGB-D perception, Qwen-VL policy, and navigation diagnostics."""
 
 from __future__ import annotations
 
@@ -8,10 +8,9 @@ import base64
 import json
 import math
 import os
-import subprocess
 import tempfile
 import time
-from typing import Any, Callable, Literal, Mapping
+from typing import Any, Callable, Mapping
 
 import cv2
 import msgpack
@@ -32,12 +31,9 @@ from gear_sonic.utils.inference.object_nav_geometry import (
 )
 
 
-DEFAULT_SCHEMA_FILENAME = "object_nav_policy.schema.json"
 DEFAULT_QWENVL_MODEL = "qwen3-vl-32b-instruct"
 DEFAULT_QWENVL_BASE_URL = "https://dashscope-intl.aliyuncs.com/compatible-mode/v1"
 DEFAULT_QWENVL_PROXY_URL = "http://127.0.0.1:7890"
-HTTP_PROXY_KEYS = ("http_proxy", "https_proxy", "HTTP_PROXY", "HTTPS_PROXY")
-ALL_PROXY_KEYS = ("all_proxy", "ALL_PROXY")
 POLICY_KEYS = (
     "visual_check",
     "action",
@@ -66,63 +62,6 @@ QWENVL_POLICY_KEYS = {
     "confidence",
     "stop_reasoning",
 }
-DEFAULT_POLICY_SCHEMA: dict[str, Any] = {
-    "type": "object",
-    "properties": {
-        "visual_check": {"type": "string"},
-        "action": {"enum": ["NAVIGATE", "STOP"]},
-        "bbox_2d": {
-            "type": ["array", "null"],
-            "items": {"type": "number", "minimum": 0, "maximum": 1000},
-            "minItems": 4,
-            "maxItems": 4,
-        },
-        "target": {"type": "string"},
-        "target_type": {
-            "enum": [
-                "global_target",
-                "intermediate_landmark",
-                "traversable_opening",
-            ]
-        },
-        "estimated_distance_m": {
-            "type": ["number", "null"],
-            "exclusiveMinimum": 0,
-        },
-        "target_center_normalized": {
-            "type": ["array", "null"],
-            "items": {"type": "number", "minimum": 0, "maximum": 1000},
-            "minItems": 2,
-            "maxItems": 2,
-        },
-        "target_center_pixel": {
-            "type": ["array", "null"],
-            "items": {"type": "number", "minimum": 0},
-            "minItems": 2,
-            "maxItems": 2,
-        },
-        "horizontal_offset_pixel": {"type": ["number", "null"]},
-        "camera_bearing_deg": {"type": ["number", "null"]},
-        "rotation_direction": {
-            "enum": ["LEFT", "RIGHT", "CENTERED", None]
-        },
-        "rotation_angle_deg": {
-            "type": ["number", "null"],
-            "minimum": 0,
-        },
-        "confidence": {"type": "number", "minimum": 0, "maximum": 1},
-        "distance_confidence": {
-            "type": "number",
-            "minimum": 0,
-            "maximum": 1,
-        },
-        "stop_reasoning": {"type": "string"},
-    },
-    "required": list(POLICY_KEYS),
-    "additionalProperties": False,
-}
-
-
 @dataclass(frozen=True)
 class RGBDSnapshot:
     rgb_bgr: np.ndarray
@@ -141,14 +80,12 @@ class RGBDSnapshot:
 class ObjectNavConfig:
     mission: str
     global_target: str
-    model: str = "gpt-5.6-luna"
-    vision_backend: Literal["codex", "qwenvl"] = "codex"
     qwenvl_model: str = DEFAULT_QWENVL_MODEL
     qwenvl_base_url: str = DEFAULT_QWENVL_BASE_URL
     camera_host: str = "localhost"
     camera_port: int = 5555
     camera_timeout_ms: int = 3000
-    codex_timeout_seconds: float = 180.0
+    qwenvl_timeout_seconds: float = 180.0
     min_confidence: float = 0.6
     rotation_speed: float = ROTATION_SPEED
     forward_speed: float = FORWARD_SPEED
@@ -413,35 +350,6 @@ def _escape_prompt_value(value: str) -> str:
     return json.dumps(str(value), ensure_ascii=False)[1:-1]
 
 
-def get_object_nav_policy_prompt(
-    mission: str, global_target: str, snapshot: RGBDSnapshot
-) -> str:
-    """Build the isolated Codex image-policy prompt using live intrinsics."""
-    height, width = snapshot.rgb_bgr.shape[:2]
-    return f"""You are the visual navigation policy for a Unitree G1 humanoid robot.
-Analyse only the supplied current chest-camera image. Visible robot arms, grippers,
-body parts, reflections, and shadows are never navigation targets.
-
-MISSION: \"{_escape_prompt_value(mission)}\"
-GLOBAL TARGET: \"{_escape_prompt_value(global_target)}\"
-IMAGE SIZE: width={width}, height={height}
-CAMERA INTRINSICS: fx={snapshot.fx}, fy={snapshot.fy}, cx={snapshot.cx}, cy={snapshot.cy}
-
-Select exactly one target. Prefer the visible global target; otherwise select a useful
-intermediate landmark, doorway, passage, or traversable opening. Return a tight bbox
-[x1,y1,x2,y2] in normalized [0,1000] coordinates. Estimate distance for diagnostics.
-Calculate horizontal bearing from the bbox centre and the supplied fx/cx. Positive
-bearing means RIGHT, negative means LEFT, and absolute bearing <=2 degrees is CENTERED.
-
-Return NAVIGATE unless the global target is clearly identified, reached, approximately
-centred/directly reachable, and no further forward motion is needed. For a discrete
-object, STOP also requires its bbox to occupy at least 20 percent of image height.
-Never return STOP merely because the target is absent or uncertain.
-
-Return exactly one JSON object matching the supplied schema, without Markdown or any
-text before or after it. Do not output hidden reasoning."""
-
-
 def get_qwenvl_policy_prompt(
     mission: str, global_target: str, snapshot: RGBDSnapshot
 ) -> str:
@@ -477,246 +385,106 @@ pixel offsets, distance, bearing, rotation direction, rotation angle, Markdown, 
 hidden reasoning."""
 
 
-class CodexBBoxClient:
-    """Run a read-only Codex CLI image request and validate its policy JSON."""
+def _is_finite_number(value: Any) -> bool:
+    return (
+        not isinstance(value, bool)
+        and isinstance(value, (int, float))
+        and math.isfinite(float(value))
+    )
 
-    def __init__(
-        self,
-        *,
-        schema_path: str | Path | None = None,
-        runner: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
-        timeout_seconds: float = 180.0,
-        codex_bin: str | None = None,
-        model: str = "gpt-5.6-sol",
-        reasoning_effort: str | None = "high",
-        http_proxy_url: str | None = None,
-        all_proxy_url: str | None = None,
-        monotonic: Callable[[], float] = time.monotonic,
+
+def _valid_point(value: Any, *, maximum: float | None = None) -> bool:
+    return isinstance(value, list) and len(value) == 2 and all(
+        _is_finite_number(item)
+        and float(item) >= 0
+        and (maximum is None or float(item) <= maximum)
+        for item in value
+    )
+
+
+def _valid_bbox(value: Any) -> bool:
+    if not isinstance(value, list) or len(value) != 4:
+        return False
+    if not all(
+        _is_finite_number(item) and 0 <= float(item) <= 1000
+        for item in value
     ):
-        self.schema_path = (
-            None if schema_path is None else Path(schema_path).resolve()
+        return False
+    x1, y1, x2, y2 = (float(item) for item in value)
+    return x1 < x2 and y1 < y2
+
+
+def validate_object_nav_policy(policy: Any) -> dict[str, Any]:
+    """Validate the canonical policy shared by Qwen-VL and geometry code."""
+
+    if not isinstance(policy, dict) or set(policy) != REQUIRED_POLICY_KEYS:
+        raise ValueError("ObjectNav policy has an invalid object schema")
+    if policy["action"] not in {"NAVIGATE", "STOP"}:
+        raise ValueError("ObjectNav policy has an invalid action")
+    if policy["target_type"] not in TARGET_TYPES:
+        raise ValueError("ObjectNav policy has an invalid target_type")
+    if any(
+        not isinstance(policy[key], str)
+        for key in ("visual_check", "target", "stop_reasoning")
+    ):
+        raise ValueError("ObjectNav policy text fields must be strings")
+    for key in ("confidence", "distance_confidence"):
+        if not _is_finite_number(policy[key]) or not 0 <= float(
+            policy[key]
+        ) <= 1:
+            raise ValueError(f"ObjectNav policy {key} is invalid")
+
+    bbox = policy["bbox_2d"]
+    if bbox is not None and not _valid_bbox(bbox):
+        raise ValueError("ObjectNav policy bbox_2d is invalid")
+    if policy["action"] == "NAVIGATE" and bbox is None:
+        raise ValueError("NAVIGATE requires a valid bbox_2d")
+    distance = policy["estimated_distance_m"]
+    if distance is not None and (
+        not _is_finite_number(distance) or float(distance) <= 0
+    ):
+        raise ValueError("ObjectNav policy estimated distance is invalid")
+    if policy["target_center_normalized"] is not None and not _valid_point(
+        policy["target_center_normalized"], maximum=1000
+    ):
+        raise ValueError("ObjectNav policy normalized target center is invalid")
+    if policy["target_center_pixel"] is not None and not _valid_point(
+        policy["target_center_pixel"]
+    ):
+        raise ValueError("ObjectNav policy pixel target center is invalid")
+    for key in ("horizontal_offset_pixel", "camera_bearing_deg"):
+        if policy[key] is not None and not _is_finite_number(policy[key]):
+            raise ValueError(f"ObjectNav policy {key} is invalid")
+    if (
+        policy["rotation_direction"] is not None
+        and policy["rotation_direction"] not in ROTATION_DIRECTIONS
+    ):
+        raise ValueError("ObjectNav policy rotation_direction is invalid")
+    angle = policy["rotation_angle_deg"]
+    if angle is not None and (
+        not _is_finite_number(angle) or float(angle) < 0
+    ):
+        raise ValueError("ObjectNav policy rotation_angle_deg is invalid")
+    if bbox is not None and any(
+        policy[key] is None
+        for key in (
+            "target_center_normalized",
+            "target_center_pixel",
+            "horizontal_offset_pixel",
+            "camera_bearing_deg",
+            "rotation_direction",
+            "rotation_angle_deg",
         )
-        self.runner = runner
-        self.timeout_seconds = float(timeout_seconds)
-        self.codex_bin = codex_bin or os.environ.get("CODEX_BIN", "codex")
-        self.model = model
-        self.reasoning_effort = reasoning_effort
-        self._monotonic = monotonic
-        self.last_auth_check_seconds = 0.0
-        self.last_api_inference_seconds = 0.0
-        self.http_proxy_url = (
-            os.environ.get("OBJECT_NAV_CODEX_HTTP_PROXY")
-            if http_proxy_url is None
-            else http_proxy_url
+    ):
+        raise ValueError(
+            "boxable ObjectNav target requires distance and rotation fields"
         )
-        self.all_proxy_url = (
-            os.environ.get("OBJECT_NAV_CODEX_ALL_PROXY")
-            if all_proxy_url is None
-            else all_proxy_url
-        )
-
-    def _subprocess_env(self) -> dict[str, str]:
-        child_env = os.environ.copy()
-        for keys, value in (
-            (HTTP_PROXY_KEYS, self.http_proxy_url),
-            (ALL_PROXY_KEYS, self.all_proxy_url),
-        ):
-            if value is None:
-                continue
-            for key in keys:
-                if value:
-                    child_env[key] = value
-                else:
-                    child_env.pop(key, None)
-        return child_env
-
-    def _check_chatgpt_login(self) -> None:
-        result = self.runner(
-            [self.codex_bin, "login", "status"],
-            capture_output=True,
-            text=True,
-            timeout=min(self.timeout_seconds, 15),
-            check=False,
-            env=self._subprocess_env(),
-        )
-        login_text = f"{result.stdout or ''}\n{result.stderr or ''}".lower()
-        if result.returncode != 0 or "chatgpt" not in login_text:
-            raise RuntimeError("Codex CLI must be logged in with a ChatGPT subscription")
-
-    def _schema_path(self, cwd: str | Path) -> Path:
-        if self.schema_path is not None:
-            if not self.schema_path.is_file():
-                raise FileNotFoundError(
-                    f"ObjectNav output schema not found: {self.schema_path}"
-                )
-            return self.schema_path
-        schema_path = Path(cwd).resolve() / DEFAULT_SCHEMA_FILENAME
-        _write_json(schema_path, DEFAULT_POLICY_SCHEMA)
-        return schema_path
-
-    @staticmethod
-    def _is_finite_number(value: Any) -> bool:
-        return (
-            not isinstance(value, bool)
-            and isinstance(value, (int, float))
-            and math.isfinite(float(value))
-        )
-
-    @classmethod
-    def _valid_point(cls, value: Any, *, maximum: float | None = None) -> bool:
-        return isinstance(value, list) and len(value) == 2 and all(
-            cls._is_finite_number(item)
-            and float(item) >= 0
-            and (maximum is None or float(item) <= maximum)
-            for item in value
-        )
-
-    @classmethod
-    def _valid_bbox(cls, value: Any) -> bool:
-        if not isinstance(value, list) or len(value) != 4:
-            return False
-        if not all(
-            cls._is_finite_number(item) and 0 <= float(item) <= 1000
-            for item in value
-        ):
-            return False
-        x1, y1, x2, y2 = (float(item) for item in value)
-        return x1 < x2 and y1 < y2
-
-    @classmethod
-    def validate_policy(cls, policy: Any) -> dict[str, Any]:
-        if not isinstance(policy, dict) or set(policy) != REQUIRED_POLICY_KEYS:
-            raise ValueError("Codex policy has an invalid object schema")
-        if policy["action"] not in {"NAVIGATE", "STOP"}:
-            raise ValueError("Codex policy has an invalid action")
-        if policy["target_type"] not in TARGET_TYPES:
-            raise ValueError("Codex policy has an invalid target_type")
-        if any(
-            not isinstance(policy[key], str)
-            for key in ("visual_check", "target", "stop_reasoning")
-        ):
-            raise ValueError("Codex policy text fields must be strings")
-        for key in ("confidence", "distance_confidence"):
-            if not cls._is_finite_number(policy[key]) or not 0 <= float(
-                policy[key]
-            ) <= 1:
-                raise ValueError(f"Codex policy {key} is invalid")
-
-        bbox = policy["bbox_2d"]
-        if bbox is not None and not cls._valid_bbox(bbox):
-            raise ValueError("Codex policy bbox_2d is invalid")
-        if policy["action"] == "NAVIGATE" and bbox is None:
-            raise ValueError("NAVIGATE requires a valid bbox_2d")
-        distance = policy["estimated_distance_m"]
-        if distance is not None and (
-            not cls._is_finite_number(distance) or float(distance) <= 0
-        ):
-            raise ValueError("Codex policy estimated distance is invalid")
-        if policy["target_center_normalized"] is not None and not cls._valid_point(
-            policy["target_center_normalized"], maximum=1000
-        ):
-            raise ValueError("Codex policy normalized target center is invalid")
-        if policy["target_center_pixel"] is not None and not cls._valid_point(
-            policy["target_center_pixel"]
-        ):
-            raise ValueError("Codex policy pixel target center is invalid")
-        for key in ("horizontal_offset_pixel", "camera_bearing_deg"):
-            if policy[key] is not None and not cls._is_finite_number(policy[key]):
-                raise ValueError(f"Codex policy {key} is invalid")
-        if (
-            policy["rotation_direction"] is not None
-            and policy["rotation_direction"] not in ROTATION_DIRECTIONS
-        ):
-            raise ValueError("Codex policy rotation_direction is invalid")
-        angle = policy["rotation_angle_deg"]
-        if angle is not None and (
-            not cls._is_finite_number(angle) or float(angle) < 0
-        ):
-            raise ValueError("Codex policy rotation_angle_deg is invalid")
-        if bbox is not None and any(
-            policy[key] is None
-            for key in (
-                "target_center_normalized",
-                "target_center_pixel",
-                "horizontal_offset_pixel",
-                "camera_bearing_deg",
-                "rotation_direction",
-                "rotation_angle_deg",
-            )
-        ):
-            raise ValueError("boxable Codex target requires distance and rotation fields")
-        if policy["action"] == "STOP":
-            if policy["target_type"] != "global_target":
-                raise ValueError("STOP is only valid for the global target")
-            if not policy["stop_reasoning"].strip():
-                raise ValueError("STOP requires stop_reasoning")
-        return policy
-
-    def locate(
-        self,
-        *,
-        image_path: str | Path,
-        mission: str,
-        global_target: str,
-        snapshot: RGBDSnapshot,
-        cwd: str | Path,
-    ) -> dict[str, Any]:
-        auth_started = self._monotonic()
-        try:
-            self._check_chatgpt_login()
-        finally:
-            self.last_auth_check_seconds = self._monotonic() - auth_started
-        image_path = Path(image_path).resolve()
-        if not image_path.is_file():
-            raise FileNotFoundError(f"ObjectNav RGB image not found: {image_path}")
-        schema_path = self._schema_path(cwd)
-        command = [
-            self.codex_bin,
-            "--ask-for-approval",
-            "never",
-            "exec",
-            "--ephemeral",
-            "--ignore-user-config",
-            "--ignore-rules",
-            "--sandbox",
-            "read-only",
-            "--skip-git-repo-check",
-            "--color",
-            "never",
-            "--model",
-            self.model,
-            "--image",
-            str(image_path),
-            "--output-schema",
-            str(schema_path),
-            get_object_nav_policy_prompt(mission, global_target, snapshot),
-        ]
-        if self.reasoning_effort is not None:
-            model_index = command.index("--image")
-            command[model_index:model_index] = [
-                "--config",
-                f'model_reasoning_effort="{self.reasoning_effort}"',
-            ]
-        api_started = self._monotonic()
-        try:
-            result = self.runner(
-                command,
-                capture_output=True,
-                text=True,
-                timeout=self.timeout_seconds,
-                check=False,
-                cwd=str(cwd),
-                env=self._subprocess_env(),
-            )
-        finally:
-            self.last_api_inference_seconds = self._monotonic() - api_started
-        if result.returncode != 0:
-            message = (result.stderr or result.stdout or "unknown error").strip()
-            raise RuntimeError(f"Codex ObjectNav policy failed: {message}")
-        try:
-            return self.validate_policy(json.loads(result.stdout))
-        except json.JSONDecodeError as exc:
-            raise ValueError("Codex ObjectNav output is not valid JSON") from exc
+    if policy["action"] == "STOP":
+        if policy["target_type"] != "global_target":
+            raise ValueError("STOP is only valid for the global target")
+        if not policy["stop_reasoning"].strip():
+            raise ValueError("STOP requires stop_reasoning")
+    return policy
 
 
 class QwenVLBBoxClient:
@@ -795,13 +563,11 @@ class QwenVLBBoxClient:
         ):
             raise ValueError("Qwen-VL policy text fields must be strings")
         confidence = payload["confidence"]
-        if not CodexBBoxClient._is_finite_number(confidence) or not 0.0 <= float(
-            confidence
-        ) <= 1.0:
+        if not _is_finite_number(confidence) or not 0.0 <= float(confidence) <= 1.0:
             raise ValueError("Qwen-VL policy confidence is invalid")
 
         bbox = payload["bbox_2d"]
-        if action == "NAVIGATE" and not CodexBBoxClient._valid_bbox(bbox):
+        if action == "NAVIGATE" and not _valid_bbox(bbox):
             raise ValueError("Qwen-VL NAVIGATE requires a valid bbox_2d")
         if action == "STOP":
             if bbox is not None:
@@ -850,7 +616,7 @@ class QwenVLBBoxClient:
             **derived,
             "distance_confidence": 0.0,
         }
-        return CodexBBoxClient.validate_policy(canonical)
+        return validate_object_nav_policy(canonical)
 
     def locate(
         self,
@@ -960,7 +726,7 @@ class ObjectNavRunner:
         self,
         config: ObjectNavConfig,
         camera: Any | None = None,
-        codex: Any | None = None,
+        policy_client: Any | None = None,
         *,
         own_camera: bool | None = None,
     ):
@@ -971,22 +737,15 @@ class ObjectNavRunner:
         self.camera = camera or ComposedRGBDCamera(
             config.camera_host, config.camera_port, config.camera_timeout_ms
         )
-        if codex is not None:
-            self.codex = codex
-        elif config.vision_backend == "codex":
-            self.codex = CodexBBoxClient(
-                model=config.model,
-                reasoning_effort=None,
-                timeout_seconds=config.codex_timeout_seconds,
-            )
-        elif config.vision_backend == "qwenvl":
-            self.codex = QwenVLBBoxClient(
+        self.policy_client = (
+            policy_client
+            if policy_client is not None
+            else QwenVLBBoxClient(
                 model=config.qwenvl_model,
                 base_url=config.qwenvl_base_url,
-                timeout_seconds=config.codex_timeout_seconds,
+                timeout_seconds=config.qwenvl_timeout_seconds,
             )
-        else:
-            raise ValueError(f"unsupported vision_backend: {config.vision_backend}")
+        )
 
     def run_once(self, *, iteration: int = 1) -> ObjectNavResult:
         total_started = time.monotonic()
@@ -1026,7 +785,7 @@ class ObjectNavRunner:
             timing["image_io"] = time.monotonic() - image_io_started
             policy_call_started = time.monotonic()
             try:
-                policy = self.codex.locate(
+                policy = self.policy_client.locate(
                     image_path=input_path,
                     mission=self.config.mission,
                     global_target=self.config.global_target,
@@ -1036,11 +795,11 @@ class ObjectNavRunner:
             finally:
                 policy_call_seconds = time.monotonic() - policy_call_started
                 timing["auth_check"] = float(
-                    getattr(self.codex, "last_auth_check_seconds", 0.0)
+                    getattr(self.policy_client, "last_auth_check_seconds", 0.0)
                 )
                 timing["api_inference"] = float(
                     getattr(
-                        self.codex,
+                        self.policy_client,
                         "last_api_inference_seconds",
                         max(0.0, policy_call_seconds - timing["auth_check"]),
                     )
@@ -1078,7 +837,7 @@ class ObjectNavRunner:
                 outcome = "NAVIGATE"
                 geometry["status"] = "ok"
 
-            geometry["codex_prediction"] = {
+            geometry["qwen_prediction"] = {
                 "distance_m": policy.get("estimated_distance_m"),
                 "rotation_direction": policy.get("rotation_direction"),
                 "rotation_angle_deg": policy.get("rotation_angle_deg"),
@@ -1106,10 +865,10 @@ class ObjectNavRunner:
 
         print(f"[ObjectNav] outcome={outcome} output={output_dir}", file=os.sys.stderr)
         if outcome == "NAVIGATE":
-            prediction = geometry["codex_prediction"]
+            prediction = geometry["qwen_prediction"]
             measured = geometry["depth_camera_measurement"]
             print(
-                "[ObjectNav] Codex vs depth: "
+                "[ObjectNav] Qwen-VL vs depth: "
                 f"distance {prediction['distance_m']} vs {measured['distance_m']}m; "
                 f"rotation {prediction['rotation_direction']} "
                 f"{prediction['rotation_angle_deg']} vs "

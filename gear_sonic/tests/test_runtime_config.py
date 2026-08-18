@@ -72,7 +72,10 @@ def test_profile_parameters_match_current_process_defaults() -> None:
     )
 
     assert profile.component("lavira")["camera_timeout_ms"] == lavira.camera_timeout_ms
-    assert profile.component("lavira")["policy_timeout_s"] == lavira.codex_timeout_seconds
+    assert (
+        profile.component("lavira")["policy_timeout_s"]
+        == lavira.qwenvl_timeout_seconds
+    )
     assert profile.component("lavira")["min_confidence"] == lavira.min_confidence
 
     navdp_profile = profile.component("navdp")

@@ -33,6 +33,15 @@ def runtime_with_intents():
     return runtime, intents
 
 
+def test_lavira_config_exposes_only_qwenvl_policy_settings() -> None:
+    config = LaviraPlannerConfig("find chair", "chair")
+
+    assert config.qwenvl_model == "qwen3-vl-32b-instruct"
+    assert config.qwenvl_timeout_seconds == 180.0
+    assert not hasattr(config, "vision_backend")
+    assert not hasattr(config, "model")
+
+
 def test_result_goal_maps_camera_right_to_negative_base_y() -> None:
     assert result_to_goal(nav_result()) == pytest.approx((1.73205, -1.0))
 

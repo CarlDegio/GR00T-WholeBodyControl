@@ -166,8 +166,6 @@ launch_inference:
   planner_input: lavira
   lavira_mission: blue basket
   lavira_global_target: blue basket
-  lavira_model: gpt-5.6-luna
-  lavira_vision_backend: qwenvl
   lavira_qwenvl_model: qwen3-vl-32b-instruct
   lavira_qwenvl_base_url: https://dashscope-intl.aliyuncs.com/compatible-mode/v1
   lavira_warmup: true
@@ -177,7 +175,7 @@ launch_inference:
   lavira_camera_timeout_ms: 15000
   lavira_depth_port: 5564
   lingbot_ready_timeout: 180.0
-  lavira_codex_timeout_seconds: 180.0
+  lavira_qwenvl_timeout_seconds: 180.0
   lavira_min_confidence: 0.6
   lavira_output_root: outputs/object_nav
   navdp_root: /home/user/Project/NavDP/baselines/x-navdp

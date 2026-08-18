@@ -190,20 +190,14 @@ class InferenceLaunchConfig:
     lavira_global_target: str = ""
     """Global target used by LaViRA when --planner-input lavira is selected."""
 
-    lavira_model: str = "gpt-5.6-luna"
-    """Codex CLI vision model used by LaViRA."""
-
-    lavira_vision_backend: Literal["codex", "qwenvl"] = "codex"
-    """Vision provider used by LaViRA target recognition."""
-
     lavira_qwenvl_model: str = "qwen3-vl-32b-instruct"
-    """DashScope Qwen-VL model used when the backend is qwenvl."""
+    """DashScope Qwen-VL model used by LaViRA."""
 
     lavira_qwenvl_base_url: str = "https://dashscope-intl.aliyuncs.com/compatible-mode/v1"
     """DashScope OpenAI-compatible endpoint; key comes from DASHSCOPE_API_KEY."""
 
     lavira_warmup: bool = True
-    """Run one discarded Luna request in the background at startup."""
+    """Run one discarded Qwen-VL request in the background at startup."""
 
     lavira_debug: bool = False
     """Enable LaViRA debug logging."""
@@ -223,11 +217,11 @@ class InferenceLaunchConfig:
     lingbot_ready_timeout: float = 180.0
     """Maximum time to wait for the independent LingBot pane to publish its first frame."""
 
-    lavira_codex_timeout_seconds: float = 180.0
-    """LaViRA Codex policy timeout (s)."""
+    lavira_qwenvl_timeout_seconds: float = 180.0
+    """LaViRA Qwen-VL policy timeout (s)."""
 
     lavira_min_confidence: float = 0.6
-    """Minimum Codex target confidence accepted by LaViRA."""
+    """Minimum Qwen-VL target confidence accepted by LaViRA."""
 
     lavira_output_root: str = "outputs/object_nav"
     """Directory where LaViRA stores ObjectNav diagnostics."""
@@ -544,15 +538,7 @@ def build_planner_input_command(config: InferenceLaunchConfig, repo_root: Path) 
 
     debug = "--debug " if config.lavira_debug else ""
     warmup = "" if config.lavira_warmup else "--no-warmup "
-    vision_backend = ""
-    local_env = ""
-    if config.lavira_vision_backend == "qwenvl":
-        local_env = "set -a; [ ! -f .env.local ] || . ./.env.local; set +a; "
-        vision_backend = (
-            "--vision-backend qwenvl "
-            f"--qwenvl-model {shlex.quote(config.lavira_qwenvl_model)} "
-            f"--qwenvl-base-url {shlex.quote(config.lavira_qwenvl_base_url)} "
-        )
+    local_env = "set -a; [ ! -f .env.local ] || . ./.env.local; set +a; "
     quoted_root = shlex.quote(str(repo_root))
     ready_file = shlex.quote(str(LINGBOT_READY_FILE))
     return (
@@ -564,15 +550,16 @@ def build_planner_input_command(config: InferenceLaunchConfig, repo_root: Path) 
         f".venv_inference/bin/python gear_sonic/scripts/lavira_planner.py "
         f"--mission {shlex.quote(config.lavira_mission)} "
         f"--global-target {shlex.quote(config.lavira_global_target)} "
-        f"--model {shlex.quote(config.lavira_model)} "
-        f"{vision_backend}{debug}{warmup}"
+        f"--qwenvl-model {shlex.quote(config.lavira_qwenvl_model)} "
+        f"--qwenvl-base-url {shlex.quote(config.lavira_qwenvl_base_url)} "
+        f"{debug}{warmup}"
         f"--camera-timeout-ms {config.lavira_camera_timeout_ms} "
         f"--sensor-gateway-endpoint tcp://127.0.0.1:{config.sensor_gateway_port} "
         f"--sensor-gateway-request-timeout-ms "
         f"{config.vla_sensor_gateway_request_timeout_ms} "
         f"--sensor-gateway-max-age-ms {config.vla_sensor_gateway_max_age_ms} "
         f"--sensor-gateway-max-skew-ms {config.vla_sensor_gateway_max_skew_ms} "
-        f"--codex-timeout-seconds {config.lavira_codex_timeout_seconds} "
+        f"--qwenvl-timeout-seconds {config.lavira_qwenvl_timeout_seconds} "
         f"--min-confidence {config.lavira_min_confidence} "
         "--control-gateway-endpoint "
         f"tcp://127.0.0.1:{config.control_gateway_dispatch_port} "
@@ -861,8 +848,7 @@ def _check_prerequisites(config: InferenceLaunchConfig):
                 "--lavira-global-target is required when --planner-input lavira"
             )
         if (
-            config.lavira_vision_backend == "qwenvl"
-            and not os.environ.get("DASHSCOPE_API_KEY", "").strip()
+            not os.environ.get("DASHSCOPE_API_KEY", "").strip()
             and not _dotenv_has_nonempty_value(repo_root / ".env.local", "DASHSCOPE_API_KEY")
         ):
             errors.append(

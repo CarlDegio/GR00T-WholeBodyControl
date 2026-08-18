@@ -4,9 +4,7 @@ from __future__ import annotations
 
 from dataclasses import FrozenInstanceError, replace
 import json
-import os
 from pathlib import Path
-import subprocess
 import sys
 from types import SimpleNamespace
 
@@ -15,7 +13,6 @@ import pytest
 
 from gear_sonic.camera.sensor_server import ImageMessageSchema
 from gear_sonic.utils.inference.object_nav import (
-    CodexBBoxClient,
     ComposedRGBDCamera,
     ObjectNavCameraError,
     ObjectNavConfig,
@@ -23,7 +20,8 @@ from gear_sonic.utils.inference.object_nav import (
     ObjectNavRunner,
     QwenVLBBoxClient,
     RGBDSnapshot,
-    get_object_nav_policy_prompt,
+    get_qwenvl_policy_prompt,
+    validate_object_nav_policy,
 )
 
 
@@ -89,8 +87,12 @@ class FakeCamera:
         self.closed = True
 
 
-class FakeCodex:
-    def __init__(self, policy_value: dict[str, object] | None = None, error: Exception | None = None):
+class FakePolicyClient:
+    def __init__(
+        self,
+        policy_value: dict[str, object] | None = None,
+        error: Exception | None = None,
+    ):
         self.policy_value = policy_value
         self.error = error
         self.calls: list[dict[str, object]] = []
@@ -108,9 +110,9 @@ def run_with_fakes(
     policy_value: dict[str, object],
     *,
     target_standoff_distance: float = 0.0,
-) -> tuple[ObjectNavResult, FakeCamera, FakeCodex]:
+) -> tuple[ObjectNavResult, FakeCamera, FakePolicyClient]:
     camera = FakeCamera([snapshot(index) for index in range(1, 6)])
-    codex = FakeCodex(policy_value)
+    policy_client = FakePolicyClient(policy_value)
     runner = ObjectNavRunner(
         ObjectNavConfig(
             mission="find the chair",
@@ -119,18 +121,56 @@ def run_with_fakes(
             output_root=str(tmp_path),
         ),
         camera=camera,
-        codex=codex,
+        policy_client=policy_client,
     )
-    return runner.run_once(), camera, codex
+    return runner.run_once(), camera, policy_client
 
 
 def test_config_preserves_agentnav_automatic_defaults() -> None:
     config = ObjectNavConfig(mission="find chair", global_target="chair")
 
     assert config.camera_timeout_ms == 3000
-    assert config.codex_timeout_seconds == 180.0
+    assert config.qwenvl_timeout_seconds == 180.0
+    assert config.qwenvl_model == "qwen3-vl-32b-instruct"
     assert config.min_confidence == 0.6
     assert config.target_standoff_distance == 0.0
+    assert not hasattr(config, "vision_backend")
+    assert not hasattr(config, "model")
+
+
+def test_default_runner_constructs_only_qwenvl_client(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    marker = object()
+    captured: dict[str, object] = {}
+
+    def build_qwenvl(**kwargs: object) -> object:
+        captured.update(kwargs)
+        return marker
+
+    monkeypatch.setattr(
+        "gear_sonic.utils.inference.object_nav.QwenVLBBoxClient",
+        build_qwenvl,
+    )
+    runner = ObjectNavRunner(
+        ObjectNavConfig(
+            "find chair",
+            "chair",
+            qwenvl_model="qwen-test",
+            qwenvl_base_url="https://qwen.invalid/v1",
+            qwenvl_timeout_seconds=42.0,
+            output_root=str(tmp_path),
+        ),
+        camera=FakeCamera([snapshot(index) for index in range(1, 6)]),
+    )
+
+    assert runner.policy_client is marker
+    assert captured == {
+        "model": "qwen-test",
+        "base_url": "https://qwen.invalid/v1",
+        "timeout_seconds": 42.0,
+    }
 
 
 def test_object_nav_result_is_immutable() -> None:
@@ -140,20 +180,17 @@ def test_object_nav_result_is_immutable() -> None:
         result.outcome = "NAVIGATE"  # type: ignore[misc]
 
 
-def test_prompt_uses_explicit_inputs_and_live_intrinsics() -> None:
+def test_qwenvl_prompt_uses_explicit_inputs_and_image_size() -> None:
     current = replace(
         snapshot(), rgb_bgr=np.zeros((10, 20, 3), dtype=np.uint8), fx=123.5
     )
-    prompt = get_object_nav_policy_prompt(
+    prompt = get_qwenvl_policy_prompt(
         'find the "red chair"\nthen stop', "red chair", current
     )
 
     assert r'find the \"red chair\"\nthen stop' in prompt
-    assert "fx=123.5" in prompt
     assert "width=20, height=10" in prompt
     assert "Never return STOP merely" in prompt
-
-
 
 
 @pytest.mark.parametrize("key", sorted(policy()))
@@ -162,7 +199,7 @@ def test_policy_rejects_every_missing_required_key(key: str) -> None:
     del value[key]
 
     with pytest.raises(ValueError, match="schema"):
-        CodexBBoxClient.validate_policy(value)
+        validate_object_nav_policy(value)
 
 
 def test_policy_rejects_extra_keys() -> None:
@@ -170,7 +207,7 @@ def test_policy_rejects_extra_keys() -> None:
     value["reasoning"] = "hidden"
 
     with pytest.raises(ValueError, match="schema"):
-        CodexBBoxClient.validate_policy(value)
+        validate_object_nav_policy(value)
 
 
 @pytest.mark.parametrize("key", ["confidence", "distance_confidence"])
@@ -180,7 +217,7 @@ def test_policy_rejects_non_finite_or_boolean_confidence(key: str, invalid: obje
     value[key] = invalid
 
     with pytest.raises(ValueError, match=key):
-        CodexBBoxClient.validate_policy(value)
+        validate_object_nav_policy(value)
 
 
 @pytest.mark.parametrize(
@@ -191,7 +228,7 @@ def test_policy_rejects_invalid_bbox_corner_ordering(bbox: list[int]) -> None:
     value["bbox_2d"] = bbox
 
     with pytest.raises(ValueError, match="bbox"):
-        CodexBBoxClient.validate_policy(value)
+        validate_object_nav_policy(value)
 
 
 @pytest.mark.parametrize(
@@ -201,19 +238,19 @@ def test_policy_accepts_each_supported_target_type(target_type: str) -> None:
     value = policy()
     value["target_type"] = target_type
 
-    assert CodexBBoxClient.validate_policy(value) == value
+    assert validate_object_nav_policy(value) == value
 
 
 def test_policy_rejects_unknown_target_type_and_non_global_stop() -> None:
     value = policy()
     value["target_type"] = "obstacle"
     with pytest.raises(ValueError, match="target_type"):
-        CodexBBoxClient.validate_policy(value)
+        validate_object_nav_policy(value)
 
     value = policy(action="STOP")
     value["target_type"] = "intermediate_landmark"
     with pytest.raises(ValueError, match="global target"):
-        CodexBBoxClient.validate_policy(value)
+        validate_object_nav_policy(value)
 
 
 @pytest.mark.parametrize("direction", ["LEFT", "RIGHT", "CENTERED"])
@@ -221,7 +258,7 @@ def test_policy_accepts_each_supported_rotation_direction(direction: str) -> Non
     value = policy()
     value["rotation_direction"] = direction
 
-    assert CodexBBoxClient.validate_policy(value) == value
+    assert validate_object_nav_policy(value) == value
 
 
 def test_policy_rejects_unknown_rotation_direction() -> None:
@@ -229,7 +266,7 @@ def test_policy_rejects_unknown_rotation_direction() -> None:
     value["rotation_direction"] = "FORWARD"
 
     with pytest.raises(ValueError, match="rotation_direction"):
-        CodexBBoxClient.validate_policy(value)
+        validate_object_nav_policy(value)
 
 
 def test_composed_camera_rejects_malformed_rgbd_payload() -> None:
@@ -241,110 +278,6 @@ def test_composed_camera_rejects_malformed_rgbd_payload() -> None:
 
     with pytest.raises(ObjectNavCameraError, match="RGB and depth"):
         ComposedRGBDCamera.decode_payload(malformed)
-
-
-def test_codex_client_builds_read_only_image_command_with_proxy_environment(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    completed = [
-        subprocess.CompletedProcess(
-            ["codex", "login", "status"], 0, stdout="Logged in using ChatGPT\n", stderr=""
-        ),
-        subprocess.CompletedProcess(
-            ["codex", "exec"], 0, stdout=json.dumps(policy()), stderr=""
-        ),
-    ]
-    calls: list[tuple[list[str], dict[str, object]]] = []
-
-    def fake_subprocess(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
-        calls.append((command, kwargs))
-        return completed[len(calls) - 1]
-
-    image_path = tmp_path / "input.png"
-    image_path.write_bytes(b"image")
-    schema_path = tmp_path / "schema.json"
-    schema_path.write_text("{}", encoding="utf-8")
-    monkeypatch.setattr(
-        os,
-        "environ",
-        {
-            "MARKER": "kept",
-            "HTTP_PROXY": "http://127.0.0.1:7890/",
-            "ALL_PROXY": "socks://127.0.0.1:7890/",
-        },
-    )
-
-    result = CodexBBoxClient(
-        schema_path=schema_path, runner=fake_subprocess, timeout_seconds=12
-    ).locate(
-        image_path=image_path,
-        mission="find chair",
-        global_target="chair",
-        snapshot=snapshot(),
-        cwd=tmp_path,
-    )
-
-    assert result["target"] == "red chair"
-    command = calls[1][0]
-    assert "--ephemeral" in command
-    assert "read-only" in command
-    assert "--output-schema" in command
-    assert calls[1][1].get("shell", False) is False
-    for _, kwargs in calls:
-        environment = kwargs["env"]
-        assert isinstance(environment, dict)
-        assert environment["HTTP_PROXY"] == "http://127.0.0.1:7890/"
-        assert environment["ALL_PROXY"] == "socks://127.0.0.1:7890/"
-        assert environment["MARKER"] == "kept"
-
-
-def test_codex_client_records_auth_and_api_latency(
-    tmp_path: Path,
-) -> None:
-    completed = iter(
-        [
-            subprocess.CompletedProcess(
-                ["codex", "login", "status"],
-                0,
-                stdout="Logged in using ChatGPT\n",
-                stderr="",
-            ),
-            subprocess.CompletedProcess(
-                ["codex", "exec"], 0, stdout=json.dumps(policy()), stderr=""
-            ),
-        ]
-    )
-    ticks = iter([10.0, 10.2, 20.0, 22.5])
-    image_path = tmp_path / "input.png"
-    image_path.write_bytes(b"image")
-    schema_path = tmp_path / "schema.json"
-    schema_path.write_text("{}", encoding="utf-8")
-    client = CodexBBoxClient(
-        schema_path=schema_path,
-        runner=lambda *_args, **_kwargs: next(completed),
-        monotonic=lambda: next(ticks),
-    )
-
-    client.locate(
-        image_path=image_path,
-        mission="find chair",
-        global_target="chair",
-        snapshot=snapshot(),
-        cwd=tmp_path,
-    )
-
-    assert client.last_auth_check_seconds == pytest.approx(0.2)
-    assert client.last_api_inference_seconds == pytest.approx(2.5)
-
-
-def test_default_runner_uses_luna_without_reasoning_override(tmp_path: Path) -> None:
-    runner = ObjectNavRunner(
-        ObjectNavConfig("find chair", "chair", output_root=str(tmp_path)),
-        camera=FakeCamera([snapshot(index) for index in range(1, 6)]),
-    )
-
-    assert runner.codex.model == "gpt-5.6-luna"
-    assert runner.codex.reasoning_effort is None
 
 
 def test_qwenvl_client_sends_local_image_and_validates_policy(tmp_path: Path) -> None:
@@ -464,33 +397,10 @@ def test_qwenvl_client_uses_isolated_http_proxy_and_ignores_environment(
     assert captured["openai"]["http_client"].__class__ is FakeHttpClient
 
 
-def test_empty_proxy_overrides_remove_inherited_values(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(
-        os,
-        "environ",
-        {
-            "HTTP_PROXY": "http://old",
-            "ALL_PROXY": "socks://old",
-            "OBJECT_NAV_CODEX_HTTP_PROXY": "",
-            "OBJECT_NAV_CODEX_ALL_PROXY": "",
-        },
-    )
-
-    environment = CodexBBoxClient()._subprocess_env()
-
-    for key in (
-        "http_proxy",
-        "https_proxy",
-        "HTTP_PROXY",
-        "HTTPS_PROXY",
-        "all_proxy",
-        "ALL_PROXY",
-    ):
-        assert key not in environment
-
-
-def test_successful_cycle_captures_five_frames_and_writes_diagnostics(tmp_path: Path) -> None:
-    result, camera, codex = run_with_fakes(
+def test_successful_cycle_captures_five_frames_and_writes_diagnostics(
+    tmp_path: Path,
+) -> None:
+    result, camera, policy_client = run_with_fakes(
         tmp_path, policy(), target_standoff_distance=0.5
     )
 
@@ -498,8 +408,9 @@ def test_successful_cycle_captures_five_frames_and_writes_diagnostics(tmp_path: 
     assert len(result.commands["commands"]) == 2
     assert result.geometry["travel"] == 1.5
     assert camera.capture_count == 5
-    assert len(codex.calls) == 1
-    assert codex.calls[0]["snapshot"].timestamp == 3.0
+    assert len(policy_client.calls) == 1
+    assert policy_client.calls[0]["snapshot"].timestamp == 3.0
+    assert "qwen_prediction" in result.geometry
     output_dir = Path(result.output_dir)
     assert sorted(path.name for path in output_dir.glob("depth_raw_*.png")) == [
         "depth_raw_01.png",
@@ -533,7 +444,7 @@ def test_object_nav_warmup_runs_iteration_zero_without_returning_motion(
     runner = ObjectNavRunner(
         ObjectNavConfig("find chair", "chair", output_root=str(tmp_path)),
         camera=camera,
-        codex=FakeCodex(policy()),
+        policy_client=FakePolicyClient(policy()),
     )
 
     warmup = runner.warmup()
@@ -556,22 +467,24 @@ def test_stop_and_low_confidence_fail_closed(
     assert result.error is None
 
 
-def test_codex_failure_returns_failed_result_and_empty_commands(tmp_path: Path) -> None:
+def test_qwenvl_failure_returns_failed_result_and_empty_commands(
+    tmp_path: Path,
+) -> None:
     camera = FakeCamera([snapshot(index) for index in range(1, 6)])
-    codex = FakeCodex(error=RuntimeError("Codex unavailable"))
+    policy_client = FakePolicyClient(error=RuntimeError("Qwen-VL unavailable"))
     runner = ObjectNavRunner(
         ObjectNavConfig("find chair", "chair", output_root=str(tmp_path)),
         camera=camera,
-        codex=codex,
+        policy_client=policy_client,
     )
 
     result = runner.run_once()
 
     assert result.outcome == "FAILED"
     assert result.commands == {"commands": []}
-    assert result.error == "Codex unavailable"
+    assert result.error == "Qwen-VL unavailable"
     assert result.geometry["status"] == "failed"
-    assert result.geometry["error"] == "Codex unavailable"
+    assert result.geometry["error"] == "Qwen-VL unavailable"
     assert set(result.geometry["timing_s"]) == {
         "camera_rgbd",
         "image_io",
@@ -587,7 +500,7 @@ def test_injected_camera_lifecycle_remains_with_caller(tmp_path: Path) -> None:
     runner = ObjectNavRunner(
         ObjectNavConfig("find chair", "chair", output_root=str(tmp_path)),
         camera=camera,
-        codex=FakeCodex(policy()),
+        policy_client=FakePolicyClient(policy()),
     )
 
     runner.close()
