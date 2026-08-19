@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import math
 import time
 from typing import Mapping
 
@@ -41,11 +42,11 @@ def _decode_rgbd_snapshot(
         depth_raw = np.asarray(snapshot.arrays[depth_stream])
         if depth_raw.ndim != 2 or depth_raw.dtype != np.uint16:
             raise BasePoseCameraError(
-                f"Gateway raw depth must be HxW uint16, got "
+                f"Gateway depth must be HxW uint16, got "
                 f"{depth_raw.shape} {depth_raw.dtype}"
             )
         if depth_raw.shape != rgb.shape[:2]:
-            raise BasePoseCameraError("Gateway RGB and raw depth shapes do not match")
+            raise BasePoseCameraError("Gateway RGB and depth shapes do not match")
         depth_info = dict(depth_frame.attributes.get("camera_info", {}))
         if depth_info:
             info = depth_info
@@ -55,6 +56,31 @@ def _decode_rgbd_snapshot(
             depth_frame.attributes.get("depth_source")
             or info.get("depth_source", "")
         ) or None
+        if depth_stream.startswith("derived/depth_anything/"):
+            if not (depth_source or "").startswith(
+                "depth-anything-v2-metric-"
+            ):
+                raise BasePoseCameraError(
+                    f"Gateway derived depth is not metric Depth Anything: "
+                    f"{depth_source!r}"
+                )
+            if not math.isclose(
+                depth_scale_m,
+                0.001,
+                rel_tol=0.0,
+                abs_tol=1.0e-9,
+            ):
+                raise BasePoseCameraError(
+                    "Depth Anything uint16 depth must use millimetre units"
+                )
+            if bool(info.get("uses_raw_depth", True)):
+                raise BasePoseCameraError(
+                    "Depth Anything stream must be estimated from RGB only"
+                )
+            if info.get("inference_owner") != "base_pose":
+                raise BasePoseCameraError(
+                    "Depth Anything frame is not owned by BasePose"
+                )
         timestamp_ns = depth_frame.source_timestamp_ns or timestamp_ns
     try:
         fx, fy, cx, cy = (float(info[name]) for name in ("fx", "fy", "cx", "cy"))
@@ -83,14 +109,14 @@ def _decode_rgbd_snapshot(
 
 
 class SensorGatewayBasePoseCamera:
-    """Read one fresh RGB or aligned raw RGB-D snapshot from SensorGateway."""
+    """Read one fresh RGB or aligned RGB-D snapshot from SensorGateway."""
 
     def __init__(
         self,
         endpoint: str,
         *,
         camera_stream: str = "ego_view",
-        depth_stream: str = "derived/lingbot_depth",
+        depth_stream: str = "camera/ego_view_depth",
         require_depth: bool = False,
         timeout_ms: int = 15000,
         request_timeout_ms: int = 100,

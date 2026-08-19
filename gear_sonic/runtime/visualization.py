@@ -16,13 +16,11 @@ NAVDP_NAVIGATION_STREAM = "visualization/navdp_navigation"
 NAVDP_ACTOR_RAY_STREAM = "visualization/navdp_actor_ray"
 NAVDP_SLAM_2D_STREAM = "visualization/navdp_slam_2d"
 NAVDP_HEAD_RGBD_STREAM = "visualization/navdp_head_rgbd"
-LINGBOT_DEPTH_STREAM = "visualization/lingbot_depth"
 VISUALIZATION_STREAMS = (
     NAVDP_NAVIGATION_STREAM,
     NAVDP_ACTOR_RAY_STREAM,
     NAVDP_SLAM_2D_STREAM,
     NAVDP_HEAD_RGBD_STREAM,
-    LINGBOT_DEPTH_STREAM,
 )
 
 

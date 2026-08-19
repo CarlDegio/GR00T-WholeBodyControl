@@ -228,11 +228,11 @@ def run_control_gateway(settings: ControlGatewaySettings) -> None:
             )
         agent_destinations: tuple[str, ...] = ()
         if action.agent_event == "start_navigation":
-            agent_destinations = ("LaViRA",)
+            agent_destinations = ("LaViRA", "DepthAnything")
         elif action.agent_event == "start_base_pose":
-            agent_destinations = ("BasePose",)
+            agent_destinations = ("BasePose", "DepthAnything")
         elif action.agent_event == "cancel_navigation":
-            agent_destinations = ("LaViRA", "BasePose")
+            agent_destinations = ("LaViRA", "BasePose", "DepthAnything")
         destinations = ("PlannerExecutor", "NavDP") + agent_destinations
         log_control_route(
             source,
@@ -275,6 +275,21 @@ def run_control_gateway(settings: ControlGatewaySettings) -> None:
                             )
                             if not command_accepted:
                                 command_reason = action.reason or "navigation request ignored"
+                        elif command.name == "lavira_rgbd_captured":
+                            if command.metadata.source != "lavira_agent":
+                                raise ValueError(
+                                    "LaViRA RGB-D completion requires lavira_agent source"
+                                )
+                            if not navigation.accept_lavira_rgbd_captured(
+                                command.parameters
+                            ):
+                                raise ValueError("stale LaViRA RGB-D completion")
+                            log_control_route(
+                                command.metadata.source,
+                                command.name,
+                                ("DepthAnything",),
+                                generation=int(command.parameters["generation"]),
+                            )
                         elif command.name == "navigation_goal":
                             action = navigation.accept_goal(command.parameters)
                             goal = command.parameters.get("goal_base")
@@ -293,6 +308,10 @@ def run_control_gateway(settings: ControlGatewaySettings) -> None:
                                         command.parameters.get("confidence", 0.0)
                                     ),
                                 )
+                            )
+                            dispatch_navigation_event(
+                                "navigation_goal",
+                                {"generation": action.generation},
                             )
                             log_control_route(
                                 command.metadata.source,

@@ -60,7 +60,10 @@ def test_dual_mode_is_the_agent_near_aligned_default() -> None:
     assert config.dual_head_camera_stream == HEAD
     assert config.dual_head_depth_stream == "camera/ego_view_depth"
     assert config.dual_chest_camera_stream == CHEST
-    assert config.dual_chest_depth_stream == "camera/chest_view_depth"
+    assert (
+        config.dual_chest_depth_stream
+        == "derived/depth_anything/chest_view"
+    )
     assert config.dual_chest_camera_pitch_deg == pytest.approx(-3.0)
     assert config.dual_match_tolerance_frames == 30
     assert config.dual_head_reacquire_frames == 10

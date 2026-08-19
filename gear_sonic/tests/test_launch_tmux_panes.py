@@ -29,7 +29,7 @@ from gear_sonic.scripts.launch_inference import (
     build_operator_console_command,
     build_operator_interface_command,
     build_livox_command,
-    build_lingbot_command,
+    build_depth_anything_command,
     build_planner_input_command,
     build_planner_velocity_executor_command,
     build_navdp_planner_command,
@@ -245,7 +245,7 @@ def test_yaml_contains_every_launch_parameter() -> None:
     loaded = load_inference_launch_config()
 
     assert loaded.deploy_policy_variant == "sonic_v1_1"
-    assert loaded.prompt.startswith("Approach the tabletop")
+    assert loaded.prompt.startswith("Move in front of the table")
     assert loaded.lavira_mission == "blue basket"
     assert loaded.lavira_global_target == "blue basket"
     assert loaded.lavira_vision_backend == "qwenvl"
@@ -278,7 +278,7 @@ def test_launcher_defaults_match_current_endpoint_inventory() -> None:
     assert config.policy_port == get_endpoint("policy_server").port
     assert config.camera_port == get_endpoint("camera_server").port
     assert config.keyboard_planner_port == get_endpoint("navigation_command").port
-    assert config.lavira_depth_port == get_endpoint("lingbot_depth").port
+    assert config.depth_anything_port == get_endpoint("depth_anything").port
     assert config.sensor_gateway_port == get_endpoint("sensor_gateway_metadata").port
     assert config.vla_timing_port == get_endpoint("vla_timing_ingress").port
     assert config.control_gateway_intent_port == get_endpoint("control_gateway_intent").port
@@ -414,25 +414,27 @@ def test_navdp_stack_commands_use_ros_topics_and_official_xnavdp_server() -> Non
     assert "mid360_reasan_open3d.py" not in " ".join((planner, server, livox, fastlio))
 
 
-def test_lingbot_uses_control_gateway_for_pose_planner_gpu_gating() -> None:
+def test_depth_anything_is_an_independent_rgb_only_shared_service() -> None:
     config = InferenceLaunchConfig(planner_input="lavira")
     planner_command = build_planner_input_command(
         config,
         Path("/workspace/sonic"),
     )
-    command = build_lingbot_command(
+    command = build_depth_anything_command(
         config,
         Path("/workspace/sonic"),
     )
 
-    assert "run_lingbot_depth_viewer.py" in command
-    assert "run_lingbot_depth_viewer.py" not in planner_command
-    assert "sonic_lingbot_ready" in planner_command
-    assert "--ready-file /tmp/sonic_lingbot_ready" in command
+    assert "run_depth_anything.py" in command
+    assert "run_depth_anything.py" not in planner_command
+    assert "sonic_depth_anything_ready" in planner_command
+    assert "--ready-file /tmp/sonic_depth_anything_ready" in command
     assert "$ready_file" not in command
     assert "--sensor-gateway-endpoint tcp://127.0.0.1:5560" in command
-    assert "run_lingbot_depth_viewer.py --camera-host" not in command
     assert "--control-gateway-endpoint tcp://127.0.0.1:5565" in command
+    assert "--encoder vitb" in command
+    assert "--input-size 644" in command
+    assert "--inference-hz 10.5" in command
 
 
 def test_lavira_uses_only_control_and_sensor_gateways() -> None:
@@ -463,7 +465,9 @@ def test_base_pose_agent_uses_gateway_arbitration_and_fixed_task() -> None:
     assert "--dual-head-camera-stream ego_view" in command
     assert "--dual-head-depth-stream camera/ego_view_depth" in command
     assert "--dual-chest-camera-stream chest_view" in command
-    assert "--dual-chest-depth-stream camera/chest_view_depth" in command
+    assert (
+        "--dual-chest-depth-stream derived/depth_anything/chest_view" in command
+    )
     assert "--sensor-gateway-endpoint tcp://127.0.0.1:5560" in command
     assert "--control-gateway-endpoint tcp://127.0.0.1:5565" in command
     assert "--control-gateway-intent-endpoint tcp://127.0.0.1:5561" in command
@@ -530,8 +534,8 @@ def test_runtime_sidecars_are_read_only_and_navdp_uses_gateway_by_default() -> N
     assert "--control-gateway-endpoint tcp://127.0.0.1:5565" in gateway
     assert "--navigation-runtime-status-endpoint tcp://127.0.0.1:5570" in gateway
     assert "/tmp/sonic_opencv_viewer.log" in gateway
-    assert "run_lingbot_depth_viewer.py" in gateway
-    assert "/tmp/sonic_lingbot.log" in gateway
+    assert "run_depth_anything.py" in gateway
+    assert "/tmp/sonic_depth_anything.log" in gateway
     assert "msg_MID360_launch.py" in gateway
     assert "run_fastlio_supervisor.py" in gateway
     assert "--control-gateway-endpoint tcp://127.0.0.1:5561" in gateway
@@ -551,6 +555,20 @@ def test_runtime_sidecars_are_read_only_and_navdp_uses_gateway_by_default() -> N
     assert "--navdp-velocity-endpoint tcp://127.0.0.1:5568" in executor
     assert "--output-endpoint 'tcp://*:5563'" in executor
     assert "--runtime-status-endpoint 'tcp://*:5570'" in executor
+
+
+def test_base_pose_starts_depth_anything_even_with_keyboard_planner() -> None:
+    command = build_sensor_gateway_command(
+        InferenceLaunchConfig(
+            planner_input="keyboard",
+            base_pose_enabled=True,
+            base_pose_task="align",
+        ),
+        Path("/workspace/sonic"),
+    )
+
+    assert "run_depth_anything.py" in command
+    assert "/tmp/sonic_depth_anything.log" in command
 
 
 def test_slam_debug_records_raw_inputs_and_fastlio_outputs_per_run() -> None:

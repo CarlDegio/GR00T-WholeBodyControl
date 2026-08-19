@@ -1325,7 +1325,16 @@ def run_dual_raw_servo_worker(
         raise ValueError("dual head reacquisition frame count must be positive")
 
     camera: Any | None = None
-    tracker: Any | None = None
+    tracker: Any = (
+        tracker_factory()
+        if tracker_factory is not None
+        else YoloePersistentTracker(
+            config.raw_yoloe_model_path,
+            confidence=config.raw_yoloe_confidence,
+            imgsz=config.raw_yoloe_imgsz,
+            device=config.raw_yoloe_device,
+        )
+    )
     reference_updater: Any | None = None
     head_monitor_tracker: Any | None = None
     try:
@@ -1441,17 +1450,6 @@ def run_dual_raw_servo_worker(
                     )
                     for stream_name in stream_names
                 }
-                if tracker is None:
-                    tracker = (
-                        tracker_factory()
-                        if tracker_factory is not None
-                        else YoloePersistentTracker(
-                            config.raw_yoloe_model_path,
-                            confidence=config.raw_yoloe_confidence,
-                            imgsz=config.raw_yoloe_imgsz,
-                            device=config.raw_yoloe_device,
-                        )
-                    )
                 if reference_updater is None:
                     if latest_reference_updater_factory is not None:
                         reference_updater = latest_reference_updater_factory()

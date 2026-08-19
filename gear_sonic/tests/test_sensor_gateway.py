@@ -16,7 +16,8 @@ from gear_sonic.runtime.client import SensorGatewayClient
 from gear_sonic.runtime.sensor_gateway import (
     CameraZmqIngress,
     CppStateZmqIngress,
-    LingBotDepthZmqIngress,
+    DepthAnythingZmqIngress,
+    DEPTH_ANYTHING_STATUS_TYPE,
     Ros2SensorIngress,
     SensorGatewayCore,
     SensorGatewayRpc,
@@ -417,15 +418,15 @@ def test_camera_and_cpp_ingress_are_read_only_copies_of_current_wires(monkeypatc
         context.term()
 
 
-def test_lingbot_depth_ingress_publishes_derived_depth_only() -> None:
+def test_depth_anything_ingress_publishes_metric_chest_depth_only() -> None:
     context = zmq.Context()
     core = SensorGatewayCore(slot_count=2, history_size=4)
-    server = FakeCameraServer(context, "inproc://gateway-lingbot")
-    ingress = LingBotDepthZmqIngress(
+    server = FakeCameraServer(context, "inproc://gateway-depth-anything")
+    ingress = DepthAnythingZmqIngress(
         context,
-        "inproc://gateway-lingbot",
+        "inproc://gateway-depth-anything",
         core,
-        expected_hz=2.0,
+        expected_hz=10.0,
     )
     depth = np.full((2, 3), 1250, dtype=np.uint16)
     schema = ImageMessageSchema(
@@ -444,6 +445,10 @@ def test_lingbot_depth_ingress_publishes_derived_depth_only() -> None:
                 "height": 2,
                 "depth_scale_m": 0.001,
                 "depth_aligned_to": "chest_view",
+                "depth_source": "depth-anything-v2-metric-hypersim-vitb",
+                "metric_model_output": True,
+                "uses_raw_depth": False,
+                "inference_owner": "base_pose",
             }
         },
     )
@@ -454,18 +459,52 @@ def test_lingbot_depth_ingress_publishes_derived_depth_only() -> None:
         ) == 1
         snapshot = core.select(
             SnapshotRequest(
-                streams=("derived/lingbot_depth",),
+                streams=("derived/depth_anything/chest_view",),
                 max_age_ms=1000.0,
                 max_skew_ms=5.0,
             )
         )
         assert snapshot.complete
-        frame = snapshot.frames["derived/lingbot_depth"]
+        frame = snapshot.frames["derived/depth_anything/chest_view"]
         np.testing.assert_array_equal(read_shared_memory_frame(frame), depth)
         assert frame.source_timestamp_ns == 123_000_000_000
         assert frame.source_clock == "camera_unix"
-        assert frame.attributes["depth_source"] == "lingbot-depth"
+        assert (
+            frame.attributes["depth_source"]
+            == "depth-anything-v2-metric-hypersim-vitb"
+        )
         assert frame.attributes["camera_info"]["depth_aligned_to"] == "chest_view"
+    finally:
+        ingress.close()
+        server.close()
+        core.close()
+        context.term()
+
+
+def test_depth_anything_idle_heartbeat_is_reported_as_intentional_idle() -> None:
+    context = zmq.Context()
+    core = SensorGatewayCore(slot_count=2, history_size=4)
+    server = FakeCameraServer(context, "inproc://gateway-depth-anything-status")
+    ingress = DepthAnythingZmqIngress(
+        context,
+        "inproc://gateway-depth-anything-status",
+        core,
+        expected_hz=10.5,
+    )
+    status = {
+        "type": DEPTH_ANYTHING_STATUS_TYPE,
+        "version": 1,
+        "active": False,
+        "owner": "idle",
+        "generation": -1,
+    }
+    try:
+        assert _publish_until_ingested(
+            lambda: server.publish(status),
+            ingress.poll_once,
+        ) == 1
+        health = core.health_payload()
+        assert health["streams"]["source/depth_anything"]["state"] == "idle"
     finally:
         ingress.close()
         server.close()

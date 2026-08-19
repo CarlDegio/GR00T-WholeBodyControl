@@ -12,7 +12,7 @@ endpoints:
   control_gateway_intent: {host: 127.0.0.1, port: 5561}
   control_gateway_status: {host: 127.0.0.1, port: 5562}
   planner_relay: {host: 127.0.0.1, port: 5563}
-  lingbot_depth: {host: 127.0.0.1, port: 5564}
+  depth_anything: {host: 127.0.0.1, port: 5564}
   control_gateway_dispatch: {host: 127.0.0.1, port: 5565}
   sensor_gateway_visualization_ingress: {host: 127.0.0.1, port: 5566}
   vla_timing_ingress: {host: 127.0.0.1, port: 5567}
@@ -96,14 +96,16 @@ components:
     linear_control_weight: 5.0
     angular_control_weight: 0.02
     curvature_speed_gain: 0.15
-  lingbot_depth:
-    model: robbyant/lingbot-depth-pretrain-vitl-14-v0.5
+  depth_anything:
+    root: /home/user/Project/Depth-Anything-V2/metric_depth
+    checkpoint: /home/user/Project/Depth-Anything-V2/metric_depth/checkpoints/depth_anything_v2_metric_hypersim_vitb.pth
+    encoder: vitb
     device: cuda
-    inference_hz: 2.0
-    display_hz: 20.0
-    max_depth_m: 10.0
-    resolution_level: 6
-    use_fp16: true
+    inference_hz: 10.5
+    input_size: 644
+    model_max_depth_m: 20.0
+    publish_max_depth_m: 20.0
+    use_amp: true
     ready_timeout_s: 180.0
   data_exporter:
     frequency_hz: 50
@@ -180,13 +182,12 @@ launch_inference:
   lavira_vision_backend: qwenvl
   lavira_qwenvl_model: qwen3-vl-32b-instruct
   lavira_qwenvl_base_url: https://dashscope-intl.aliyuncs.com/compatible-mode/v1
-  lavira_warmup: true
   lavira_debug: false
   lavira_host: '*'
   lavira_control_input: gateway
   lavira_camera_timeout_ms: 15000
-  lavira_depth_port: 5564
-  lingbot_ready_timeout: 180.0
+  depth_anything_port: 5564
+  depth_anything_ready_timeout: 180.0
   lavira_codex_timeout_seconds: 180.0
   lavira_min_confidence: 0.6
   lavira_output_root: outputs/object_nav
@@ -212,7 +213,7 @@ launch_inference:
   base_pose_dual_head_camera_stream: ego_view
   base_pose_dual_head_depth_stream: camera/ego_view_depth
   base_pose_dual_chest_camera_stream: chest_view
-  base_pose_dual_chest_depth_stream: camera/chest_view_depth
+  base_pose_dual_chest_depth_stream: derived/depth_anything/chest_view
   base_pose_dual_chest_camera_pitch_deg: -3.0
   base_pose_dual_chest_camera_roll_deg: 0.0
   base_pose_dual_chest_camera_yaw_deg: 0.0

@@ -303,10 +303,10 @@ class ComposedRGBDCamera:
 
 
 class SensorGatewayRGBDCamera:
-    """Read raw chest RGB and LingBot-completed depth from shared memory."""
+    """Read chest RGB and Depth Anything metric depth from shared memory."""
 
     RGB_STREAM = "camera/chest_view"
-    DEPTH_STREAM = "derived/lingbot_depth"
+    DEPTH_STREAM = "derived/depth_anything/chest_view"
 
     def __init__(
         self,
@@ -339,11 +339,13 @@ class SensorGatewayRGBDCamera:
             )
         if depth_raw.ndim != 2 or depth_raw.dtype != np.uint16:
             raise ObjectNavCameraError(
-                f"Gateway LingBot depth must be HxW uint16, got "
+                f"Gateway Depth Anything depth must be HxW uint16, got "
                 f"{depth_raw.shape} {depth_raw.dtype}"
             )
         if rgb.shape[:2] != depth_raw.shape:
-            raise ObjectNavCameraError("Gateway RGB and LingBot depth shapes do not match")
+            raise ObjectNavCameraError(
+                "Gateway RGB and Depth Anything depth shapes do not match"
+            )
         info = dict(depth_frame.attributes.get("camera_info", {}))
         if not info:
             info = dict(rgb_frame.attributes.get("camera_info", {}))
@@ -357,7 +359,21 @@ class SensorGatewayRGBDCamera:
         except (KeyError, TypeError, ValueError) as exc:
             raise ObjectNavCameraError("Gateway RGB-D calibration is incomplete") from exc
         if info.get("depth_aligned_to") != "chest_view":
-            raise ObjectNavCameraError("Gateway LingBot depth is not aligned to chest_view")
+            raise ObjectNavCameraError(
+                "Gateway Depth Anything depth is not aligned to chest_view"
+            )
+        depth_source = str(
+            depth_frame.attributes.get("depth_source")
+            or info.get("depth_source", "")
+        )
+        if not depth_source.startswith("depth-anything-v2-metric-"):
+            raise ObjectNavCameraError(
+                f"Gateway depth source is not metric Depth Anything: {depth_source!r}"
+            )
+        if info.get("inference_owner") != "lavira":
+            raise ObjectNavCameraError(
+                "Gateway Depth Anything frame is not owned by LaViRA"
+            )
         if (width, height) != (rgb.shape[1], rgb.shape[0]):
             raise ObjectNavCameraError("Gateway camera_info dimensions do not match RGB-D")
         timestamp_ns = depth_frame.source_timestamp_ns or rgb_frame.source_timestamp_ns
@@ -988,7 +1004,12 @@ class ObjectNavRunner:
         else:
             raise ValueError(f"unsupported vision_backend: {config.vision_backend}")
 
-    def run_once(self, *, iteration: int = 1) -> ObjectNavResult:
+    def run_once(
+        self,
+        *,
+        iteration: int = 1,
+        rgbd_capture_complete: Callable[[], None] | None = None,
+    ) -> ObjectNavResult:
         total_started = time.monotonic()
         timing = {
             "camera_rgbd": 0.0,
@@ -1013,9 +1034,14 @@ class ObjectNavRunner:
         outcome = "FAILED"
         try:
             camera_started = time.monotonic()
-            snapshots = [
-                self.camera.capture_aligned_rgbd() for _ in range(FRAME_COUNT)
-            ]
+            snapshots = []
+            try:
+                snapshots = [
+                    self.camera.capture_aligned_rgbd() for _ in range(FRAME_COUNT)
+                ]
+            finally:
+                if rgbd_capture_complete is not None:
+                    rgbd_capture_complete()
             timing["camera_rgbd"] = time.monotonic() - camera_started
             image_io_started = time.monotonic()
             _save_raw_depth_outputs(snapshots, output_dir)

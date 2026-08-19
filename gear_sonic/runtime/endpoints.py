@@ -117,12 +117,12 @@ def _build_endpoints() -> Mapping[str, EndpointSpec]:
             purpose="Safety-filtered SONIC planner binary messages",
         ),
         EndpointSpec(
-            "lingbot_depth",
+            "depth_anything",
             5564,
             Transport.ZMQ,
-            "LingBot Depth",
+            "Depth Anything Metric",
             ("SensorGateway",),
-            purpose="Completed chest depth ingress copied into shared memory",
+            purpose="RGB-estimated metric chest depth copied into shared memory",
         ),
         EndpointSpec(
             "xnavdp_http",
@@ -142,7 +142,7 @@ def _build_endpoints() -> Mapping[str, EndpointSpec]:
                 "NavDP",
                 "planner_velocity_executor",
                 "LaViRA",
-                "LingBot Depth",
+                "Depth Anything Metric",
                 "data exporter",
             ),
             purpose="Shared-memory snapshots, health, and readiness queries",
@@ -168,7 +168,7 @@ def _build_endpoints() -> Mapping[str, EndpointSpec]:
             5565,
             Transport.ZMQ,
             "SonicControlGateway",
-            ("VLA", "LaViRA", "LingBot Depth", "data exporter"),
+            ("VLA", "LaViRA", "Depth Anything Metric", "data exporter"),
             purpose="Validated structured control commands for consumers",
         ),
         EndpointSpec(
@@ -176,7 +176,7 @@ def _build_endpoints() -> Mapping[str, EndpointSpec]:
             5566,
             Transport.ZMQ,
             "SonicSensorGateway",
-            ("navdp_planner", "LingBot Depth"),
+            ("navdp_planner",),
             purpose="Best-effort rendered panels for the unified OpenCV viewer",
         ),
         EndpointSpec(

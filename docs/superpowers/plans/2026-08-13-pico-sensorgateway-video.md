@@ -699,7 +699,7 @@ python gear_sonic/scripts/run_mock_camera_server.py --port 5555
 python gear_sonic/scripts/run_sensor_gateway.py \
   --camera-host 127.0.0.1 --camera-port 5555 \
   --rpc-bind-host 127.0.0.1 \
-  --no-enable-lingbot-depth --no-enable-cpp-state --no-enable-ros \
+  --no-enable-depth-anything --no-enable-cpp-state --no-enable-ros \
   --no-enable-visualization --no-enable-vla-timing
 
 # Terminal 3: PICO bridge (portable CPU encoder for first workstation check)
