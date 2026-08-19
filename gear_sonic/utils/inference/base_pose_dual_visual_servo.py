@@ -72,7 +72,7 @@ def _reference_bbox(
 
 @dataclass(frozen=True)
 class DualCameraReference:
-    """One coherent visual prompt whose image and boxes share a camera frame."""
+    """One coherent target prompt with optional desk boxes from the same frame."""
 
     stream_name: str
     rgb: np.ndarray
@@ -97,8 +97,6 @@ class DualCameraReference:
             _reference_bbox(value, field="table_bbox")
             for value in self.table_bboxes
         )
-        if not table_bboxes:
-            raise ValueError("reference requires at least one table bbox")
         timestamp = float(self.camera_timestamp)
         if not math.isfinite(timestamp):
             raise ValueError("reference camera_timestamp must be finite")
@@ -408,6 +406,7 @@ def _ground_camera_reference(
         stream_dir,
         client_factory=client_factory,
         calibration=calibration,
+        require_table=stream_name != str(config.dual_chest_camera_stream),
     )
     return DualCameraReference(
         stream_name=stream_name,
@@ -502,6 +501,7 @@ _PROCESS_CONFIG_FIELDS = (
     "qwenvl_base_url",
     "qwenvl_thinking_budget",
     "qwenvl_timeout_seconds",
+    "dual_chest_camera_stream",
 )
 
 
@@ -698,6 +698,7 @@ def ground_qwen_fallback_reference(
         workdir,
         client_factory=client_factory,
         calibration=calibration,
+        require_table=stream_name != str(config.dual_chest_camera_stream),
     )
     reference = DualCameraReference(
         stream_name=stream_name,
@@ -1198,10 +1199,12 @@ class HeadCameraTextMonitor:
 
 
 def _attempt_prompt_mode(attempt: DualCameraAttempt) -> str:
-    if attempt.stage == "origin_text":
-        return "target_text_surface_visual"
-    if attempt.stage == "alternate_text":
+    if _attempt_uses_all_text(attempt):
         return "target_text_surface_text"
+    if _attempt_uses_target_text(attempt):
+        return "target_text_surface_visual"
+    if _attempt_uses_surface_text(attempt):
+        return "target_visual_surface_text"
     return "visual"
 
 
@@ -1210,7 +1213,11 @@ def _attempt_uses_target_text(attempt: DualCameraAttempt) -> bool:
 
 
 def _attempt_uses_surface_text(attempt: DualCameraAttempt) -> bool:
-    return attempt.stage == "alternate_text"
+    return attempt.stage == "alternate_text" or not attempt.reference.table_bboxes
+
+
+def _attempt_uses_all_text(attempt: DualCameraAttempt) -> bool:
+    return _attempt_uses_target_text(attempt) and _attempt_uses_surface_text(attempt)
 
 
 def _capture_camera_stream(
@@ -1545,7 +1552,7 @@ def run_dual_raw_servo_worker(
                                 attempt,
                                 reference=qwen_reference,
                             )
-                        if _attempt_uses_surface_text(attempt):
+                        if _attempt_uses_all_text(attempt):
                             tracker.start_all_text(
                                 target_prompt=attempt.reference.target_prompt,
                                 surface_prompt=DUAL_TEXT_SURFACE_PROMPT,
@@ -1557,6 +1564,13 @@ def run_dual_raw_servo_worker(
                                 target_bbox=attempt.reference.target_bbox,
                                 surface_prompt=DUAL_TEXT_SURFACE_PROMPT,
                                 surface_bboxes=attempt.reference.table_bboxes,
+                            )
+                        elif not attempt.reference.table_bboxes:
+                            tracker.start_target(
+                                attempt.reference.rgb,
+                                target_prompt=attempt.reference.target_prompt,
+                                target_bbox=attempt.reference.target_bbox,
+                                surface_prompt=DUAL_TEXT_SURFACE_PROMPT,
                             )
                         else:
                             tracker.start(
@@ -1733,9 +1747,13 @@ def run_dual_raw_servo_worker(
                             calibration = calibrations[attempt.live_stream]
                             calibration.validate_snapshot(snapshot)
                             instances = list(tracker.track(snapshot.rgb))
+                            # Chest starts target-only and approaches without desk
+                            # geometry. Once initialized, the controller callback
+                            # re-enables the desk only for phases such as yaw align.
                             require_table = (
-                                not initialized
-                                or table_required is None
+                                attempt.live_stream != stream_names[1]
+                                if not initialized
+                                else table_required is None
                                 or bool(table_required())
                             )
                             if initialized:

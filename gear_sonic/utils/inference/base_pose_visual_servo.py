@@ -709,6 +709,95 @@ class YoloePersistentTracker:
             "prompt_mode": "target_text_surface_text",
         }
 
+    def start_target(
+        self,
+        reference_rgb: np.ndarray,
+        *,
+        target_prompt: str,
+        target_bbox: tuple[float, float, float, float],
+        surface_prompt: str,
+    ) -> dict[str, Any]:
+        """Install a visual target plus text surface without a surface box."""
+        import torch
+        from ultralytics.models.yolo.yoloe import YOLOEVPSegPredictor
+
+        target = str(target_prompt).strip()
+        surface = str(surface_prompt).strip()
+        if not target or not surface:
+            raise ValueError("YOLOE target and surface prompts must be non-empty")
+        if reference_rgb.ndim != 3 or reference_rgb.shape[2] != 3:
+            raise ValueError("YOLOE reference image must be an HxWx3 RGB array")
+        height, width = reference_rgb.shape[:2]
+        prompt_boxes = np.asarray(
+            [normalized_bbox_to_pixels(target_bbox, width, height)],
+            dtype=np.float32,
+        )
+        prompt_classes = np.asarray([0], dtype=np.int32)
+        surface_embedding = self.model.get_text_pe([surface])
+        if surface_embedding.ndim != 3 or surface_embedding.shape[1] != 1:
+            raise RuntimeError(
+                "YOLOE expected one surface text embedding, got "
+                f"{tuple(surface_embedding.shape)}"
+            )
+        bgr = cv2.cvtColor(reference_rgb, cv2.COLOR_RGB2BGR)
+        self.model.predictor = None
+        try:
+            results = self.model.predict(
+                source=bgr,
+                refer_image=bgr,
+                visual_prompts={"bboxes": prompt_boxes, "cls": prompt_classes},
+                predictor=YOLOEVPSegPredictor,
+                device=self.device,
+                imgsz=self.imgsz,
+                conf=self.confidence,
+                half=True,
+                quantize=16,
+                verbose=False,
+                save=False,
+            )
+        finally:
+            self.model.predictor = None
+        if len(results) != 1:
+            raise RuntimeError(
+                "YOLOE target-only initialization returned "
+                f"{len(results)} results"
+            )
+        target_embedding = getattr(self.model.model, "pe", None)
+        if (
+            target_embedding is None
+            or target_embedding.ndim != 3
+            or target_embedding.shape[1] != 1
+        ):
+            shape = (
+                None
+                if target_embedding is None
+                else tuple(target_embedding.shape)
+            )
+            raise RuntimeError(
+                f"YOLOE expected one target visual embedding, got {shape}"
+            )
+        surface_embedding = surface_embedding.detach().to(
+            device=target_embedding.device,
+            dtype=target_embedding.dtype,
+        )
+        if tuple(surface_embedding.shape) != tuple(target_embedding.shape):
+            raise RuntimeError(
+                "YOLOE target and surface embedding shapes differ: "
+                f"{tuple(target_embedding.shape)} != "
+                f"{tuple(surface_embedding.shape)}"
+            )
+        embeddings = torch.cat((target_embedding, surface_embedding), dim=1)
+        self.class_names = (target, surface)
+        self._initial_surface_embedding = surface_embedding.detach().clone()
+        self.model.set_classes(list(self.class_names), embeddings=embeddings)
+        self.model.predictor = None
+        return {
+            "class_names": list(self.class_names),
+            "prompt_mode": "target_visual_surface_text",
+            "reference_boxes_xyxy": prompt_boxes.tolist(),
+            "reference_class_ids": prompt_classes.tolist(),
+        }
+
     def start_text(
         self,
         reference_rgb: np.ndarray,
@@ -2608,6 +2697,7 @@ def ground_raw_servo_references(
     *,
     client_factory: Callable[[], Any] | None = None,
     calibration: RawServoCalibration | None = None,
+    require_table: bool = True,
 ) -> tuple[
     RawServoTargetSpec,
     tuple[tuple[float, float, float, float], ...],
@@ -2618,9 +2708,10 @@ def ground_raw_servo_references(
         config.task,
         calibration if calibration is not None else calibration_from_config(config),
     )
-    table_prompt = build_raw_servo_table_prompt()
     _write_text(workdir / "target_prompt.txt", target_prompt)
-    _write_text(workdir / "table_prompt.txt", table_prompt)
+    table_prompt = build_raw_servo_table_prompt() if require_table else None
+    if table_prompt is not None:
+        _write_text(workdir / "table_prompt.txt", table_prompt)
 
     def make_client() -> Any:
         if client_factory is not None:
@@ -2639,6 +2730,7 @@ def ground_raw_servo_references(
         return validate_raw_servo_target(raw_target)
 
     def run_table() -> tuple[tuple[float, float, float, float], ...]:
+        assert table_prompt is not None
         raw_table = make_client().run(
             prompt=table_prompt,
             image_paths=[image_path],
@@ -2648,6 +2740,9 @@ def ground_raw_servo_references(
         )
         _write_json(workdir / "table_result.json", raw_table)
         return validate_raw_servo_table(raw_table)
+
+    if not require_table:
+        return run_target(), ()
 
     with ThreadPoolExecutor(
         max_workers=2, thread_name_prefix="raw-servo-grounding"
