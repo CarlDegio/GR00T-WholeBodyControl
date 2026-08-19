@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import shlex
+import subprocess
 import sys
 import types
 from pathlib import Path
@@ -16,6 +17,7 @@ from gear_sonic.scripts.launch_inference import (
     InferenceLaunchConfig,
     _clear_stale_fastlio_processes,
     _dotenv_has_nonempty_value,
+    _inference_pane_count,
     _parse_pane_ids,
     build_base_pose_agent_command,
     build_fastlio_command,
@@ -31,6 +33,8 @@ from gear_sonic.scripts.launch_inference import (
     build_planner_input_command,
     build_planner_velocity_executor_command,
     build_navdp_planner_command,
+    build_navdp_planner_pane_command,
+    build_navdp_server_background_command,
     build_navdp_server_command,
     build_sensor_gateway_command,
     build_vla_inference_command,
@@ -203,20 +207,24 @@ def test_dotenv_key_check_does_not_require_loading_secret(tmp_path: Path) -> Non
 
 
 def test_parse_pane_ids_returns_stable_ids_in_visual_index_order() -> None:
-    output = "2 %8\n0 %3\n1 %5\n5 %13\n4 %11\n3 %9\n"
+    output = "2 %8\n0 %3\n1 %5\n4 %11\n3 %9\n"
 
-    assert _parse_pane_ids(output) == ["%3", "%5", "%8", "%9", "%11", "%13"]
+    assert _parse_pane_ids(output) == ["%3", "%5", "%8", "%9", "%11"]
 
 
 def test_parse_pane_ids_rejects_incomplete_layout() -> None:
-    with pytest.raises(RuntimeError, match="expected 6 tmux panes, found 5"):
-        _parse_pane_ids("0 %1\n1 %2\n2 %3\n3 %4\n4 %5\n")
+    with pytest.raises(RuntimeError, match="expected 5 tmux panes, found 4"):
+        _parse_pane_ids("0 %1\n1 %2\n2 %3\n3 %4\n")
 
 
 def test_parse_pane_ids_supports_gateways_in_the_inference_window() -> None:
     output = "\n".join(f"{index} %{index + 1}" for index in range(8))
 
     assert _parse_pane_ids(output, 8) == [f"%{index + 1}" for index in range(8)]
+
+
+def test_configured_inference_layout_uses_nine_panes() -> None:
+    assert _inference_pane_count(load_inference_launch_config()) == 9
 
 
 def test_vla_action_horizon_defaults_to_fifty() -> None:
@@ -354,7 +362,11 @@ def test_launcher_defaults_match_unified_runtime_profile() -> None:
 def test_navdp_stack_commands_use_ros_topics_and_official_xnavdp_server() -> None:
     config = InferenceLaunchConfig()
     planner = build_navdp_planner_command(config, Path("/workspace/sonic"))
+    planner_pane = build_navdp_planner_pane_command(
+        config, Path("/workspace/sonic")
+    )
     server = build_navdp_server_command(config)
+    background_server = build_navdp_server_background_command(config)
     livox = build_livox_command(config)
     fastlio = build_fastlio_command(config)
     fastlio_supervisor = build_fastlio_supervisor_command(config)
@@ -378,6 +390,20 @@ def test_navdp_stack_commands_use_ros_topics_and_official_xnavdp_server() -> Non
     assert "--embodiment humanoid" in server
     assert "--real" in server
     assert "--no-visualization" in server
+    assert "PYTHONUNBUFFERED=1" in server
+    assert "NAVDP_SERVER_PID=$!" in background_server
+    assert "[NavDP server:stderr]" in background_server
+    assert "logs are routed to this pane" in background_server
+    assert "trap _stop_navdp_server EXIT HUP" in background_server
+    assert "navdp_planner.py" in planner_pane
+    assert "_stop_navdp_server" in planner_pane
+    assert 'exit "${NAVDP_PLANNER_STATUS}"' in planner_pane
+    subprocess.run(
+        ["bash", "-n"],
+        input=f"{background_server}\n{planner_pane}\n",
+        text=True,
+        check=True,
+    )
     assert f"--checkpoint {config.navdp_checkpoint}" in server
     assert "msg_MID360_launch.py" in livox
     assert "mapping.launch.py" in fastlio

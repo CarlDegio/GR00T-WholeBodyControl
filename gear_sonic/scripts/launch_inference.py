@@ -1,8 +1,9 @@
 """All-in-one tmux launcher for SONIC VLA inference.
 
 The inference window contains the core deploy, operator, VLA, navigation, and
-gateway panes, plus an optional Base-Pose agent pane. Simulation and data
-collection use optional additional windows.
+gateway panes, plus an optional Base-Pose agent pane. The NavDP policy server
+runs in the background of the NavDP planner pane and shares its log output.
+Simulation and data collection use optional additional windows.
 
 Prerequisites:
     - tmux installed (sudo apt install tmux)
@@ -414,6 +415,7 @@ def parse_inference_launch_config(
 
 SESSION_NAME = "sonic_inference"
 LINGBOT_READY_FILE = Path("/tmp/sonic_lingbot_ready")
+INFERENCE_CORE_PANE_COUNT = 5
 
 
 def _runtime_profile(config: InferenceLaunchConfig):
@@ -862,10 +864,49 @@ def build_navdp_server_command(config: InferenceLaunchConfig) -> str:
     navdp_port = _runtime_profile(config).endpoint("xnavdp_http").port
     return (
         f"cd {shlex.quote(config.navdp_root)} && "
-        "conda run --no-capture-output -n navdp python -m eval.src.policy_server "
+        "PYTHONUNBUFFERED=1 conda run --no-capture-output -n navdp "
+        "python -m eval.src.policy_server "
         f"--port {navdp_port} --embodiment humanoid "
         f"--checkpoint {shlex.quote(config.navdp_checkpoint)} "
         "--device cuda:0 --real --no-visualization"
+    )
+
+
+def build_navdp_server_background_command(config: InferenceLaunchConfig) -> str:
+    """Start NavDP server as a managed background job in the planner pane."""
+
+    server = build_navdp_server_command(config)
+    return (
+        "_stop_navdp_server() { "
+        "if [ -n \"${NAVDP_SERVER_PID:-}\" ]; then "
+        "kill -- \"-${NAVDP_SERVER_PID}\" 2>/dev/null || "
+        "kill \"${NAVDP_SERVER_PID}\" 2>/dev/null || true; "
+        "wait \"${NAVDP_SERVER_PID}\" 2>/dev/null || true; "
+        "unset NAVDP_SERVER_PID; "
+        "fi; "
+        "}; "
+        "trap _stop_navdp_server EXIT HUP; "
+        f"{server} "
+        "> >(sed -u 's/^/[NavDP server] /') "
+        "2> >(sed -u 's/^/[NavDP server:stderr] /' >&2) & "
+        "NAVDP_SERVER_PID=$!; "
+        "echo \"[NavDP server] started in background as PID "
+        "${NAVDP_SERVER_PID}; logs are routed to this pane\""
+    )
+
+
+def build_navdp_planner_pane_command(
+    config: InferenceLaunchConfig, repo_root: Path
+) -> str:
+    """Run the planner in front, then stop its pane-local NavDP server."""
+
+    planner = build_navdp_planner_command(config, repo_root)
+    return (
+        f"{planner}; "
+        "NAVDP_PLANNER_STATUS=$?; "
+        "_stop_navdp_server; "
+        "trap - EXIT HUP; "
+        "exit \"${NAVDP_PLANNER_STATUS}\""
     )
 
 
@@ -1263,7 +1304,9 @@ def _clear_stale_fastlio_processes() -> None:
         subprocess.run(["pkill", "-KILL", "-f", pattern], capture_output=True)
 
 
-def _parse_pane_ids(output: str, expected_count: int = 6) -> list[str]:
+def _parse_pane_ids(
+    output: str, expected_count: int = INFERENCE_CORE_PANE_COUNT
+) -> list[str]:
     indexed = {}
     for line in output.splitlines():
         fields = line.split()
@@ -1276,9 +1319,22 @@ def _parse_pane_ids(output: str, expected_count: int = 6) -> list[str]:
     return [indexed[index] for index in range(expected_count)]
 
 
-def _create_tmux_session(pane_count: int = 6) -> list[str]:
-    if pane_count < 6:
-        raise ValueError("inference pane_count cannot be smaller than 6")
+def _inference_pane_count(config: InferenceLaunchConfig) -> int:
+    base_pose_runtime_enabled = config.keyboard_planner and config.base_pose_enabled
+    runtime_pane_count = (
+        2 + int(config.keyboard_planner) + int(base_pose_runtime_enabled)
+    )
+    return INFERENCE_CORE_PANE_COUNT + runtime_pane_count
+
+
+def _create_tmux_session(
+    pane_count: int = INFERENCE_CORE_PANE_COUNT,
+) -> list[str]:
+    if pane_count < INFERENCE_CORE_PANE_COUNT:
+        raise ValueError(
+            "inference pane_count cannot be smaller than "
+            f"{INFERENCE_CORE_PANE_COUNT}"
+        )
     bash = shutil.which("bash") or "/bin/bash"
     subprocess.run(
         [
@@ -1404,8 +1460,7 @@ def main(config: InferenceLaunchConfig):
     print("=" * 60)
 
     base_pose_runtime_enabled = config.keyboard_planner and config.base_pose_enabled
-    runtime_pane_count = 2 + int(config.keyboard_planner) + int(base_pose_runtime_enabled)
-    pane_ids = _create_tmux_session(6 + runtime_pane_count)
+    pane_ids = _create_tmux_session(_inference_pane_count(config))
     print(f"Created tmux session: {SESSION_NAME}")
 
     # --- Window 1 (sim only): MuJoCo Simulator ---
@@ -1441,11 +1496,11 @@ def main(config: InferenceLaunchConfig):
         print("WARNING: C++ deploy pane may have failed to start.")
 
     # Start the two mandatory Gateway boundaries before their clients.
-    runtime_panes = pane_ids[6:]
+    runtime_panes = pane_ids[INFERENCE_CORE_PANE_COUNT:]
     runtime_index = 0
     print(
         "Starting SensorGateway with background ROS/OpenCV/LingBot services "
-        f"(pane {6 + runtime_index})..."
+        f"(pane {INFERENCE_CORE_PANE_COUNT + runtime_index})..."
     )
     _send_to_pane(
         runtime_panes[runtime_index],
@@ -1455,7 +1510,10 @@ def main(config: InferenceLaunchConfig):
     if config.slam_debug and config.keyboard_planner and not config.sim:
         print("SLAM/IMU debug recording: outputs/slam_debug/<launch timestamp>/")
     runtime_index += 1
-    print(f"Starting ControlGateway router (pane {6 + runtime_index})...")
+    print(
+        "Starting ControlGateway router "
+        f"(pane {INFERENCE_CORE_PANE_COUNT + runtime_index})..."
+    )
     _send_to_pane(
         runtime_panes[runtime_index],
         build_control_gateway_command(config, repo_root),
@@ -1463,7 +1521,10 @@ def main(config: InferenceLaunchConfig):
     )
     if config.keyboard_planner:
         runtime_index += 1
-        print(f"Starting shared Planner velocity executor (pane {6 + runtime_index})...")
+        print(
+            "Starting shared Planner velocity executor "
+            f"(pane {INFERENCE_CORE_PANE_COUNT + runtime_index})..."
+        )
         _send_to_pane(
             runtime_panes[runtime_index],
             build_planner_velocity_executor_command(config, repo_root),
@@ -1471,7 +1532,10 @@ def main(config: InferenceLaunchConfig):
         )
     if base_pose_runtime_enabled:
         runtime_index += 1
-        print(f"Starting Base-Pose agent (pane {6 + runtime_index})...")
+        print(
+            "Starting Base-Pose agent "
+            f"(pane {INFERENCE_CORE_PANE_COUNT + runtime_index})..."
+        )
         _send_to_pane(
             runtime_panes[runtime_index],
             build_base_pose_agent_command(config, repo_root),
@@ -1492,19 +1556,26 @@ def main(config: InferenceLaunchConfig):
         wait=2.0,
     )
 
-    # --- Panes 3-5: semantic target, NavDP planner, and NavDP server ---
+    # --- Panes 3-4: semantic target and the combined NavDP planner/server ---
     if config.keyboard_planner:
         planner_input_cmd = build_planner_input_command(config, repo_root)
+        navdp_pane = 4
         commands = [
             (3, "LaViRA semantic planner", planner_input_cmd),
-            (4, "NavDP planner", build_navdp_planner_command(config, repo_root)),
-            (5, "NavDP server", build_navdp_server_command(config)),
+            (
+                navdp_pane,
+                "NavDP planner",
+                build_navdp_planner_pane_command(config, repo_root),
+            ),
         ]
         # Strictly serialized startup: the launcher does not dispatch a later
         # stage until real data has passed the previous readiness gate.
-        pane, label, command = commands[2]
-        print(f"Starting {label} (pane {pane})...")
-        _send_to_pane(pane_ids[pane], command, wait=1.0)
+        print(f"Starting NavDP server in background (pane {navdp_pane})...")
+        _send_to_pane(
+            pane_ids[navdp_pane],
+            build_navdp_server_background_command(config),
+            wait=1.0,
+        )
         print("Waiting for real MID-360 LiDAR and IMU samples...")
         if not run_readiness_gate(config, repo_root, "lidar"):
             raise RuntimeError(
@@ -1517,7 +1588,7 @@ def main(config: InferenceLaunchConfig):
                 "navigation prerequisites did not become ready; LaViRA and NavDP planner were not started"
             )
 
-        for pane, label, command in (commands[0], commands[1]):
+        for pane, label, command in commands:
             print(f"Starting {label} (pane {pane})...")
             _send_to_pane(pane_ids[pane], command, wait=1.0)
 
@@ -1551,9 +1622,8 @@ def main(config: InferenceLaunchConfig):
     print("    Pane 1: SONIC Operator CLI")
     print("    Pane 2: VLA Inference")
     print("    Pane 3: LaViRA Semantic + LISTEN_WASD")
-    print("    Pane 4: NavDP Velocity Producer")
-    print("    Pane 5: NavDP Server")
-    runtime_label_index = 6
+    print("    Pane 4: NavDP Velocity Producer + background Server")
+    runtime_label_index = INFERENCE_CORE_PANE_COUNT
     print(f"    Pane {runtime_label_index}: Read-only SensorGateway")
     runtime_label_index += 1
     print(f"    Pane {runtime_label_index}: ControlGateway Router")
