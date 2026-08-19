@@ -222,6 +222,7 @@ class RawServoObservation:
     image_width: int = 640
     image_height: int = 480
     table_geometry_error: str | None = None
+    desk_mask: np.ndarray | None = None
 
 
 @dataclass(frozen=True)
@@ -1227,18 +1228,77 @@ def _ransac_line(
     )
 
 
+def _largest_filled_component(mask: np.ndarray) -> np.ndarray:
+    binary = (np.asarray(mask) > 0).astype(np.uint8)
+    if binary.ndim != 2:
+        raise ValueError("table mask must be two-dimensional")
+    component_count, labels, stats, _ = cv2.connectedComponentsWithStats(
+        binary,
+        connectivity=8,
+    )
+    if component_count <= 1:
+        return binary
+
+    largest_label = 1 + int(
+        np.argmax(stats[1:, cv2.CC_STAT_AREA])
+    )
+    largest = (labels == largest_label).astype(np.uint8)
+
+    padded = np.pad(largest, 1, mode="constant", constant_values=0)
+    flooded = padded.copy()
+    cv2.floodFill(flooded, None, (0, 0), 2)
+    holes = flooded[1:-1, 1:-1] == 0
+    largest[holes] = 1
+    return largest
+
+
+def _binary_mask_row_spans(
+    mask: np.ndarray,
+) -> tuple[tuple[int, int, int], ...]:
+    """Encode a binary mask as (row, start, exclusive-end) runs."""
+    binary = np.asarray(mask) > 0
+    if binary.ndim != 2:
+        raise ValueError("desk mask must be two-dimensional")
+    spans: list[tuple[int, int, int]] = []
+    for row_index, row in enumerate(binary):
+        padded = np.pad(row, (1, 1), mode="constant", constant_values=False)
+        transitions = np.flatnonzero(padded[1:] != padded[:-1])
+        spans.extend(
+            (int(row_index), int(start), int(end))
+            for start, end in zip(transitions[::2], transitions[1::2])
+        )
+    return tuple(spans)
+
+
 def estimate_table_geometry(
     snapshot: AlignedRGBDSnapshot,
     mask: np.ndarray,
     calibration: RawServoCalibration,
+    *,
+    target_mask: np.ndarray | None = None,
 ) -> TableGeometry:
     calibration.validate_snapshot(snapshot)
     assert snapshot.depth_raw is not None
     assert snapshot.depth_scale_m is not None
-    binary = np.asarray(mask, dtype=np.uint8)
+    binary = _largest_filled_component(mask)
     if binary.shape != snapshot.depth_raw.shape:
         raise ValueError("table mask is not aligned to RGB-D")
     contour = binary - cv2.erode(binary, np.ones((7, 7), np.uint8), iterations=1)
+    if target_mask is not None:
+        target_binary = np.asarray(target_mask, dtype=np.uint8)
+        if target_binary.shape != binary.shape:
+            raise ValueError("target mask is not aligned to RGB-D")
+        exclusion_radius_px = 20
+        exclusion_kernel = cv2.getStructuringElement(
+            cv2.MORPH_ELLIPSE,
+            (2 * exclusion_radius_px + 1, 2 * exclusion_radius_px + 1),
+        )
+        target_exclusion = cv2.dilate(
+            target_binary,
+            exclusion_kernel,
+            iterations=1,
+        )
+        contour[target_exclusion > 0] = 0
     depth_m = snapshot.depth_raw.astype(np.float64) * snapshot.depth_scale_m
     valid = (contour > 0) & np.isfinite(depth_m) & (depth_m >= 0.15) & (depth_m <= 4.0)
     v, u = np.nonzero(valid)
@@ -2184,6 +2244,7 @@ def build_servo_velocity_message(
     viewer_target_bbox_xyxy: Sequence[float] | None = None,
     viewer_target_lateral_anchor_px: Sequence[float] | None = None,
     viewer_table_edge_endpoints_px: Sequence[Sequence[float]] | None = None,
+    viewer_desk_mask_row_spans: Sequence[Sequence[int]] | None = None,
     viewer_image_size: tuple[int, int] | None = None,
 ) -> str:
     payload = {
@@ -2222,6 +2283,11 @@ def build_servo_velocity_message(
             overlay["table_edge_endpoints_px"] = [
                 [float(value) for value in point]
                 for point in viewer_table_edge_endpoints_px
+            ]
+        if viewer_desk_mask_row_spans:
+            overlay["desk_mask_row_spans"] = [
+                [int(value) for value in span]
+                for span in viewer_desk_mask_row_spans
             ]
         if viewer_image_size is not None:
             overlay["image_size"] = [
@@ -2459,9 +2525,16 @@ def _observation(
 ) -> RawServoObservation:
     table = None
     table_error = None
+    desk_mask = None
     if surface is not None:
+        desk_mask = _largest_filled_component(surface.mask)
         try:
-            table = estimate_table_geometry(snapshot, surface.mask, calibration)
+            table = estimate_table_geometry(
+                snapshot,
+                desk_mask,
+                calibration,
+                target_mask=target.mask,
+            )
         except ValueError as exc:
             table = None
             table_error = str(exc)
@@ -2480,6 +2553,7 @@ def _observation(
         image_width=int(snapshot.rgb.shape[1]),
         image_height=int(snapshot.rgb.shape[0]),
         table_geometry_error=table_error,
+        desk_mask=desk_mask,
     )
 
 
@@ -3263,6 +3337,9 @@ class RawServoRuntime:
         self.viewer_table_edge_endpoints_px: (
             tuple[tuple[float, float], tuple[float, float]] | None
         ) = None
+        self.viewer_desk_mask_row_spans: (
+            tuple[tuple[int, int, int], ...] | None
+        ) = None
         self.viewer_image_size: tuple[int, int] | None = None
         self.navigation_started_at: float | None = None
         self.soft_stale = False
@@ -3333,6 +3410,7 @@ class RawServoRuntime:
         self.viewer_target_bbox_xyxy = None
         self.viewer_target_lateral_anchor_px = None
         self.viewer_table_edge_endpoints_px = None
+        self.viewer_desk_mask_row_spans = None
         self.viewer_image_size = None
 
     def _set_viewer_overlay(self, observation: RawServoObservation) -> None:
@@ -3355,6 +3433,20 @@ class RawServoRuntime:
                 for point in observation.table.line_endpoints_px
             )
         )
+        if observation.desk_mask is None:
+            self.viewer_desk_mask_row_spans = None
+        else:
+            expected_shape = (
+                int(observation.image_height),
+                int(observation.image_width),
+            )
+            if observation.desk_mask.shape != expected_shape:
+                raise ValueError(
+                    "desk mask shape does not match viewer image size"
+                )
+            self.viewer_desk_mask_row_spans = _binary_mask_row_spans(
+                observation.desk_mask
+            )
         self.viewer_image_size = (
             int(observation.image_width),
             int(observation.image_height),
@@ -3378,6 +3470,9 @@ class RawServoRuntime:
                 ),
                 viewer_table_edge_endpoints_px=(
                     self.viewer_table_edge_endpoints_px
+                ),
+                viewer_desk_mask_row_spans=(
+                    self.viewer_desk_mask_row_spans
                 ),
                 viewer_image_size=self.viewer_image_size,
             )

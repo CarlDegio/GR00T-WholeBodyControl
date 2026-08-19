@@ -589,6 +589,76 @@ def test_table_mask_depth_recovers_front_facing_horizontal_edge() -> None:
     )
 
 
+def test_table_mask_cleanup_keeps_largest_component_and_fills_holes() -> None:
+    mask = np.zeros((30, 45), dtype=bool)
+    mask[5:25, 5:25] = True
+    mask[10:15, 10:15] = False
+    mask[1:4, 35:38] = True
+
+    cleaned = raw_servo._largest_filled_component(mask)
+
+    assert cleaned.dtype == np.uint8
+    assert int(np.count_nonzero(cleaned)) == 400
+    assert np.all(cleaned[10:15, 10:15] == 1)
+    assert np.all(cleaned[1:4, 35:38] == 0)
+
+
+def test_observation_exposes_completed_desk_mask() -> None:
+    target_mask = np.zeros((480, 640), dtype=bool)
+    target_mask[40:80, 280:320] = True
+    desk_mask = np.zeros_like(target_mask)
+    desk_mask[120:360, 100:540] = True
+    desk_mask[180:220, 240:280] = False
+    desk_mask[10:20, 10:20] = True
+    target = TrackedInstance(
+        1, 0, "blue basket", 0.9, (280.0, 40.0, 320.0, 80.0), target_mask
+    )
+    desk = TrackedInstance(
+        2, 1, "desk", 0.8, (100.0, 120.0, 540.0, 360.0), desk_mask
+    )
+
+    value = _observation(
+        snapshot(), target, desk, fixed_calibration(camera_pitch_deg=0.0)
+    )
+
+    assert value.desk_mask is not None
+    assert value.desk_mask.dtype == np.uint8
+    assert np.all(value.desk_mask[180:220, 240:280] == 1)
+    assert np.all(value.desk_mask[10:20, 10:20] == 0)
+
+
+def test_table_geometry_excludes_target_mask_dilated_by_twenty_pixels(
+    monkeypatch,
+) -> None:
+    table_mask = np.zeros((480, 640), dtype=bool)
+    table_mask[120:360, 100:540] = True
+    target_mask = np.zeros_like(table_mask)
+    target_mask[100:380, 300:320] = True
+    calibration = fixed_calibration(camera_pitch_deg=0.0)
+    captured: dict[str, np.ndarray] = {}
+    original_ransac = raw_servo._ransac_line
+
+    def capture_ransac_points(points, **kwargs):
+        captured["points"] = points.copy()
+        return original_ransac(points, **kwargs)
+
+    monkeypatch.setattr(raw_servo, "_ransac_line", capture_ransac_points)
+
+    estimate_table_geometry(
+        snapshot(),
+        table_mask,
+        calibration,
+        target_mask=target_mask,
+    )
+
+    candidate_u = np.rint(
+        calibration.cx - captured["points"][:, 1] * calibration.fx
+    ).astype(int)
+    assert not np.any((candidate_u >= 280) & (candidate_u <= 339))
+    assert 279 in candidate_u
+    assert 340 in candidate_u
+
+
 def test_controller_coarse_yaw_keeps_translation_zero() -> None:
     controller = VisualServoController()
     controller.reset(1.0)
@@ -1378,6 +1448,10 @@ def test_runtime_velocity_status_reports_control_geometry(tmp_path) -> None:
             value.table,
             line_endpoints_px=((20.0, 300.0), (620.0, 310.0)),
         ),
+        desk_mask=np.pad(
+            np.ones((2, 3), dtype=np.uint8),
+            ((10, 468), (20, 617)),
+        ),
     )
 
     runtime._set_viewer_overlay(value)
@@ -1389,6 +1463,7 @@ def test_runtime_velocity_status_reports_control_geometry(tmp_path) -> None:
         "target_bbox_xyxy": [120.0, 80.0, 360.0, 280.0],
         "target_lateral_anchor_px": [240.0, 210.0],
         "table_edge_endpoints_px": [[20.0, 300.0], [620.0, 310.0]],
+        "desk_mask_row_spans": [[10, 20, 23], [11, 20, 23]],
         "image_size": [640, 480],
     }
 

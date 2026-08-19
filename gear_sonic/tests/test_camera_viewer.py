@@ -73,6 +73,7 @@ def test_base_pose_viewer_status_exposes_active_camera_and_velocity() -> None:
     assert status.target_bbox_xyxy is None
     assert status.target_lateral_anchor_px is None
     assert status.table_edge_endpoints_px is None
+    assert status.desk_mask_row_spans is None
     assert status.overlay_image_size is None
     assert camera_label_color("chest_view", status.active_camera_stream) == (
         0,
@@ -128,6 +129,39 @@ def test_base_pose_viewer_overlay_requires_valid_bbox_corner_order() -> None:
             b'{"type":"navila_reasan_velocity_command","source":"base_pose",'
             b'"velocity":{"vx":0.0,"vy":0.0,"wz":0.0},'
             b'"viewer_overlay":{"target_bbox_xyxy":[20,10,5,30]}}'
+        )
+
+
+def test_base_pose_viewer_draws_processed_desk_mask_on_active_camera() -> None:
+    spans = ",".join(f"[{row},2,12]" for row in range(2, 12))
+    status = parse_base_pose_viewer_status(
+        '{"type":"navila_reasan_velocity_command","source":"base_pose",'
+        '"camera_stream":"chest_view",'
+        '"velocity":{"vx":0.0,"vy":0.0,"wz":0.0},'
+        '"viewer_overlay":{"target_bbox_xyxy":[15,15,19,19],'
+        f'"desk_mask_row_spans":[{spans}],"image_size":[20,20]}}}}'
+    )
+    active = np.zeros((20, 20, 3), dtype=np.uint8)
+    inactive = np.zeros_like(active)
+
+    draw_base_pose_overlays(active, "chest_view", status)
+    draw_base_pose_overlays(inactive, "ego_view", status)
+
+    assert status.desk_mask_row_spans is not None
+    assert active[7, 7, 0] > active[7, 7, 1] > 0
+    assert active[7, 7, 2] == 0
+    assert not np.any(inactive)
+
+
+def test_base_pose_viewer_rejects_desk_mask_span_outside_image() -> None:
+    with pytest.raises(ValueError, match="outside the image"):
+        parse_base_pose_viewer_status(
+            b'{"type":"navila_reasan_velocity_command",'
+            b'"source":"base_pose",'
+            b'"velocity":{"vx":0.0,"vy":0.0,"wz":0.0},'
+            b'"viewer_overlay":{"target_bbox_xyxy":[1,1,2,2],'
+            b'"desk_mask_row_spans":[[4,2,11]],'
+            b'"image_size":[10,10]}}'
         )
 
 

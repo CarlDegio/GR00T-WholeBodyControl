@@ -80,6 +80,7 @@ class BasePoseViewerStatus:
     table_edge_endpoints_px: (
         tuple[tuple[float, float], tuple[float, float]] | None
     ) = None
+    desk_mask_row_spans: tuple[tuple[int, int, int], ...] | None = None
     overlay_image_size: tuple[int, int] | None = None
 
 
@@ -134,11 +135,12 @@ def _parse_viewer_overlay(
     tuple[float, float, float, float] | None,
     tuple[float, float] | None,
     tuple[tuple[float, float], tuple[float, float]] | None,
+    tuple[tuple[int, int, int], ...] | None,
     tuple[int, int] | None,
 ]:
     raw_overlay = payload.get("viewer_overlay")
     if raw_overlay is None:
-        return None, None, None, None
+        return None, None, None, None, None
     if not isinstance(raw_overlay, dict):
         raise ValueError("Base Pose viewer overlay must be an object")
     raw_bbox = _finite_tuple(
@@ -195,7 +197,42 @@ def _parse_viewer_overlay(
                 "Base Pose viewer image size must contain positive integers"
             )
         image_size = (width, height)
-    return target_bbox, target_lateral_anchor, table_edge, image_size
+
+    desk_mask_row_spans = None
+    raw_spans = raw_overlay.get("desk_mask_row_spans")
+    if raw_spans is not None:
+        if image_size is None:
+            raise ValueError(
+                "Base Pose viewer desk mask requires an image size"
+            )
+        if not isinstance(raw_spans, (list, tuple)):
+            raise ValueError("Base Pose viewer desk mask spans must be a list")
+        parsed_spans: list[tuple[int, int, int]] = []
+        for raw_span in raw_spans:
+            values = _finite_tuple(
+                raw_span,
+                length=3,
+                description="viewer desk mask row span",
+            )
+            row, start, end = (int(value) for value in values)
+            if (row, start, end) != values:
+                raise ValueError(
+                    "Base Pose viewer desk mask spans must contain integers"
+                )
+            width, height = image_size
+            if not (0 <= row < height and 0 <= start < end <= width):
+                raise ValueError(
+                    "Base Pose viewer desk mask span is outside the image"
+                )
+            parsed_spans.append((row, start, end))
+        desk_mask_row_spans = tuple(parsed_spans)
+    return (
+        target_bbox,
+        target_lateral_anchor,
+        table_edge,
+        desk_mask_row_spans,
+        image_size,
+    )
 
 
 def parse_base_pose_viewer_status(raw: bytes | str) -> BasePoseViewerStatus:
@@ -225,15 +262,20 @@ def parse_base_pose_viewer_status(raw: bytes | str) -> BasePoseViewerStatus:
         if raw_camera_stream is None or not str(raw_camera_stream).strip()
         else str(raw_camera_stream).strip()
     )
-    target_bbox, target_lateral_anchor, table_edge, image_size = (
-        _parse_viewer_overlay(payload)
-    )
+    (
+        target_bbox,
+        target_lateral_anchor,
+        table_edge,
+        desk_mask_row_spans,
+        image_size,
+    ) = _parse_viewer_overlay(payload)
     return BasePoseViewerStatus(
         active_camera_stream=active_camera_stream,
         velocity=(values[0], values[1], values[2]),
         target_bbox_xyxy=target_bbox,
         target_lateral_anchor_px=target_lateral_anchor,
         table_edge_endpoints_px=table_edge,
+        desk_mask_row_spans=desk_mask_row_spans,
         overlay_image_size=image_size,
     )
 
@@ -320,6 +362,38 @@ def draw_base_pose_overlays(
         return (
             min(width - 1, max(0, int(round(x * scale_x)))),
             min(height - 1, max(0, int(round(y * scale_y)))),
+        )
+
+    if status.desk_mask_row_spans:
+        source_mask = np.zeros((source_height, source_width), dtype=np.uint8)
+        for row, start, end in status.desk_mask_row_spans:
+            source_mask[row, start:end] = 255
+        display_mask = (
+            source_mask
+            if (source_width, source_height) == (width, height)
+            else cv2.resize(
+                source_mask,
+                (width, height),
+                interpolation=cv2.INTER_NEAREST,
+            )
+        )
+        desk_color = (255, 128, 0)
+        color_layer = np.empty_like(image_bgr)
+        color_layer[:] = desk_color
+        blended = cv2.addWeighted(image_bgr, 0.72, color_layer, 0.28, 0.0)
+        np.copyto(image_bgr, blended, where=(display_mask > 0)[..., None])
+        contours, _ = cv2.findContours(
+            display_mask,
+            cv2.RETR_EXTERNAL,
+            cv2.CHAIN_APPROX_SIMPLE,
+        )
+        cv2.drawContours(
+            image_bgr,
+            contours,
+            -1,
+            desk_color,
+            2,
+            cv2.LINE_AA,
         )
 
     x1, y1, x2, y2 = status.target_bbox_xyxy
