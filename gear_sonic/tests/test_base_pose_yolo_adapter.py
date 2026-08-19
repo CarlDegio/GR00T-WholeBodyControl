@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 import json
 import math
 
@@ -18,6 +19,9 @@ from gear_sonic.utils.inference.base_pose_visual_servo import (
     TargetGeometry,
     VisualServoController,
     validate_raw_servo_target,
+)
+from gear_sonic.utils.inference.base_pose_visual_servo_diagnostics import (
+    DetectionFrameData,
 )
 from gear_sonic.utils.inference.base_pose import AlignedRGBDSnapshot, BasePoseCameraError
 
@@ -114,6 +118,129 @@ def test_yolo_adapter_forwards_viewer_overlay_without_touching_velocity(
     assert intents[-1][1]["viewer_overlay"] == overlay
 
 
+def test_mixed_camera_overlay_keeps_mode_border_and_routes_geometry(
+    tmp_path,
+) -> None:
+    intents: list[tuple[str, dict[str, object]]] = []
+    adapter = GatewayRawServoAdapter(
+        BasePoseAgentConfig(
+            task="align to the basket",
+            output_root=str(tmp_path),
+        ),
+        submit_intent=lambda name, values: intents.append((name, dict(values))),
+    )
+    assert adapter.start(2, now=1.0)
+    runtime = adapter.runtime
+    runtime.active_camera_stream = "ego_view"
+    runtime.control_source_stream = "chest_view"
+    desk_mask = np.zeros((48, 64), dtype=np.uint8)
+    desk_mask[32:34, 4:60] = 1
+    observation = replace(
+        _servo_observation(),
+        image_width=64,
+        image_height=48,
+        desk_mask=desk_mask,
+        table=replace(
+            _servo_observation().table,
+            line_endpoints_px=((5.0, 35.0), (55.0, 35.0)),
+        ),
+        table_camera_stream="ego_view",
+    )
+
+    runtime._set_viewer_overlay(
+        observation,
+        {"yaw_source": {"stream": "ego_view", "valid": True}},
+    )
+    runtime._publish(ServoCommand(0.0, 0.0, 0.0), "visual_servo")
+
+    parameters = intents[-1][1]
+    assert parameters["camera_stream"] == "ego_view"
+    overlay = parameters["viewer_overlay"]
+    assert overlay["target_camera_stream"] == "chest_view"
+    assert overlay["table_camera_stream"] == "ego_view"
+    assert overlay["table_edge_endpoints_px"] == [
+        [5.0, 35.0],
+        [55.0, 35.0],
+    ]
+    assert overlay["desk_mask_row_spans"]
+
+
+@pytest.mark.parametrize(
+    ("frame_kwargs", "viewer_attribute", "expected"),
+    (
+        (
+            {"target_bbox_xyxy": (1.0, 2.0, 10.0, 20.0)},
+            "viewer_target_bbox_xyxy",
+            (1.0, 2.0, 10.0, 20.0),
+        ),
+        (
+            {
+                "surface_mask": np.pad(
+                    np.ones((1, 4), dtype=np.uint8),
+                    ((3, 44), (5, 55)),
+                )
+            },
+            "viewer_desk_mask_row_spans",
+            ((3, 5, 9),),
+        ),
+        (
+            {
+                "table_geometry": {
+                    "line_endpoints_px": ((2.0, 30.0), (60.0, 31.0))
+                }
+            },
+            "viewer_table_edge_endpoints_px",
+            ((2.0, 30.0), (60.0, 31.0)),
+        ),
+    ),
+)
+def test_incomplete_yoloe_frame_keeps_each_available_viewer_overlay(
+    tmp_path,
+    frame_kwargs: dict[str, object],
+    viewer_attribute: str,
+    expected: object,
+) -> None:
+    adapter = GatewayRawServoAdapter(
+        BasePoseAgentConfig(
+            task="align to the basket",
+            mode="raw_yoloe_servo",
+            output_root=str(tmp_path),
+        ),
+        submit_intent=lambda _name, _values: None,
+    )
+    assert adapter.start(2, now=1.0)
+    assert adapter.runtime.accept_event(
+        RawServoEvent(
+            2,
+            "initialized",
+            observation=_servo_observation(),
+            details={"camera_stream": "ego_view"},
+        ),
+        now=1.1,
+    )
+    frame = DetectionFrameData(
+        frame_index=1,
+        camera_timestamp=1.2,
+        rgb=np.zeros((48, 64, 3), dtype=np.uint8),
+        perception_kind="invalid",
+        perception_error="partial detection",
+        **frame_kwargs,
+    )
+
+    assert adapter.runtime.accept_event(
+        RawServoEvent(
+            2,
+            "invalid",
+            error="partial detection",
+            frame=frame,
+        ),
+        now=1.2,
+    )
+
+    assert getattr(adapter.runtime, viewer_attribute) == expected
+    assert adapter.runtime.viewer_image_size == (64, 48)
+
+
 def test_yolo_adapter_injects_agent_near_orientation_provider(tmp_path) -> None:
     provider = lambda _now: {
         "actual_heading_rad": 0.1,
@@ -160,7 +287,7 @@ def test_yolo_adapter_reports_terminal_worker_failure_once(tmp_path) -> None:
     ]
 
 
-def test_chest_handoff_failure_stops_before_reporting_failed(tmp_path) -> None:
+def test_dual_worker_failure_stops_before_reporting_failed(tmp_path) -> None:
     intents: list[tuple[str, dict[str, object]]] = []
     adapter = GatewayRawServoAdapter(
         BasePoseAgentConfig(
@@ -175,7 +302,7 @@ def test_chest_handoff_failure_stops_before_reporting_failed(tmp_path) -> None:
         RawServoEvent(
             4,
             "error",
-            error="head_target_not_found_after_chest_handoff",
+            error="both-camera Qwen failover exhausted",
             hard=True,
         )
     )
@@ -194,7 +321,7 @@ def test_chest_handoff_failure_stops_before_reporting_failed(tmp_path) -> None:
         {
             "generation": 4,
             "state": "failed",
-            "reason": "head_target_not_found_after_chest_handoff",
+            "reason": "both-camera Qwen failover exhausted",
         }
     ]
     assert intents[-1][0] == "base_pose_status"

@@ -17,6 +17,7 @@ from gear_sonic.scripts.launch_inference import (
     InferenceLaunchConfig,
     _check_prerequisites,
     _clear_stale_fastlio_processes,
+    _clear_stale_navdp_processes,
     _dotenv_has_nonempty_value,
     _inference_pane_count,
     _parse_pane_ids,
@@ -63,6 +64,28 @@ def test_startup_clears_only_stale_fastlio_processes(monkeypatch) -> None:
         ["pkill", "-KILL", "-f"],
     ]
     assert all("fast_lio" in command[-1] or "fastlio_mapping" in command[-1] for command in commands)
+
+
+def test_startup_clears_only_stale_navdp_processes(monkeypatch) -> None:
+    commands: list[list[str]] = []
+    monkeypatch.setattr(
+        "gear_sonic.scripts.launch_inference.subprocess.run",
+        lambda command, **_kwargs: commands.append(command),
+    )
+    monkeypatch.setattr("gear_sonic.scripts.launch_inference.time.sleep", lambda _s: None)
+
+    _clear_stale_navdp_processes()
+
+    assert [command[:3] for command in commands] == [
+        ["pkill", "-TERM", "-f"],
+        ["pkill", "-TERM", "-f"],
+        ["pkill", "-KILL", "-f"],
+        ["pkill", "-KILL", "-f"],
+    ]
+    assert all(
+        "navdp_planner" in command[-1] or "eval\\.src\\.policy_server" in command[-1]
+        for command in commands
+    )
 
 
 def _write_deploy_policy_files(
@@ -251,7 +274,11 @@ def test_yaml_contains_every_launch_parameter() -> None:
     assert loaded.lavira_global_target == "blue basket"
     assert loaded.lavira_qwenvl_model == "qwen3-vl-32b-instruct"
     assert loaded.base_pose_enabled is True
-    assert loaded.base_pose_task == loaded.prompt
+    assert loaded.base_pose_task == "align to the blue basket"
+    assert loaded.base_pose_surface_prompt == "desk"
+    assert loaded.base_pose_dual_chest_depth_stream == "camera/chest_view_depth"
+    assert loaded.base_pose_raw_min_linear_speed_m_s == pytest.approx(0.4)
+    assert loaded.base_pose_raw_max_lateral_speed_m_s == pytest.approx(0.4)
     assert loaded.base_pose_mode == "dual_raw_yoloe_servo"
     assert not hasattr(loaded, "base_pose_vision_backend")
     assert not hasattr(loaded, "base_pose_model")
@@ -466,18 +493,18 @@ def test_base_pose_agent_uses_gateway_arbitration_and_fixed_task() -> None:
     config = InferenceLaunchConfig(
         base_pose_enabled=True,
         base_pose_task="align with the medicine bottle and basket",
+        base_pose_surface_prompt="work bench",
     )
     command = build_base_pose_agent_command(config, Path("/workspace/sonic"))
 
     assert "gear_sonic/scripts/base_pose_agent.py" in command
     assert "--task 'align with the medicine bottle and basket'" in command
+    assert "--surface-prompt 'work bench'" in command
     assert "--mode dual_raw_yoloe_servo" in command
     assert "--dual-head-camera-stream ego_view" in command
     assert "--dual-head-depth-stream camera/ego_view_depth" in command
     assert "--dual-chest-camera-stream chest_view" in command
-    assert (
-        "--dual-chest-depth-stream derived/depth_anything/chest_view" in command
-    )
+    assert "--dual-chest-depth-stream camera/chest_view_depth" in command
     assert "--sensor-gateway-endpoint tcp://127.0.0.1:5560" in command
     assert "--control-gateway-endpoint tcp://127.0.0.1:5565" in command
     assert "--control-gateway-intent-endpoint tcp://127.0.0.1:5561" in command
@@ -486,31 +513,16 @@ def test_base_pose_agent_uses_gateway_arbitration_and_fixed_task() -> None:
     assert "--qwenvl-timeout-seconds 600.0" in command
     assert "--dual-rgbd-buffer-size 8" in command
     assert "--dual-rgbd-poll-hz 60.0" in command
-    assert "--raw-chest-handoff-distance-m 0.65" in command
-    assert "--raw-chest-target-distance-m" not in command
+    assert "--dual-head-reacquire-frames 1" in command
+    assert "--dual-head-release-missing-frames 3" in command
+    assert "--raw-chest-handoff-distance-m" not in command
+    assert "--raw-chest-fallback-forward-tolerance-m" not in command
+    assert "--raw-chest-fallback-lateral-tolerance-m" not in command
+    assert "--raw-head-target-distance-m 1.0" in command
+    assert "--raw-chest-target-distance-m 0.8" in command
     assert "--vision-backend" not in command
     assert "codex" not in command.lower()
     assert "--port 5558" not in command
-
-
-@pytest.mark.parametrize("distance", [0.0, float("nan"), float("inf")])
-def test_launcher_rejects_invalid_chest_handoff_distance(
-    distance: float,
-    capsys,
-) -> None:
-    config = InferenceLaunchConfig(
-        base_pose_enabled=True,
-        base_pose_task="align",
-        base_pose_raw_chest_handoff_distance_m=distance,
-        data_exporter=False,
-    )
-
-    with pytest.raises(SystemExit):
-        _check_prerequisites(config)
-
-    assert "Base-Pose chest handoff distance must be finite and positive" in (
-        capsys.readouterr().out
-    )
 
 
 def test_base_pose_qwenvl_command_loads_local_key_without_persisting_by_default() -> None:
@@ -544,7 +556,8 @@ def test_base_pose_yoloe_command_uses_aligned_raw_depth_and_local_model() -> Non
     assert "--mode raw_yoloe_servo" in command
     assert "--depth-stream camera/ego_view_depth" in command
     assert "--raw-yoloe-model-path tools/yoloe26m/weights/yoloe-26m-seg.pt" in command
-    assert "--raw-head-target-distance-m 0.9" in command
+    assert "--raw-head-target-distance-m 1.0" in command
+    assert "--raw-chest-target-distance-m 0.8" in command
     assert "--raw-orientation-telemetry-source tcp://127.0.0.1:5569" in command
     assert "--orientation-output-endpoint 'tcp://*:5569'" in executor
 
@@ -596,7 +609,7 @@ def test_runtime_sidecars_are_read_only_and_navdp_uses_gateway_by_default() -> N
     assert "--runtime-status-endpoint 'tcp://*:5570'" in executor
 
 
-def test_base_pose_starts_depth_anything_even_with_keyboard_planner() -> None:
+def test_base_pose_uses_raw_chest_depth_without_starting_depth_anything() -> None:
     command = build_sensor_gateway_command(
         InferenceLaunchConfig(
             planner_input="keyboard",
@@ -606,8 +619,9 @@ def test_base_pose_starts_depth_anything_even_with_keyboard_planner() -> None:
         Path("/workspace/sonic"),
     )
 
-    assert "run_depth_anything.py" in command
-    assert "/tmp/sonic_depth_anything.log" in command
+    assert "run_depth_anything.py" not in command
+    assert "/tmp/sonic_depth_anything.log" not in command
+    assert "--no-enable-depth-anything" in command
 
 
 def test_slam_debug_records_raw_inputs_and_fastlio_outputs_per_run() -> None:

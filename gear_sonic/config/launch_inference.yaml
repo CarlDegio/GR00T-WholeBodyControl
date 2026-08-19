@@ -190,7 +190,9 @@ launch_inference:
   lavira_min_confidence: 0.6
   lavira_output_root: outputs/object_nav
   base_pose_enabled: true
-  base_pose_task: *vla_task_prompt
+  base_pose_task: >-
+    align to the blue basket
+  base_pose_surface_prompt: desk
   base_pose_mode: dual_raw_yoloe_servo
   base_pose_qwenvl_model: qwen3-vl-plus
   base_pose_qwenvl_base_url: https://dashscope-intl.aliyuncs.com/compatible-mode/v1
@@ -207,13 +209,15 @@ launch_inference:
   base_pose_dual_head_camera_stream: ego_view
   base_pose_dual_head_depth_stream: camera/ego_view_depth
   base_pose_dual_chest_camera_stream: chest_view
-  base_pose_dual_chest_depth_stream: derived/depth_anything/chest_view
+  base_pose_dual_chest_depth_stream: camera/chest_view_depth
   base_pose_dual_chest_camera_pitch_deg: -3.0
   base_pose_dual_chest_camera_roll_deg: 0.0
   base_pose_dual_chest_camera_yaw_deg: 0.0
   base_pose_dual_chest_camera_forward_offset_m: 0.0
   base_pose_dual_chest_camera_lateral_offset_m: 0.0
   base_pose_dual_match_tolerance_frames: 30
+  base_pose_dual_head_reacquire_frames: 1
+  base_pose_dual_head_release_missing_frames: 3
   base_pose_dual_initialization_grace_s: 30.0
   base_pose_dual_qwenvl_fallback_model: qwen3-vl-8b-instruct
   base_pose_dual_rgbd_buffer_size: 8
@@ -229,16 +233,16 @@ launch_inference:
   base_pose_raw_reference_update_min_confidence: 0.35
   base_pose_raw_reference_update_min_iou: 0.50
   base_pose_raw_servo_hz: 10.0
-  base_pose_raw_head_target_distance_m: 0.90
-  base_pose_raw_chest_handoff_distance_m: 0.65
-  base_pose_raw_forward_tolerance_m: 0.10
-  base_pose_raw_lateral_tolerance_m: 0.10
-  base_pose_raw_min_linear_speed_m_s: 0.40
+  base_pose_raw_head_target_distance_m: 0.85
+  base_pose_raw_chest_target_distance_m: 0.65
+  base_pose_raw_forward_tolerance_m: 0.07
+  base_pose_raw_lateral_tolerance_m: 0.07
+  base_pose_raw_min_linear_speed_m_s: 0.35
   base_pose_raw_max_lateral_speed_m_s: 0.40
-  base_pose_raw_min_yaw_speed_rad_s: 0.10
-  base_pose_raw_yaw_tolerance_deg: 8.0
-  base_pose_raw_yaw_coarse_speed_rad_s: 0.30
-  base_pose_raw_yaw_trim_speed_rad_s: 0.20
+  base_pose_raw_min_yaw_speed_rad_s: 0.05
+  base_pose_raw_yaw_tolerance_deg: 3.0
+  base_pose_raw_yaw_coarse_speed_rad_s: 0.10
+  base_pose_raw_yaw_trim_speed_rad_s: 0.10
   base_pose_raw_forward_recenter_yaw_speed_rad_s: 0.30
   base_pose_raw_horizontal_guard_fraction: 0.25
   base_pose_raw_horizontal_recovery_fraction: 0.30

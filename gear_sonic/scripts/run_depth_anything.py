@@ -62,8 +62,6 @@ class DepthAnythingInferenceGate:
         "lavira_rgbd_captured",
         "navigation_goal",
         "navigation_status",
-        "start_base_pose",
-        "base_pose_runtime_status",
         "cancel_navigation",
     }
     TERMINAL_STATES = {"reached", "failed", "stopped"}
@@ -82,9 +80,6 @@ class DepthAnythingInferenceGate:
         if name == "start_navigation" and generation >= self.generation:
             self.owner = "lavira"
             self.generation = generation
-        elif name == "start_base_pose" and generation >= self.generation:
-            self.owner = "base_pose"
-            self.generation = generation
         elif (
             name in {"lavira_rgbd_captured", "navigation_goal"}
             and self.owner == "lavira"
@@ -94,13 +89,6 @@ class DepthAnythingInferenceGate:
         elif (
             name == "navigation_status"
             and self.owner == "lavira"
-            and generation == self.generation
-            and str(parameters.get("state", "")) in self.TERMINAL_STATES
-        ):
-            self.owner = None
-        elif (
-            name == "base_pose_runtime_status"
-            and self.owner == "base_pose"
             and generation == self.generation
             and str(parameters.get("state", "")) in self.TERMINAL_STATES
         ):

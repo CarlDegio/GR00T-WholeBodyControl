@@ -21,6 +21,7 @@ class ControlGatewayIntentClient:
         source: str,
         context: zmq.Context | None = None,
         ttl_ms: int = 1000,
+        latest_only: bool = False,
     ) -> None:
         if not endpoint.startswith(("tcp://", "inproc://")):
             raise ValueError(f"unsupported ControlGateway endpoint: {endpoint}")
@@ -28,7 +29,14 @@ class ControlGatewayIntentClient:
         self._owns_context = context is None
         self._context = zmq.Context() if context is None else context
         self._socket = self._context.socket(zmq.PUSH)
-        self._socket.setsockopt(zmq.SNDHWM, 100)
+        if latest_only:
+            # Velocity intents describe the desired state now, not a motion
+            # sequence. If the gateway falls behind, retain only the newest
+            # intent so a later stop can replace queued motion immediately.
+            self._socket.setsockopt(zmq.CONFLATE, 1)
+            self._socket.setsockopt(zmq.SNDHWM, 1)
+        else:
+            self._socket.setsockopt(zmq.SNDHWM, 100)
         self._socket.setsockopt(zmq.LINGER, 0)
         self._socket.connect(endpoint)
         self._core = ControlGatewayCore(source=source, ttl_ms=ttl_ms)

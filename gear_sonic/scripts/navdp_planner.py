@@ -348,7 +348,15 @@ def main(config: NavDPPlannerConfig) -> None:
                 pose_history = list(sensors.pose_history)
                 points, points_time = sensors.points.copy(), sensors.points_time
                 slam_map_xy = sensors.slam_map_xy.copy()
+                slam_map_time = sensors.slam_map_time
                 robot_history = sensors.robot_history.copy()
+            slam_max_age_s = config.sensor_gateway_max_age_ms * 1.0e-3
+            if slam_map_time <= 0.0 or now - slam_map_time > slam_max_age_s:
+                # Do not keep presenting the last map as live after FAST-LIO or
+                # SensorGateway has stopped.  The ingress also starts a fresh
+                # map when registered-cloud samples resume after this gap.
+                slam_map_xy = np.empty((0, 2), dtype=np.float32)
+                robot_history = np.empty((0, 2), dtype=np.float32)
             if mode == "nav_goal" and pose is not None and world_goal is not None:
                 current_local_goal = local_goal_from_world(world_goal, pose)
                 if math.hypot(*current_local_goal) <= config.goal_tolerance_m:

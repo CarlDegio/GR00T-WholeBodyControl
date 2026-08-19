@@ -1,10 +1,14 @@
 from __future__ import annotations
 
 import argparse
+import json
+import time
 
 import pytest
+import zmq
 
 from gear_sonic.runtime.contracts import OperatorCommand
+from gear_sonic.runtime.control_client import ControlGatewayIntentClient
 from gear_sonic.runtime.control_gateway import (
     ControlGatewayCore,
     ControlGatewayRouter,
@@ -16,6 +20,34 @@ from gear_sonic.scripts.run_control_gateway import (
     build_base_pose_runtime_status,
     resolve_control_gateway_settings,
 )
+
+
+def test_latest_only_intent_client_conflates_pending_commands() -> None:
+    context = zmq.Context()
+    receiver = context.socket(zmq.PULL)
+    receiver.setsockopt(zmq.LINGER, 0)
+    receiver.bind("inproc://latest-only-intent-client")
+    client = ControlGatewayIntentClient(
+        "inproc://latest-only-intent-client",
+        source="base_pose_agent",
+        context=context,
+        latest_only=True,
+    )
+    try:
+        assert client._socket.getsockopt(zmq.CONFLATE) == 1
+        assert client._socket.getsockopt(zmq.SNDHWM) == 1
+        for vx in (0.4, -0.4, 0.0):
+            client.send("base_pose_velocity", {"velocity": [vx, 0.0, 0.0]})
+        time.sleep(0.02)
+        payloads = []
+        while receiver.poll(0):
+            payloads.append(json.loads(receiver.recv()))
+        assert len(payloads) == 1
+        assert payloads[0]["parameters"]["velocity"] == [0.0, 0.0, 0.0]
+    finally:
+        client.close()
+        receiver.close()
+        context.term()
 
 
 def test_console_translation_normalizes_prompt_and_single_key_input() -> None:

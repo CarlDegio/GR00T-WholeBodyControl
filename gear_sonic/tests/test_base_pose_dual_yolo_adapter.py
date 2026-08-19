@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 import json
 from pathlib import Path
 import queue
@@ -18,9 +19,6 @@ from gear_sonic.scripts.base_pose_yolo_agent import (
 )
 from gear_sonic.utils.inference.base_pose import BasePoseCameraError
 from gear_sonic.utils.inference.base_pose_dual_visual_servo import (
-    CHEST_HANDOFF_FAILURE_REASON,
-    CHEST_HANDOFF_QWEN_STAGE,
-    ChestDistanceHandoffGate,
     DualCameraFailoverCoordinator,
     DualCameraReference,
     HeadCameraTextMonitor,
@@ -35,10 +33,13 @@ from gear_sonic.utils.inference.base_pose_sensor import (
 )
 from gear_sonic.utils.inference.base_pose_visual_servo import (
     GenerationGate,
+    HEAD_MONITOR_HOLD_EVENT,
     RawServoCalibration,
     RawServoEvent,
     RawServoObservation,
+    RawServoRuntime,
     ServoPhase,
+    TableGeometry,
     TargetGeometry,
     TrackedInstance,
     run_raw_servo_worker,
@@ -71,35 +72,25 @@ def test_dual_mode_is_the_agent_near_aligned_default() -> None:
     assert not hasattr(config, "codex_timeout_seconds")
     assert config.qwenvl_model == "qwen3-vl-plus"
     assert config.qwenvl_timeout_seconds == pytest.approx(600.0)
+    assert config.surface_prompt == "desk"
     assert config.dual_head_camera_stream == HEAD
     assert config.dual_head_depth_stream == "camera/ego_view_depth"
     assert config.dual_chest_camera_stream == CHEST
-    assert (
-        config.dual_chest_depth_stream
-        == "derived/depth_anything/chest_view"
-    )
+    assert config.dual_chest_depth_stream == "camera/chest_view_depth"
     assert config.dual_chest_camera_pitch_deg == pytest.approx(-3.0)
     assert config.dual_match_tolerance_frames == 30
-    assert config.dual_head_reacquire_frames == 10
+    assert config.dual_head_reacquire_frames == 1
+    assert config.dual_head_release_missing_frames == 3
     assert config.dual_initialization_grace_s == pytest.approx(30.0)
     assert config.dual_rgbd_buffer_size == 8
     assert config.dual_rgbd_poll_hz == pytest.approx(60.0)
-    assert config.raw_chest_handoff_distance_m == pytest.approx(0.65)
-    assert not hasattr(config, "raw_chest_target_distance_m")
-
-
-@pytest.mark.parametrize("distance", [0.0, -0.1, float("nan"), float("inf")])
-def test_agent_rejects_invalid_chest_handoff_distance(
-    distance: float,
-) -> None:
-    with pytest.raises(
-        ValueError,
-        match="raw_chest_handoff_distance_m must be finite and positive",
-    ):
-        BasePoseAgentConfig(
-            task="align",
-            raw_chest_handoff_distance_m=distance,
-        )
+    assert not hasattr(config, "raw_chest_handoff_distance_m")
+    assert config.raw_head_target_distance_m == pytest.approx(1.0)
+    assert config.raw_chest_target_distance_m == pytest.approx(0.8)
+    assert config.raw_forward_tolerance_m == pytest.approx(0.10)
+    assert config.raw_lateral_tolerance_m == pytest.approx(0.10)
+    assert config.raw_min_linear_speed_m_s == pytest.approx(0.4)
+    assert config.raw_max_lateral_speed_m_s == pytest.approx(0.4)
 
 
 def test_dual_worker_selection_keeps_single_mode_available() -> None:
@@ -168,22 +159,6 @@ def test_normal_chest_failure_can_try_head_then_return_to_chest() -> None:
     assert (chest_text.live_stream, chest_text.stage) == (CHEST, "origin_text")
 
 
-def test_distance_handoff_is_terminal_only_until_head_initializes() -> None:
-    coordinator = DualCameraFailoverCoordinator(
-        (HEAD, CHEST),
-        {CHEST: _reference(CHEST, 2)},
-    )
-
-    failed_handoff = coordinator.begin_chest_distance_handoff()
-    assert coordinator.advance_after_failure(failed_handoff) is None
-
-    active_handoff = coordinator.begin_chest_distance_handoff()
-    coordinator.mark_success(active_handoff)
-    head_text = coordinator.advance_after_failure(active_handoff)
-    assert head_text is not None
-    assert (head_text.live_stream, head_text.stage) == (HEAD, "origin_text")
-
-
 @pytest.mark.parametrize("stream_name", (CHEST, HEAD))
 def test_initial_reference_grounds_only_target_and_uses_text_desk(
     tmp_path: Path,
@@ -228,6 +203,7 @@ def test_initial_reference_grounds_only_target_and_uses_text_desk(
 
     assert client.calls == 1
     assert reference.stream_name == stream_name
+    assert reference.target_prompt == "blue basket"
     assert reference.table_bboxes == ()
     assert not (tmp_path / stream_name / "table_prompt.txt").exists()
 
@@ -242,7 +218,6 @@ def test_head_monitor_without_table_requires_zero_hold_before_qwen() -> None:
 
     assert attempt.stage == "head_monitor_qwen"
     assert attempt.stage in QWEN_HOLD_STAGES
-    assert CHEST_HANDOFF_QWEN_STAGE in QWEN_HOLD_STAGES
 
 
 def test_head_monitor_reuses_initialized_dynamic_target_prompt() -> None:
@@ -289,6 +264,55 @@ def test_head_monitor_reuses_initialized_dynamic_target_prompt() -> None:
     assert second.reference is not None
     assert second.reference.kind == "head_monitor"
     assert second.reference.target_prompt == "red tote returned by qwen"
+
+
+def test_head_monitor_holds_through_two_misses_and_releases_on_third() -> None:
+    target = TrackedInstance(
+        1,
+        0,
+        "blue basket",
+        0.9,
+        (1.0, 0.0, 4.0, 3.0),
+        np.ones((4, 6), dtype=np.uint8),
+    )
+
+    class Tracker:
+        def __init__(self) -> None:
+            self.responses = iter(
+                ([target], [], [], [target], [], [], [])
+            )
+
+        def start_all_text(self, **_kwargs):
+            return None
+
+        def track(self, _rgb):
+            return next(self.responses)
+
+    monitor = HeadCameraTextMonitor(
+        Tracker(),
+        "blue basket",
+        required_target_frames=5,
+        release_missing_frames=3,
+    )
+    monitor.start()
+
+    first_hit = monitor.inspect(_worker_snapshot(HEAD, 1))
+    first_miss = monitor.inspect(_worker_snapshot(HEAD, 2))
+    second_miss = monitor.inspect(_worker_snapshot(HEAD, 3))
+    recovered = monitor.inspect(_worker_snapshot(HEAD, 4))
+    recovery_first_miss = monitor.inspect(_worker_snapshot(HEAD, 5))
+    recovery_second_miss = monitor.inspect(_worker_snapshot(HEAD, 6))
+    recovery_third_miss = monitor.inspect(_worker_snapshot(HEAD, 7))
+
+    assert (first_hit.target_streak, first_hit.hold_active) == (1, True)
+    assert (first_miss.missing_streak, first_miss.hold_active) == (1, True)
+    assert (second_miss.missing_streak, second_miss.hold_active) == (2, True)
+    assert (recovered.target_streak, recovered.missing_streak) == (1, 0)
+    assert recovered.hold_active
+    assert recovery_first_miss.hold_active
+    assert recovery_second_miss.hold_active
+    assert recovery_third_miss.missing_streak == 3
+    assert not recovery_third_miss.hold_active
 
 
 def test_dual_calibration_uses_head_and_chest_mounts() -> None:
@@ -460,17 +484,17 @@ def test_dual_runtime_uses_chest_approach_mode_and_head_standoff(tmp_path) -> No
 
     adapter.runtime.active_camera_stream = HEAD
     adapter.runtime._reset_controller(1.0)
-    assert adapter.runtime.controller.target_distance_m == pytest.approx(0.9)
+    assert adapter.runtime.controller.target_distance_m == pytest.approx(1.0)
     assert not adapter.runtime.controller.chest_approach_only
     assert adapter.runtime.controller.phase is ServoPhase.YAW_ALIGN
 
     adapter.runtime.active_camera_stream = CHEST
     adapter.runtime._reset_controller(2.0)
-    assert adapter.runtime.controller.target_distance_m == pytest.approx(0.9)
+    assert adapter.runtime.controller.target_distance_m == pytest.approx(0.8)
     assert adapter.runtime.controller.chest_approach_only
     assert adapter.runtime.controller.phase is ServoPhase.FORWARD_APPROACH
 
-    for stage in ("head_monitor", "alternate_text", CHEST_HANDOFF_QWEN_STAGE):
+    for stage in ("head_monitor", "alternate_text"):
         assert adapter.runtime._is_vertical_recenter_switch(
             previous_stream=CHEST,
             next_stream=HEAD,
@@ -481,6 +505,50 @@ def test_dual_runtime_uses_chest_approach_mode_and_head_standoff(tmp_path) -> No
     adapter.runtime._reset_controller(3.0)
     assert not adapter.runtime.controller.chest_approach_only
     assert adapter.runtime.controller.phase is ServoPhase.VERTICAL_RECENTER
+
+
+def test_head_stage_control_source_uses_shared_tolerances_without_reset(
+    tmp_path: Path,
+) -> None:
+    config = BasePoseAgentConfig(
+        task="align",
+        output_root=str(tmp_path),
+        raw_forward_tolerance_m=0.03,
+        raw_lateral_tolerance_m=0.04,
+    )
+    runtime = RawServoRuntime(
+        config,
+        publish=lambda _message: None,
+        logger=lambda _message: None,
+    )
+    runtime.active_camera_stream = HEAD
+    runtime.control_source_stream = HEAD
+    runtime.controller.phase = ServoPhase.TRANSLATE_TARGET
+    observation = _handoff_observation(1.2)
+
+    runtime._prepare_control_source(
+        {"control_source_stream": CHEST},
+        observation,
+    )
+
+    assert runtime.active_camera_stream == HEAD
+    assert runtime.control_source_stream == CHEST
+    assert runtime.controller.target_distance_m == pytest.approx(0.8)
+    assert runtime.controller.phase is ServoPhase.TRANSLATE_TARGET
+    assert runtime.controller.forward_tolerance_m == pytest.approx(0.03)
+    assert runtime.controller.lateral_tolerance_m == pytest.approx(0.04)
+
+    runtime._prepare_control_source(
+        {"control_source_stream": HEAD},
+        observation,
+    )
+
+    assert runtime.active_camera_stream == HEAD
+    assert runtime.control_source_stream == HEAD
+    assert runtime.controller.target_distance_m == pytest.approx(1.0)
+    assert runtime.controller.phase is ServoPhase.TRANSLATE_TARGET
+    assert runtime.controller.forward_tolerance_m == pytest.approx(0.03)
+    assert runtime.controller.lateral_tolerance_m == pytest.approx(0.04)
 
 
 def test_runtime_preserves_vertical_recenter_across_head_retries_and_resets_chest(
@@ -708,22 +776,248 @@ def _handoff_observation(forward_m: float) -> RawServoObservation:
     )
 
 
-def test_chest_handoff_gate_requires_three_raw_valid_measurements() -> None:
-    gate = ChestDistanceHandoffGate(0.65)
-    close = _handoff_observation(0.65)
+def _joint_observation(
+    forward_m: float,
+    *,
+    right_m: float = 0.0,
+    yaw_rad: float = 0.0,
+) -> RawServoObservation:
+    return replace(
+        _handoff_observation(forward_m),
+        target=TargetGeometry(
+            forward_m,
+            right_m,
+            (forward_m, -right_m, 0.4),
+            100,
+            0.9,
+            forward_m,
+        ),
+        table=TableGeometry(
+            yaw_rad,
+            1.0,
+            100,
+            0.01,
+            (1.0, 0.0),
+        ),
+        table_camera_stream=HEAD,
+    )
 
-    assert not gate.observe(close)
-    assert not gate.observe(close)
-    gate.reset()
-    assert gate.streak == 0
-    assert not gate.observe(close)
-    assert not gate.observe(close)
-    assert gate.observe(close)
-    assert not gate.observe(_handoff_observation(0.66))
-    assert gate.streak == 0
+
+def test_runtime_allows_joint_completion_regardless_of_live_stream(
+    tmp_path: Path,
+) -> None:
+    runtime = RawServoRuntime(
+        BasePoseAgentConfig(
+            task="align",
+            output_root=str(tmp_path),
+            raw_chest_target_distance_m=0.7,
+            raw_forward_tolerance_m=0.07,
+            raw_lateral_tolerance_m=0.07,
+            raw_post_stop_sample_s=0.0,
+        ),
+        publish=lambda _message: None,
+        logger=lambda _message: None,
+    )
+    assert runtime.handle_key("n", now=0.0) == "started"
+    details = {
+        "attempt_id": 1,
+        "live_stream": HEAD,
+        "failover_stage": "initial",
+        "control_source_stream": CHEST,
+        "yaw_source": {"stream": HEAD, "valid": True, "realtime": True},
+    }
+    assert runtime.accept_event(
+        RawServoEvent(1, "detecting", details=details),
+        now=0.01,
+    )
+    for index in range(5):
+        assert runtime.accept_event(
+            RawServoEvent(
+                1,
+                "initialized" if index == 0 else "observation",
+                observation=_joint_observation(0.7, right_m=0.02),
+                details=details,
+            ),
+            now=0.02 + index * 0.01,
+        )
+
+    assert runtime.controller.terminal_reason == "aligned"
+    assert runtime.controller.current.velocity == (0.0, 0.0, 0.0)
+    assert runtime.controller.target_distance_m == pytest.approx(0.7)
+    assert runtime.phase == "idle"
 
 
-def test_chest_distance_handoff_qwen_failure_does_not_return_to_chest(
+def test_joint_chest_loss_coasts_four_frames_then_holds_zero(
+    tmp_path: Path,
+) -> None:
+    runtime = RawServoRuntime(
+        BasePoseAgentConfig(task="align", output_root=str(tmp_path)),
+        publish=lambda _message: None,
+        logger=lambda _message: None,
+    )
+    assert runtime.handle_key("n", now=0.0) == "started"
+    common = {
+        "attempt_id": 1,
+        "live_stream": CHEST,
+        "failover_stage": "initial",
+        "control_source_stream": CHEST,
+    }
+    assert runtime.accept_event(
+        RawServoEvent(1, "detecting", details=common),
+        now=0.01,
+    )
+    assert runtime.accept_event(
+        RawServoEvent(
+            1,
+            "initialized",
+            observation=_handoff_observation(1.2),
+            details=common,
+        ),
+        now=0.02,
+    )
+    original = runtime.controller.current
+    assert original.vx > 0.0
+
+    for missing_frames in range(1, 5):
+        assert runtime.accept_event(
+            RawServoEvent(
+                1,
+                "invalid",
+                error="missing tracked target",
+                details={
+                    **common,
+                    "chest_target_loss": {
+                        "missing_frames": missing_frames,
+                        "grace_frames": 5,
+                        "zero_hold_frames": 5,
+                        "stage": "grace",
+                    },
+                },
+            ),
+            now=0.02 + missing_frames * 0.01,
+        )
+        assert runtime.controller.current.velocity == original.velocity
+
+    assert runtime.accept_event(
+        RawServoEvent(
+            1,
+            "invalid",
+            error="missing tracked target",
+            details={
+                **common,
+                "chest_target_loss": {
+                    "missing_frames": 5,
+                    "grace_frames": 5,
+                    "zero_hold_frames": 5,
+                    "stage": "zero_hold",
+                },
+            },
+        ),
+        now=0.07,
+    )
+    assert runtime.controller.current.velocity == (0.0, 0.0, 0.0)
+
+
+def test_runtime_stops_on_first_head_hit_and_resumes_after_three_misses(
+    tmp_path: Path,
+) -> None:
+    published: list[str] = []
+    runtime = RawServoRuntime(
+        BasePoseAgentConfig(task="align", output_root=str(tmp_path)),
+        publish=published.append,
+        logger=lambda _message: None,
+    )
+    assert runtime.handle_key("n", now=0.0) == "started"
+    common = {
+        "attempt_id": 1,
+        "live_stream": CHEST,
+        "failover_stage": "initial",
+    }
+    assert runtime.accept_event(
+        RawServoEvent(1, "detecting", details=common),
+        now=0.01,
+    )
+    assert runtime.accept_event(
+        RawServoEvent(
+            1,
+            "initialized",
+            observation=_handoff_observation(1.2),
+            details={
+                **common,
+                "head_monitor": {
+                    "target_streak": 0,
+                    "missing_streak": 3,
+                    "hold_active": False,
+                },
+            },
+        ),
+        now=0.02,
+    )
+    assert runtime.controller.current.vx > 0.0
+
+    assert runtime.accept_event(
+        RawServoEvent(
+            1,
+            HEAD_MONITOR_HOLD_EVENT,
+            details={
+                **common,
+                "head_monitor": {
+                    "target_streak": 1,
+                    "missing_streak": 0,
+                    "hold_active": True,
+                },
+            },
+        ),
+        now=0.03,
+    )
+    assert runtime.head_monitor_hold_active
+    assert json.loads(published[-1])["velocity"] == {
+        "vx": 0.0,
+        "vy": 0.0,
+        "wz": 0.0,
+    }
+
+    for missing_streak in (1, 2):
+        assert runtime.accept_event(
+            RawServoEvent(
+                1,
+                "observation",
+                observation=_handoff_observation(1.2),
+                details={
+                    **common,
+                    "head_monitor": {
+                        "target_streak": 0,
+                        "missing_streak": missing_streak,
+                        "hold_active": True,
+                    },
+                },
+            ),
+            now=0.03 + missing_streak * 0.01,
+        )
+        assert runtime.head_monitor_hold_active
+        assert runtime.controller.current.velocity == (0.0, 0.0, 0.0)
+
+    assert runtime.accept_event(
+        RawServoEvent(
+            1,
+            "observation",
+            observation=_handoff_observation(1.2),
+            details={
+                **common,
+                "head_monitor": {
+                    "target_streak": 0,
+                    "missing_streak": 3,
+                    "hold_active": False,
+                },
+            },
+        ),
+        now=0.06,
+    )
+    assert not runtime.head_monitor_hold_active
+    assert runtime.controller.current.vx > 0.0
+
+
+def test_close_chest_distance_does_not_trigger_head_handoff(
     tmp_path: Path,
 ) -> None:
     from gear_sonic.utils.inference.base_pose import AlignedRGBDSnapshot
@@ -806,11 +1100,17 @@ def test_chest_distance_handoff_qwen_failure_does_not_return_to_chest(
             self.track_calls += 1
             return [target]
 
+    class EmptyHeadMonitorTracker:
+        def start_all_text(self, **_kwargs):
+            return None
+
+        def track(self, _rgb):
+            return []
+
     config = BasePoseAgentConfig(
         task="approach the blue basket",
         output_root=str(tmp_path),
         raw_servo_hz=10000.0,
-        raw_chest_handoff_distance_m=2.0,
     )
     chest_reference = DualCameraReference(
         stream_name=CHEST,
@@ -836,15 +1136,14 @@ def test_chest_distance_handoff_qwen_failure_does_not_return_to_chest(
         raise RuntimeError("head target not found")
 
     emitted: list[RawServoEvent] = []
-    hold_ready = threading.Event()
     worker = threading.Thread(
         target=run_dual_raw_servo_worker,
         args=(config, requests, events, gate, threading.Event()),
         kwargs={
             "camera_factory": lambda: camera,
             "tracker_factory": lambda: tracker,
+            "head_monitor_tracker_factory": EmptyHeadMonitorTracker,
             "qwen_reference_factory": fail_qwen,
-            "handoff_hold_event": hold_ready,
             "calibration_factory": lambda _config: {
                 HEAD: RawServoCalibration(
                     width, height, 100.0, 101.0, 79.5, 59.5
@@ -868,11 +1167,15 @@ def test_chest_distance_handoff_qwen_failure_does_not_return_to_chest(
         daemon=True,
     )
     worker.start()
-    while not any(event.kind == "switching" for event in emitted):
+    while len(
+        [
+            event
+            for event in emitted
+            if event.kind in {"initialized", "observation"}
+        ]
+    ) < 5:
         emitted.append(events.get(timeout=2.0))
-    assert qwen_calls == 0
-    assert worker.is_alive()
-    hold_ready.set()
+    gate.cancel(1)
     worker.join(timeout=2.0)
     while not events.empty():
         emitted.append(events.get_nowait())
@@ -884,27 +1187,18 @@ def test_chest_distance_handoff_qwen_failure_does_not_return_to_chest(
     switching = [event for event in emitted if event.kind == "switching"]
     terminal = [event for event in emitted if event.kind == "error"]
 
-    assert len(applied) == 2
-    assert applied[0].observation is not None
-    assert applied[0].observation.table is None
-    assert applied[1].observation is not None
-    assert applied[1].observation.table is None
-    assert len(switching) == 1
-    assert switching[0].details["live_stream"] == HEAD
-    assert switching[0].details["failover_stage"] == CHEST_HANDOFF_QWEN_STAGE
-    assert switching[0].details["chest_distance_handoff"]["streak"] == 3
-    assert len(terminal) == 1
-    assert terminal[0].error == CHEST_HANDOFF_FAILURE_REASON
-    assert terminal[0].details["terminal_cause"].endswith(
-        "head target not found"
-    )
-    assert qwen_calls == 1
+    assert len(applied) >= 5
+    assert all(event.observation is not None for event in applied)
+    assert all(event.observation.table is None for event in applied)
+    assert switching == []
+    assert terminal == []
+    assert qwen_calls == 0
     assert tracker.start_calls == 1
     assert not worker.is_alive()
     assert camera.closed
 
 
-def test_head_monitor_tenth_frame_wins_over_same_frame_chest_distance(
+def test_head_monitor_keeps_chest_position_when_live_head_yaw_is_valid(
     tmp_path: Path,
 ) -> None:
     from gear_sonic.utils.inference.base_pose import AlignedRGBDSnapshot
@@ -943,7 +1237,7 @@ def test_head_monitor_tenth_frame_wins_over_same_frame_chest_distance(
             depth_mm = 600
             if stream_name == CHEST:
                 self.chest_live_frames += 1
-                depth_mm = 1000 if self.chest_live_frames <= 7 else 600
+                depth_mm = 1000 if self.chest_live_frames <= 2 else 600
             return snapshot(stream_name, self.marker, depth_mm=depth_mm)
 
         def capture(self) -> DualBasePoseCapture:
@@ -1000,7 +1294,6 @@ def test_head_monitor_tenth_frame_wins_over_same_frame_chest_distance(
         task="approach the blue basket",
         output_root=str(tmp_path),
         raw_servo_hz=10000.0,
-        raw_chest_handoff_distance_m=0.8,
     )
     chest_reference = DualCameraReference(
         stream_name=CHEST,
@@ -1041,31 +1334,291 @@ def test_head_monitor_tenth_frame_wins_over_same_frame_chest_distance(
     worker.start()
 
     emitted: list[RawServoEvent] = []
-    switching = None
+    observations: list[RawServoEvent] = []
     for _ in range(20):
         event = events.get(timeout=2.0)
         emitted.append(event)
-        if event.kind == "switching":
-            switching = event
+        if event.kind in {"initialized", "observation"}:
+            observations.append(event)
+        if len(observations) == 3:
             break
     gate.cancel(1)
     requests.put(None)
     worker.join(timeout=2.0)
 
-    assert switching is not None
-    assert switching.details["failover_stage"] == "head_monitor"
-    assert switching.details["head_monitor"]["target_streak"] == 10
+    assert observations
+    assert all(event.details["live_stream"] == CHEST for event in observations)
     assert all(
-        event.details.get("failover_stage") != CHEST_HANDOFF_QWEN_STAGE
+        event.details["control_source_stream"] == CHEST
+        for event in observations
+    )
+    assert all(event.observation is not None for event in observations)
+    assert all(event.observation.table is not None for event in observations)
+    assert all(
+        event.observation.table_camera_stream == HEAD
+        for event in observations
+        if event.observation is not None
+    )
+    assert all(event.details["yaw_source"]["valid"] for event in observations)
+    assert all(
+        event.details["head_monitor"]["status"] == "joint_tracking"
+        for event in observations
+    )
+    assert all(
+        event.details["head_monitor"]["hold_active"] is False
+        for event in observations
+    )
+    hold_events = [
+        event for event in emitted if event.kind == HEAD_MONITOR_HOLD_EVENT
+    ]
+    assert hold_events == []
+    assert all(
+        "chest_distance_handoff" not in event.details
         for event in emitted
         if event.details is not None
     )
-    chest_observations = [
+    assert all(event.kind != "switching" for event in emitted)
+    assert not worker.is_alive()
+    assert camera.closed
+
+
+def test_head_stage_keeps_chest_basket_until_it_becomes_invalid(
+    tmp_path: Path,
+) -> None:
+    from gear_sonic.utils.inference.base_pose import AlignedRGBDSnapshot
+
+    height, width = 120, 160
+
+    def snapshot(stream_name: str, marker: int) -> AlignedRGBDSnapshot:
+        rgb = np.zeros((height, width, 3), dtype=np.uint8)
+        if stream_name == HEAD:
+            rgb[99:102, 5:155] = 255
+        return AlignedRGBDSnapshot(
+            rgb=rgb,
+            depth_raw=np.full((height, width), 1000, dtype=np.uint16),
+            fx=100.0,
+            fy=101.0,
+            cx=79.5,
+            cy=59.5,
+            depth_scale_m=0.001,
+            depth_aligned_to=stream_name,
+            depth_source=None,
+            timestamp=float(marker),
+        )
+
+    class Camera:
+        def __init__(self) -> None:
+            self.marker = 0
+            self.closed = False
+            self.capture_streams: list[str] = []
+
+        def capture(self) -> DualBasePoseCapture:
+            return DualBasePoseCapture(
+                snapshots={HEAD: snapshot(HEAD, 0), CHEST: snapshot(CHEST, 0)},
+                errors={},
+            )
+
+        def capture_stream(self, stream_name: str, *, timeout_ms: int):
+            assert stream_name in {HEAD, CHEST}
+            assert timeout_ms > 0
+            self.capture_streams.append(stream_name)
+            self.marker += 1
+            return snapshot(stream_name, self.marker)
+
+        def close(self) -> None:
+            self.closed = True
+
+    target_mask = np.zeros((height, width), dtype=np.uint8)
+    target_mask[25:65, 55:105] = 1
+    chest_target = TrackedInstance(
+        7,
+        0,
+        "blue basket",
+        0.9,
+        (55.0, 25.0, 105.0, 65.0),
+        target_mask,
+    )
+    head_target = replace(chest_target, track_id=8)
+    surface_mask = np.zeros((height, width), dtype=np.uint8)
+    surface_mask[85:115, 5:155] = 1
+    head_surface = TrackedInstance(
+        9,
+        1,
+        "desk",
+        0.95,
+        (5.0, 85.0, 155.0, 115.0),
+        surface_mask,
+    )
+
+    class HeadTracker:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def start_target(self, _rgb, **_kwargs):
+            return {}
+
+        def track(self, _rgb):
+            self.calls += 1
+            return (
+                [head_surface]
+                if self.calls == 1
+                else [head_target, head_surface]
+            )
+
+    class ChestFallbackTracker:
+        def __init__(self) -> None:
+            self.started = False
+            self.calls = 0
+
+        def start_target(self, _rgb, **_kwargs):
+            self.started = True
+            return {}
+
+        def track(self, _rgb):
+            assert self.started
+            self.calls += 1
+            return [chest_target] if self.calls <= 2 else []
+
+    config = BasePoseAgentConfig(
+        task="align to the blue basket",
+        output_root=str(tmp_path),
+        raw_servo_hz=20.0,
+    )
+    references = {
+        HEAD: DualCameraReference(
+            stream_name=HEAD,
+            rgb=snapshot(HEAD, 0).rgb,
+            target_prompt="blue basket",
+            target_bbox=(250.0, 150.0, 750.0, 850.0),
+            table_bboxes=(),
+            camera_timestamp=0.0,
+        ),
+        CHEST: DualCameraReference(
+            stream_name=CHEST,
+            rgb=snapshot(CHEST, 0).rgb,
+            target_prompt="blue basket",
+            target_bbox=(250.0, 150.0, 750.0, 850.0),
+            table_bboxes=(),
+            camera_timestamp=0.0,
+        ),
+    }
+    calibration = RawServoCalibration(
+        width,
+        height,
+        100.0,
+        101.0,
+        79.5,
+        59.5,
+    )
+    requests: queue.Queue[int | None] = queue.Queue()
+    requests.put(1)
+    events: queue.Queue[RawServoEvent] = queue.Queue()
+    gate = GenerationGate()
+    gate.activate(1)
+    camera = Camera()
+    worker = threading.Thread(
+        target=run_dual_raw_servo_worker,
+        args=(config, requests, events, gate, threading.Event()),
+        kwargs={
+            "camera_factory": lambda: camera,
+            "tracker_factory": HeadTracker,
+            "head_monitor_tracker_factory": ChestFallbackTracker,
+            "calibration_factory": lambda _config: {
+                HEAD: calibration,
+                CHEST: calibration,
+            },
+            "reference_factory": lambda *_args, **_kwargs: (
+                references,
+                {},
+            ),
+            "table_required": lambda: False,
+            "position_fallback_allowed": lambda: True,
+        },
+        daemon=True,
+    )
+    worker.start()
+
+    emitted: list[RawServoEvent] = []
+    observations: list[RawServoEvent] = []
+    for _ in range(20):
+        event = events.get(timeout=2.0)
+        emitted.append(event)
+        if event.kind in {"initialized", "observation"}:
+            observations.append(event)
+        if len(observations) == 3:
+            break
+    gate.cancel(1)
+    requests.put(None)
+    worker.join(timeout=2.0)
+
+    assert [event.details["control_source_stream"] for event in observations] == [
+        CHEST,
+        CHEST,
+        HEAD,
+    ]
+    assert observations[0].details["basket_source"] == {
+        "preferred_stream": HEAD,
+        "selected_stream": CHEST,
+        "source_switched": True,
+        f"{HEAD}_valid": False,
+        f"{HEAD}_error": "missing tracked target",
+        f"{CHEST}_valid": True,
+        "chest_fallback_used": True,
+        "without_stage_switch": True,
+    }
+    assert observations[1].details["basket_source"]["preferred_stream"] == CHEST
+    assert observations[1].details["basket_source"]["selected_stream"] == CHEST
+    assert not observations[1].details["basket_source"]["source_switched"]
+    assert observations[1].details["basket_source"][f"{CHEST}_valid"]
+    assert observations[0].details["yaw_source"]["stream"] == HEAD
+    assert observations[0].details["yaw_source"]["realtime"]
+    assert observations[0].details["yaw_source"]["valid"]
+    assert observations[1].details["yaw_source"]["stream"] == HEAD
+    assert observations[1].details["yaw_source"]["realtime"]
+    assert observations[1].details["yaw_source"]["valid"]
+    assert observations[0].observation is not None
+    assert observations[0].observation.table is not None
+    assert observations[0].observation.table.line_endpoints_px is not None
+    assert observations[0].observation.desk_mask is not None
+    assert observations[0].observation.table_camera_stream == HEAD
+    assert observations[1].observation is not None
+    assert observations[1].observation.table is not None
+    assert observations[1].observation.table.line_endpoints_px is not None
+    assert observations[1].observation.desk_mask is not None
+    assert observations[1].observation.table_camera_stream == HEAD
+    loss_events = [
         event
         for event in emitted
-        if event.kind in {"initialized", "observation"}
-        and event.details["live_stream"] == CHEST
+        if event.kind == "invalid"
+        and event.details.get("chest_target_loss") is not None
     ]
-    assert len(chest_observations) == 9
+    assert [
+        event.details["chest_target_loss"]["missing_frames"]
+        for event in loss_events
+    ] == list(range(1, 11))
+    assert [
+        event.details["chest_target_loss"]["stage"]
+        for event in loss_events
+    ] == ["grace"] * 4 + ["zero_hold"] * 5 + ["switch_to_head"]
+    assert observations[2].details["basket_source"]["preferred_stream"] == HEAD
+    assert observations[2].details["basket_source"]["selected_stream"] == HEAD
+    assert not observations[2].details["basket_source"]["source_switched"]
+    assert observations[2].details["basket_source"][f"{HEAD}_valid"]
+    assert observations[0].frame is not None
+    assert observations[0].frame.camera_stream == CHEST
+    assert observations[1].frame is not None
+    assert observations[1].frame.camera_stream == CHEST
+    assert observations[2].frame is not None
+    assert observations[2].frame.camera_stream == HEAD
+    assert camera.capture_streams[:7] == [
+        HEAD,
+        CHEST,
+        HEAD,
+        CHEST,
+        HEAD,
+        CHEST,
+        CHEST,
+    ]
+    assert all(event.kind != "switching" for event in emitted)
     assert not worker.is_alive()
     assert camera.closed

@@ -13,6 +13,7 @@ from gear_sonic.camera.calibration import DEFAULT_CAMERA_INTRINSICS_PATH
 @dataclass
 class BasePoseAgentConfig:
     task: str
+    surface_prompt: str = "desk"
     mode: Literal[
         "raw_yoloe_servo",
         "dual_raw_yoloe_servo",
@@ -48,14 +49,15 @@ class BasePoseAgentConfig:
     dual_head_camera_stream: str = "ego_view"
     dual_head_depth_stream: str = "camera/ego_view_depth"
     dual_chest_camera_stream: str = "chest_view"
-    dual_chest_depth_stream: str = "derived/depth_anything/chest_view"
+    dual_chest_depth_stream: str = "camera/chest_view_depth"
     dual_chest_camera_pitch_deg: float = -3.0
     dual_chest_camera_roll_deg: float = 0.0
     dual_chest_camera_yaw_deg: float = 0.0
     dual_chest_camera_forward_offset_m: float = 0.0
     dual_chest_camera_lateral_offset_m: float = 0.0
     dual_match_tolerance_frames: int = 30
-    dual_head_reacquire_frames: int = 10
+    dual_head_reacquire_frames: int = 1
+    dual_head_release_missing_frames: int = 3
     dual_initialization_grace_s: float = 30.0
     dual_qwenvl_fallback_model: str = "qwen3-vl-8b-instruct"
     dual_rgbd_buffer_size: int = 8
@@ -70,8 +72,8 @@ class BasePoseAgentConfig:
     raw_reference_update_min_confidence: float = 0.35
     raw_reference_update_min_iou: float = 0.50
     raw_servo_hz: float = 10.0
-    raw_head_target_distance_m: float = 0.90
-    raw_chest_handoff_distance_m: float = 0.65
+    raw_head_target_distance_m: float = 1.00
+    raw_chest_target_distance_m: float = 0.80
     raw_forward_tolerance_m: float = 0.10
     raw_lateral_tolerance_m: float = 0.10
     raw_min_linear_speed_m_s: float = 0.40
@@ -91,13 +93,20 @@ class BasePoseAgentConfig:
     raw_allow_missing_table: Literal[0, 1] = 0
 
     def __post_init__(self) -> None:
-        if (
-            not math.isfinite(self.raw_chest_handoff_distance_m)
-            or self.raw_chest_handoff_distance_m <= 0.0
+        self.surface_prompt = str(self.surface_prompt).strip()
+        if not self.surface_prompt:
+            raise ValueError("surface_prompt must be non-empty")
+        for value, name in (
+            (self.raw_head_target_distance_m, "raw_head_target_distance_m"),
+            (
+                self.raw_chest_target_distance_m,
+                "raw_chest_target_distance_m",
+            ),
+            (self.raw_forward_tolerance_m, "raw_forward_tolerance_m"),
+            (self.raw_lateral_tolerance_m, "raw_lateral_tolerance_m"),
         ):
-            raise ValueError(
-                "raw_chest_handoff_distance_m must be finite and positive"
-            )
+            if not math.isfinite(value) or value <= 0.0:
+                raise ValueError(f"{name} must be finite and positive")
 
 
 def main(config: BasePoseAgentConfig) -> None:

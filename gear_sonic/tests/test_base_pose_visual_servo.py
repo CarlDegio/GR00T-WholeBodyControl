@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+import math
 from dataclasses import replace
 
 import cv2
@@ -19,7 +21,48 @@ from gear_sonic.utils.inference.base_pose_visual_servo import (
 )
 
 
-def test_yoloe_tracker_always_uses_desk_for_surface_text() -> None:
+@pytest.mark.parametrize(
+    ("overlay_kwargs", "expected_key"),
+    (
+        (
+            {"viewer_target_bbox_xyxy": (10.0, 20.0, 30.0, 40.0)},
+            "target_bbox_xyxy",
+        ),
+        (
+            {
+                "viewer_table_edge_endpoints_px": (
+                    (0.0, 35.0),
+                    (50.0, 35.0),
+                )
+            },
+            "table_edge_endpoints_px",
+        ),
+        (
+            {
+                "viewer_desk_mask_row_spans": ((35, 0, 50),),
+                "viewer_image_size": (64, 48),
+            },
+            "desk_mask_row_spans",
+        ),
+    ),
+)
+def test_velocity_message_publishes_each_viewer_overlay_independently(
+    overlay_kwargs: dict[str, object],
+    expected_key: str,
+) -> None:
+    payload = json.loads(
+        raw_servo.build_servo_velocity_message(
+            raw_servo.ServoCommand(0.0, 0.0, 0.0),
+            action="hold",
+            camera_stream="camera/ego_view",
+            **overlay_kwargs,
+        )
+    )
+
+    assert expected_key in payload["viewer_overlay"]
+
+
+def test_yoloe_tracker_uses_configured_surface_text() -> None:
     class Embedding:
         ndim = 3
 
@@ -55,12 +98,13 @@ def test_yoloe_tracker_always_uses_desk_for_surface_text() -> None:
     tracker.model = Model()
     tracker.class_names = None
     tracker._initial_surface_embedding = None
+    tracker.surface_prompt = "workbench"
 
     artifact = tracker.start_all_text(target_prompt="blue basket")
 
-    assert tracker.model.requested_texts == ["blue basket", "desk"]
-    assert tracker.model.classes == ["blue basket", "desk"]
-    assert tracker.class_names == ("blue basket", "desk")
+    assert tracker.model.requested_texts == ["blue basket", "workbench"]
+    assert tracker.model.classes == ["blue basket", "workbench"]
+    assert tracker.class_names == ("blue basket", "workbench")
     assert artifact["prompt_mode"] == "target_text_surface_text"
 
 
@@ -101,6 +145,19 @@ def test_table_mask_cleanup_keeps_largest_component_and_fills_holes() -> None:
     assert int(np.count_nonzero(cleaned)) == 400
     assert np.all(cleaned[10:15, 10:15] == 1)
     assert np.all(cleaned[1:4, 35:38] == 0)
+
+
+def test_table_edge_mask_dilation_expands_by_three_pixels() -> None:
+    mask = np.zeros((20, 20), dtype=np.uint8)
+    mask[8:12, 8:12] = 1
+
+    dilated = raw_servo._dilate_table_edge_mask(mask)
+
+    assert dilated.dtype == np.uint8
+    assert np.all(dilated[8:12, 8:12] == 1)
+    assert dilated[7, 9] == 1
+    assert dilated[4, 9] == 0
+    assert dilated[9, 15] == 0
 
 
 def test_desk_mask_row_spans_round_trip_binary_regions() -> None:
@@ -197,7 +254,8 @@ def test_rgb_pixel_line_depth_tie_prefers_longer_segment() -> None:
     assert selected is long
 
 
-def test_rgb_pixel_line_requires_all_twenty_valid_depths() -> None:
+def test_rgb_pixel_line_accepts_twelve_valid_depths_and_averages_only_them(
+) -> None:
     segment = raw_servo._PixelLineSegment(
         endpoint_a=np.array([20.0, 100.0]),
         endpoint_b=np.array([220.0, 100.0]),
@@ -207,9 +265,37 @@ def test_rgb_pixel_line_requires_all_twenty_valid_depths() -> None:
     sampled = np.rint(
         np.linspace(segment.endpoint_a, segment.endpoint_b, 20)
     ).astype(int)
-    depth_raw[sampled[5, 1], sampled[5, 0]] = 0
+    for x, y in sampled[:8]:
+        depth_raw[y, x] = 0
 
-    with pytest.raises(ValueError, match="20 valid sampled depths"):
+    selected, valid_pixels, valid_depth_m = (
+        raw_servo._select_nearest_pixel_segment(
+            [segment],
+            depth_raw=depth_raw,
+            depth_scale_m=0.001,
+        )
+    )
+
+    assert selected is segment
+    assert valid_pixels.shape == (12, 2)
+    assert valid_depth_m.shape == (12,)
+    assert np.mean(valid_depth_m) == pytest.approx(1.0)
+
+
+def test_rgb_pixel_line_rejects_fewer_than_twelve_valid_depths() -> None:
+    segment = raw_servo._PixelLineSegment(
+        endpoint_a=np.array([20.0, 100.0]),
+        endpoint_b=np.array([220.0, 100.0]),
+        length=200.0,
+    )
+    depth_raw = np.full((200, 240), 1000, dtype=np.uint16)
+    sampled = np.rint(
+        np.linspace(segment.endpoint_a, segment.endpoint_b, 20)
+    ).astype(int)
+    for x, y in sampled[:9]:
+        depth_raw[y, x] = 0
+
+    with pytest.raises(ValueError, match="at least 12 of 20"):
         raw_servo._select_nearest_pixel_segment(
             [segment],
             depth_raw=depth_raw,
@@ -395,6 +481,68 @@ def test_chest_approach_mode_never_enters_head_alignment_states() -> None:
     assert command.wz == 0.0
 
 
+def test_joint_completion_stops_chest_approach_at_chest_standoff() -> None:
+    controller = VisualServoController(
+        target_distance_m=0.7,
+        forward_tolerance_m=0.07,
+        lateral_tolerance_m=0.07,
+        stable_frames=2,
+        post_stop_sample_s=0.0,
+        chest_approach_only=True,
+    )
+    controller.reset(0.0, initial_phase=ServoPhase.FORWARD_APPROACH)
+    observation = _observation(bbox=(240.0, 120.0, 400.0, 360.0))
+    observation = replace(
+        observation,
+        target=replace(
+            observation.target,
+            forward_m=0.7,
+            right_m=0.02,
+            body_xyz_m=(0.7, -0.02, 0.5),
+            median_depth_m=0.7,
+        ),
+        table_camera_stream="ego_view",
+    )
+
+    first = controller.update(
+        observation,
+        now=0.1,
+        joint_completion=True,
+    )
+    second = controller.update(
+        observation,
+        now=0.2,
+        joint_completion=True,
+    )
+
+    assert first.velocity == (0.0, 0.0, 0.0)
+    assert second.velocity == (0.0, 0.0, 0.0)
+    assert controller.phase is ServoPhase.DONE
+    assert controller.terminal_reason == "aligned"
+
+
+def test_position_fallback_remains_allowed_during_head_yaw_phases() -> None:
+    controller = VisualServoController()
+
+    controller.phase = ServoPhase.TRANSLATE_TARGET
+    assert controller.position_fallback_allowed
+    controller.phase = ServoPhase.RECENTER
+    assert controller.position_fallback_allowed
+    controller.phase = ServoPhase.YAW_ALIGN
+    assert controller.position_fallback_allowed
+    controller.phase = ServoPhase.YAW_TRIM
+    assert controller.position_fallback_allowed
+    controller.phase = ServoPhase.GLOBAL_YAW_ALIGN
+    assert controller.position_fallback_allowed
+    controller.phase = ServoPhase.POST_STOP_SAMPLING
+    assert controller.position_fallback_allowed
+    controller.phase = ServoPhase.VERTICAL_RECENTER
+    assert not controller.position_fallback_allowed
+    controller.chest_approach_only = True
+    controller.phase = ServoPhase.TRANSLATE_TARGET
+    assert not controller.position_fallback_allowed
+
+
 def test_vertical_recenter_uses_only_configured_forward_speed() -> None:
     controller = VisualServoController(min_linear_speed_m_s=0.22)
     controller.reset(1.0, initial_phase=ServoPhase.VERTICAL_RECENTER)
@@ -407,6 +555,16 @@ def test_vertical_recenter_uses_only_configured_forward_speed() -> None:
     assert controller.phase is ServoPhase.VERTICAL_RECENTER
     assert controller.vertical_recenter_started_at == pytest.approx(1.1)
     assert command.velocity == pytest.approx((0.22, 0.0, 0.0))
+
+
+def test_default_axis_speeds_keep_vx_at_point_three_and_vy_at_point_four() -> None:
+    controller = VisualServoController()
+
+    vx, _ = controller._enforce_min_linear_speed(0.1, 0.0)
+    _, vy = controller._enforce_min_linear_speed(0.0, 0.1)
+
+    assert vx == math.nextafter(0.3, math.inf)
+    assert vy == math.nextafter(0.4, math.inf)
 
 
 def test_vertical_recenter_exits_at_eighty_percent_box_bottom() -> None:

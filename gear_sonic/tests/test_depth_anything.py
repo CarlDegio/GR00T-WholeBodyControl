@@ -79,7 +79,7 @@ def test_depth_anything_base_defaults_target_ten_hz() -> None:
     assert config.use_amp
 
 
-def test_depth_anything_gate_only_runs_for_lavira_capture_and_base_pose() -> None:
+def test_depth_anything_gate_only_runs_for_lavira_capture() -> None:
     gate = DepthAnythingInferenceGate()
     assert not gate.active
 
@@ -88,17 +88,7 @@ def test_depth_anything_gate_only_runs_for_lavira_capture_and_base_pose() -> Non
     assert gate.apply("lavira_rgbd_captured", {"generation": 1})
     assert not gate.active
 
-    assert gate.apply("start_base_pose", {"generation": 2})
-    assert gate.active and gate.owner == "base_pose"
-    assert not gate.apply(
-        "base_pose_runtime_status",
-        {"generation": 2, "state": "motion"},
-    )
-    assert gate.active
-    assert gate.apply(
-        "base_pose_runtime_status",
-        {"generation": 2, "state": "reached"},
-    )
+    assert not gate.apply("start_base_pose", {"generation": 2})
     assert not gate.active
 
 

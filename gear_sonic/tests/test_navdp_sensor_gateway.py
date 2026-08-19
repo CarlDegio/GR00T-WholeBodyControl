@@ -18,6 +18,7 @@ from gear_sonic.scripts.navdp_planner import (
     _SharedSensors,
     _extract_camera_frame,
     _gateway_camera_frame,
+    _update_slam_cloud_state,
     _update_odometry_state,
 )
 
@@ -164,6 +165,43 @@ def test_gateway_odometry_updates_internal_pose() -> None:
     assert gateway.pose_time == pytest.approx(10.0)
     assert list(gateway.pose_history) == [(123.0, gateway.pose)]
     np.testing.assert_array_equal(gateway.robot_history, [[1.0, -2.0]])
+
+
+def test_slam_cloud_resets_cached_map_after_a_stale_gap() -> None:
+    sensors = _SharedSensors()
+    sensors.pose = navdp_gateway.Pose2D(10.0, 20.0, 0.0)
+    sensors.slam_map_xy = np.asarray([[9.0, 20.0]], dtype=np.float32)
+    sensors.slam_map_time = 10.0
+    sensors.robot_history = np.asarray([[9.0, 20.0], [9.5, 20.0]], dtype=np.float32)
+
+    _update_slam_cloud_state(
+        sensors,
+        np.asarray([[10.5, 20.5, 0.2]], dtype=np.float32),
+        received_monotonic_s=12.0,
+        reset_after_s=1.0,
+    )
+
+    np.testing.assert_array_equal(sensors.slam_map_xy, [[10.5, 20.5]])
+    np.testing.assert_array_equal(sensors.robot_history, [[10.0, 20.0]])
+
+
+def test_slam_cloud_keeps_accumulating_while_fresh() -> None:
+    sensors = _SharedSensors()
+    sensors.pose = navdp_gateway.Pose2D(10.0, 20.0, 0.0)
+    sensors.slam_map_xy = np.asarray([[9.0, 20.0]], dtype=np.float32)
+    sensors.slam_map_time = 10.0
+
+    _update_slam_cloud_state(
+        sensors,
+        np.asarray([[10.5, 20.5, 0.2]], dtype=np.float32),
+        received_monotonic_s=10.5,
+        reset_after_s=1.0,
+    )
+
+    assert {tuple(point) for point in sensors.slam_map_xy} == {
+        (9.0, 20.0),
+        (10.5, 20.5),
+    }
 
 
 class _BlockingClient:

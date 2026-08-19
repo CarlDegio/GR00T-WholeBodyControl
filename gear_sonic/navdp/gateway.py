@@ -156,22 +156,35 @@ def _update_slam_cloud_state(
     xyz: np.ndarray,
     *,
     received_monotonic_s: float | None,
+    reset_after_s: float | None = None,
 ) -> None:
     values = np.asarray(xyz, dtype=np.float32).reshape(-1, 3)
-    with sensors.lock:
-        pose = sensors.pose
-        previous = sensors.slam_map_xy
-    if pose is None:
-        return
-    updated = update_slam_map(previous, values[:, :2], center_xy=(pose.x, pose.y))
     timestamp_s = (
         time.monotonic()
         if received_monotonic_s is None
         else float(received_monotonic_s)
     )
     with sensors.lock:
+        pose = sensors.pose
+        previous = sensors.slam_map_xy
+        reset_map = bool(
+            reset_after_s is not None
+            and sensors.slam_map_time > 0.0
+            and timestamp_s - sensors.slam_map_time > float(reset_after_s)
+        )
+        if reset_map:
+            previous = np.empty((0, 2), dtype=np.float32)
+    if pose is None:
+        return
+    updated = update_slam_map(previous, values[:, :2], center_xy=(pose.x, pose.y))
+    with sensors.lock:
         sensors.slam_map_xy = updated
         sensors.slam_map_time = timestamp_s
+        if reset_map:
+            current_pose = sensors.pose or pose
+            sensors.robot_history = np.asarray(
+                [[current_pose.x, current_pose.y]], dtype=np.float32
+            )
 
 
 def _gateway_camera_frame(snapshot: MaterializedSnapshot) -> GatewayCameraFrame:
@@ -328,6 +341,7 @@ class NavDPSensorGatewayIngress:
             self.sensors,
             points,
             received_monotonic_s=received_s,
+            reset_after_s=self.max_age_ms * 1.0e-3,
         )
 
     def _report_error(self, exc: Exception) -> None:

@@ -231,6 +231,9 @@ class InferenceLaunchConfig:
     base_pose_task: str = ""
     """Fixed manipulation task used whenever B starts Base-Pose alignment."""
 
+    base_pose_surface_prompt: str = "desk"
+    """YOLOE text prompt for the Base-Pose support surface."""
+
     base_pose_mode: Literal[
         "raw_yoloe_servo",
         "dual_raw_yoloe_servo",
@@ -252,13 +255,15 @@ class InferenceLaunchConfig:
     base_pose_dual_head_camera_stream: str = "ego_view"
     base_pose_dual_head_depth_stream: str = "camera/ego_view_depth"
     base_pose_dual_chest_camera_stream: str = "chest_view"
-    base_pose_dual_chest_depth_stream: str = "derived/depth_anything/chest_view"
+    base_pose_dual_chest_depth_stream: str = "camera/chest_view_depth"
     base_pose_dual_chest_camera_pitch_deg: float = -3.0
     base_pose_dual_chest_camera_roll_deg: float = 0.0
     base_pose_dual_chest_camera_yaw_deg: float = 0.0
     base_pose_dual_chest_camera_forward_offset_m: float = 0.0
     base_pose_dual_chest_camera_lateral_offset_m: float = 0.0
     base_pose_dual_match_tolerance_frames: int = 30
+    base_pose_dual_head_reacquire_frames: int = 1
+    base_pose_dual_head_release_missing_frames: int = 3
     base_pose_dual_initialization_grace_s: float = 30.0
     base_pose_dual_qwenvl_fallback_model: str = "qwen3-vl-8b-instruct"
     base_pose_dual_rgbd_buffer_size: int = 8
@@ -274,8 +279,8 @@ class InferenceLaunchConfig:
     base_pose_raw_reference_update_min_confidence: float = 0.35
     base_pose_raw_reference_update_min_iou: float = 0.50
     base_pose_raw_servo_hz: float = 10.0
-    base_pose_raw_head_target_distance_m: float = 0.90
-    base_pose_raw_chest_handoff_distance_m: float = 0.65
+    base_pose_raw_head_target_distance_m: float = 1.00
+    base_pose_raw_chest_target_distance_m: float = 0.80
     base_pose_raw_forward_tolerance_m: float = 0.10
     base_pose_raw_lateral_tolerance_m: float = 0.10
     base_pose_raw_min_linear_speed_m_s: float = 0.40
@@ -410,6 +415,11 @@ INFERENCE_CORE_PANE_COUNT = 5
 
 def _runtime_profile(config: InferenceLaunchConfig):
     return load_runtime_profile(config.config)
+
+
+def _depth_anything_required(config: InferenceLaunchConfig) -> bool:
+    """Return whether the active navigation input still consumes DA depth."""
+    return bool(config.keyboard_planner and config.planner_input == "lavira")
 
 
 DEPLOY_POLICY_PRESETS = {
@@ -671,6 +681,10 @@ def build_base_pose_agent_command(
             f"{config.base_pose_dual_chest_camera_lateral_offset_m} "
             f"--dual-match-tolerance-frames "
             f"{config.base_pose_dual_match_tolerance_frames} "
+            f"--dual-head-reacquire-frames "
+            f"{config.base_pose_dual_head_reacquire_frames} "
+            f"--dual-head-release-missing-frames "
+            f"{config.base_pose_dual_head_release_missing_frames} "
             f"--dual-initialization-grace-s "
             f"{config.base_pose_dual_initialization_grace_s} "
             f"--dual-qwenvl-fallback-model "
@@ -687,6 +701,7 @@ def build_base_pose_agent_command(
         f"--camera-lateral-offset-m {config.base_pose_camera_lateral_offset_m} "
         f"{dual}"
         f"--raw-yoloe-model-path {shlex.quote(config.base_pose_yoloe_model_path)} "
+        f"--surface-prompt {shlex.quote(config.base_pose_surface_prompt)} "
         f"--raw-yoloe-device {shlex.quote(config.base_pose_yoloe_device)} "
         f"--raw-yoloe-confidence {config.base_pose_yoloe_confidence} "
         f"--raw-yoloe-imgsz {config.base_pose_yoloe_imgsz} "
@@ -698,8 +713,8 @@ def build_base_pose_agent_command(
         f"{config.base_pose_raw_reference_update_min_iou} "
         f"--raw-servo-hz {config.base_pose_raw_servo_hz} "
         f"--raw-head-target-distance-m {config.base_pose_raw_head_target_distance_m} "
-        f"--raw-chest-handoff-distance-m "
-        f"{config.base_pose_raw_chest_handoff_distance_m} "
+        f"--raw-chest-target-distance-m "
+        f"{config.base_pose_raw_chest_target_distance_m} "
         f"--raw-forward-tolerance-m {config.base_pose_raw_forward_tolerance_m} "
         f"--raw-lateral-tolerance-m {config.base_pose_raw_lateral_tolerance_m} "
         f"--raw-min-linear-speed-m-s {config.base_pose_raw_min_linear_speed_m_s} "
@@ -945,6 +960,11 @@ def build_sensor_gateway_command(config: InferenceLaunchConfig, repo_root: Path)
         f"cd {shlex.quote(str(repo_root))} && source .venv_teleop/bin/activate && "
         f"export PYTHONPATH={shlex.quote(str(repo_root))}:$PYTHONPATH; "
     )
+    depth_anything_flag = (
+        "--enable-depth-anything "
+        if _depth_anything_required(config)
+        else "--no-enable-depth-anything "
+    )
     gateway = (
         "python gear_sonic/scripts/run_sensor_gateway.py "
         f"--camera-host {shlex.quote(config.camera_host)} "
@@ -952,6 +972,7 @@ def build_sensor_gateway_command(config: InferenceLaunchConfig, repo_root: Path)
         f"--rpc-port {config.sensor_gateway_port} "
         f"--visualization-port {config.sensor_gateway_visualization_port} "
         f"--vla-timing-port {config.vla_timing_port} "
+        f"{depth_anything_flag}"
         f"{ros_mode}"
     )
     ros_stack_enabled = config.keyboard_planner and not config.sim
@@ -1006,9 +1027,7 @@ def build_sensor_gateway_command(config: InferenceLaunchConfig, repo_root: Path)
                 "/tmp/sonic_opencv_viewer.log",
             )
         )
-    depth_anything_required = config.base_pose_enabled or (
-        config.keyboard_planner and config.planner_input == "lavira"
-    )
+    depth_anything_required = _depth_anything_required(config)
     if depth_anything_required:
         background_commands.append(
             (
@@ -1104,9 +1123,7 @@ def _check_prerequisites(config: InferenceLaunchConfig):
     if not (repo_root / ".venv_teleop" / "bin" / "activate").exists():
         errors.append(".venv_teleop not found. Run: bash install_scripts/install_pico.sh")
 
-    depth_anything_required = config.base_pose_enabled or (
-        config.keyboard_planner and config.planner_input == "lavira"
-    )
+    depth_anything_required = _depth_anything_required(config)
     if depth_anything_required:
         depth_settings = _runtime_profile(config).component("depth_anything")
         for path, label in (
@@ -1157,6 +1174,10 @@ def _check_prerequisites(config: InferenceLaunchConfig):
     if config.base_pose_enabled:
         if not config.base_pose_task.strip():
             errors.append("--base-pose-task is required when Base-Pose is enabled")
+        if not config.base_pose_surface_prompt.strip():
+            errors.append(
+                "--base-pose-surface-prompt is required when Base-Pose is enabled"
+            )
         if config.base_pose_planner_hz <= 0.0:
             errors.append("--base-pose-planner-hz must be positive")
         if config.base_pose_mode == "raw_yoloe_servo":
@@ -1172,7 +1193,7 @@ def _check_prerequisites(config: InferenceLaunchConfig):
             if not head or not chest or head == chest:
                 errors.append("dual Base-Pose camera streams must be distinct")
             expected_head_depth = f"camera/{head}_depth"
-            expected_chest_depth = f"derived/depth_anything/{chest}"
+            expected_chest_depth = f"camera/{chest}_depth"
             if config.base_pose_dual_head_depth_stream != expected_head_depth:
                 errors.append(
                     "dual head raw depth must match its RGB: "
@@ -1180,11 +1201,15 @@ def _check_prerequisites(config: InferenceLaunchConfig):
                 )
             if config.base_pose_dual_chest_depth_stream != expected_chest_depth:
                 errors.append(
-                    "dual chest depth must use metric Depth Anything: "
+                    "dual chest raw depth must match its RGB: "
                     f"--base-pose-dual-chest-depth-stream {expected_chest_depth}"
                 )
             if config.base_pose_dual_match_tolerance_frames <= 0:
                 errors.append("dual match tolerance must be positive")
+            if config.base_pose_dual_head_reacquire_frames <= 0:
+                errors.append("dual head reacquisition frame count must be positive")
+            if config.base_pose_dual_head_release_missing_frames <= 0:
+                errors.append("dual head release missing frame count must be positive")
             if config.base_pose_dual_initialization_grace_s <= 0.0:
                 errors.append("dual initialization grace must be positive")
             if config.base_pose_dual_rgbd_buffer_size <= 0:
@@ -1202,8 +1227,8 @@ def _check_prerequisites(config: InferenceLaunchConfig):
             (config.base_pose_raw_servo_hz, "raw servo frequency"),
             (config.base_pose_raw_head_target_distance_m, "head target distance"),
             (
-                config.base_pose_raw_chest_handoff_distance_m,
-                "chest handoff distance",
+                config.base_pose_raw_chest_target_distance_m,
+                "chest target distance",
             ),
             (config.base_pose_raw_forward_tolerance_m, "forward tolerance"),
             (config.base_pose_raw_lateral_tolerance_m, "lateral tolerance"),
@@ -1326,6 +1351,26 @@ def _clear_stale_fastlio_processes() -> None:
     patterns = (
         r"(^|/)ros2 launch fast_lio mapping\.launch\.py( |$)",
         r"(^|/)fastlio_mapping( |$)",
+    )
+    for pattern in patterns:
+        subprocess.run(["pkill", "-TERM", "-f", pattern], capture_output=True)
+    time.sleep(0.5)
+    for pattern in patterns:
+        subprocess.run(["pkill", "-KILL", "-f", pattern], capture_output=True)
+
+
+def _clear_stale_navdp_processes() -> None:
+    """Remove NavDP workers that survived an earlier tmux session.
+
+    A dead pane can leave both the planner's ZMQ publishers and the policy
+    server alive with a deleted pseudo-terminal.  Besides occupying the fixed
+    ports, that planner keeps publishing its last in-memory SLAM map forever.
+    Match only the two repository-owned entry points so unrelated Python and
+    conda jobs are left untouched.
+    """
+    patterns = (
+        r"(^|/)(python|python3) gear_sonic/scripts/navdp_planner\.py( |$)",
+        r"(^|/)(python|python3) -m eval\.src\.policy_server( |$)",
     )
     for pattern in patterns:
         subprocess.run(["pkill", "-TERM", "-f", pattern], capture_output=True)
@@ -1468,6 +1513,7 @@ def main(config: InferenceLaunchConfig):
     _check_prerequisites(config)
     _kill_existing_session()
     _clear_stale_fastlio_processes()
+    _clear_stale_navdp_processes()
 
     exporter_prompt = config.task_prompt if config.task_prompt else config.prompt
 

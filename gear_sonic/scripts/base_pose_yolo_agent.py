@@ -148,6 +148,7 @@ def run_base_pose_yolo_agent(config: Any) -> None:
         source="base_pose_agent",
         context=context,
         ttl_ms=max(100, int(3000.0 / config.planner_hz)),
+        latest_only=True,
     )
     orientation_socket = None
     orientation_provider = None
@@ -232,6 +233,9 @@ def run_base_pose_yolo_agent(config: Any) -> None:
     }
     if dual_mode:
         worker_kwargs["handoff_hold_event"] = adapter.runtime.handoff_hold_ready
+        worker_kwargs["position_fallback_allowed"] = (
+            lambda: adapter.runtime.controller.position_fallback_allowed
+        )
     worker = threading.Thread(
         target=worker_target,
         args=(

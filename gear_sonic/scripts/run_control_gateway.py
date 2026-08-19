@@ -230,7 +230,7 @@ def run_control_gateway(settings: ControlGatewaySettings) -> None:
         if action.agent_event == "start_navigation":
             agent_destinations = ("LaViRA", "DepthAnything")
         elif action.agent_event == "start_base_pose":
-            agent_destinations = ("BasePose", "DepthAnything")
+            agent_destinations = ("BasePose",)
         elif action.agent_event == "cancel_navigation":
             agent_destinations = ("LaViRA", "BasePose", "DepthAnything")
         destinations = ("PlannerExecutor", "NavDP") + agent_destinations

@@ -30,10 +30,13 @@ from gear_sonic.utils.inference.base_pose_sensor import (
     SensorGatewayDualBasePoseCamera,
 )
 from gear_sonic.utils.inference.base_pose_visual_servo import (
+    DEFAULT_SURFACE_TEXT_PROMPT,
     GenerationGate,
+    HEAD_MONITOR_HOLD_EVENT,
     RawServoEvent,
     RawServoCalibration,
     RawServoObservation,
+    TableGeometry,
     TrackedInstance,
     YoloePersistentTracker,
     YoloeTargetReferenceEncoder,
@@ -44,6 +47,7 @@ from gear_sonic.utils.inference.base_pose_visual_servo import (
     _publish_worker_event,
     _resolve_target,
     _save_png,
+    _surface_geometry_components,
     ground_raw_servo_references,
 )
 from gear_sonic.utils.inference.base_pose_visual_servo_diagnostics import (
@@ -52,12 +56,9 @@ from gear_sonic.utils.inference.base_pose_visual_servo_diagnostics import (
 
 
 DEFAULT_DUAL_QWEN_FALLBACK_MODEL = "qwen3-vl-8b-instruct"
-CHEST_HANDOFF_REQUIRED_FRAMES = 3
-CHEST_HANDOFF_QWEN_STAGE = "chest_distance_qwen"
-CHEST_HANDOFF_FAILURE_REASON = "head_target_not_found_after_chest_handoff"
-QWEN_HOLD_STAGES = frozenset(
-    {"head_monitor_qwen", CHEST_HANDOFF_QWEN_STAGE}
-)
+QWEN_HOLD_STAGES = frozenset({"head_monitor_qwen"})
+JOINT_CHEST_LOSS_GRACE_FRAMES = 5
+JOINT_CHEST_LOSS_ZERO_HOLD_FRAMES = 5
 
 
 def _reference_bbox(
@@ -231,17 +232,6 @@ class DualCameraFailoverCoordinator:
             origin_stream=head_stream,
         )
 
-    def begin_chest_distance_handoff(self) -> DualCameraAttempt:
-        """Start the head-Qwen handoff that must initialize before recovery."""
-
-        head_stream, chest_stream = self.stream_names
-        return self._attempt(
-            head_stream,
-            self._initial_reference(head_stream),
-            stage=CHEST_HANDOFF_QWEN_STAGE,
-            origin_stream=chest_stream,
-        )
-
     def _recovery_sequence(
         self,
         origin_stream: str,
@@ -267,11 +257,6 @@ class DualCameraFailoverCoordinator:
         self,
         attempt: DualCameraAttempt,
     ) -> DualCameraAttempt | None:
-        if (
-            attempt.stage == CHEST_HANDOFF_QWEN_STAGE
-            and self._active_attempt_id != attempt.attempt_id
-        ):
-            return None
         if (
             attempt.stage == "head_monitor_qwen"
             and self._active_attempt_id != attempt.attempt_id
@@ -1139,43 +1124,119 @@ def _best_instance(
     return max(candidates, key=lambda item: item.confidence, default=None)
 
 
+def _observe_tracked_snapshot(
+    snapshot: AlignedRGBDSnapshot,
+    tracker: Any,
+    calibration: RawServoCalibration,
+    *,
+    target_id: int | None,
+    surface_id: int | None,
+    require_table: bool,
+) -> tuple[
+    TrackedInstance,
+    TrackedInstance | None,
+    RawServoObservation,
+    bool,
+    bool,
+]:
+    """Build one observation while keeping IDs local to one camera stream."""
+    calibration.validate_snapshot(snapshot)
+    instances = list(tracker.track(snapshot.rgb))
+    target_reacquired = False
+    surface_reacquired = False
+    if target_id is None:
+        target = _best_instance(instances, 0)
+    else:
+        target, target_reacquired, _ = _resolve_target(instances, target_id)
+    if surface_id is None:
+        surface = _best_instance(instances, 1)
+    else:
+        surface, surface_reacquired, _ = _resolve_target(
+            instances,
+            surface_id,
+            class_index=1,
+        )
+    if target is None:
+        raise ValueError("missing tracked target")
+    if surface is None and require_table:
+        raise ValueError("missing tracked table")
+    observation = _observation(snapshot, target, surface, calibration)
+    if observation.table is None and require_table:
+        raise ValueError(
+            observation.table_geometry_error or "missing table geometry"
+        )
+    return (
+        target,
+        surface,
+        observation,
+        target_reacquired,
+        surface_reacquired,
+    )
+
+
+def _observe_head_yaw_snapshot(
+    snapshot: AlignedRGBDSnapshot,
+    tracker: Any,
+    calibration: RawServoCalibration,
+    *,
+    target_id: int | None,
+    surface_id: int | None,
+) -> tuple[
+    TrackedInstance | None,
+    TrackedInstance,
+    TableGeometry,
+    np.ndarray,
+    bool,
+    bool,
+]:
+    """Measure live head-camera desk yaw without requiring a head basket."""
+    calibration.validate_snapshot(snapshot)
+    instances = list(tracker.track(snapshot.rgb))
+    target_reacquired = False
+    surface_reacquired = False
+    if target_id is None:
+        target = _best_instance(instances, 0)
+    else:
+        target, target_reacquired, _ = _resolve_target(instances, target_id)
+    if surface_id is None:
+        surface = _best_instance(instances, 1)
+    else:
+        surface, surface_reacquired, _ = _resolve_target(
+            instances,
+            surface_id,
+            class_index=1,
+        )
+    if surface is None:
+        raise ValueError("missing tracked desk for live head yaw")
+    table, table_error, desk_mask, _ = _surface_geometry_components(
+        snapshot,
+        surface,
+        calibration,
+        target_mask=None if target is None else target.mask,
+    )
+    if table is None:
+        raise ValueError(table_error or "missing live head desk geometry")
+    return (
+        target,
+        surface,
+        table,
+        desk_mask,
+        target_reacquired,
+        surface_reacquired,
+    )
+
+
 @dataclass(frozen=True)
 class HeadCameraMonitorResult:
     """One result from the text-only head-camera monitor."""
 
     target_streak: int
+    missing_streak: int
+    hold_active: bool
     triggered: bool
     reference: DualCameraReference | None
     target: TrackedInstance | None
     surface: TrackedInstance | None
-
-
-@dataclass
-class ChestDistanceHandoffGate:
-    """Require consecutive raw chest-forward measurements before handoff."""
-
-    distance_m: float
-    required_frames: int = CHEST_HANDOFF_REQUIRED_FRAMES
-    streak: int = 0
-
-    def __post_init__(self) -> None:
-        self.distance_m = float(self.distance_m)
-        self.required_frames = int(self.required_frames)
-        if not math.isfinite(self.distance_m) or self.distance_m <= 0.0:
-            raise ValueError("chest handoff distance must be finite and positive")
-        if self.required_frames <= 0:
-            raise ValueError("chest handoff frame count must be positive")
-
-    def reset(self) -> None:
-        self.streak = 0
-
-    def observe(self, observation: RawServoObservation) -> bool:
-        forward_m = float(observation.target.forward_m)
-        if math.isfinite(forward_m) and forward_m <= self.distance_m:
-            self.streak += 1
-        else:
-            self.reset()
-        return self.streak >= self.required_frames
 
 
 class HeadCameraTextMonitor:
@@ -1186,27 +1247,42 @@ class HeadCameraTextMonitor:
         tracker: Any,
         target_prompt: str,
         *,
-        required_target_frames: int = 10,
+        required_target_frames: int = 1,
+        release_missing_frames: int = 3,
     ):
         required = int(required_target_frames)
+        release_missing = int(release_missing_frames)
         target = str(target_prompt).strip()
         if not target:
             raise ValueError("head monitor target prompt must be non-empty")
         self.target_prompt = target
         if required <= 0:
             raise ValueError("head reacquisition frame count must be positive")
+        if release_missing <= 0:
+            raise ValueError("head release missing frame count must be positive")
         self.tracker = tracker
         self.required_target_frames = required
+        self.release_missing_frames = release_missing
         self.target_streak = 0
+        self.missing_streak = 0
+        self.hold_active = False
 
     def start(self) -> None:
         self.target_streak = 0
+        self.missing_streak = 0
+        self.hold_active = False
         self.tracker.start_all_text(
             target_prompt=self.target_prompt,
         )
 
     def note_missing_frame(self) -> None:
         self.target_streak = 0
+        self.missing_streak = min(
+            self.missing_streak + 1,
+            self.release_missing_frames,
+        )
+        if self.missing_streak >= self.release_missing_frames:
+            self.hold_active = False
 
     def inspect(
         self,
@@ -1216,12 +1292,30 @@ class HeadCameraTextMonitor:
         target = _best_instance(instances, 0)
         surface = _best_instance(instances, 1)
         if target is None:
-            self.target_streak = 0
-            return HeadCameraMonitorResult(0, False, None, None, surface)
+            self.note_missing_frame()
+            return HeadCameraMonitorResult(
+                target_streak=self.target_streak,
+                missing_streak=self.missing_streak,
+                hold_active=self.hold_active,
+                triggered=False,
+                reference=None,
+                target=None,
+                surface=surface,
+            )
+        self.missing_streak = 0
+        self.hold_active = True
         self.target_streak += 1
         streak = self.target_streak
         if streak < self.required_target_frames:
-            return HeadCameraMonitorResult(streak, False, None, target, surface)
+            return HeadCameraMonitorResult(
+                target_streak=streak,
+                missing_streak=0,
+                hold_active=True,
+                triggered=False,
+                reference=None,
+                target=target,
+                surface=surface,
+            )
 
         self.target_streak = 0
         height, width = snapshot.rgb.shape[:2]
@@ -1236,7 +1330,15 @@ class HeadCameraTextMonitor:
             camera_timestamp=snapshot.timestamp,
             kind="head_monitor",
         )
-        return HeadCameraMonitorResult(streak, True, reference, target, surface)
+        return HeadCameraMonitorResult(
+            target_streak=streak,
+            missing_streak=0,
+            hold_active=True,
+            triggered=True,
+            reference=reference,
+            target=target,
+            surface=surface,
+        )
 
 
 def _attempt_prompt_mode(attempt: DualCameraAttempt) -> str:
@@ -1299,9 +1401,13 @@ def _attempt_details(
     }
 
 
-def _attempt_frame_details(attempt: DualCameraAttempt) -> dict[str, Any]:
+def _attempt_frame_details(
+    attempt: DualCameraAttempt,
+    *,
+    camera_stream: str | None = None,
+) -> dict[str, Any]:
     return {
-        "camera_stream": attempt.live_stream,
+        "camera_stream": camera_stream or attempt.live_stream,
         "attempt_id": attempt.attempt_id,
         "failover_stage": attempt.stage,
         "reference_source_stream": attempt.reference.stream_name,
@@ -1375,6 +1481,7 @@ def run_dual_raw_servo_worker(
         | None
     ) = None,
     table_required: Callable[[], bool] | None = None,
+    position_fallback_allowed: Callable[[], bool] | None = None,
 ) -> None:
     """Run one bounded dual-camera failover session per operator generation."""
 
@@ -1383,19 +1490,22 @@ def run_dual_raw_servo_worker(
         str(config.dual_head_camera_stream),
         str(config.dual_chest_camera_stream),
     )
+    surface_prompt = str(
+        getattr(config, "surface_prompt", DEFAULT_SURFACE_TEXT_PROMPT)
+    ).strip()
+    if not surface_prompt:
+        raise ValueError("surface_prompt must be non-empty")
     tolerance = int(config.dual_match_tolerance_frames)
     if tolerance <= 0:
         raise ValueError("dual match tolerance must be positive")
-    head_reacquire_frames = int(getattr(config, "dual_head_reacquire_frames", 10))
+    head_reacquire_frames = int(getattr(config, "dual_head_reacquire_frames", 1))
     if head_reacquire_frames <= 0:
         raise ValueError("dual head reacquisition frame count must be positive")
-    chest_handoff_distance_m = float(config.raw_chest_handoff_distance_m)
-    if (
-        not math.isfinite(chest_handoff_distance_m)
-        or chest_handoff_distance_m <= 0.0
-    ):
-        raise ValueError("chest handoff distance must be finite and positive")
-
+    head_release_missing_frames = int(
+        getattr(config, "dual_head_release_missing_frames", 3)
+    )
+    if head_release_missing_frames <= 0:
+        raise ValueError("dual head release missing frame count must be positive")
     camera: Any | None = None
     tracker: Any = (
         tracker_factory()
@@ -1405,6 +1515,7 @@ def run_dual_raw_servo_worker(
             confidence=config.raw_yoloe_confidence,
             imgsz=config.raw_yoloe_imgsz,
             device=config.raw_yoloe_device,
+            surface_prompt=surface_prompt,
         )
     )
     reference_updater: Any | None = None
@@ -1535,7 +1646,6 @@ def run_dual_raw_servo_worker(
                             "origin_qwen",
                             "alternate_qwen",
                             "head_monitor_qwen",
-                            CHEST_HANDOFF_QWEN_STAGE,
                         }:
                             qwen_snapshot = pending_head_qwen.pop(
                                 attempt.attempt_id, None
@@ -1590,6 +1700,8 @@ def run_dual_raw_servo_worker(
                                 target_prompt=attempt.reference.target_prompt,
                                 target_bbox=attempt.reference.target_bbox,
                             )
+                        chest_fallback_ready = False
+                        chest_fallback_init_error: str | None = None
                         if attempt.live_stream == stream_names[1]:
                             if head_monitor_tracker is None:
                                 if head_monitor_tracker_factory is not None:
@@ -1602,16 +1714,57 @@ def run_dual_raw_servo_worker(
                                         confidence=config.raw_yoloe_confidence,
                                         imgsz=config.raw_yoloe_imgsz,
                                         device=config.raw_yoloe_device,
+                                        surface_prompt=surface_prompt,
                                     )
                             if head_monitor_tracker is not None:
                                 head_monitor = HeadCameraTextMonitor(
                                     head_monitor_tracker,
                                     head_monitor_target_prompt,
                                     required_target_frames=head_reacquire_frames,
+                                    release_missing_frames=(
+                                        head_release_missing_frames
+                                    ),
                                 )
                                 head_monitor.start()
                         else:
                             head_monitor = None
+                            if head_monitor_tracker is None:
+                                if head_monitor_tracker_factory is not None:
+                                    head_monitor_tracker = (
+                                        head_monitor_tracker_factory()
+                                    )
+                                elif tracker_factory is None:
+                                    head_monitor_tracker = YoloePersistentTracker(
+                                        config.raw_yoloe_model_path,
+                                        confidence=config.raw_yoloe_confidence,
+                                        imgsz=config.raw_yoloe_imgsz,
+                                        device=config.raw_yoloe_device,
+                                        surface_prompt=surface_prompt,
+                                    )
+                            if head_monitor_tracker is not None:
+                                try:
+                                    chest_reference = initial_references.get(
+                                        stream_names[1]
+                                    )
+                                    if chest_reference is None:
+                                        head_monitor_tracker.start_all_text(
+                                            target_prompt=(
+                                                attempt.reference.target_prompt
+                                            )
+                                        )
+                                    else:
+                                        head_monitor_tracker.start_target(
+                                            chest_reference.rgb,
+                                            target_prompt=(
+                                                chest_reference.target_prompt
+                                            ),
+                                            target_bbox=(
+                                                chest_reference.target_bbox
+                                            ),
+                                        )
+                                    chest_fallback_ready = True
+                                except Exception as exc:
+                                    chest_fallback_init_error = str(exc)
                     except Exception as exc:
                         failure_reason = (
                             f"{attempt.stage} initialization failed: {exc}"
@@ -1629,21 +1782,29 @@ def run_dual_raw_servo_worker(
                                 generation,
                                 "detecting",
                                 output_dir=str(output_dir),
-                                details=_attempt_details(attempt),
+                                details=_attempt_details(
+                                    attempt,
+                                    chest_position_fallback_available=(
+                                        chest_fallback_ready
+                                    ),
+                                    chest_position_fallback_error=(
+                                        chest_fallback_init_error
+                                    ),
+                                ),
                             ),
                         )
                     invalid_frames = 0
                     initialized = False
                     target_id: int | None = None
                     surface_id: int | None = None
+                    fallback_target_id: int | None = None
+                    fallback_surface_id: int | None = None
+                    position_source_stream = attempt.live_stream
+                    joint_chest_tracking_active = False
+                    joint_chest_missing_frames = 0
                     failure_frame = None
                     preempt_attempt: DualCameraAttempt | None = None
                     switch_details: dict[str, Any] = {}
-                    chest_handoff_gate = (
-                        ChestDistanceHandoffGate(chest_handoff_distance_m)
-                        if attempt.live_stream == stream_names[1]
-                        else None
-                    )
                     while (
                         not failure_reason
                         and gate.is_active(generation)
@@ -1661,14 +1822,58 @@ def run_dual_raw_servo_worker(
                         hard_failure = False
                         target_reacquired = False
                         surface_reacquired = False
-                        previous_target_id = target_id
-                        previous_surface_id = surface_id
                         monitor_details: dict[str, Any] = {}
+                        basket_source_details: dict[str, Any] = {}
+                        yaw_source_details: dict[str, Any] = {}
                         head_snapshot: AlignedRGBDSnapshot | None = None
+                        live_head_table: TableGeometry | None = None
+                        live_head_desk_mask: np.ndarray | None = None
+                        live_head_yaw_error: str | None = None
+                        joint_chest_target_missing = False
+                        chest_active = attempt.live_stream == stream_names[1]
+                        require_table = (
+                            False
+                            if chest_active
+                            else table_required is None
+                            or bool(table_required())
+                        )
+                        fallback_allowed = (
+                            attempt.live_stream == stream_names[0]
+                            and chest_fallback_ready
+                            and (
+                                position_fallback_allowed is None
+                                or bool(position_fallback_allowed())
+                            )
+                        )
+                        control_source_stream = (
+                            position_source_stream
+                            if fallback_allowed
+                            else attempt.live_stream
+                        )
+                        source_is_active = (
+                            control_source_stream == attempt.live_stream
+                        )
+                        source_tracker = (
+                            tracker
+                            if source_is_active
+                            else head_monitor_tracker
+                        )
+                        source_target_id = (
+                            target_id
+                            if source_is_active
+                            else fallback_target_id
+                        )
+                        source_surface_id = (
+                            surface_id
+                            if source_is_active
+                            else fallback_surface_id
+                        )
+                        previous_target_id = source_target_id
+                        previous_surface_id = source_surface_id
                         try:
                             snapshot = _capture_camera_stream(
                                 camera,
-                                attempt.live_stream,
+                                control_source_stream,
                                 timeout_ms=max(
                                     1,
                                     int(float(config.raw_camera_stale_s) * 1000.0),
@@ -1679,6 +1884,8 @@ def run_dual_raw_servo_worker(
                                 attempt.live_stream == stream_names[1]
                                 and head_monitor is not None
                             ):
+                                was_holding = head_monitor.hold_active
+                                monitor_result: HeadCameraMonitorResult | None = None
                                 try:
                                     head_snapshot = _poll_camera_stream(
                                         camera,
@@ -1696,15 +1903,61 @@ def run_dual_raw_servo_worker(
                                     )
                                 except Exception as exc:
                                     head_monitor.note_missing_frame()
-                                    monitor_details["head_monitor"] = {
+                                    monitor_state = {
                                         "status": "error",
-                                        "target_streak": 0,
+                                        "target_streak": (
+                                            head_monitor.target_streak
+                                        ),
+                                        "required_target_frames": (
+                                            head_reacquire_frames
+                                        ),
+                                        "missing_streak": (
+                                            head_monitor.missing_streak
+                                        ),
+                                        "release_missing_frames": (
+                                            head_release_missing_frames
+                                        ),
+                                        "hold_active": (
+                                            head_monitor.hold_active
+                                            and not joint_chest_tracking_active
+                                        ),
                                         "error": str(exc),
                                     }
                                 else:
-                                    monitor_details["head_monitor"] = {
+                                    if monitor_result.surface is None:
+                                        live_head_yaw_error = (
+                                            "missing tracked desk for live head yaw"
+                                        )
+                                    else:
+                                        try:
+                                            (
+                                                live_head_table,
+                                                live_head_yaw_error,
+                                                live_head_desk_mask,
+                                                _,
+                                            ) = _surface_geometry_components(
+                                                head_snapshot,
+                                                monitor_result.surface,
+                                                calibrations[stream_names[0]],
+                                                target_mask=(
+                                                    None
+                                                    if monitor_result.target is None
+                                                    else monitor_result.target.mask
+                                                ),
+                                            )
+                                        except Exception as exc:
+                                            live_head_table = None
+                                            live_head_desk_mask = None
+                                            live_head_yaw_error = str(exc)
+                                    effective_hold = (
+                                        monitor_result.hold_active
+                                        and live_head_table is None
+                                    )
+                                    monitor_state = {
                                         "status": (
-                                            "triggered"
+                                            "joint_tracking"
+                                            if live_head_table is not None
+                                            else "triggered"
                                             if monitor_result.triggered
                                             else "tracking"
                                         ),
@@ -1714,11 +1967,52 @@ def run_dual_raw_servo_worker(
                                         "required_target_frames": (
                                             head_reacquire_frames
                                         ),
+                                        "missing_streak": (
+                                            monitor_result.missing_streak
+                                        ),
+                                        "release_missing_frames": (
+                                            head_release_missing_frames
+                                        ),
+                                        "hold_active": (
+                                            effective_hold
+                                        ),
                                         "desk_detected": (
                                             monitor_result.surface is not None
                                         ),
+                                        "yaw_valid": live_head_table is not None,
+                                        "yaw_error": live_head_yaw_error,
                                     }
-                                    if monitor_result.triggered:
+                                monitor_details["head_monitor"] = monitor_state
+                                if (
+                                    bool(monitor_state.get("hold_active", False))
+                                    and (
+                                        not was_holding
+                                        or (
+                                            monitor_result is not None
+                                            and monitor_result.triggered
+                                        )
+                                    )
+                                ):
+                                    _publish_worker_event(
+                                        events,
+                                        observation_events,
+                                        diagnostics,
+                                        RawServoEvent(
+                                            generation=generation,
+                                            kind=HEAD_MONITOR_HOLD_EVENT,
+                                            output_dir=str(output_dir),
+                                            details=_attempt_details(
+                                                attempt,
+                                                head_monitor=monitor_state,
+                                            ),
+                                        ),
+                                    )
+                                if monitor_result is not None:
+                                    if (
+                                        monitor_result.triggered
+                                        and live_head_table is None
+                                        and not joint_chest_tracking_active
+                                    ):
                                         if monitor_result.reference is not None:
                                             preempt_attempt = (
                                                 coordinator
@@ -1760,69 +2054,321 @@ def run_dual_raw_servo_worker(
                                             ),
                                         )
                                         break
-                            calibration = calibrations[attempt.live_stream]
-                            calibration.validate_snapshot(snapshot)
-                            instances = list(tracker.track(snapshot.rgb))
-                            chest_active = attempt.live_stream == stream_names[1]
-                            # Chest is a target-only far-approach camera from
-                            # its first live frame onward.  Head tracking keeps
-                            # the phase-dependent table requirement.
-                            require_table = (
-                                False
-                                if chest_active
-                                else table_required is None
-                                or bool(table_required())
-                            )
-                            if initialized:
-                                assert target_id is not None
-                                target, target_reacquired, _ = _resolve_target(
-                                    instances,
-                                    target_id,
-                                )
-                                if surface_id is None:
-                                    surface = _best_instance(instances, 1)
-                                else:
-                                    (
-                                        surface,
-                                        surface_reacquired,
-                                        _,
-                                    ) = _resolve_target(
-                                        instances,
-                                        surface_id,
-                                        class_index=1,
-                                    )
-                            else:
-                                target = _best_instance(instances, 0)
-                                surface = _best_instance(instances, 1)
-                            if target is None:
-                                raise ValueError("missing tracked target")
-                            if surface is None and require_table:
-                                raise ValueError("missing tracked table")
-                            observation = _observation(
-                                snapshot,
+                            (
                                 target,
                                 surface,
-                                calibration,
+                                observation,
+                                target_reacquired,
+                                surface_reacquired,
+                            ) = _observe_tracked_snapshot(
+                                snapshot,
+                                source_tracker,
+                                calibrations[control_source_stream],
+                                target_id=source_target_id,
+                                surface_id=source_surface_id,
+                                require_table=(
+                                    require_table if source_is_active else False
+                                ),
                             )
-                            if observation.table is None and require_table:
-                                raise ValueError(
-                                    observation.table_geometry_error
-                                    or "missing table geometry"
+                            if attempt.live_stream == stream_names[0]:
+                                basket_source_details = {
+                                    "preferred_stream": control_source_stream,
+                                    "selected_stream": control_source_stream,
+                                    "source_switched": False,
+                                    f"{control_source_stream}_valid": True,
+                                    "chest_fallback_used": (
+                                        control_source_stream == stream_names[1]
+                                    ),
+                                    "without_stage_switch": True,
+                                }
+                        except (BasePoseCameraError, ValueError) as exc:
+                            primary_error = str(exc)
+                            joint_chest_target_missing = (
+                                joint_chest_tracking_active
+                                and control_source_stream == stream_names[1]
+                                and primary_error == "missing tracked target"
+                            )
+                            if joint_chest_target_missing:
+                                # Once chest position and live head yaw have
+                                # formed a joint observation, do not abandon the
+                                # chest target on a single dropped detection.
+                                perception_error = primary_error
+                                hard_failure = False
+                                basket_source_details = {
+                                    "preferred_stream": stream_names[1],
+                                    "selected_stream": None,
+                                    "source_switched": False,
+                                    f"{stream_names[1]}_valid": False,
+                                    f"{stream_names[1]}_error": primary_error,
+                                    "chest_fallback_used": False,
+                                    "without_stage_switch": True,
+                                }
+                            elif fallback_allowed:
+                                alternate_stream = (
+                                    stream_names[1]
+                                    if control_source_stream == stream_names[0]
+                                    else stream_names[0]
                                 )
-                        except BasePoseCameraError as exc:
-                            perception_error = str(exc)
-                            hard_failure = True
-                        except ValueError as exc:
-                            perception_error = str(exc)
+                                alternate_is_active = (
+                                    alternate_stream == attempt.live_stream
+                                )
+                                alternate_tracker = (
+                                    tracker
+                                    if alternate_is_active
+                                    else head_monitor_tracker
+                                )
+                                alternate_target_id = (
+                                    target_id
+                                    if alternate_is_active
+                                    else fallback_target_id
+                                )
+                                alternate_surface_id = (
+                                    surface_id
+                                    if alternate_is_active
+                                    else fallback_surface_id
+                                )
+                                try:
+                                    fallback_snapshot = _capture_camera_stream(
+                                        camera,
+                                        alternate_stream,
+                                        timeout_ms=max(
+                                            1,
+                                            int(
+                                                float(config.raw_camera_stale_s)
+                                                * 1000.0
+                                            ),
+                                        ),
+                                    )
+                                    (
+                                        fallback_target,
+                                        fallback_surface,
+                                        fallback_observation,
+                                        fallback_target_reacquired,
+                                        fallback_surface_reacquired,
+                                    ) = _observe_tracked_snapshot(
+                                        fallback_snapshot,
+                                        alternate_tracker,
+                                        calibrations[alternate_stream],
+                                        target_id=alternate_target_id,
+                                        surface_id=alternate_surface_id,
+                                        require_table=False,
+                                    )
+                                except Exception as fallback_exc:
+                                    perception_error = (
+                                        f"{control_source_stream} basket invalid: "
+                                        f"{primary_error}; {alternate_stream} "
+                                        "basket invalid: "
+                                        f"{fallback_exc}"
+                                    )
+                                    hard_failure = (
+                                        isinstance(exc, BasePoseCameraError)
+                                        and isinstance(
+                                            fallback_exc,
+                                            BasePoseCameraError,
+                                        )
+                                    )
+                                    basket_source_details = {
+                                        "preferred_stream": (
+                                            control_source_stream
+                                        ),
+                                        "selected_stream": None,
+                                        "source_switched": False,
+                                        f"{control_source_stream}_valid": False,
+                                        f"{control_source_stream}_error": (
+                                            primary_error
+                                        ),
+                                        f"{alternate_stream}_valid": False,
+                                        f"{alternate_stream}_error": str(
+                                            fallback_exc
+                                        ),
+                                        "chest_fallback_used": False,
+                                        "without_stage_switch": True,
+                                    }
+                                else:
+                                    if snapshot is None:
+                                        frame_index += 1
+                                    snapshot = fallback_snapshot
+                                    target = fallback_target
+                                    surface = fallback_surface
+                                    observation = fallback_observation
+                                    target_reacquired = (
+                                        fallback_target_reacquired
+                                    )
+                                    surface_reacquired = (
+                                        fallback_surface_reacquired
+                                    )
+                                    previous_target_id = alternate_target_id
+                                    previous_surface_id = alternate_surface_id
+                                    previous_source_stream = (
+                                        control_source_stream
+                                    )
+                                    control_source_stream = alternate_stream
+                                    position_source_stream = alternate_stream
+                                    perception_error = ""
+                                    hard_failure = False
+                                    basket_source_details = {
+                                        "preferred_stream": (
+                                            previous_source_stream
+                                        ),
+                                        "selected_stream": alternate_stream,
+                                        "source_switched": True,
+                                        f"{previous_source_stream}_valid": False,
+                                        f"{previous_source_stream}_error": (
+                                            primary_error
+                                        ),
+                                        f"{alternate_stream}_valid": True,
+                                        "chest_fallback_used": (
+                                            alternate_stream == stream_names[1]
+                                        ),
+                                        "without_stage_switch": True,
+                                    }
+                            else:
+                                perception_error = primary_error
+                                hard_failure = isinstance(
+                                    exc,
+                                    BasePoseCameraError,
+                                )
                         except Exception as exc:
                             perception_error = str(exc)
                             hard_failure = True
                         else:
                             perception_error = ""
 
+                        if (
+                            not perception_error
+                            and observation is not None
+                            and attempt.live_stream == stream_names[1]
+                            and live_head_table is not None
+                            and head_snapshot is not None
+                        ):
+                            observation = replace(
+                                observation,
+                                table=live_head_table,
+                                table_geometry_error=None,
+                                desk_mask=live_head_desk_mask,
+                                table_rgb_edges=None,
+                                table_camera_stream=stream_names[0],
+                            )
+                            yaw_source_details = {
+                                "stream": stream_names[0],
+                                "realtime": True,
+                                "valid": True,
+                                "camera_timestamp": head_snapshot.timestamp,
+                                "surface_track_id": (
+                                    None
+                                    if monitor_result is None
+                                    or monitor_result.surface is None
+                                    else monitor_result.surface.track_id
+                                ),
+                            }
+                        elif (
+                            not perception_error
+                            and observation is not None
+                            and attempt.live_stream == stream_names[1]
+                        ):
+                            yaw_source_details = {
+                                "stream": stream_names[0],
+                                "realtime": True,
+                                "valid": False,
+                                "error": (
+                                    live_head_yaw_error
+                                    or "live head yaw unavailable"
+                                ),
+                            }
+                        elif (
+                            not perception_error
+                            and observation is not None
+                            and attempt.live_stream == stream_names[0]
+                            and control_source_stream == stream_names[1]
+                        ):
+                            try:
+                                live_head_snapshot = _capture_camera_stream(
+                                    camera,
+                                    stream_names[0],
+                                    timeout_ms=max(
+                                        1,
+                                        int(
+                                            float(config.raw_camera_stale_s)
+                                            * 1000.0
+                                        ),
+                                    ),
+                                )
+                                (
+                                    live_head_target,
+                                    live_head_surface,
+                                    live_head_table,
+                                    live_head_desk_mask,
+                                    _,
+                                    _,
+                                ) = _observe_head_yaw_snapshot(
+                                    live_head_snapshot,
+                                    tracker,
+                                    calibrations[stream_names[0]],
+                                    target_id=target_id,
+                                    surface_id=surface_id,
+                                )
+                            except Exception as exc:
+                                perception_error = (
+                                    f"live head yaw invalid: {exc}"
+                                )
+                                hard_failure = False
+                                yaw_source_details = {
+                                    "stream": stream_names[0],
+                                    "realtime": True,
+                                    "valid": False,
+                                    "error": str(exc),
+                                }
+                            else:
+                                if live_head_target is not None:
+                                    target_id = live_head_target.track_id
+                                surface_id = live_head_surface.track_id
+                                observation = replace(
+                                    observation,
+                                    table=live_head_table,
+                                    table_geometry_error=None,
+                                    desk_mask=live_head_desk_mask,
+                                    table_rgb_edges=None,
+                                    table_camera_stream=stream_names[0],
+                                )
+                                yaw_source_details = {
+                                    "stream": stream_names[0],
+                                    "realtime": True,
+                                    "valid": True,
+                                    "camera_timestamp": (
+                                        live_head_snapshot.timestamp
+                                    ),
+                                    "surface_track_id": (
+                                        live_head_surface.track_id
+                                    ),
+                                }
+                        elif (
+                            not perception_error
+                            and observation is not None
+                            and attempt.live_stream == stream_names[0]
+                        ):
+                            yaw_source_details = {
+                                "stream": stream_names[0],
+                                "realtime": True,
+                                "valid": observation.table is not None,
+                                "camera_timestamp": snapshot.timestamp,
+                                "surface_track_id": (
+                                    None
+                                    if surface is None
+                                    else surface.track_id
+                                ),
+                                "error": observation.table_geometry_error,
+                            }
+
+                        if (
+                            not perception_error
+                            and observation is not None
+                            and control_source_stream == stream_names[1]
+                        ):
+                            joint_chest_missing_frames = 0
+                            if bool(yaw_source_details.get("valid", False)):
+                                joint_chest_tracking_active = True
+
                         if perception_error:
-                            if chest_handoff_gate is not None:
-                                chest_handoff_gate.reset()
                             diagnostic_frame = (
                                 None
                                 if snapshot is None
@@ -1834,7 +2380,10 @@ def run_dual_raw_servo_worker(
                                     None,
                                     kind="invalid",
                                     error=perception_error,
-                                    **_attempt_frame_details(attempt),
+                                    **_attempt_frame_details(
+                                        attempt,
+                                        camera_stream=control_source_stream,
+                                    ),
                                 )
                             )
                             if hard_failure:
@@ -1842,7 +2391,45 @@ def run_dual_raw_servo_worker(
                                 failure_frame = diagnostic_frame
                                 break
                             invalid_frames += 1
-                            if invalid_frames >= tolerance:
+                            chest_target_loss: dict[str, Any] | None = None
+                            switch_position_to_head = False
+                            if joint_chest_target_missing:
+                                joint_chest_missing_frames += 1
+                                missing_frames = joint_chest_missing_frames
+                                total_loss_frames = (
+                                    JOINT_CHEST_LOSS_GRACE_FRAMES
+                                    + JOINT_CHEST_LOSS_ZERO_HOLD_FRAMES
+                                )
+                                if missing_frames >= total_loss_frames:
+                                    loss_stage = "switch_to_head"
+                                elif (
+                                    missing_frames
+                                    >= JOINT_CHEST_LOSS_GRACE_FRAMES
+                                ):
+                                    loss_stage = "zero_hold"
+                                else:
+                                    loss_stage = "grace"
+                                chest_target_loss = {
+                                    "missing_frames": missing_frames,
+                                    "grace_frames": (
+                                        JOINT_CHEST_LOSS_GRACE_FRAMES
+                                    ),
+                                    "zero_hold_frames": (
+                                        JOINT_CHEST_LOSS_ZERO_HOLD_FRAMES
+                                    ),
+                                    "stage": loss_stage,
+                                }
+                                if missing_frames >= total_loss_frames:
+                                    if attempt.live_stream == stream_names[0]:
+                                        switch_position_to_head = True
+                                    else:
+                                        failure_reason = (
+                                            "chest target missing for 10 consecutive "
+                                            "frames after joint observation"
+                                        )
+                                        failure_frame = diagnostic_frame
+                                        break
+                            elif invalid_frames >= tolerance:
                                 failure_reason = perception_error
                                 failure_frame = diagnostic_frame
                                 break
@@ -1860,71 +2447,49 @@ def run_dual_raw_servo_worker(
                                         details=_attempt_details(
                                             attempt,
                                             match_invalid_frames=invalid_frames,
+                                            control_source_stream=(
+                                                control_source_stream
+                                            ),
+                                            basket_source=basket_source_details,
+                                            yaw_source=yaw_source_details,
+                                            chest_target_loss=(
+                                                chest_target_loss
+                                            ),
                                             **monitor_details,
                                         ),
                                         frame=diagnostic_frame,
                                     ),
                                 )
+                            if switch_position_to_head:
+                                position_source_stream = stream_names[0]
+                                joint_chest_tracking_active = False
+                                joint_chest_missing_frames = 0
                             continue
 
                         assert snapshot is not None
                         assert target is not None
                         assert observation is not None
                         invalid_frames = 0
-                        if (
-                            chest_handoff_gate is not None
-                            and chest_handoff_gate.observe(observation)
-                        ):
-                            preempt_attempt = (
-                                coordinator.begin_chest_distance_handoff()
-                            )
-                            if head_snapshot is not None:
-                                pending_head_qwen[
-                                    preempt_attempt.attempt_id
-                                ] = head_snapshot
-                            raw_forward_m = float(
-                                observation.target.forward_m
-                            )
-                            failure_reason = (
-                                "chest target forward distance reached "
-                                f"{raw_forward_m:.3f}m <= "
-                                f"{chest_handoff_distance_m:.3f}m for "
-                                f"{CHEST_HANDOFF_REQUIRED_FRAMES} consecutive "
-                                "frames; requesting head Qwen"
-                            )
-                            switch_details = {
-                                **monitor_details,
-                                "chest_distance_handoff": {
-                                    "raw_forward_m": raw_forward_m,
-                                    "threshold_m": chest_handoff_distance_m,
-                                    "streak": chest_handoff_gate.streak,
-                                    "required_frames": (
-                                        CHEST_HANDOFF_REQUIRED_FRAMES
-                                    ),
-                                },
-                            }
-                            failure_frame = _diagnostic_frame(
-                                frame_index,
-                                snapshot,
-                                target,
-                                surface,
-                                observation,
-                                kind="switching",
-                                error=failure_reason,
-                                **_attempt_frame_details(preempt_attempt),
-                            )
-                            break
                         if not initialized:
                             coordinator.mark_success(attempt)
                             initialized = True
                             event_kind = "initialized"
                         else:
                             event_kind = "observation"
-                        target_id = target.track_id
-                        if surface is not None:
-                            surface_id = surface.track_id
+                        if control_source_stream == attempt.live_stream:
+                            target_id = target.track_id
+                            if surface is not None:
+                                surface_id = surface.track_id
+                        else:
+                            fallback_target_id = target.track_id
+                            fallback_surface_id = (
+                                None if surface is None else surface.track_id
+                            )
                         refresh_details: dict[str, Any] = {}
-                        if reference_updater is not None:
+                        if (
+                            reference_updater is not None
+                            and control_source_stream == attempt.live_stream
+                        ):
                             update_result = reference_updater.poll_latest()
                             if update_result is not None:
                                 if update_result.generation != generation:
@@ -2061,26 +2626,37 @@ def run_dual_raw_servo_worker(
                                             ),
                                             "surface_iou": update_result.surface_iou,
                                         }
-                        latest, latest_reason = latest_gates[
-                            attempt.live_stream
-                        ].consider(
-                            frame_index=frame_index,
-                            stream_name=attempt.live_stream,
-                            rgb=snapshot.rgb,
-                            camera_timestamp=snapshot.timestamp,
-                            target_prompt=attempt.reference.target_prompt,
-                            target_bbox_xyxy=target.bbox_xyxy,
-                            table_bboxes_xyxy=(
-                                () if surface is None else (surface.bbox_xyxy,)
-                            ),
-                            target_confidence=target.confidence,
-                            target_geometry_valid=True,
-                            table_geometry_valid=observation.table is not None,
-                        )
+                        if control_source_stream == attempt.live_stream:
+                            latest, latest_reason = latest_gates[
+                                attempt.live_stream
+                            ].consider(
+                                frame_index=frame_index,
+                                stream_name=attempt.live_stream,
+                                rgb=snapshot.rgb,
+                                camera_timestamp=snapshot.timestamp,
+                                target_prompt=attempt.reference.target_prompt,
+                                target_bbox_xyxy=target.bbox_xyxy,
+                                table_bboxes_xyxy=(
+                                    ()
+                                    if surface is None
+                                    else (surface.bbox_xyxy,)
+                                ),
+                                target_confidence=target.confidence,
+                                target_geometry_valid=True,
+                                table_geometry_valid=(
+                                    observation.table is not None
+                                ),
+                            )
+                        else:
+                            latest = None
+                            latest_reason = "chest_position_fallback"
                         details = _attempt_details(
                             attempt,
                             match_invalid_frames=0,
-                            target_track_id=target_id,
+                            control_source_stream=control_source_stream,
+                            basket_source=basket_source_details,
+                            yaw_source=yaw_source_details,
+                            target_track_id=target.track_id,
                             surface_track_id=(
                                 None if surface is None else surface.track_id
                             ),
@@ -2140,7 +2716,10 @@ def run_dual_raw_servo_worker(
                                     surface,
                                     observation,
                                     kind=event_kind,
-                                    **_attempt_frame_details(attempt),
+                                    **_attempt_frame_details(
+                                        attempt,
+                                        camera_stream=control_source_stream,
+                                    ),
                                 ),
                             ),
                         )
@@ -2152,12 +2731,8 @@ def run_dual_raw_servo_worker(
                     )
                     if next_attempt is None:
                         terminal_error = (
-                            CHEST_HANDOFF_FAILURE_REASON
-                            if attempt.stage == CHEST_HANDOFF_QWEN_STAGE
-                            else (
-                                "both-camera Qwen failover exhausted: "
-                                f"{failure_reason or 'perception failed'}"
-                            )
+                            "both-camera Qwen failover exhausted: "
+                            f"{failure_reason or 'perception failed'}"
                         )
                         _publish_worker_event(
                             events,

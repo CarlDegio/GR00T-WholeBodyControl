@@ -101,23 +101,40 @@ def parse_base_pose_viewer_overlay(
     tuple[tuple[float, float], tuple[float, float]] | None,
     tuple[tuple[int, int, int], ...] | None,
     tuple[int, int] | None,
+    str | None,
+    str | None,
 ]:
     """Validate optional BasePose geometry carried through ControlGateway."""
 
     raw_overlay = payload.get("viewer_overlay")
     if raw_overlay is None:
-        return None, None, None, None, None
+        return None, None, None, None, None, None, None
     if not isinstance(raw_overlay, Mapping):
         raise ValueError("Base Pose viewer overlay must be an object")
-
-    raw_bbox = _finite_tuple(
-        raw_overlay.get("target_bbox_xyxy"),
-        length=4,
-        description="viewer target bbox",
+    default_stream = _camera_stream_name(payload.get("camera_stream"))
+    target_camera_stream = (
+        _camera_stream_name(raw_overlay.get("target_camera_stream"))
+        or default_stream
     )
-    target_bbox = (raw_bbox[0], raw_bbox[1], raw_bbox[2], raw_bbox[3])
-    if target_bbox[2] < target_bbox[0] or target_bbox[3] < target_bbox[1]:
-        raise ValueError("Base Pose viewer target bbox has invalid corner order")
+    table_camera_stream = (
+        _camera_stream_name(raw_overlay.get("table_camera_stream"))
+        or default_stream
+    )
+
+    target_bbox = None
+    raw_bbox = raw_overlay.get("target_bbox_xyxy")
+    if raw_bbox is not None:
+        bbox = _finite_tuple(
+            raw_bbox,
+            length=4,
+            description="viewer target bbox",
+        )
+        target_bbox = (bbox[0], bbox[1], bbox[2], bbox[3])
+        if (
+            target_bbox[2] < target_bbox[0]
+            or target_bbox[3] < target_bbox[1]
+        ):
+            raise ValueError("Base Pose viewer target bbox has invalid corner order")
 
     target_lateral_anchor = None
     raw_anchor = raw_overlay.get("target_lateral_anchor_px")
@@ -192,6 +209,8 @@ def parse_base_pose_viewer_overlay(
         table_edge,
         desk_mask_row_spans,
         image_size,
+        target_camera_stream,
+        table_camera_stream,
     )
 
 
@@ -217,6 +236,8 @@ class NavigationViewerState:
     ) = None
     desk_mask_row_spans: tuple[tuple[int, int, int], ...] | None = None
     overlay_image_size: tuple[int, int] | None = None
+    target_camera_stream: str | None = None
+    table_camera_stream: str | None = None
 
     def clear_base_pose_overlay(self) -> None:
         self.target_bbox_xyxy = None
@@ -224,6 +245,8 @@ class NavigationViewerState:
         self.table_edge_endpoints_px = None
         self.desk_mask_row_spans = None
         self.overlay_image_size = None
+        self.target_camera_stream = None
+        self.table_camera_stream = None
 
     def set_base_pose_overlay(self, parameters: Mapping[str, Any]) -> None:
         (
@@ -232,6 +255,8 @@ class NavigationViewerState:
             self.table_edge_endpoints_px,
             self.desk_mask_row_spans,
             self.overlay_image_size,
+            self.target_camera_stream,
+            self.table_camera_stream,
         ) = parse_base_pose_viewer_overlay(parameters)
 
     def accept_control(
@@ -540,12 +565,25 @@ def draw_base_pose_overlays(
 ) -> np.ndarray:
     """Draw the exact target and desk geometry consumed by BasePose."""
 
+    draw_target = camera_stream == (
+        state.target_camera_stream or state.camera_stream
+    )
+    draw_table = camera_stream == (
+        state.table_camera_stream or state.camera_stream
+    )
     if (
         image_bgr.ndim != 3
         or image_bgr.shape[2] != 3
-        or camera_stream != state.camera_stream
         or not state.active
-        or state.target_bbox_xyxy is None
+        or not (draw_target or draw_table)
+        or not any(
+            (
+                state.target_bbox_xyxy is not None,
+                state.target_lateral_anchor_px is not None,
+                state.table_edge_endpoints_px is not None,
+                bool(state.desk_mask_row_spans),
+            )
+        )
     ):
         return image_bgr
     height, width = image_bgr.shape[:2]
@@ -559,7 +597,7 @@ def draw_base_pose_overlays(
             min(height - 1, max(0, int(round(y * scale_y)))),
         )
 
-    if state.desk_mask_row_spans:
+    if draw_table and state.desk_mask_row_spans:
         source_mask = np.zeros((source_height, source_width), dtype=np.uint8)
         for row, start, end in state.desk_mask_row_spans:
             source_mask[row, start:end] = 255
@@ -591,19 +629,26 @@ def draw_base_pose_overlays(
             cv2.LINE_AA,
         )
 
-    x1, y1, x2, y2 = state.target_bbox_xyxy
-    target_start = point(x1, y1)
-    target_end = point(x2, y2)
     target_color = (0, 255, 0)
-    cv2.rectangle(
-        image_bgr,
-        target_start,
-        target_end,
-        target_color,
-        3,
-        cv2.LINE_AA,
-    )
-    if state.target_lateral_anchor_px is not None:
+    if draw_target and state.target_bbox_xyxy is not None:
+        x1, y1, x2, y2 = state.target_bbox_xyxy
+        target_start = point(x1, y1)
+        target_end = point(x2, y2)
+        cv2.rectangle(
+            image_bgr,
+            target_start,
+            target_end,
+            target_color,
+            3,
+            cv2.LINE_AA,
+        )
+        _outlined_text(
+            image_bgr,
+            "TARGET (F/R)",
+            (target_start[0], max(18, target_start[1] - 7)),
+            target_color,
+        )
+    if draw_target and state.target_lateral_anchor_px is not None:
         cv2.drawMarker(
             image_bgr,
             point(*state.target_lateral_anchor_px),
@@ -613,14 +658,7 @@ def draw_base_pose_overlays(
             2,
             cv2.LINE_AA,
         )
-    _outlined_text(
-        image_bgr,
-        "TARGET (F/R)",
-        (target_start[0], max(18, target_start[1] - 7)),
-        target_color,
-    )
-
-    if state.table_edge_endpoints_px is not None:
+    if draw_table and state.table_edge_endpoints_px is not None:
         edge_start = point(*state.table_edge_endpoints_px[0])
         edge_end = point(*state.table_edge_endpoints_px[1])
         edge_color = (0, 0, 255)

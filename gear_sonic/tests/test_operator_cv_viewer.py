@@ -174,6 +174,97 @@ def test_base_pose_status_draws_target_desk_and_table_on_active_camera() -> None
     assert state.target_bbox_xyxy is None
 
 
+def test_base_pose_routes_target_and_table_to_their_source_cameras() -> None:
+    state = NavigationViewerState()
+    state.accept_control(
+        _command("start_base_pose", {"generation": 4}, sequence=0), now=1.0
+    )
+    assert state.accept_control(
+        _command(
+            "base_pose_runtime_status",
+            {
+                "generation": 4,
+                "state": "motion",
+                # The red mode border remains on the head-stage window.
+                "camera_stream": "ego_view",
+                "viewer_overlay": {
+                    "target_camera_stream": "chest_view",
+                    "table_camera_stream": "ego_view",
+                    "target_bbox_xyxy": [10.0, 10.0, 30.0, 30.0],
+                    "table_edge_endpoints_px": [
+                        [5.0, 35.0],
+                        [55.0, 35.0],
+                    ],
+                    "desk_mask_row_spans": [[32, 4, 60]],
+                    "image_size": [64, 48],
+                },
+            },
+            sequence=1,
+        ),
+        now=1.1,
+    )
+    source = np.zeros((48, 64, 3), dtype=np.uint8)
+
+    head = draw_base_pose_overlays(source.copy(), HEAD_RGB_STREAM, state)
+    chest = draw_base_pose_overlays(source.copy(), CHEST_RGB_STREAM, state)
+
+    assert state.is_active_camera(HEAD_RGB_STREAM)
+    assert not state.is_active_camera(CHEST_RGB_STREAM)
+    np.testing.assert_array_equal(head[35, 40], (0, 0, 255))
+    assert not np.any(head[10, 10])
+    np.testing.assert_array_equal(chest[10, 10], (0, 255, 0))
+    assert not np.any(chest[35, 40])
+
+
+@pytest.mark.parametrize(
+    ("overlay", "expected_pixel"),
+    (
+        ({"target_bbox_xyxy": [10.0, 10.0, 30.0, 30.0]}, (10, 10)),
+        (
+            {"table_edge_endpoints_px": [[5.0, 35.0], [55.0, 35.0]]},
+            (35, 40),
+        ),
+        (
+            {
+                "desk_mask_row_spans": [[32, 4, 60]],
+                "image_size": [64, 48],
+            },
+            (32, 20),
+        ),
+    ),
+)
+def test_base_pose_draws_each_available_overlay_independently(
+    overlay: dict[str, object],
+    expected_pixel: tuple[int, int],
+) -> None:
+    state = NavigationViewerState()
+    state.accept_control(
+        _command("start_base_pose", {"generation": 4}, sequence=0), now=1.0
+    )
+    assert state.accept_control(
+        _command(
+            "base_pose_runtime_status",
+            {
+                "generation": 4,
+                "state": "motion",
+                "camera_stream": "ego_view",
+                "viewer_overlay": overlay,
+            },
+            sequence=1,
+        ),
+        now=1.1,
+    )
+
+    rendered = draw_base_pose_overlays(
+        np.zeros((48, 64, 3), dtype=np.uint8),
+        HEAD_RGB_STREAM,
+        state,
+    )
+
+    assert np.any(rendered)
+    assert np.any(rendered[expected_pixel])
+
+
 def test_base_pose_viewer_rejects_mask_span_outside_source_image() -> None:
     with pytest.raises(ValueError, match="outside the image"):
         parse_base_pose_viewer_overlay(
