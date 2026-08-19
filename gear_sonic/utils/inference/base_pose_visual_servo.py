@@ -1826,6 +1826,16 @@ class VisualServoController:
         center_y = 0.5 * (y1 + y2)
         return 1.0 - center_y / height
 
+    @staticmethod
+    def _vertical_bottom_fraction(
+        observation: RawServoObservation,
+    ) -> float | None:
+        height = float(observation.image_height)
+        if height <= 0.0:
+            return None
+        _, _, _, y2 = observation.target_bbox_xyxy
+        return float(y2) / height
+
     def _vertical_recenter_timed_out(self, now: float) -> bool:
         started_at = self.vertical_recenter_started_at
         if started_at is None:
@@ -1833,11 +1843,11 @@ class VisualServoController:
         self.vertical_recenter_elapsed_s = max(
             0.0, float(now) - started_at
         )
-        if self.vertical_recenter_elapsed_s < 1.0:
+        if self.vertical_recenter_elapsed_s < 0.7:
             return False
         self._transition(
             ServoPhase.YAW_ALIGN,
-            "vertical recenter completed after one second",
+            "vertical recenter completed after 0.7 seconds",
         )
         return True
 
@@ -1870,20 +1880,14 @@ class VisualServoController:
         elif self._vertical_recenter_timed_out(now):
             return self.current
 
-        below_exit_height = (
-            height_from_bottom is not None
-            and height_from_bottom < 0.80
-        )
-        self.vertical_recenter_stable_frames = (
-            self.vertical_recenter_stable_frames + 1
-            if below_exit_height
-            else 0
-        )
-        if self.vertical_recenter_stable_frames >= 3:
+        bottom_fraction = self._vertical_bottom_fraction(observation)
+        if bottom_fraction is not None and bottom_fraction >= 0.80:
+            self.vertical_recenter_stable_frames = 1
             return self._transition(
                 ServoPhase.YAW_ALIGN,
-                "target remained below 80 percent image height for three frames",
+                "target box bottom reached 80 percent image height",
             )
+        self.vertical_recenter_stable_frames = 0
 
         self.invalid_frames = 0
         self.current = self._vertical_recenter_command()

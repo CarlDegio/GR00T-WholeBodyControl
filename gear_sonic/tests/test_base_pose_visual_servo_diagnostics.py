@@ -318,6 +318,47 @@ def test_async_writer_drains_rows_in_frame_order(tmp_path) -> None:
     assert rows[1]["orientation"] is None
 
 
+def test_async_writer_keeps_frames_and_masks_after_nonfinite_controller_values(
+    tmp_path,
+) -> None:
+    warnings: list[str] = []
+    writer = AsyncFrameDiagnosticsWriter(logger=warnings.append)
+    output_dir = tmp_path / "run"
+
+    for index in range(6):
+        writer.submit_frame(
+            1, output_dir, diagnostic_frame(index, include_table=True)
+        )
+        writer.submit_decision(
+            1,
+            index,
+            control_applied=True,
+            controller_state={
+                "phase": "vertical_recenter",
+                "filtered_errors": (
+                    [float("inf"), float("-inf"), float("nan")]
+                    if index == 0
+                    else [0.1, 0.2, 0.3]
+                ),
+            },
+            command={"vx": 0.3, "vy": 0.0, "wz": 0.0, "duration_s": 0.15},
+        )
+    writer.close(drain=True)
+
+    rows = [
+        json.loads(line)
+        for line in (output_dir / "raw_servo_frames.jsonl").read_text().splitlines()
+    ]
+    assert [row["frame_index"] for row in rows] == list(range(6))
+    assert rows[0]["controller"]["filtered_errors"] == [None, None, None]
+    assert not warnings
+    review_dir = output_dir / "review_samples"
+    assert (review_dir / "raw" / "000000.png").exists()
+    assert (review_dir / "raw" / "000005.png").exists()
+    assert (review_dir / "masks" / "000005_target.png").exists()
+    assert (review_dir / "masks" / "000005_table.png").exists()
+
+
 def test_runtime_attaches_latest_orientation_to_applied_frame(tmp_path) -> None:
     provider_calls: list[float] = []
 
@@ -433,21 +474,27 @@ def test_async_writer_submit_does_not_wait_for_blocked_disk(tmp_path) -> None:
     writer.close(drain=True)
 
 
-def test_async_writer_failure_disables_only_failed_generation(tmp_path) -> None:
+def test_async_writer_failure_does_not_stop_later_frames(tmp_path) -> None:
     warnings: list[str] = []
 
-    class FailingWriter:
-        def __init__(self, _output_dir) -> None:
-            pass
+    class FailOnceWriter:
+        def __init__(self, output_dir) -> None:
+            self.writer = FrameDiagnosticsWriter(output_dir)
+            self.failed = False
 
-        def write(self, *_args, **_kwargs) -> None:
-            raise OSError("injected disk failure")
+        def write(self, *args, **kwargs) -> None:
+            if not self.failed:
+                self.failed = True
+                raise OSError("injected disk failure")
+            self.writer.write(*args, **kwargs)
 
+    bad_dir = tmp_path / "bad"
+    bad_dir.mkdir()
     good_dir = tmp_path / "good"
 
     def writer_factory(output_dir):
         if str(output_dir).endswith("bad"):
-            return FailingWriter(output_dir)
+            return FailOnceWriter(output_dir)
         return FrameDiagnosticsWriter(output_dir)
 
     writer = AsyncFrameDiagnosticsWriter(
@@ -477,11 +524,14 @@ def test_async_writer_failure_disables_only_failed_generation(tmp_path) -> None:
 
     assert len(warnings) == 1
     assert "injected disk failure" in warnings[0]
-    row = json.loads((good_dir / "raw_servo_frames.jsonl").read_text())
-    assert row["frame_index"] == 0
+    assert "continuing with later frames" in warnings[0]
+    bad_row = json.loads((bad_dir / "raw_servo_frames.jsonl").read_text())
+    good_row = json.loads((good_dir / "raw_servo_frames.jsonl").read_text())
+    assert bad_row["frame_index"] == 1
+    assert good_row["frame_index"] == 0
 
 
-def test_sampled_png_failure_disables_diagnostics_without_stopping_servo(
+def test_sampled_png_failure_skips_frame_without_stopping_servo(
     tmp_path, monkeypatch
 ) -> None:
     def fail_encode_png(*_args, **_kwargs) -> bytes:
@@ -541,7 +591,8 @@ def test_sampled_png_failure_disables_diagnostics_without_stopping_servo(
     assert not runtime.controller.terminal
     assert len(messages) == 1
     diagnostic_warnings = [
-        message for message in warnings if "diagnostics disabled" in message
+        message for message in warnings if "diagnostic frame write failed" in message
     ]
     assert len(diagnostic_warnings) == 1
     assert "injected review PNG failure" in diagnostic_warnings[0]
+    assert "continuing with later frames" in diagnostic_warnings[0]

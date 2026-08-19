@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 import json
+import math
 import queue
 import threading
 from typing import Any, Callable, Mapping
@@ -43,6 +44,23 @@ class DetectionFrameData:
 
 def _optional_float(value: Any) -> float | None:
     return None if value is None else float(value)
+
+
+def _json_compatible(value: Any) -> Any:
+    """Convert diagnostic values to strict JSON without losing later frames."""
+    if isinstance(value, (float, np.floating)):
+        normalized = float(value)
+        return normalized if math.isfinite(normalized) else None
+    if isinstance(value, np.integer):
+        return int(value)
+    if isinstance(value, Mapping):
+        return {
+            str(key): _json_compatible(item)
+            for key, item in value.items()
+        }
+    if isinstance(value, (list, tuple)):
+        return [_json_compatible(item) for item in value]
+    return value
 
 
 def _bbox_json(value: tuple[float, float, float, float] | None) -> list[float] | None:
@@ -260,7 +278,14 @@ class FrameDiagnosticsWriter:
             "orientation": None if orientation is None else dict(orientation),
         }
         with self.jsonl_path.open("a", encoding="utf-8") as handle:
-            handle.write(json.dumps(record, ensure_ascii=False, allow_nan=False) + "\n")
+            handle.write(
+                json.dumps(
+                    _json_compatible(record),
+                    ensure_ascii=False,
+                    allow_nan=False,
+                )
+                + "\n"
+            )
             handle.flush()
 
 
@@ -325,7 +350,7 @@ class AsyncFrameDiagnosticsWriter:
         self._decisions: dict[tuple[int, int], _ControlDecision] = {}
         self._next_index: dict[int, int] = {}
         self._writers: dict[int, FrameDiagnosticsWriter] = {}
-        self._disabled: set[int] = set()
+        self._reported_failures: set[tuple[int, str, str]] = set()
         self._thread = threading.Thread(
             target=self._run,
             name="raw-servo-diagnostics",
@@ -380,35 +405,21 @@ class AsyncFrameDiagnosticsWriter:
             self._items.put_nowait(_CloseWriter(bool(drain)))
         self._thread.join()
 
-    def _discard_generation(self, generation: int) -> None:
-        self._frames = {
-            key: value
-            for key, value in self._frames.items()
-            if key[0] != generation
-        }
-        self._decisions = {
-            key: value
-            for key, value in self._decisions.items()
-            if key[0] != generation
-        }
-        self._next_index.pop(generation, None)
-        self._writers.pop(generation, None)
-
-    def _disable(self, generation: int, output_dir: Path, exc: Exception) -> None:
-        if generation not in self._disabled:
-            self._disabled.add(generation)
+    def _report_failure(
+        self, generation: int, output_dir: Path, exc: Exception
+    ) -> None:
+        key = (generation, type(exc).__name__, str(exc))
+        if key not in self._reported_failures:
+            self._reported_failures.add(key)
             self.logger(
-                "[RawServo] WARNING diagnostics disabled for "
-                f"{output_dir}: {exc}"
+                "[RawServo] WARNING diagnostic frame write failed for "
+                f"{output_dir}; continuing with later frames: {exc}"
             )
-        self._discard_generation(generation)
 
     def _write(
         self, produced: _ProducedFrame, decision: _ControlDecision
     ) -> bool:
         generation = produced.generation
-        if generation in self._disabled:
-            return False
         try:
             writer = self._writers.get(generation)
             if writer is None:
@@ -423,12 +434,12 @@ class AsyncFrameDiagnosticsWriter:
             )
             return True
         except Exception as exc:
-            self._disable(generation, produced.output_dir, exc)
+            self._report_failure(generation, produced.output_dir, exc)
             return False
 
     def _flush_ready(self, generation: int) -> None:
         next_index = self._next_index.setdefault(generation, 0)
-        while generation not in self._disabled:
+        while True:
             key = (generation, next_index)
             produced = self._frames.get(key)
             decision = self._decisions.get(key)
@@ -436,8 +447,7 @@ class AsyncFrameDiagnosticsWriter:
                 return
             self._frames.pop(key, None)
             self._decisions.pop(key, None)
-            if not self._write(produced, decision):
-                return
+            self._write(produced, decision)
             next_index += 1
             self._next_index[generation] = next_index
 
@@ -449,16 +459,13 @@ class AsyncFrameDiagnosticsWriter:
                 )
         generations = sorted({key[0] for key in self._frames})
         for generation in generations:
-            if generation in self._disabled:
-                continue
             for key in sorted(
                 (key for key in self._frames if key[0] == generation),
                 key=lambda value: value[1],
             ):
                 produced = self._frames.pop(key)
                 decision = self._decisions.pop(key)
-                if not self._write(produced, decision):
-                    break
+                self._write(produced, decision)
 
     def _run(self) -> None:
         while True:
@@ -468,15 +475,11 @@ class AsyncFrameDiagnosticsWriter:
                     self._drain_pending()
                 return
             if isinstance(item, _ProducedFrame):
-                if item.generation in self._disabled:
-                    continue
                 key = (item.generation, int(item.frame.frame_index))
                 self._frames[key] = item
                 self._flush_ready(item.generation)
                 continue
             if isinstance(item, _ControlDecision):
-                if item.generation in self._disabled:
-                    continue
                 key = (item.generation, item.frame_index)
                 self._decisions[key] = item
                 self._flush_ready(item.generation)

@@ -2027,17 +2027,16 @@ def test_runtime_vertical_recenter_only_uses_chest_to_head_monitor_switch(
         (0.23, 0.0, 0.0)
     )
 
-    below_eighty = observation(bbox=(260.0, 100.0, 380.0, 140.0))
-    for index in range(3):
-        assert runtime.accept_event(
-            RawServoEvent(
-                generation=1,
-                kind="observation",
-                observation=below_eighty,
-                details=details,
-            ),
-            now=1.3 + index * 0.1,
-        )
+    below_eighty = observation(bbox=(260.0, 300.0, 380.0, 400.0))
+    assert runtime.accept_event(
+        RawServoEvent(
+            generation=1,
+            kind="observation",
+            observation=below_eighty,
+            details=details,
+        ),
+        now=1.3,
+    )
 
     assert not runtime.vertical_recenter_armed
     assert runtime.controller.phase is ServoPhase.YAW_ALIGN
@@ -3355,47 +3354,51 @@ def test_vertical_recenter_uses_global_linear_speed_and_only_vx() -> None:
     assert command.velocity == pytest.approx((0.22, 0.0, 0.0))
 
 
-def test_vertical_recenter_exits_after_three_frames_below_eighty_percent() -> None:
+def test_vertical_recenter_exits_when_box_bottom_reaches_eighty_percent() -> None:
     controller = VisualServoController()
     controller.reset(1.0, initial_phase=ServoPhase.VERTICAL_RECENTER)
     controller.update(
         observation(bbox=(260.0, 0.0, 380.0, 20.0)), now=1.1
     )
 
-    below_eighty = observation(bbox=(260.0, 100.0, 380.0, 140.0))
-    for index in range(2):
-        command = controller.update(
-            below_eighty,
-            now=1.2 + index * 0.1,
-        )
-        assert command.velocity == pytest.approx((0.40, 0.0, 0.0))
-        assert controller.phase is ServoPhase.VERTICAL_RECENTER
+    command = controller.update(
+        observation(bbox=(260.0, 300.0, 380.0, 383.9)),
+        now=1.2,
+    )
+    assert command.velocity == pytest.approx((0.40, 0.0, 0.0))
+    assert controller.phase is ServoPhase.VERTICAL_RECENTER
 
-    command = controller.update(below_eighty, now=1.4)
+    command = controller.update(
+        observation(bbox=(260.0, 300.0, 380.0, 384.0)),
+        now=1.3,
+    )
 
     assert command.velocity == (0.0, 0.0, 0.0)
     assert controller.phase is ServoPhase.YAW_ALIGN
-    assert controller.vertical_recenter_stable_frames == 3
+    assert controller.vertical_recenter_stable_frames == 1
     assert controller.last_transition_reason == (
-        "target remained below 80 percent image height for three frames"
+        "target box bottom reached 80 percent image height"
     )
 
 
-def test_vertical_recenter_exits_after_one_second() -> None:
+def test_vertical_recenter_exits_after_point_seven_seconds() -> None:
     controller = VisualServoController()
     controller.reset(1.0, initial_phase=ServoPhase.VERTICAL_RECENTER)
     controller.update(
         observation(bbox=(260.0, 0.0, 380.0, 20.0)), now=1.1
     )
 
-    assert not controller.stop_if_timed_out(now=2.099)
+    assert not controller.stop_if_timed_out(now=1.799)
     assert controller.phase is ServoPhase.VERTICAL_RECENTER
     assert controller.current.velocity == pytest.approx((0.40, 0.0, 0.0))
 
-    assert not controller.stop_if_timed_out(now=2.1)
+    assert not controller.stop_if_timed_out(now=1.8)
     assert controller.phase is ServoPhase.YAW_ALIGN
     assert controller.current.velocity == (0.0, 0.0, 0.0)
-    assert controller.vertical_recenter_elapsed_s == pytest.approx(1.0)
+    assert controller.vertical_recenter_elapsed_s == pytest.approx(0.7)
+    assert controller.last_transition_reason == (
+        "vertical recenter completed after 0.7 seconds"
+    )
 
 
 def test_vertical_recenter_keeps_vx_during_invalid_detection() -> None:

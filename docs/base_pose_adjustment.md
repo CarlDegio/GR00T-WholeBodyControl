@@ -120,8 +120,10 @@ relay. Its visual state machine is:
    error inside the configured tolerance for all five consecutive frames.
    The table track is optional in this phase.
 
-The target box's vertical image coordinate does not trigger a recovery state,
-motion command, or reference-update pause.
+Only a chest-to-head `head_monitor` switch can enter `VERTICAL_RECENTER`. It
+moves forward until the target box's lower edge reaches 80% of image height,
+or until 0.7 seconds have elapsed, whichever happens first. Other head-camera
+flows do not use the target box's vertical coordinate for recovery.
 
 Every nonzero closed-loop yaw command has magnitude at least
 `base_pose_raw_min_yaw_speed_rad_s`, defaulting to `0.10 rad/s`. The launcher
