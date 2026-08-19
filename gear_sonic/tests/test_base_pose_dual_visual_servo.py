@@ -742,8 +742,12 @@ def worker_config(tmp_path: Path) -> SimpleNamespace:
 
 
 def large_snapshot(stream_name: str, *, marker: int, timestamp: float) -> AlignedRGBDSnapshot:
+    rgb = np.full((480, 640, 3), marker, dtype=np.uint8)
+    table_value = 255 if marker < 128 else 0
+    rgb[120:360, 100:540] = table_value
+    rgb[0, 0] = marker
     return AlignedRGBDSnapshot(
-        rgb=np.full((480, 640, 3), marker, dtype=np.uint8),
+        rgb=rgb,
         depth_raw=np.full((480, 640), 1000, dtype=np.uint16),
         fx=607.0,
         fy=608.0,

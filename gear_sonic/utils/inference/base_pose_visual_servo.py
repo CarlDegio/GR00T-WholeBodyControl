@@ -1172,57 +1172,154 @@ def estimate_target_geometry(
     )
 
 
-def _ransac_line(
-    points: np.ndarray,
+_TABLE_EDGE_GAUSSIAN_KERNEL = 5
+_TABLE_EDGE_CANNY_LOW = 50
+_TABLE_EDGE_CANNY_HIGH = 150
+_TABLE_EDGE_HOUGH_THRESHOLD = 25
+_TABLE_EDGE_MIN_LENGTH_PX = 45.0
+_TABLE_EDGE_HOUGH_MAX_LINE_GAP_PX = 12
+_TABLE_EDGE_DEPTH_SAMPLES = 20
+
+
+@dataclass(frozen=True)
+class _TLSSegment:
+    points: np.ndarray
+    center: np.ndarray
+    direction: np.ndarray
+    residual_q90: float
+    residual_median: float
+    length: float
+    endpoint_a: np.ndarray
+    endpoint_b: np.ndarray
+
+
+@dataclass(frozen=True)
+class _PixelLineSegment:
+    endpoint_a: np.ndarray
+    endpoint_b: np.ndarray
+    length: float
+
+
+def _fit_tls_segment(points: np.ndarray) -> _TLSSegment:
+    values = np.asarray(points, dtype=np.float64)
+    if values.ndim != 2 or values.shape[1] != 2 or len(values) < 2:
+        raise ValueError("TLS line fitting requires at least two 2D points")
+    center = np.mean(values, axis=0)
+    centered = values - center
+    if np.allclose(centered, 0.0):
+        direction = np.array([1.0, 0.0], dtype=np.float64)
+    else:
+        _, _, vh = np.linalg.svd(centered, full_matrices=False)
+        direction = vh[0]
+    direction /= max(float(np.linalg.norm(direction)), 1e-12)
+    normal = np.array([-direction[1], direction[0]])
+    residuals = np.abs(centered @ normal)
+    projection = centered @ direction
+    minimum = float(np.min(projection))
+    maximum = float(np.max(projection))
+    return _TLSSegment(
+        points=values,
+        center=center,
+        direction=direction,
+        residual_q90=float(np.quantile(residuals, 0.90)),
+        residual_median=float(np.median(residuals)),
+        length=maximum - minimum,
+        endpoint_a=center + minimum * direction,
+        endpoint_b=center + maximum * direction,
+    )
+
+
+def _rgb_mask_edge_intersection(
+    rgb: np.ndarray,
+    mask: np.ndarray,
     *,
-    source_pixels: np.ndarray,
+    exclusion_mask: np.ndarray | None = None,
+) -> np.ndarray:
+    image = np.asarray(rgb)
+    binary = np.asarray(mask) > 0
+    if image.ndim != 3 or image.shape[2] != 3:
+        raise ValueError("table-edge RGB image must have three channels")
+    if binary.ndim != 2 or binary.shape != image.shape[:2]:
+        raise ValueError("table mask is not aligned to RGB")
+    effective_mask = binary.copy()
+    if exclusion_mask is not None:
+        excluded = np.asarray(exclusion_mask) > 0
+        if excluded.shape != binary.shape:
+            raise ValueError("table-edge exclusion mask is not aligned")
+        effective_mask[excluded] = False
+
+    gray = cv2.cvtColor(image, cv2.COLOR_RGB2GRAY)
+    blurred = cv2.GaussianBlur(
+        gray,
+        (_TABLE_EDGE_GAUSSIAN_KERNEL, _TABLE_EDGE_GAUSSIAN_KERNEL),
+        0,
+    )
+    edges = cv2.Canny(
+        blurred,
+        _TABLE_EDGE_CANNY_LOW,
+        _TABLE_EDGE_CANNY_HIGH,
+        apertureSize=3,
+        L2gradient=True,
+    )
+    intersection = np.zeros_like(edges)
+    intersection[effective_mask] = edges[effective_mask]
+    return intersection
+
+
+def _rgb_mask_line_segments(
+    rgb: np.ndarray,
+    mask: np.ndarray,
+    *,
+    exclusion_mask: np.ndarray | None = None,
+) -> list[_PixelLineSegment]:
+    intersection = _rgb_mask_edge_intersection(
+        rgb,
+        mask,
+        exclusion_mask=exclusion_mask,
+    )
+    detected = cv2.HoughLinesP(
+        intersection,
+        rho=1.0,
+        theta=np.pi / 180.0,
+        threshold=_TABLE_EDGE_HOUGH_THRESHOLD,
+        minLineLength=_TABLE_EDGE_MIN_LENGTH_PX,
+        maxLineGap=_TABLE_EDGE_HOUGH_MAX_LINE_GAP_PX,
+    )
+    segments: list[_PixelLineSegment] = []
+    if detected is not None:
+        for x1, y1, x2, y2 in detected[:, 0, :]:
+            endpoint_a = np.array([x1, y1], dtype=np.float64)
+            endpoint_b = np.array([x2, y2], dtype=np.float64)
+            length = float(np.linalg.norm(endpoint_b - endpoint_a))
+            if length > _TABLE_EDGE_MIN_LENGTH_PX:
+                segments.append(
+                    _PixelLineSegment(
+                        endpoint_a=endpoint_a,
+                        endpoint_b=endpoint_b,
+                        length=length,
+                    )
+                )
+    return sorted(segments, key=lambda segment: segment.length, reverse=True)
+
+
+def _select_nearest_pixel_segment(
+    segments: Sequence[_PixelLineSegment],
+    *,
     depth_raw: np.ndarray,
     depth_scale_m: float,
-    threshold_m: float = 0.02,
-    iterations: int = 240,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, float, np.ndarray]:
-    if len(points) < 50:
-        raise ValueError("table edge has fewer than 50 depth points")
-    pixels = np.asarray(source_pixels)
-    if pixels.shape != (len(points), 2):
-        raise ValueError("table-edge source pixels must match points")
+) -> tuple[_PixelLineSegment, np.ndarray, np.ndarray]:
     if depth_raw.ndim != 2 or not math.isfinite(depth_scale_m):
-        raise ValueError("table-edge midpoint depth source is invalid")
-    source_indices = np.arange(len(points), dtype=int)
-    if len(points) > 2500:
-        indices = np.linspace(0, len(points) - 1, 2500, dtype=int)
-        points = points[indices]
-        pixels = pixels[indices]
-        source_indices = source_indices[indices]
-    rng = np.random.default_rng(0)
+        raise ValueError("table-edge depth source is invalid")
     best: tuple[
-        float, np.ndarray, np.ndarray, np.ndarray, float
+        float, _PixelLineSegment, np.ndarray, np.ndarray
     ] | None = None
-    for _ in range(iterations):
-        a, b = points[rng.choice(len(points), size=2, replace=False)]
-        direction = b - a
-        norm = float(np.linalg.norm(direction))
-        if norm < 0.10:
-            continue
-        direction /= norm
-        distance = np.abs(
-            (points[:, 0] - a[0]) * direction[1]
-            - (points[:, 1] - a[1]) * direction[0]
-        )
-        inliers = distance <= threshold_m
-        count = int(np.count_nonzero(inliers))
-        if count < 50:
-            continue
-        inlier_points = points[inliers]
-        inlier_pixels = pixels[inliers]
-        projection = (inlier_points - a) @ direction
-        endpoint_indices = (
-            int(np.argmin(projection)),
-            int(np.argmax(projection)),
-        )
-        endpoint_pixels = inlier_pixels[np.asarray(endpoint_indices)]
+    for segment in segments:
         sampled_pixels = np.rint(
-            np.linspace(endpoint_pixels[0], endpoint_pixels[1], 20)
+            np.linspace(
+                segment.endpoint_a,
+                segment.endpoint_b,
+                _TABLE_EDGE_DEPTH_SAMPLES,
+            )
         ).astype(int)
         sampled_u = sampled_pixels[:, 0]
         sampled_v = sampled_pixels[:, 1]
@@ -1242,30 +1339,25 @@ def _ransac_line(
         ):
             continue
         mean_depth_m = float(np.mean(sampled_depth_m))
-        midpoint_projection = 0.5 * (
-            float(np.min(projection)) + float(np.max(projection))
-        )
-        center = a + midpoint_projection * direction
-        residual = float(np.median(distance[inliers]))
-        if best is None or mean_depth_m < best[0]:
+        if (
+            best is None
+            or mean_depth_m < best[0]
+            or (
+                mean_depth_m == best[0]
+                and segment.length > best[1].length
+            )
+        ):
             best = (
                 mean_depth_m,
-                center,
-                direction.copy(),
-                inliers.copy(),
-                residual,
+                segment,
+                sampled_pixels,
+                sampled_depth_m,
             )
     if best is None:
-        raise ValueError("no table-edge line has 20 valid sampled depths")
-    inlier_points = points[best[3]]
-    inlier_indices = source_indices[best[3]]
-    return (
-        best[1],
-        best[2],
-        inlier_points,
-        best[4],
-        inlier_indices,
-    )
+        raise ValueError(
+            "no RGB-mask table-edge line has 20 valid sampled depths"
+        )
+    return best[1], best[2], best[3]
 
 
 def _largest_filled_component(mask: np.ndarray) -> np.ndarray:
@@ -1323,7 +1415,8 @@ def estimate_table_geometry(
     binary = _largest_filled_component(mask)
     if binary.shape != snapshot.depth_raw.shape:
         raise ValueError("table mask is not aligned to RGB-D")
-    contour = binary - cv2.erode(binary, np.ones((7, 7), np.uint8), iterations=1)
+
+    target_exclusion: np.ndarray | None = None
     if target_mask is not None:
         target_binary = np.asarray(target_mask, dtype=np.uint8)
         if target_binary.shape != binary.shape:
@@ -1338,22 +1431,42 @@ def estimate_table_geometry(
             exclusion_kernel,
             iterations=1,
         )
-        contour[target_exclusion > 0] = 0
-    depth_m = snapshot.depth_raw.astype(np.float64) * snapshot.depth_scale_m
-    valid = (contour > 0) & np.isfinite(depth_m) & (depth_m >= 0.15) & (depth_m <= 4.0)
-    v, u = np.nonzero(valid)
-    if len(u) < 50:
-        raise ValueError("table contour has fewer than 50 valid depth points")
-    z = depth_m[v, u]
-    camera = _deproject(u, v, z, calibration)
-    camera_forward_left = np.column_stack((camera[:, 2], -camera[:, 0]))
-    center, direction, inliers, residual, inlier_indices = _ransac_line(
-        camera_forward_left,
-        source_pixels=np.column_stack((u, v)),
+
+    segments = _rgb_mask_line_segments(
+        snapshot.rgb,
+        binary,
+        exclusion_mask=target_exclusion,
+    )
+    candidates = [
+        segment
+        for segment in segments
+        if segment.length > _TABLE_EDGE_MIN_LENGTH_PX
+    ]
+    if not candidates:
+        raise ValueError(
+            "RGB edge and table mask intersection has no line longer than 45 px"
+        )
+    selected, sampled_pixels, sampled_depth_m = _select_nearest_pixel_segment(
+        candidates,
         depth_raw=snapshot.depth_raw,
         depth_scale_m=snapshot.depth_scale_m,
     )
-    projection = (inliers - center) @ direction
+
+    sampled_u = sampled_pixels[:, 0].astype(np.float64)
+    sampled_v = sampled_pixels[:, 1].astype(np.float64)
+    camera = _deproject(
+        sampled_u,
+        sampled_v,
+        sampled_depth_m,
+        calibration,
+    )
+    camera_forward_left = np.column_stack((camera[:, 2], -camera[:, 0]))
+    metric_line = _fit_tls_segment(camera_forward_left)
+    center = metric_line.center
+    direction = metric_line.direction.copy()
+    if float(direction @ (camera_forward_left[-1] - camera_forward_left[0])) < 0.0:
+        direction = -direction
+    projection = (camera_forward_left - center) @ direction
     length = float(np.max(projection) - np.min(projection))
     normal = np.array([-direction[1], direction[0]])
     if float(normal @ center) < 0.0:
@@ -1365,10 +1478,7 @@ def estimate_table_geometry(
         for index in endpoint_indices
     )
     line_endpoints_px = tuple(
-        (
-            float(u[inlier_indices[index]]),
-            float(v[inlier_indices[index]]),
-        )
+        tuple(float(item) for item in sampled_pixels[index])
         for index in endpoint_indices
     )
     if line_endpoints_px[1] < line_endpoints_px[0]:
@@ -1380,8 +1490,8 @@ def estimate_table_geometry(
     return TableGeometry(
         yaw_error_rad=yaw,
         line_length_m=length,
-        inlier_count=int(len(inliers)),
-        residual_m=residual,
+        inlier_count=int(round(selected.length)) + 1,
+        residual_m=metric_line.residual_median,
         line_center_xy_m=(float(center[0]), float(center[1])),
         line_endpoints_xy_m=line_endpoints_xy_m,
         line_endpoints_px=line_endpoints_px,

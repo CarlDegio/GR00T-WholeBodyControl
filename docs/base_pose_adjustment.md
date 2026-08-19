@@ -96,13 +96,19 @@ assigned class `0` and every desk box assigned class `1`. The resulting visual
 embeddings, rather than text-only class embeddings, are installed in YOLOE-26M
 before persistent BoT-SORT tracking begins at `10 Hz`. The primary box controls
 target centering and the eroded target mask provides robust raw-depth range.
-The desk contour is deprojected only into the camera forward-left plane; it is
-not transformed into the robot body frame. The fixed-seed 240-attempt RANSAC
-samples 20 evenly spaced RGB pixels along each candidate segment, reads their
-aligned raw depths, and selects the candidate with the smallest mean depth. All
-20 depths must be valid. That selected candidate controls yaw directly, without
-SVD refinement or subsequent
-length/inlier/residual rejection.
+The aligned RGB image is converted to grayscale, blurred with a 5-by-5
+Gaussian kernel, and passed through Canny with thresholds 50 and 150. Those
+RGB edge pixels are intersected directly with the completed desk mask after
+the target mask has been dilated by 20 pixels and removed. Probabilistic Hough
+line detection then uses a one-pixel rho step, one-degree theta step, vote
+threshold 25, minimum line length 45 pixels, and maximum line gap 12 pixels.
+Every detected segment strictly longer than 45 pixels is a depth candidate.
+
+The servo samples 20 evenly spaced RGB pixels along each candidate, reads their
+aligned raw depths, and selects the smallest mean depth; an exact depth tie
+prefers the longer segment. All 20 depths must be valid. Those 20 samples are
+deprojected only into the camera forward-left plane and fitted there for the
+yaw result; table-edge points are never transformed into the robot body frame.
 
 The bounded controller publishes at `20 Hz` through the existing direct 5558
 relay. Its visual state machine is:

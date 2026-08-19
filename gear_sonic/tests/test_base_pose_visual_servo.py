@@ -12,6 +12,7 @@ import threading
 import time
 import types
 
+import cv2
 import numpy as np
 import pytest
 
@@ -254,7 +255,7 @@ def test_worker_rolls_target_reference_regardless_of_vertical_position(
 
     class Camera:
         def capture(self):
-            return snapshot()
+            return snapshot(rgb=rgb_with_standard_table_contrast())
 
         def close(self):
             pass
@@ -392,6 +393,7 @@ def test_worker_rolls_target_reference_regardless_of_vertical_position(
 def snapshot(
     depth_raw: np.ndarray | None = None,
     *,
+    rgb: np.ndarray | None = None,
     fx: float = 607.878662,
     fy: float = 608.063232,
     cx: float = 319.858765,
@@ -399,8 +401,10 @@ def snapshot(
 ) -> AlignedRGBDSnapshot:
     if depth_raw is None:
         depth_raw = np.full((480, 640), 1000, dtype=np.uint16)
+    if rgb is None:
+        rgb = np.zeros((480, 640, 3), dtype=np.uint8)
     return AlignedRGBDSnapshot(
-        rgb=np.zeros((480, 640, 3), dtype=np.uint8),
+        rgb=rgb,
         depth_raw=depth_raw,
         fx=fx,
         fy=fy,
@@ -411,6 +415,19 @@ def snapshot(
         depth_source=None,
         timestamp=10.0,
     )
+
+
+def rgb_with_mask_contrast(mask: np.ndarray) -> np.ndarray:
+    rgb = np.zeros((*mask.shape, 3), dtype=np.uint8)
+    rgb[np.asarray(mask) > 0] = 255
+    return rgb
+
+
+def rgb_with_standard_table_contrast() -> np.ndarray:
+    mask = np.zeros((480, 640), dtype=bool)
+    mask[120:360, 100:540] = True
+    return rgb_with_mask_contrast(mask)
+
 
 def fixed_calibration(**overrides: float | int) -> RawServoCalibration:
     values: dict[str, float | int] = {
@@ -574,7 +591,11 @@ def test_table_mask_depth_recovers_front_facing_horizontal_edge() -> None:
     mask[120:360, 100:540] = True
     calibration = fixed_calibration(camera_pitch_deg=0.0)
 
-    geometry = estimate_table_geometry(snapshot(), mask, calibration)
+    geometry = estimate_table_geometry(
+        snapshot(rgb=rgb_with_mask_contrast(mask)),
+        mask,
+        calibration,
+    )
 
     assert geometry.line_length_m > 0.20
     assert geometry.inlier_count >= 50
@@ -589,48 +610,66 @@ def test_table_mask_depth_recovers_front_facing_horizontal_edge() -> None:
     )
 
 
-def test_ransac_selects_line_with_minimum_mean_of_twenty_depths() -> None:
-    midpoint_near_points = np.column_stack(
-        (
-            np.full(80, 1.5),
-            np.linspace(-0.4, 0.4, 80),
-        )
+def test_rgb_pixel_lines_select_minimum_mean_of_twenty_depths() -> None:
+    midpoint_near = raw_servo._PixelLineSegment(
+        endpoint_a=np.array([100.0, 100.0]),
+        endpoint_b=np.array([300.0, 100.0]),
+        length=200.0,
     )
-    lower_mean_points = np.column_stack(
-        (
-            np.full(160, 0.5),
-            np.linspace(-0.5, 0.5, 160),
-        )
+    lower_mean = raw_servo._PixelLineSegment(
+        endpoint_a=np.array([350.0, 200.0]),
+        endpoint_b=np.array([600.0, 200.0]),
+        length=250.0,
     )
-    points = np.vstack((midpoint_near_points, lower_mean_points))
-    midpoint_near_pixels = np.column_stack(
-        (
-            np.rint(np.linspace(100, 300, 80)).astype(int),
-            np.full(80, 100),
-        )
-    )
-    lower_mean_pixels = np.column_stack(
-        (
-            np.rint(np.linspace(350, 600, 160)).astype(int),
-            np.full(160, 200),
-        )
-    )
-    pixels = np.vstack((midpoint_near_pixels, lower_mean_pixels))
     depth_raw = np.full((480, 640), 2000, dtype=np.uint16)
     depth_raw[100, :] = 1500
     depth_raw[100, 190:211] = 500
     depth_raw[200, :] = 1000
 
-    center, _direction, inliers, _residual, indices = raw_servo._ransac_line(
-        points,
-        source_pixels=pixels,
-        depth_raw=depth_raw,
-        depth_scale_m=0.001,
+    selected, sampled_pixels, sampled_depth_m = (
+        raw_servo._select_nearest_pixel_segment(
+            [midpoint_near, lower_mean],
+            depth_raw=depth_raw,
+            depth_scale_m=0.001,
+        )
     )
 
-    assert center[0] == pytest.approx(0.5)
-    assert len(inliers) == 160
-    assert np.all(indices >= 80)
+    assert selected is lower_mean
+    assert sampled_pixels.shape == (20, 2)
+    assert np.mean(sampled_depth_m) == pytest.approx(1.0)
+
+
+def test_rgb_edges_are_intersected_with_mask_and_exclusion() -> None:
+    rgb = np.zeros((200, 240, 3), dtype=np.uint8)
+    cv2.line(rgb, (20, 100), (220, 100), (255, 255, 255), 3)
+    mask = np.zeros((200, 240), dtype=np.uint8)
+    mask[70:130, 100:230] = 1
+    exclusion = np.zeros_like(mask)
+    exclusion[:, 140:161] = 1
+
+    intersection = raw_servo._rgb_mask_edge_intersection(
+        rgb,
+        mask,
+        exclusion_mask=exclusion,
+    )
+
+    assert np.count_nonzero(intersection) > 0
+    assert not np.any(intersection[:, :100])
+    assert not np.any(intersection[:, 140:161])
+
+
+def test_hough_candidates_are_strictly_longer_than_45_pixels() -> None:
+    rgb = np.zeros((200, 240, 3), dtype=np.uint8)
+    cv2.line(rgb, (20, 100), (220, 100), (255, 255, 255), 3)
+    mask = np.ones((200, 240), dtype=np.uint8)
+
+    candidates = raw_servo._rgb_mask_line_segments(rgb, mask)
+
+    assert candidates
+    assert all(
+        segment.length > raw_servo._TABLE_EDGE_MIN_LENGTH_PX
+        for segment in candidates
+    )
 
 
 def test_table_geometry_does_not_transform_edge_points_to_body(
@@ -648,7 +687,7 @@ def test_table_geometry_does_not_transform_edge_points_to_body(
     mask[120:360, 100:540] = True
 
     geometry = estimate_table_geometry(
-        snapshot(),
+        snapshot(rgb=rgb_with_mask_contrast(mask)),
         mask,
         fixed_calibration(camera_pitch_deg=0.0),
     )
@@ -656,31 +695,29 @@ def test_table_geometry_does_not_transform_edge_points_to_body(
     assert geometry.line_endpoints_px is not None
 
 
-def test_table_geometry_accepts_selected_line_without_post_checks(
+def test_table_geometry_rejects_rgb_lines_not_longer_than_45_pixels(
     monkeypatch,
 ) -> None:
-    def selected_line(_points, **_kwargs):
-        return (
-            np.array([1.0, 0.0]),
-            np.array([0.0, 1.0]),
-            np.array([[1.0, 0.0], [1.0, 0.05]]),
-            0.50,
-            np.array([0, 1]),
-        )
-
-    monkeypatch.setattr(raw_servo, "_ransac_line", selected_line)
+    short_segment = raw_servo._PixelLineSegment(
+        endpoint_a=np.array([100.0, 100.0]),
+        endpoint_b=np.array([145.0, 100.0]),
+        length=45.0,
+    )
+    monkeypatch.setattr(
+        raw_servo,
+        "_rgb_mask_line_segments",
+        lambda *_args, **_kwargs: [short_segment],
+    )
     mask = np.zeros((480, 640), dtype=bool)
     mask[120:360, 100:540] = True
 
-    geometry = estimate_table_geometry(
-        snapshot(),
-        mask,
-        fixed_calibration(camera_pitch_deg=0.0),
-    )
+    with pytest.raises(ValueError, match="longer than 45 px"):
+        estimate_table_geometry(
+            snapshot(rgb=rgb_with_mask_contrast(mask)),
+            mask,
+            fixed_calibration(camera_pitch_deg=0.0),
+        )
 
-    assert geometry.line_length_m == pytest.approx(0.05)
-    assert geometry.inlier_count == 2
-    assert geometry.residual_m == pytest.approx(0.50)
 
 def test_table_mask_cleanup_keeps_largest_component_and_fills_holes() -> None:
     mask = np.zeros((30, 45), dtype=bool)
@@ -742,27 +779,30 @@ def test_table_geometry_excludes_target_mask_dilated_by_twenty_pixels(
     target_mask[100:380, 300:320] = True
     calibration = fixed_calibration(camera_pitch_deg=0.0)
     captured: dict[str, np.ndarray] = {}
-    original_ransac = raw_servo._ransac_line
+    original_intersection = raw_servo._rgb_mask_edge_intersection
 
-    def capture_ransac_points(points, **kwargs):
-        captured["points"] = points.copy()
-        return original_ransac(points, **kwargs)
+    def capture_intersection(rgb, mask, **kwargs):
+        captured["exclusion_mask"] = kwargs["exclusion_mask"].copy()
+        intersection = original_intersection(rgb, mask, **kwargs)
+        captured["intersection"] = intersection.copy()
+        return intersection
 
-    monkeypatch.setattr(raw_servo, "_ransac_line", capture_ransac_points)
+    monkeypatch.setattr(
+        raw_servo,
+        "_rgb_mask_edge_intersection",
+        capture_intersection,
+    )
 
     estimate_table_geometry(
-        snapshot(),
+        snapshot(rgb=rgb_with_mask_contrast(table_mask)),
         table_mask,
         calibration,
         target_mask=target_mask,
     )
 
-    candidate_u = np.rint(
-        calibration.cx - captured["points"][:, 1] * calibration.fx
-    ).astype(int)
-    assert not np.any((candidate_u >= 280) & (candidate_u <= 339))
-    assert 279 in candidate_u
-    assert 340 in candidate_u
+    assert np.count_nonzero(captured["intersection"]) > 0
+    assert not np.any(captured["intersection"][:, 280:340])
+    assert np.all(captured["exclusion_mask"][100:380, 300:320] > 0)
 
 
 def test_controller_coarse_yaw_keeps_translation_zero() -> None:
@@ -2365,7 +2405,7 @@ def test_worker_preserves_target_and_surface_reacquisition_after_observation_fai
 
     class Camera:
         def capture(self):
-            return snapshot()
+            return snapshot(rgb=rgb_with_standard_table_contrast())
 
         def close(self):
             pass
@@ -2490,7 +2530,7 @@ def test_single_camera_recovers_with_two_text_prompts_then_returns_to_visual(
 
     class Camera:
         def capture(self):
-            return snapshot()
+            return snapshot(rgb=rgb_with_standard_table_contrast())
 
         def close(self):
             pass
