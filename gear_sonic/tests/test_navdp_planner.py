@@ -14,11 +14,9 @@ import pytest
 from gear_sonic.scripts.navdp_planner import (
     NavigationCommand,
     Pose2D,
-    SonicPlannerState,
     base_goal_to_world,
     build_navigation_message,
     decode_navigation_message,
-    depth_requires_stop,
     filter_livox_points,
     format_navigation_diagnostics,
     integrate_velocity_path,
@@ -30,6 +28,7 @@ from gear_sonic.scripts.navdp_planner import (
     update_slam_map,
     should_abort_nav_for_zero_action,
 )
+from gear_sonic.planner_control import SonicPlannerState, depth_requires_stop
 from gear_sonic.scripts import navdp_planner
 
 
@@ -48,7 +47,7 @@ def test_navdp_runs_unthrottled_inference_with_ten_hz_mpc() -> None:
     assert config.mpc_result_timeout_s == pytest.approx(0.3)
     assert not hasattr(config, "inference_hz")
     assert config.heading_preview_s == pytest.approx(0.6)
-    assert config.radar_timeout_s == pytest.approx(0.75)
+    assert not hasattr(config, "radar_timeout_s")
     assert config.trajectory_timeout_s == pytest.approx(2.5)
 
 
@@ -81,15 +80,14 @@ def test_xnavdp_speed_mapping_is_unicycle_without_lateral_velocity() -> None:
     )
 
 
-def test_sonic_target_heading_integrates_the_original_mpc_yaw_rate() -> None:
-    heading = navdp_planner.sonic_heading_from_mpc(
+def test_fastlio_heading_target_integrates_the_original_mpc_yaw_rate() -> None:
+    heading = navdp_planner.fastlio_heading_target_from_mpc(
         fastlio_yaw=0.4,
-        fastlio_to_sonic_offset=0.2,
         mpc_angular_velocity=0.5,
         heading_preview_s=0.6,
     )
 
-    assert heading == pytest.approx(0.90)
+    assert heading == pytest.approx(0.70)
 
 
 def test_xnavdp_request_keeps_lateral_trajectory_axis_unchanged(monkeypatch) -> None:
@@ -456,7 +454,7 @@ def test_navigation_protocol_round_trip_preserves_generation_and_goal() -> None:
         goal_base=(2.0, 0.4),
         target="blue basket",
         target_type="global_target",
-        confidence=pytest.approx(0.91),
+        confidence=0.91,
     )
 
 
@@ -487,32 +485,6 @@ def test_actor_ray_uses_3d_range_and_full_vertical_field() -> None:
     rays = navdp_planner.actor_ray_from_points(points)
 
     assert rays[90] == pytest.approx(np.sqrt(5.0))
-
-
-def test_near_radar_point_is_visualized_without_stopping_control_output() -> None:
-    velocity, rays, camera_stop = navdp_planner._prepare_control_output(
-        (0.3, 0.0, 0.1),
-        np.array([[0.09, 0.0, 0.0]], dtype=np.float32),
-        np.ones((60, 60), dtype=np.float32),
-    )
-
-    assert velocity == pytest.approx((0.3, 0.0, 0.1))
-    assert rays[90] == pytest.approx(0.09)
-    assert not camera_stop
-
-
-def test_depth_stop_still_zeros_control_output() -> None:
-    depth = np.ones((60, 60), dtype=np.float32)
-    depth.flat[:2001] = 0.09
-
-    velocity, _, camera_stop = navdp_planner._prepare_control_output(
-        (0.3, 0.0, 0.1),
-        np.empty((0, 3), dtype=np.float32),
-        depth,
-    )
-
-    assert velocity == (0.0, 0.0, 0.0)
-    assert camera_stop
 
 
 def test_runtime_has_no_actor_ray_temporal_filter_state() -> None:
@@ -655,14 +627,14 @@ def test_direction_chain_diagnostics_exposes_every_yaw_sign() -> None:
         mpc_angular_velocity=0.25,
         fastlio_yaw=0.4,
         fastlio_yaw_delta=-0.03,
-        sonic_target_heading=0.62,
+        fastlio_target_heading=0.62,
     )
 
     assert "path_dy=+0.100" in text
     assert "mpc_wz=+0.250" in text
     assert "fastlio_yaw=+0.400" in text
     assert "fastlio_dyaw=-0.030" in text
-    assert "sonic_heading=+0.620" in text
+    assert "fastlio_target_heading=+0.620" in text
 
 
 def test_actor_ray_control_text_reports_sent_speed_and_yaw_rate() -> None:

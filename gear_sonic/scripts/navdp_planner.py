@@ -18,11 +18,10 @@ from gear_sonic.navdp.control import (
     LatestMessageWorker,
     MpcSolveRequest,
     MpcSolveResult,
-    SonicPlannerState,
+    fastlio_heading_target_from_mpc,
     fresh_mpc_control,
     prepare_internnav_world_reference,
     should_abort_nav_for_zero_action,
-    sonic_heading_from_mpc,
     xnavdp_adaptive_speed,
     xnavdp_control_to_body_velocity,
 )
@@ -69,7 +68,6 @@ from gear_sonic.navdp.visualization import (
     actor_ray_velocity_arrow,
     compose_head_rgbd_view,
     compose_reasan_navigation_view,
-    depth_requires_stop,
     filter_livox_points,
     format_actor_ray_control_text,
     format_direction_chain_diagnostics,
@@ -80,6 +78,7 @@ from gear_sonic.navdp.visualization import (
     render_head_depth_panel,
     render_slam_world_panel,
 )
+from gear_sonic.planner_control import build_planner_velocity_message
 
 __all__ = [
     "COMMAND_TYPE",
@@ -97,7 +96,6 @@ __all__ = [
     "NavDPSensorGatewayIngress",
     "NavigationCommand",
     "Pose2D",
-    "SonicPlannerState",
     "_SharedSensors",
     "_VIZ_CENTER",
     "_VIZ_RADIUS",
@@ -123,7 +121,6 @@ __all__ = [
     "compose_head_rgbd_view",
     "compose_reasan_navigation_view",
     "decode_navigation_message",
-    "depth_requires_stop",
     "filter_livox_points",
     "format_actor_ray_control_text",
     "format_direction_chain_diagnostics",
@@ -140,29 +137,22 @@ __all__ = [
     "render_head_depth_panel",
     "render_slam_world_panel",
     "should_abort_nav_for_zero_action",
-    "sonic_heading_from_mpc",
+    "fastlio_heading_target_from_mpc",
     "update_slam_map",
     "xnavdp_adaptive_speed",
     "xnavdp_control_to_body_velocity",
 ]
 
 
-def _prepare_control_output(
-    velocity: Sequence[float],
-    points: np.ndarray,
-    latest_depth: np.ndarray | None,
-) -> tuple[tuple[float, float, float], np.ndarray, bool]:
-    command = tuple(map(float, velocity))
-    camera_stop = latest_depth is not None and depth_requires_stop(latest_depth)
-    if camera_stop:
-        command = (0.0, 0.0, 0.0)
-    return command, actor_ray_from_points(points), camera_stop
-
-
 def main(config: NavDPPlannerConfig) -> None:
     import cv2
     import zmq
-    from gear_sonic.runtime.visualization import VisualizationPublisher
+    from gear_sonic.runtime.visualization import (
+        NAVDP_ACTOR_RAY_STREAM,
+        NAVDP_HEAD_RGBD_STREAM,
+        NAVDP_SLAM_2D_STREAM,
+        VisualizationPublisher,
+    )
 
     install_shutdown_signal_handlers()
 
@@ -199,7 +189,6 @@ def main(config: NavDPPlannerConfig) -> None:
 
     generation = 0
     mode = "stop"
-    manual = (0.0, 0.0, 0.0)
     world_goal: tuple[float, float] | None = None
     current_local_goal = (0.0, 0.0)
     nav_confidence = 0.0
@@ -215,9 +204,9 @@ def main(config: NavDPPlannerConfig) -> None:
         tuple[int, np.ndarray | None, Pose2D | None, str | None]
     ] = queue.Queue(maxsize=1)
     trajectory_log_pending = False
-    last_safety_blocked = False
-    sonic_planner = SonicPlannerState()
-    sonic_fastlio_yaw_offset = 0.0
+    last_output_blocked = False
+    nav_fastlio_reference_yaw: float | None = None
+    fastlio_target_heading: float | None = None
     mpc_solver = AsyncMpcSolver()
     mpc_reference = np.empty((0, 2), dtype=np.float64)
     mpc_reference_version = 0
@@ -275,7 +264,7 @@ def main(config: NavDPPlannerConfig) -> None:
                 trajectory = np.empty((0, 2), dtype=np.float32)
                 invalid_count = 0
                 trajectory_log_pending = False
-                last_safety_blocked = False
+                last_output_blocked = False
                 mpc_reference = np.empty((0, 2), dtype=np.float64)
                 mpc_reference_version += 1
                 mpc_linear_velocity = 0.0
@@ -283,10 +272,12 @@ def main(config: NavDPPlannerConfig) -> None:
                 mpc_result_time = 0.0
                 next_mpc_update = 0.0
                 if mode == "manual_velocity":
-                    manual = command.velocity or (0.0, 0.0, 0.0)
+                    # Manual/BasePose velocity is consumed only by the common
+                    # planner executor. NavDP clears its own navigation state.
+                    mode = "stop"
+                    world_goal = None
                     nav_confidence = 0.0
                 elif mode == "stop":
-                    manual = (0.0, 0.0, 0.0)
                     world_goal = None
                     nav_confidence = 0.0
                 else:
@@ -298,9 +289,8 @@ def main(config: NavDPPlannerConfig) -> None:
                     else:
                         nav_confidence = command.confidence
                         world_goal = base_goal_to_world(command.goal_base, pose)
-                        sonic_fastlio_yaw_offset = math.remainder(
-                            sonic_planner.heading - pose.yaw, 2.0 * math.pi
-                        )
+                        nav_fastlio_reference_yaw = pose.yaw
+                        fastlio_target_heading = pose.yaw
                         if actorray_recording is not None:
                             actorray_recording.start(generation)
                         send_status("active", "goal_accepted")
@@ -403,9 +393,7 @@ def main(config: NavDPPlannerConfig) -> None:
                         f"status={result.return_status}: {result.error}",
                         flush=True,
                     )
-            if mode == "manual_velocity":
-                velocity = manual
-            elif mode == "nav_goal":
+            if mode == "nav_goal":
                 if now >= next_mpc_update and len(mpc_reference) and pose is not None:
                     next_mpc_update = now + 1.0 / config.mpc_hz
                     mpc_solver.submit(
@@ -434,9 +422,8 @@ def main(config: NavDPPlannerConfig) -> None:
                         ),
                         command_available=mpc_solution_available,
                     )
-                    sonic_planner.heading = sonic_heading_from_mpc(
+                    fastlio_target_heading = fastlio_heading_target_from_mpc(
                         fastlio_yaw=pose.yaw,
-                        fastlio_to_sonic_offset=sonic_fastlio_yaw_offset,
                         mpc_angular_velocity=mpc_angular_velocity,
                         heading_preview_s=config.heading_preview_s,
                     )
@@ -455,7 +442,7 @@ def main(config: NavDPPlannerConfig) -> None:
                                 mpc_angular_velocity=mpc_angular_velocity,
                                 fastlio_yaw=pose.yaw,
                                 fastlio_yaw_delta=fastlio_yaw_delta,
-                                sonic_target_heading=sonic_planner.heading,
+                                fastlio_target_heading=fastlio_target_heading,
                             ),
                             flush=True,
                         )
@@ -467,23 +454,17 @@ def main(config: NavDPPlannerConfig) -> None:
                 )
             else:
                 velocity = (0.0, 0.0, 0.0)
-            pose, pose_time, points, points_time = _control_freshness_snapshot(
-                sensors
-            )
+            pose, pose_time, points, _ = _control_freshness_snapshot(sensors)
             now = time.monotonic()
             candidate_velocity = velocity
             stale_reason = None
-            if now - points_time > config.radar_timeout_s:
-                stale_reason = "radar_timeout"
-            elif mode == "nav_goal" and now - pose_time > config.odom_timeout_s:
+            if mode == "nav_goal" and now - pose_time > config.odom_timeout_s:
                 stale_reason = "odometry_timeout"
             elif mode == "nav_goal" and (not len(trajectory) or now - trajectory_time > config.trajectory_timeout_s):
                 stale_reason = "trajectory_stale"
             if stale_reason:
                 velocity = (0.0, 0.0, 0.0)
-            velocity, current_rays, camera_stop = _prepare_control_output(
-                velocity, points, latest_depth
-            )
+            current_rays = actor_ray_from_points(points)
             if actorray_recording is not None and mode == "nav_goal":
                 actorray_recording.write(
                     render_actor_ray_panel(
@@ -492,13 +473,25 @@ def main(config: NavDPPlannerConfig) -> None:
                         velocity=velocity,
                     )
                 )
-            output.send(
-                sonic_planner.message(
-                    velocity,
-                    dt=period if mode == "manual_velocity" else 0.0,
+            heading_kwargs = (
+                {
+                    "heading_target_rad": fastlio_target_heading,
+                    "heading_reference_rad": nav_fastlio_reference_yaw,
+                }
+                if mode == "nav_goal"
+                and fastlio_target_heading is not None
+                and nav_fastlio_reference_yaw is not None
+                else {}
+            )
+            output.send_string(
+                build_planner_velocity_message(
+                    generation=generation,
+                    source="navdp",
+                    velocity=velocity,
+                    **heading_kwargs,
                 )
             )
-            safety_blocked = not np.allclose(velocity, candidate_velocity, atol=1.0e-6)
+            output_blocked = not np.allclose(velocity, candidate_velocity, atol=1.0e-6)
             if zero_action_aborted:
                 stop_reason = "navdp_zero_action"
                 print(f"[NavDP] navigation stopped: {stop_reason}", flush=True)
@@ -516,9 +509,9 @@ def main(config: NavDPPlannerConfig) -> None:
                 mode == "nav_goal"
                 and world_goal is not None
                 and len(trajectory)
-                and (trajectory_log_pending or safety_blocked != last_safety_blocked)
+                and (trajectory_log_pending or output_blocked != last_output_blocked)
             ):
-                reason = stale_reason or ("depth_hard_stop" if camera_stop else "clear")
+                reason = stale_reason or "clear"
                 print(
                     format_navigation_diagnostics(
                         generation=generation,
@@ -528,32 +521,47 @@ def main(config: NavDPPlannerConfig) -> None:
                         trajectory=trajectory,
                         velocity=velocity,
                     )
-                    + f"\n  safety_state={reason}",
+                    + f"\n  navdp_output_state={reason}",
                     flush=True,
                 )
                 trajectory_log_pending = False
-            last_safety_blocked = safety_blocked
+            last_output_blocked = output_blocked
 
             if config.visualize or visualization_publisher is not None:
-                canvas = compose_reasan_navigation_view(
-                    points,
+                actor_ray_panel = render_actor_ray_panel(
                     current_rays,
-                    trajectory,
-                    slam_map_xy=slam_map_xy,
+                    trajectory=trajectory,
+                    velocity=velocity,
+                )
+                slam_2d_panel = render_slam_world_panel(
+                    slam_map_xy,
                     pose=pose,
                     world_goal=world_goal,
+                    trajectory_world=None,
                     robot_history=robot_history,
-                    velocity=velocity,
                 )
                 head_rgbd = compose_head_rgbd_view(latest_rgb, latest_depth)
                 if visualization_publisher is not None:
                     visualization_publisher.publish(
-                        "visualization/navdp_navigation", canvas
+                        NAVDP_ACTOR_RAY_STREAM, actor_ray_panel
                     )
                     visualization_publisher.publish(
-                        "visualization/navdp_head_rgbd", head_rgbd
+                        NAVDP_SLAM_2D_STREAM, slam_2d_panel
+                    )
+                    visualization_publisher.publish(
+                        NAVDP_HEAD_RGBD_STREAM, head_rgbd
                     )
                 if config.visualize:
+                    canvas = compose_reasan_navigation_view(
+                        points,
+                        current_rays,
+                        trajectory,
+                        slam_map_xy=slam_map_xy,
+                        pose=pose,
+                        world_goal=world_goal,
+                        robot_history=robot_history,
+                        velocity=velocity,
+                    )
                     cv2.imshow("NavDP + MID360 + FAST-LIO world map", canvas)
                     cv2.imshow("NavDP Head RGB-D", head_rgbd)
                     if cv2.waitKey(1) & 0xFF == 27:
@@ -566,7 +574,13 @@ def main(config: NavDPPlannerConfig) -> None:
     finally:
         mpc_solver.close()
         for _ in range(3):
-            output.send(sonic_planner.message((0.0, 0.0, 0.0)))
+            output.send_string(
+                build_planner_velocity_message(
+                    generation=generation,
+                    source="navdp",
+                    velocity=(0.0, 0.0, 0.0),
+                )
+            )
         gateway.close()
         commands.close(0)
         status.close(0)

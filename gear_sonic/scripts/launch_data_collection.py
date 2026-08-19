@@ -438,7 +438,7 @@ def build_sensor_gateway_command(
         f"--camera-host {shlex.quote(config.camera_host)} "
         f"--camera-port {config.camera_port} "
         "--enable-rgb-preview "
-        "--no-enable-lingbot-depth --no-enable-ros "
+        "--no-enable-depth-anything --no-enable-ros "
         "--no-enable-visualization --no-enable-vla-timing"
     )
 

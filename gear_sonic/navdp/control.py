@@ -1,4 +1,4 @@
-"""NavDP safety, MPC, and planner-output control logic."""
+"""NavDP trajectory conversion and asynchronous MPC logic."""
 
 from __future__ import annotations
 
@@ -16,7 +16,6 @@ from gear_sonic.navdp.navigation import (
     local_trajectory_to_world,
 )
 from gear_sonic.runtime.config import load_runtime_profile
-from gear_sonic.utils.teleop.zmq.zmq_planner_sender import build_planner_message
 
 XNAVDP_G1_MPC_DEFAULTS = dict(
     load_runtime_profile().component("xnavdp_mpc")
@@ -26,23 +25,20 @@ XNAVDP_G1_MPC_DEFAULTS = dict(
 def xnavdp_control_to_body_velocity(
     linear_velocity: float, angular_velocity: float
 ) -> tuple[float, float, float]:
-    """Map X-NavDP's unicycle control directly to the SONIC body twist."""
+    """Map X-NavDP's unicycle control to a body-frame velocity command."""
     return float(linear_velocity), 0.0, float(angular_velocity)
 
 
-def sonic_heading_from_mpc(
+def fastlio_heading_target_from_mpc(
     *,
     fastlio_yaw: float,
-    fastlio_to_sonic_offset: float,
     mpc_angular_velocity: float,
     heading_preview_s: float,
 ) -> float:
-    """Preview SONIC's absolute heading far enough to survive planner smoothing."""
-    sonic_wz = xnavdp_control_to_body_velocity(0.0, mpc_angular_velocity)[2]
+    """Preview an absolute heading target in the FAST-LIO frame."""
     return math.remainder(
         float(fastlio_yaw)
-        + float(fastlio_to_sonic_offset)
-        + sonic_wz * float(heading_preview_s),
+        + float(mpc_angular_velocity) * float(heading_preview_s),
         2.0 * math.pi,
     )
 
@@ -483,59 +479,3 @@ def should_abort_nav_for_zero_action(
         and command_available
         and np.allclose(command, (0.0, 0.0, 0.0), atol=1.0e-9)
     )
-
-
-@dataclass
-class SonicPlannerState:
-    """Convert body-frame velocity commands into SONIC's planner wire protocol."""
-
-    heading: float = 0.0
-
-    def directional_message(
-        self,
-        *,
-        speed: float,
-        movement_heading: float,
-        facing_heading: float,
-    ) -> bytes:
-        """Build a command with independent world movement and facing directions."""
-        self.heading = math.remainder(float(facing_heading), 2.0 * math.pi)
-        movement = (
-            math.cos(float(movement_heading)),
-            math.sin(float(movement_heading)),
-            0.0,
-        )
-        facing = (math.cos(self.heading), math.sin(self.heading), 0.0)
-        return build_planner_message(
-            1,
-            movement if speed > 1.0e-6 else (0.0, 0.0, 0.0),
-            facing,
-            speed=max(0.0, float(speed)),
-            height=-1.0,
-        )
-
-    def arc_message(self, *, speed: float, heading: float) -> bytes:
-        """Build a forward arc command with coincident movement and facing."""
-        return self.directional_message(
-            speed=speed,
-            movement_heading=heading,
-            facing_heading=heading,
-        )
-
-    def message(self, velocity: Sequence[float], dt: float = 0.0) -> bytes:
-        vx, vy, wz = map(float, velocity)
-        if dt:
-            self.heading = math.remainder(
-                self.heading + wz * float(dt), 2.0 * math.pi
-            )
-        cosine, sine = math.cos(self.heading), math.sin(self.heading)
-        world_x = cosine * vx - sine * vy
-        world_y = sine * vx + cosine * vy
-        speed = math.hypot(world_x, world_y)
-        movement = (
-            (0.0, 0.0, 0.0)
-            if speed < 1.0e-6
-            else (world_x / speed, world_y / speed, 0.0)
-        )
-        facing = (cosine, sine, 0.0)
-        return build_planner_message(1, movement, facing, speed=speed, height=-1.0)

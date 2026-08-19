@@ -15,6 +15,12 @@ from gear_sonic.scripts.navdp_planner import (
     build_navigation_message,
     decode_navigation_message,
 )
+from gear_sonic.planner_control import (
+    build_navigation_runtime_status_message,
+    build_planner_velocity_message,
+    decode_navigation_runtime_status_message,
+    decode_planner_velocity_message,
+)
 from gear_sonic.utils.teleop.zmq.zmq_planner_sender import build_planner_message
 
 
@@ -120,6 +126,53 @@ def test_planner_binary_wire_format_is_frozen() -> None:
     assert payload == struct.pack("<i8f", 1, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.3, -1.0)
 
 
+def test_navdp_velocity_wire_format_is_generation_scoped() -> None:
+    message = build_planner_velocity_message(
+        generation=7,
+        source="navdp",
+        velocity=(0.3, 0.0, 0.4),
+        timestamp=12.5,
+        heading_target_rad=0.8,
+        heading_reference_rad=0.2,
+    )
+
+    assert json.loads(message) == {
+        "type": "sonic_planner_velocity",
+        "version": 1,
+        "generation": 7,
+        "timestamp": 12.5,
+        "source": "navdp",
+        "velocity": {"vx": 0.3, "vy": 0.0, "wz": 0.4},
+        "heading": {"target_rad": 0.8, "reference_rad": 0.2},
+    }
+    assert decode_planner_velocity_message(message).generation == 7
+
+
+def test_navigation_runtime_status_wire_format_exposes_final_safety_output() -> None:
+    message = build_navigation_runtime_status_message(
+        generation=9,
+        timestamp=12.5,
+        mode="manual_velocity",
+        source="operator_console",
+        requested_velocity=(0.3, 0.0, 0.0),
+        velocity=(0.0, 0.0, 0.0),
+        reason="depth_hard_stop",
+    )
+
+    assert json.loads(message) == {
+        "type": "sonic_navigation_runtime_status",
+        "version": 1,
+        "generation": 9,
+        "timestamp": 12.5,
+        "mode": "manual_velocity",
+        "source": "operator_console",
+        "requested_velocity": {"vx": 0.3, "vy": 0.0, "wz": 0.0},
+        "velocity": {"vx": 0.0, "vy": 0.0, "wz": 0.0},
+        "reason": "depth_hard_stop",
+    }
+    assert decode_navigation_runtime_status_message(message).reason == "depth_hard_stop"
+
+
 @pytest.mark.parametrize(
     ("payload", "topic"),
     [
@@ -142,6 +195,27 @@ def test_planner_binary_wire_format_is_frozen() -> None:
                 speed=0.3,
             ),
             b"planner",
+        ),
+        (
+            build_planner_velocity_message(
+                generation=8,
+                source="navdp",
+                velocity=(0.2, 0.0, -0.1),
+                timestamp=123.0,
+            ).encode(),
+            b"",
+        ),
+        (
+            build_navigation_runtime_status_message(
+                generation=8,
+                timestamp=123.0,
+                mode="nav_goal",
+                source="navdp",
+                requested_velocity=(0.2, 0.0, -0.1),
+                velocity=(0.2, 0.0, -0.1),
+                reason="clear",
+            ).encode(),
+            b"",
         ),
     ],
 )

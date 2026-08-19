@@ -1,8 +1,9 @@
 """All-in-one tmux launcher for SONIC VLA inference.
 
-The inference window always contains eight panes: C++ deploy, operator CLI,
-VLA, LaViRA, NavDP planner/server, SensorGateway, and ControlGateway. Simulation
-and data collection use optional additional windows.
+The inference window contains the core deploy, operator, VLA, navigation, and
+gateway panes, plus an optional Base-Pose agent pane. The NavDP policy server
+runs in the background of the NavDP planner pane and shares its log output.
+Simulation and data collection use optional additional windows.
 
 Prerequisites:
     - tmux installed (sudo apt install tmux)
@@ -196,9 +197,6 @@ class InferenceLaunchConfig:
     lavira_qwenvl_base_url: str = "https://dashscope-intl.aliyuncs.com/compatible-mode/v1"
     """DashScope OpenAI-compatible endpoint; key comes from DASHSCOPE_API_KEY."""
 
-    lavira_warmup: bool = True
-    """Run one discarded Qwen-VL request in the background at startup."""
-
     lavira_debug: bool = False
     """Enable LaViRA debug logging."""
 
@@ -209,13 +207,13 @@ class InferenceLaunchConfig:
     """LaViRA navigation keys come from its own pane or ControlGateway."""
 
     lavira_camera_timeout_ms: int = 15000
-    """LaViRA pure LingBot RGB-D receive timeout (ms)."""
+    """LaViRA metric RGB-D receive timeout (ms)."""
 
-    lavira_depth_port: int = 5564
-    """Local pure LingBot completed RGB-D stream consumed by LaViRA."""
+    depth_anything_port: int = 5564
+    """Local Depth Anything metric-depth publisher port."""
 
-    lingbot_ready_timeout: float = 180.0
-    """Maximum time to wait for the independent LingBot pane to publish its first frame."""
+    depth_anything_ready_timeout: float = 180.0
+    """Maximum time to wait for the metric model to become ready."""
 
     lavira_qwenvl_timeout_seconds: float = 180.0
     """LaViRA Qwen-VL policy timeout (s)."""
@@ -225,6 +223,75 @@ class InferenceLaunchConfig:
 
     lavira_output_root: str = "outputs/object_nav"
     """Directory where LaViRA stores ObjectNav diagnostics."""
+
+    base_pose_enabled: bool = False
+    """Start the independently triggered Base-Pose navigation agent."""
+
+    base_pose_task: str = ""
+    """Fixed manipulation task used whenever B starts Base-Pose alignment."""
+
+    base_pose_mode: Literal[
+        "raw_yoloe_servo",
+        "dual_raw_yoloe_servo",
+    ] = "dual_raw_yoloe_servo"
+    """Agent-near raw-depth YOLOE mode."""
+
+    base_pose_vision_backend: Literal["codex", "qwenvl"] = "codex"
+    base_pose_model: str = "gpt-5.6-sol"
+    base_pose_qwenvl_model: str = "qwen3-vl-plus"
+    base_pose_qwenvl_base_url: str = "https://dashscope-intl.aliyuncs.com/compatible-mode/v1"
+    base_pose_qwenvl_thinking_budget: int = 500
+    base_pose_reasoning_effort: str = "xhigh"
+    base_pose_codex_fast: bool = True
+    base_pose_codex_timeout_seconds: float = 600.0
+    base_pose_camera_stream: str = "ego_view"
+    base_pose_yoloe_depth_stream: str = "camera/ego_view_depth"
+    base_pose_camera_intrinsics_path: str = "gear_sonic/config/camera_intrinsics.json"
+    base_pose_camera_pitch_deg: float = -38.0
+    base_pose_camera_roll_deg: float = 0.0
+    base_pose_camera_yaw_deg: float = 0.0
+    base_pose_camera_forward_offset_m: float = 0.0
+    base_pose_camera_lateral_offset_m: float = 0.0
+    base_pose_dual_head_camera_stream: str = "ego_view"
+    base_pose_dual_head_depth_stream: str = "camera/ego_view_depth"
+    base_pose_dual_chest_camera_stream: str = "chest_view"
+    base_pose_dual_chest_depth_stream: str = "derived/depth_anything/chest_view"
+    base_pose_dual_chest_camera_pitch_deg: float = -3.0
+    base_pose_dual_chest_camera_roll_deg: float = 0.0
+    base_pose_dual_chest_camera_yaw_deg: float = 0.0
+    base_pose_dual_chest_camera_forward_offset_m: float = 0.0
+    base_pose_dual_chest_camera_lateral_offset_m: float = 0.0
+    base_pose_dual_match_tolerance_frames: int = 30
+    base_pose_dual_initialization_grace_s: float = 30.0
+    base_pose_dual_qwenvl_fallback_model: str = "qwen3-vl-8b-instruct"
+    base_pose_camera_timeout_ms: int = 15000
+    base_pose_planner_hz: float = 20.0
+    base_pose_output_root: str = "outputs/base_pose_adjustment"
+    base_pose_yoloe_model_path: str = "tools/yoloe26m/weights/yoloe-26m-seg.pt"
+    base_pose_yoloe_device: str = "0"
+    base_pose_yoloe_confidence: float = 0.25
+    base_pose_yoloe_imgsz: int = 640
+    base_pose_raw_reference_update_interval_frames: int = 5
+    base_pose_raw_reference_update_min_confidence: float = 0.35
+    base_pose_raw_reference_update_min_iou: float = 0.50
+    base_pose_raw_servo_hz: float = 10.0
+    base_pose_raw_head_target_distance_m: float = 0.90
+    base_pose_raw_chest_target_distance_m: float = 0.80
+    base_pose_raw_forward_tolerance_m: float = 0.10
+    base_pose_raw_lateral_tolerance_m: float = 0.10
+    base_pose_raw_min_linear_speed_m_s: float = 0.40
+    base_pose_raw_max_lateral_speed_m_s: float = 0.40
+    base_pose_raw_min_yaw_speed_rad_s: float = 0.10
+    base_pose_raw_yaw_tolerance_deg: float = 8.0
+    base_pose_raw_yaw_coarse_speed_rad_s: float = 0.30
+    base_pose_raw_yaw_trim_speed_rad_s: float = 0.20
+    base_pose_raw_forward_recenter_yaw_speed_rad_s: float = 0.30
+    base_pose_raw_horizontal_guard_fraction: float = 0.25
+    base_pose_raw_horizontal_recovery_fraction: float = 0.30
+    base_pose_raw_camera_stale_s: float = 0.40
+    base_pose_raw_max_run_s: float = 180.0
+    base_pose_raw_post_stop_sample_s: float = 3.0
+    base_pose_raw_allow_missing_table: Literal[0, 1] = 0
 
     navdp_root: str = "/home/user/Project/NavDP/baselines/x-navdp"
     navdp_checkpoint: str = (
@@ -338,7 +405,8 @@ def parse_inference_launch_config(
 
 
 SESSION_NAME = "sonic_inference"
-LINGBOT_READY_FILE = Path("/tmp/sonic_lingbot_ready")
+DEPTH_ANYTHING_READY_FILE = Path("/tmp/sonic_depth_anything_ready")
+INFERENCE_CORE_PANE_COUNT = 5
 
 
 def _runtime_profile(config: InferenceLaunchConfig):
@@ -537,22 +605,21 @@ def build_planner_input_command(config: InferenceLaunchConfig, repo_root: Path) 
         )
 
     debug = "--debug " if config.lavira_debug else ""
-    warmup = "" if config.lavira_warmup else "--no-warmup "
     local_env = "set -a; [ ! -f .env.local ] || . ./.env.local; set +a; "
     quoted_root = shlex.quote(str(repo_root))
-    ready_file = shlex.quote(str(LINGBOT_READY_FILE))
+    ready_file = shlex.quote(str(DEPTH_ANYTHING_READY_FILE))
     return (
         f"cd {quoted_root} && "
         f"{local_env}"
-        f"timeout {config.lingbot_ready_timeout}s sh -c "
+        f"timeout {config.depth_anything_ready_timeout}s sh -c "
         f"'while [ ! -f {ready_file} ]; do sleep 0.2; done' || "
-        "{ echo '[LaViRA] LingBot did not become ready' >&2; exit 1; }; "
+        "{ echo '[LaViRA] Depth Anything did not become ready' >&2; exit 1; }; "
         f".venv_inference/bin/python gear_sonic/scripts/lavira_planner.py "
         f"--mission {shlex.quote(config.lavira_mission)} "
         f"--global-target {shlex.quote(config.lavira_global_target)} "
         f"--qwenvl-model {shlex.quote(config.lavira_qwenvl_model)} "
         f"--qwenvl-base-url {shlex.quote(config.lavira_qwenvl_base_url)} "
-        f"{debug}{warmup}"
+        f"{debug}"
         f"--camera-timeout-ms {config.lavira_camera_timeout_ms} "
         f"--sensor-gateway-endpoint tcp://127.0.0.1:{config.sensor_gateway_port} "
         f"--sensor-gateway-request-timeout-ms "
@@ -569,19 +636,139 @@ def build_planner_input_command(config: InferenceLaunchConfig, repo_root: Path) 
     )
 
 
-def build_lingbot_command(config: InferenceLaunchConfig, repo_root: Path) -> str:
-    """Build the independent background LingBot depth-completion process."""
+def build_base_pose_agent_command(
+    config: InferenceLaunchConfig, repo_root: Path
+) -> str:
+    """Build the independent ControlGateway-backed Base-Pose agent."""
+
     quoted_root = shlex.quote(str(repo_root))
-    ready_file = shlex.quote(str(LINGBOT_READY_FILE))
+    local_env = ""
+    backend = f"--vision-backend {config.base_pose_vision_backend} "
+    if config.base_pose_vision_backend == "qwenvl":
+        local_env = "set -a; [ ! -f .env.local ] || . ./.env.local; set +a; "
+        backend += (
+            f"--qwenvl-model {shlex.quote(config.base_pose_qwenvl_model)} "
+            f"--qwenvl-base-url {shlex.quote(config.base_pose_qwenvl_base_url)} "
+            f"--qwenvl-thinking-budget {config.base_pose_qwenvl_thinking_budget} "
+        )
+    codex_fast = "" if config.base_pose_codex_fast else "--no-codex-fast "
+    dual = ""
+    if config.base_pose_mode == "dual_raw_yoloe_servo":
+        dual = (
+            f"--dual-head-camera-stream "
+            f"{shlex.quote(config.base_pose_dual_head_camera_stream)} "
+            f"--dual-head-depth-stream "
+            f"{shlex.quote(config.base_pose_dual_head_depth_stream)} "
+            f"--dual-chest-camera-stream "
+            f"{shlex.quote(config.base_pose_dual_chest_camera_stream)} "
+            f"--dual-chest-depth-stream "
+            f"{shlex.quote(config.base_pose_dual_chest_depth_stream)} "
+            f"--dual-chest-camera-pitch-deg "
+            f"{config.base_pose_dual_chest_camera_pitch_deg} "
+            f"--dual-chest-camera-roll-deg "
+            f"{config.base_pose_dual_chest_camera_roll_deg} "
+            f"--dual-chest-camera-yaw-deg "
+            f"{config.base_pose_dual_chest_camera_yaw_deg} "
+            f"--dual-chest-camera-forward-offset-m "
+            f"{config.base_pose_dual_chest_camera_forward_offset_m} "
+            f"--dual-chest-camera-lateral-offset-m "
+            f"{config.base_pose_dual_chest_camera_lateral_offset_m} "
+            f"--dual-match-tolerance-frames "
+            f"{config.base_pose_dual_match_tolerance_frames} "
+            f"--dual-initialization-grace-s "
+            f"{config.base_pose_dual_initialization_grace_s} "
+            f"--dual-qwenvl-fallback-model "
+            f"{shlex.quote(config.base_pose_dual_qwenvl_fallback_model)} "
+        )
+    yoloe = (
+        f"--camera-intrinsics-path {shlex.quote(config.base_pose_camera_intrinsics_path)} "
+        f"--camera-pitch-deg {config.base_pose_camera_pitch_deg} "
+        f"--camera-roll-deg {config.base_pose_camera_roll_deg} "
+        f"--camera-yaw-deg {config.base_pose_camera_yaw_deg} "
+        f"--camera-forward-offset-m {config.base_pose_camera_forward_offset_m} "
+        f"--camera-lateral-offset-m {config.base_pose_camera_lateral_offset_m} "
+        f"{dual}"
+        f"--raw-yoloe-model-path {shlex.quote(config.base_pose_yoloe_model_path)} "
+        f"--raw-yoloe-device {shlex.quote(config.base_pose_yoloe_device)} "
+        f"--raw-yoloe-confidence {config.base_pose_yoloe_confidence} "
+        f"--raw-yoloe-imgsz {config.base_pose_yoloe_imgsz} "
+        f"--raw-reference-update-interval-frames "
+        f"{config.base_pose_raw_reference_update_interval_frames} "
+        f"--raw-reference-update-min-confidence "
+        f"{config.base_pose_raw_reference_update_min_confidence} "
+        f"--raw-reference-update-min-iou "
+        f"{config.base_pose_raw_reference_update_min_iou} "
+        f"--raw-servo-hz {config.base_pose_raw_servo_hz} "
+        f"--raw-head-target-distance-m {config.base_pose_raw_head_target_distance_m} "
+        f"--raw-chest-target-distance-m "
+        f"{config.base_pose_raw_chest_target_distance_m} "
+        f"--raw-forward-tolerance-m {config.base_pose_raw_forward_tolerance_m} "
+        f"--raw-lateral-tolerance-m {config.base_pose_raw_lateral_tolerance_m} "
+        f"--raw-min-linear-speed-m-s {config.base_pose_raw_min_linear_speed_m_s} "
+        f"--raw-max-lateral-speed-m-s {config.base_pose_raw_max_lateral_speed_m_s} "
+        f"--raw-min-yaw-speed-rad-s {config.base_pose_raw_min_yaw_speed_rad_s} "
+        f"--raw-yaw-tolerance-deg {config.base_pose_raw_yaw_tolerance_deg} "
+        f"--raw-yaw-coarse-speed-rad-s {config.base_pose_raw_yaw_coarse_speed_rad_s} "
+        f"--raw-yaw-trim-speed-rad-s {config.base_pose_raw_yaw_trim_speed_rad_s} "
+        f"--raw-forward-recenter-yaw-speed-rad-s "
+        f"{config.base_pose_raw_forward_recenter_yaw_speed_rad_s} "
+        f"--raw-horizontal-guard-fraction "
+        f"{config.base_pose_raw_horizontal_guard_fraction} "
+        f"--raw-horizontal-recovery-fraction "
+        f"{config.base_pose_raw_horizontal_recovery_fraction} "
+        f"--raw-camera-stale-s {config.base_pose_raw_camera_stale_s} "
+        f"--raw-max-run-s {config.base_pose_raw_max_run_s} "
+        f"--raw-post-stop-sample-s {config.base_pose_raw_post_stop_sample_s} "
+        f"--raw-allow-missing-table {config.base_pose_raw_allow_missing_table} "
+        "--raw-orientation-telemetry-source "
+        f"{shlex.quote(_runtime_profile(config).endpoint_uri('orientation_telemetry'))} "
+    )
     return (
-        f"PYTHONPATH={quoted_root} {quoted_root}/.venv_lingbot_depth/bin/python "
-        "gear_sonic/scripts/run_lingbot_depth_viewer.py "
+        f"cd {quoted_root} && {local_env}"
+        ".venv_inference/bin/python gear_sonic/scripts/base_pose_agent.py "
+        f"--task {shlex.quote(config.base_pose_task)} "
+        f"--mode {config.base_pose_mode} {backend}"
+        f"--model {shlex.quote(config.base_pose_model)} "
+        f"--reasoning-effort {shlex.quote(config.base_pose_reasoning_effort)} "
+        f"{codex_fast}"
+        f"--codex-timeout-seconds {config.base_pose_codex_timeout_seconds} "
+        f"--camera-stream {shlex.quote(config.base_pose_camera_stream)} "
+        f"--depth-stream {shlex.quote(config.base_pose_yoloe_depth_stream)} "
+        f"--camera-timeout-ms {config.base_pose_camera_timeout_ms} "
         f"--sensor-gateway-endpoint tcp://127.0.0.1:{config.sensor_gateway_port} "
-        f"--publish-port {config.lavira_depth_port} --ready-file {ready_file} "
-        "--no-visualize --visualization-gateway-endpoint "
-        f"tcp://127.0.0.1:{config.sensor_gateway_visualization_port} "
-        "--control-gateway-endpoint tcp://127.0.0.1:"
-        f"{config.control_gateway_dispatch_port}"
+        f"--sensor-gateway-request-timeout-ms {config.vla_sensor_gateway_request_timeout_ms} "
+        f"--sensor-gateway-max-age-ms {config.vla_sensor_gateway_max_age_ms} "
+        f"--sensor-gateway-max-skew-ms {config.vla_sensor_gateway_max_skew_ms} "
+        f"--control-gateway-endpoint tcp://127.0.0.1:{config.control_gateway_dispatch_port} "
+        f"--control-gateway-intent-endpoint tcp://127.0.0.1:{config.control_gateway_intent_port} "
+        f"--planner-hz {config.base_pose_planner_hz} "
+        f"{yoloe}"
+        f"--output-root {shlex.quote(config.base_pose_output_root)}"
+    )
+
+
+def build_depth_anything_command(
+    config: InferenceLaunchConfig, repo_root: Path
+) -> str:
+    """Build the shared RGB-only metric chest-depth process."""
+    quoted_root = shlex.quote(str(repo_root))
+    ready_file = shlex.quote(str(DEPTH_ANYTHING_READY_FILE))
+    settings = _runtime_profile(config).component("depth_anything")
+    return (
+        f"PYTHONPATH={quoted_root} {quoted_root}/.venv_depth_anything/bin/python "
+        "gear_sonic/scripts/run_depth_anything.py "
+        f"--sensor-gateway-endpoint tcp://127.0.0.1:{config.sensor_gateway_port} "
+        f"--control-gateway-endpoint tcp://127.0.0.1:{config.control_gateway_dispatch_port} "
+        f"--publish-port {config.depth_anything_port} --ready-file {ready_file} "
+        f"--depth-anything-root {shlex.quote(str(settings['root']))} "
+        f"--checkpoint {shlex.quote(str(settings['checkpoint']))} "
+        f"--encoder {shlex.quote(str(settings['encoder']))} "
+        f"--device {shlex.quote(str(settings['device']))} "
+        f"--inference-hz {settings['inference_hz']} "
+        f"--input-size {settings['input_size']} "
+        f"--model-max-depth-m {settings['model_max_depth_m']} "
+        f"--publish-max-depth-m {settings['publish_max_depth_m']} "
+        + ("--use-amp" if settings["use_amp"] else "--no-use-amp")
     )
 
 
@@ -596,7 +783,7 @@ def build_navdp_planner_command(config: InferenceLaunchConfig, repo_root: Path) 
         else ""
     )
     navigation_status = profile.endpoint("navigation_status")
-    planner_relay = profile.endpoint("planner_relay")
+    navdp_velocity = profile.endpoint("navdp_velocity")
     return (
         "unset COLCON_CURRENT_PREFIX AMENT_PREFIX_PATH CMAKE_PREFIX_PATH; "
         "source /opt/ros/humble/setup.bash && "
@@ -605,7 +792,7 @@ def build_navdp_planner_command(config: InferenceLaunchConfig, repo_root: Path) 
         "python gear_sonic/scripts/navdp_planner.py "
         f"--command-endpoint {shlex.quote(profile.endpoint_uri('navigation_command'))} "
         f"--status-endpoint {shlex.quote(f'tcp://*:{navigation_status.port}')} "
-        f"--output-endpoint {shlex.quote(f'tcp://*:{planner_relay.port}')} "
+        f"--output-endpoint {shlex.quote(f'tcp://*:{navdp_velocity.port}')} "
         f"--sensor-gateway-endpoint "
         f"{shlex.quote(profile.endpoint_uri('sensor_gateway_metadata'))} "
         f"--navdp-server {shlex.quote(profile.endpoint_uri('xnavdp_http'))} "
@@ -620,7 +807,6 @@ def build_navdp_planner_command(config: InferenceLaunchConfig, repo_root: Path) 
         f"--heading-preview-s {settings['heading_preview_s']} "
         f"--goal-tolerance-m {settings['goal_tolerance_m']} "
         f"--navdp-stop-threshold {settings['stop_threshold']} "
-        f"--radar-timeout-s {settings['radar_timeout_s']} "
         f"--odom-timeout-s {settings['odometry_timeout_s']} "
         f"--trajectory-timeout-s {settings['trajectory_timeout_s']} "
         f"--navdp-request-timeout-s {settings['request_timeout_s']} "
@@ -630,14 +816,89 @@ def build_navdp_planner_command(config: InferenceLaunchConfig, repo_root: Path) 
     )
 
 
+def build_planner_velocity_executor_command(
+    config: InferenceLaunchConfig, repo_root: Path
+) -> str:
+    profile = _runtime_profile(config)
+    settings = profile.component("planner_executor")
+    planner_relay = profile.endpoint("planner_relay")
+    orientation_telemetry = profile.endpoint("orientation_telemetry")
+    navigation_runtime_status = profile.endpoint("navigation_runtime_status")
+    orientation_output = (
+        "--orientation-output-endpoint "
+        f"{shlex.quote(f'tcp://*:{orientation_telemetry.port}')} "
+        if config.base_pose_enabled
+        and config.base_pose_mode
+        in {"raw_yoloe_servo", "dual_raw_yoloe_servo"}
+        else ""
+    )
+    return (
+        f"cd {shlex.quote(str(repo_root))} && source .venv_teleop/bin/activate && "
+        "python gear_sonic/scripts/planner_velocity_executor.py "
+        f"--command-endpoint {shlex.quote(profile.endpoint_uri('navigation_command'))} "
+        f"--navdp-velocity-endpoint {shlex.quote(profile.endpoint_uri('navdp_velocity'))} "
+        f"--output-endpoint {shlex.quote(f'tcp://*:{planner_relay.port}')} "
+        "--runtime-status-endpoint "
+        f"{shlex.quote(f'tcp://*:{navigation_runtime_status.port}')} "
+        f"--sensor-gateway-endpoint {shlex.quote(profile.endpoint_uri('sensor_gateway_metadata'))} "
+        f"--control-hz {settings['control_hz']} "
+        f"--manual-velocity-timeout-s {settings['manual_velocity_timeout_s']} "
+        f"--navdp-velocity-timeout-s {settings['navdp_velocity_timeout_s']} "
+        f"--radar-timeout-s {settings['radar_timeout_s']} "
+        f"--sensor-gateway-poll-hz {settings['sensor_gateway_poll_hz']} "
+        f"--sensor-gateway-request-timeout-ms {settings['sensor_gateway_request_timeout_ms']} "
+        f"--sensor-gateway-max-age-ms {settings['sensor_gateway_max_age_ms']} "
+        f"{orientation_output}"
+    )
+
+
 def build_navdp_server_command(config: InferenceLaunchConfig) -> str:
     navdp_port = _runtime_profile(config).endpoint("xnavdp_http").port
     return (
         f"cd {shlex.quote(config.navdp_root)} && "
-        "conda run --no-capture-output -n navdp python -m eval.src.policy_server "
+        "PYTHONUNBUFFERED=1 conda run --no-capture-output -n navdp "
+        "python -m eval.src.policy_server "
         f"--port {navdp_port} --embodiment humanoid "
         f"--checkpoint {shlex.quote(config.navdp_checkpoint)} "
         "--device cuda:0 --real --no-visualization"
+    )
+
+
+def build_navdp_server_background_command(config: InferenceLaunchConfig) -> str:
+    """Start NavDP server as a managed background job in the planner pane."""
+
+    server = build_navdp_server_command(config)
+    return (
+        "_stop_navdp_server() { "
+        "if [ -n \"${NAVDP_SERVER_PID:-}\" ]; then "
+        "kill -- \"-${NAVDP_SERVER_PID}\" 2>/dev/null || "
+        "kill \"${NAVDP_SERVER_PID}\" 2>/dev/null || true; "
+        "wait \"${NAVDP_SERVER_PID}\" 2>/dev/null || true; "
+        "unset NAVDP_SERVER_PID; "
+        "fi; "
+        "}; "
+        "trap _stop_navdp_server EXIT HUP; "
+        f"{server} "
+        "> >(sed -u 's/^/[NavDP server] /') "
+        "2> >(sed -u 's/^/[NavDP server:stderr] /' >&2) & "
+        "NAVDP_SERVER_PID=$!; "
+        "echo \"[NavDP server] started in background as PID "
+        "${NAVDP_SERVER_PID}; logs are routed to this pane\""
+    )
+
+
+def build_navdp_planner_pane_command(
+    config: InferenceLaunchConfig, repo_root: Path
+) -> str:
+    """Run the planner in front, then stop its pane-local NavDP server."""
+
+    planner = build_navdp_planner_command(config, repo_root)
+    return (
+        f"{planner}; "
+        "NAVDP_PLANNER_STATUS=$?; "
+        "_stop_navdp_server; "
+        "trap - EXIT HUP; "
+        "exit \"${NAVDP_PLANNER_STATUS}\""
     )
 
 
@@ -680,6 +941,7 @@ def build_slam_debug_command(config: InferenceLaunchConfig) -> str:
 
 
 def build_sensor_gateway_command(config: InferenceLaunchConfig, repo_root: Path) -> str:
+    profile = _runtime_profile(config)
     ros_mode = "" if config.keyboard_planner and not config.sim else "--no-enable-ros "
     setup = (
         "unset COLCON_CURRENT_PREFIX AMENT_PREFIX_PATH CMAKE_PREFIX_PATH; "
@@ -742,24 +1004,31 @@ def build_sensor_gateway_command(config: InferenceLaunchConfig, repo_root: Path)
             (
                 "viewer_pid",
                 "python gear_sonic/scripts/run_operator_cv_viewer.py "
-                f"--sensor-gateway-endpoint tcp://127.0.0.1:{config.sensor_gateway_port}",
+                f"--sensor-gateway-endpoint tcp://127.0.0.1:{config.sensor_gateway_port} "
+                "--control-gateway-endpoint "
+                f"tcp://127.0.0.1:{config.control_gateway_dispatch_port} "
+                "--navigation-runtime-status-endpoint "
+                f"{shlex.quote(profile.endpoint_uri('navigation_runtime_status'))}",
                 "/tmp/sonic_opencv_viewer.log",
             )
         )
-    if config.keyboard_planner and config.planner_input == "lavira":
+    depth_anything_required = config.base_pose_enabled or (
+        config.keyboard_planner and config.planner_input == "lavira"
+    )
+    if depth_anything_required:
         background_commands.append(
             (
-                "lingbot_pid",
-                build_lingbot_command(config, repo_root),
-                "/tmp/sonic_lingbot.log",
+                "depth_anything_pid",
+                build_depth_anything_command(config, repo_root),
+                "/tmp/sonic_depth_anything.log",
             )
         )
     if not background_commands:
         return setup + gateway
 
     ready_file_setup = (
-        f"rm -f {shlex.quote(str(LINGBOT_READY_FILE))}; "
-        if config.keyboard_planner and config.planner_input == "lavira"
+        f"rm -f {shlex.quote(str(DEPTH_ANYTHING_READY_FILE))}; "
+        if depth_anything_required
         else ""
     )
     launch_background = "".join(
@@ -775,7 +1044,8 @@ def build_sensor_gateway_command(config: InferenceLaunchConfig, repo_root: Path)
         + gateway
         + f"; gateway_status=$?; kill {pid_names} 2>/dev/null; "
         + f"wait {pid_names} 2>/dev/null; "
-        + f"rm -f {shlex.quote(str(LINGBOT_READY_FILE))}; (exit $gateway_status)"
+        + f"rm -f {shlex.quote(str(DEPTH_ANYTHING_READY_FILE))}; "
+        + "(exit $gateway_status)"
     )
 
 
@@ -840,6 +1110,22 @@ def _check_prerequisites(config: InferenceLaunchConfig):
     if not (repo_root / ".venv_teleop" / "bin" / "activate").exists():
         errors.append(".venv_teleop not found. Run: bash install_scripts/install_pico.sh")
 
+    depth_anything_required = config.base_pose_enabled or (
+        config.keyboard_planner and config.planner_input == "lavira"
+    )
+    if depth_anything_required:
+        depth_settings = _runtime_profile(config).component("depth_anything")
+        for path, label in (
+            (Path(str(depth_settings["root"])), "Depth Anything metric source"),
+            (Path(str(depth_settings["checkpoint"])), "Depth Anything Base checkpoint"),
+            (
+                repo_root / ".venv_depth_anything" / "bin" / "python",
+                "Depth Anything Python",
+            ),
+        ):
+            if not path.exists():
+                errors.append(f"{label} not found: {path}")
+
     if config.planner_input == "lavira":
         if not config.lavira_mission.strip():
             errors.append("--lavira-mission is required when --planner-input lavira")
@@ -872,6 +1158,109 @@ def _check_prerequisites(config: InferenceLaunchConfig):
         except OSError:
             errors.append(
                 f"robot camera is not reachable at {config.camera_host}:{config.camera_port}"
+            )
+
+    if config.base_pose_enabled:
+        if not config.base_pose_task.strip():
+            errors.append("--base-pose-task is required when Base-Pose is enabled")
+        if config.base_pose_planner_hz <= 0.0:
+            errors.append("--base-pose-planner-hz must be positive")
+        if config.base_pose_mode == "raw_yoloe_servo":
+            expected_depth = f"camera/{config.base_pose_camera_stream}_depth"
+            if config.base_pose_yoloe_depth_stream != expected_depth:
+                errors.append(
+                    "raw_yoloe_servo requires the raw depth stream aligned to its RGB: "
+                    f"--base-pose-yoloe-depth-stream {expected_depth}"
+                )
+        elif config.base_pose_mode == "dual_raw_yoloe_servo":
+            head = config.base_pose_dual_head_camera_stream
+            chest = config.base_pose_dual_chest_camera_stream
+            if not head or not chest or head == chest:
+                errors.append("dual Base-Pose camera streams must be distinct")
+            expected_head_depth = f"camera/{head}_depth"
+            expected_chest_depth = f"derived/depth_anything/{chest}"
+            if config.base_pose_dual_head_depth_stream != expected_head_depth:
+                errors.append(
+                    "dual head raw depth must match its RGB: "
+                    f"--base-pose-dual-head-depth-stream {expected_head_depth}"
+                )
+            if config.base_pose_dual_chest_depth_stream != expected_chest_depth:
+                errors.append(
+                    "dual chest depth must use metric Depth Anything: "
+                    f"--base-pose-dual-chest-depth-stream {expected_chest_depth}"
+                )
+            if config.base_pose_dual_match_tolerance_frames <= 0:
+                errors.append("dual match tolerance must be positive")
+            if config.base_pose_dual_initialization_grace_s <= 0.0:
+                errors.append("dual initialization grace must be positive")
+            if config.base_pose_raw_reference_update_interval_frames <= 0:
+                errors.append(
+                    "dual Base-Pose reference update interval must be positive"
+                )
+        else:
+            errors.append(f"unsupported Base-Pose mode: {config.base_pose_mode}")
+        for value, label in (
+            (config.base_pose_yoloe_confidence, "YOLOE confidence"),
+            (config.base_pose_raw_servo_hz, "raw servo frequency"),
+            (config.base_pose_raw_head_target_distance_m, "head target distance"),
+            (config.base_pose_raw_chest_target_distance_m, "chest target distance"),
+            (config.base_pose_raw_forward_tolerance_m, "forward tolerance"),
+            (config.base_pose_raw_lateral_tolerance_m, "lateral tolerance"),
+            (config.base_pose_raw_min_linear_speed_m_s, "minimum linear speed"),
+            (config.base_pose_raw_max_lateral_speed_m_s, "maximum lateral speed"),
+            (config.base_pose_raw_min_yaw_speed_rad_s, "minimum yaw speed"),
+            (config.base_pose_raw_yaw_tolerance_deg, "yaw tolerance"),
+            (config.base_pose_raw_yaw_coarse_speed_rad_s, "coarse yaw speed"),
+            (config.base_pose_raw_yaw_trim_speed_rad_s, "trim yaw speed"),
+            (
+                config.base_pose_raw_forward_recenter_yaw_speed_rad_s,
+                "forward recenter yaw speed",
+            ),
+            (config.base_pose_raw_camera_stale_s, "camera stale timeout"),
+            (config.base_pose_raw_max_run_s, "maximum run time"),
+        ):
+            if value <= 0.0:
+                errors.append(f"Base-Pose {label} must be positive")
+        if not 0.0 < config.base_pose_yoloe_confidence <= 1.0:
+            errors.append("Base-Pose YOLOE confidence must be in (0, 1]")
+        if config.base_pose_yoloe_imgsz <= 0:
+            errors.append("Base-Pose YOLOE image size must be positive")
+        if config.base_pose_raw_reference_update_interval_frames < 0:
+            errors.append("Base-Pose reference update interval cannot be negative")
+        if not (
+            0.0
+            <= config.base_pose_raw_reference_update_min_confidence
+            <= 1.0
+            and 0.0 <= config.base_pose_raw_reference_update_min_iou <= 1.0
+        ):
+            errors.append("Base-Pose reference confidence and IoU must be in [0, 1]")
+        if not (
+            0.0 < config.base_pose_raw_horizontal_guard_fraction
+            < config.base_pose_raw_horizontal_recovery_fraction
+            < 0.5
+        ):
+            errors.append(
+                "Base-Pose horizontal fractions must satisfy 0 < guard < recovery < 0.5"
+            )
+        for relative_path, label in (
+            (config.base_pose_yoloe_model_path, "YOLOE model"),
+            (config.base_pose_camera_intrinsics_path, "camera intrinsics"),
+        ):
+            path = Path(relative_path)
+            if not path.is_absolute():
+                path = repo_root / path
+            if not path.is_file():
+                errors.append(f"Base-Pose {label} not found: {path}")
+        if (
+            config.base_pose_vision_backend == "qwenvl"
+            and not os.environ.get("DASHSCOPE_API_KEY", "").strip()
+            and not _dotenv_has_nonempty_value(
+                repo_root / ".env.local", "DASHSCOPE_API_KEY"
+            )
+        ):
+            errors.append(
+                "Base-Pose Qwen-VL requires DASHSCOPE_API_KEY in the launcher "
+                "environment or the gitignored .env.local file"
             )
 
     deploy_dir = repo_root / "gear_sonic_deploy"
@@ -926,7 +1315,9 @@ def _clear_stale_fastlio_processes() -> None:
         subprocess.run(["pkill", "-KILL", "-f", pattern], capture_output=True)
 
 
-def _parse_pane_ids(output: str, expected_count: int = 6) -> list[str]:
+def _parse_pane_ids(
+    output: str, expected_count: int = INFERENCE_CORE_PANE_COUNT
+) -> list[str]:
     indexed = {}
     for line in output.splitlines():
         fields = line.split()
@@ -939,9 +1330,22 @@ def _parse_pane_ids(output: str, expected_count: int = 6) -> list[str]:
     return [indexed[index] for index in range(expected_count)]
 
 
-def _create_tmux_session(pane_count: int = 6) -> list[str]:
-    if pane_count < 6:
-        raise ValueError("inference pane_count cannot be smaller than 6")
+def _inference_pane_count(config: InferenceLaunchConfig) -> int:
+    base_pose_runtime_enabled = config.keyboard_planner and config.base_pose_enabled
+    runtime_pane_count = (
+        2 + int(config.keyboard_planner) + int(base_pose_runtime_enabled)
+    )
+    return INFERENCE_CORE_PANE_COUNT + runtime_pane_count
+
+
+def _create_tmux_session(
+    pane_count: int = INFERENCE_CORE_PANE_COUNT,
+) -> list[str]:
+    if pane_count < INFERENCE_CORE_PANE_COUNT:
+        raise ValueError(
+            "inference pane_count cannot be smaller than "
+            f"{INFERENCE_CORE_PANE_COUNT}"
+        )
     bash = shutil.which("bash") or "/bin/bash"
     subprocess.run(
         [
@@ -1066,8 +1470,8 @@ def main(config: InferenceLaunchConfig):
     print(f"  PC IP:           {_get_local_ip()}")
     print("=" * 60)
 
-    runtime_pane_count = 2
-    pane_ids = _create_tmux_session(6 + runtime_pane_count)
+    base_pose_runtime_enabled = config.keyboard_planner and config.base_pose_enabled
+    pane_ids = _create_tmux_session(_inference_pane_count(config))
     print(f"Created tmux session: {SESSION_NAME}")
 
     # --- Window 1 (sim only): MuJoCo Simulator ---
@@ -1103,11 +1507,11 @@ def main(config: InferenceLaunchConfig):
         print("WARNING: C++ deploy pane may have failed to start.")
 
     # Start the two mandatory Gateway boundaries before their clients.
-    runtime_panes = pane_ids[6:]
+    runtime_panes = pane_ids[INFERENCE_CORE_PANE_COUNT:]
     runtime_index = 0
     print(
-        "Starting SensorGateway with background ROS/OpenCV/LingBot services "
-        f"(pane {6 + runtime_index})..."
+        "Starting SensorGateway with background ROS/OpenCV/Depth Anything services "
+        f"(pane {INFERENCE_CORE_PANE_COUNT + runtime_index})..."
     )
     _send_to_pane(
         runtime_panes[runtime_index],
@@ -1117,12 +1521,37 @@ def main(config: InferenceLaunchConfig):
     if config.slam_debug and config.keyboard_planner and not config.sim:
         print("SLAM/IMU debug recording: outputs/slam_debug/<launch timestamp>/")
     runtime_index += 1
-    print(f"Starting ControlGateway router (pane {6 + runtime_index})...")
+    print(
+        "Starting ControlGateway router "
+        f"(pane {INFERENCE_CORE_PANE_COUNT + runtime_index})..."
+    )
     _send_to_pane(
         runtime_panes[runtime_index],
         build_control_gateway_command(config, repo_root),
         wait=1.0,
     )
+    if config.keyboard_planner:
+        runtime_index += 1
+        print(
+            "Starting shared Planner velocity executor "
+            f"(pane {INFERENCE_CORE_PANE_COUNT + runtime_index})..."
+        )
+        _send_to_pane(
+            runtime_panes[runtime_index],
+            build_planner_velocity_executor_command(config, repo_root),
+            wait=1.0,
+        )
+    if base_pose_runtime_enabled:
+        runtime_index += 1
+        print(
+            "Starting Base-Pose agent "
+            f"(pane {INFERENCE_CORE_PANE_COUNT + runtime_index})..."
+        )
+        _send_to_pane(
+            runtime_panes[runtime_index],
+            build_base_pose_agent_command(config, repo_root),
+            wait=1.0,
+        )
 
     # --- Pane 2: VLA Inference ---
     inference_cmd = build_vla_inference_command(config, repo_root)
@@ -1138,19 +1567,26 @@ def main(config: InferenceLaunchConfig):
         wait=2.0,
     )
 
-    # --- Panes 3-5: semantic target, NavDP planner, and NavDP server ---
+    # --- Panes 3-4: semantic target and the combined NavDP planner/server ---
     if config.keyboard_planner:
         planner_input_cmd = build_planner_input_command(config, repo_root)
+        navdp_pane = 4
         commands = [
             (3, "LaViRA semantic planner", planner_input_cmd),
-            (4, "NavDP planner", build_navdp_planner_command(config, repo_root)),
-            (5, "NavDP server", build_navdp_server_command(config)),
+            (
+                navdp_pane,
+                "NavDP planner",
+                build_navdp_planner_pane_command(config, repo_root),
+            ),
         ]
         # Strictly serialized startup: the launcher does not dispatch a later
         # stage until real data has passed the previous readiness gate.
-        pane, label, command = commands[2]
-        print(f"Starting {label} (pane {pane})...")
-        _send_to_pane(pane_ids[pane], command, wait=1.0)
+        print(f"Starting NavDP server in background (pane {navdp_pane})...")
+        _send_to_pane(
+            pane_ids[navdp_pane],
+            build_navdp_server_background_command(config),
+            wait=1.0,
+        )
         print("Waiting for real MID-360 LiDAR and IMU samples...")
         if not run_readiness_gate(config, repo_root, "lidar"):
             raise RuntimeError(
@@ -1163,7 +1599,7 @@ def main(config: InferenceLaunchConfig):
                 "navigation prerequisites did not become ready; LaViRA and NavDP planner were not started"
             )
 
-        for pane, label, command in (commands[0], commands[1]):
+        for pane, label, command in commands:
             print(f"Starting {label} (pane {pane})...")
             _send_to_pane(pane_ids[pane], command, wait=1.0)
 
@@ -1197,12 +1633,17 @@ def main(config: InferenceLaunchConfig):
     print("    Pane 1: SONIC Operator CLI")
     print("    Pane 2: VLA Inference")
     print("    Pane 3: LaViRA Semantic + LISTEN_WASD")
-    print("    Pane 4: NavDP Continuous Planner + Safety")
-    print("    Pane 5: NavDP Server")
-    runtime_label_index = 6
+    print("    Pane 4: NavDP Velocity Producer + background Server")
+    runtime_label_index = INFERENCE_CORE_PANE_COUNT
     print(f"    Pane {runtime_label_index}: Read-only SensorGateway")
     runtime_label_index += 1
     print(f"    Pane {runtime_label_index}: ControlGateway Router")
+    runtime_label_index += 1
+    if config.keyboard_planner:
+        print(f"    Pane {runtime_label_index}: Shared Planner Velocity Executor + Safety")
+        runtime_label_index += 1
+    if config.keyboard_planner and config.base_pose_enabled:
+        print(f"    Pane {runtime_label_index}: Base-Pose Agent")
     if config.data_exporter:
         print("    Window 'data_exporter':")
         print("      Data Exporter (.venv_data_collection)")
@@ -1214,7 +1655,10 @@ def main(config: InferenceLaunchConfig):
     print("  Planner workflow:")
     print("    1. In pane 1: k (start) -> o (PLANNER mode)")
     if config.planner_input == "lavira":
-        print("    2. In pane 3: N starts AgentNav; Space cancels and stops")
+        if config.base_pose_enabled:
+            print("    2. In pane 1: N starts AgentNav; B starts Base-Pose; Space cancels")
+        else:
+            print("    2. In pane 1: N starts AgentNav; Space cancels and stops")
     else:
         print("    2. In pane 3: W/S/A/D/Q/E for safety-guarded locomotion")
     print("    3. In pane 1: i (POSE mode)")

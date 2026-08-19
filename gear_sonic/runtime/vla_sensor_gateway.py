@@ -7,34 +7,16 @@ import threading
 import time
 from typing import Any, Mapping
 
-import msgpack
-import msgpack_numpy as mnp
 import numpy as np
 
 from gear_sonic.runtime.client import MaterializedSnapshot, SensorGatewayClient
 from gear_sonic.runtime.contracts import SharedMemoryFrame
+from gear_sonic.runtime.cpp_state import decode_cpp_state_array
 from gear_sonic.runtime.snapshot import SnapshotRequest
 
 VLA_CAMERA_NAMES = ("ego_view", "chest_view", "left_wrist", "right_wrist")
 VLA_CAMERA_STREAMS = tuple(f"camera_encoded/{name}" for name in VLA_CAMERA_NAMES)
 VLA_STATE_STREAM = "cpp/state_msgpack"
-
-
-def _convert_lists_to_numpy(value: Any) -> Any:
-    if isinstance(value, dict):
-        return {key: _convert_lists_to_numpy(item) for key, item in value.items()}
-    if isinstance(value, (list, tuple)):
-        return np.asarray(value)
-    return value
-
-
-def decode_cpp_state_array(values: np.ndarray) -> dict[str, Any]:
-    """Decode the untouched C++ msgpack state payload stored by Gateway."""
-    payload = np.asarray(values, dtype=np.uint8).reshape(-1).tobytes()
-    decoded = msgpack.unpackb(payload, raw=False, object_hook=mnp.decode)
-    if not isinstance(decoded, dict):
-        raise ValueError("C++ state payload must decode to a mapping")
-    return _convert_lists_to_numpy(decoded)
 
 
 def camera_message_from_snapshot(snapshot: MaterializedSnapshot) -> dict[str, Any]:

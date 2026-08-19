@@ -200,6 +200,7 @@ uv.lock
 .venv_data_collection/
 .venv_camera/
 .venv_inference/
+.venv_depth_anything
 
 # Local secrets (never commit)
 .env

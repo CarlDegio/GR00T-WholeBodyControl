@@ -12,10 +12,13 @@ endpoints:
   control_gateway_intent: {host: 127.0.0.1, port: 5561}
   control_gateway_status: {host: 127.0.0.1, port: 5562}
   planner_relay: {host: 127.0.0.1, port: 5563}
-  lingbot_depth: {host: 127.0.0.1, port: 5564}
+  depth_anything: {host: 127.0.0.1, port: 5564}
   control_gateway_dispatch: {host: 127.0.0.1, port: 5565}
   sensor_gateway_visualization_ingress: {host: 127.0.0.1, port: 5566}
   vla_timing_ingress: {host: 127.0.0.1, port: 5567}
+  navdp_velocity: {host: 127.0.0.1, port: 5568}
+  orientation_telemetry: {host: 127.0.0.1, port: 5569}
+  navigation_runtime_status: {host: 127.0.0.1, port: 5570}
   xnavdp_http: {host: 127.0.0.1, port: 19999}
 ros_topics:
   lidar: /livox/lidar
@@ -65,13 +68,20 @@ components:
     sensor_gateway_request_timeout_ms: 100
     sensor_gateway_max_age_ms: 1000.0
     sensor_gateway_max_skew_ms: 5.0
-    radar_timeout_s: 0.75
     odometry_timeout_s: 0.3
     trajectory_timeout_s: 2.5
     visualize: true
     record_actorray: false
     actorray_output_dir: outputs/navdp
     actorray_record_fps: 20.0
+  planner_executor:
+    control_hz: 20.0
+    manual_velocity_timeout_s: 0.70
+    navdp_velocity_timeout_s: 0.30
+    radar_timeout_s: 0.75
+    sensor_gateway_poll_hz: 20.0
+    sensor_gateway_request_timeout_ms: 100
+    sensor_gateway_max_age_ms: 1000.0
   xnavdp_mpc:
     horizon_steps: 30
     desired_velocity: 0.3
@@ -86,14 +96,16 @@ components:
     linear_control_weight: 5.0
     angular_control_weight: 0.02
     curvature_speed_gain: 0.15
-  lingbot_depth:
-    model: robbyant/lingbot-depth-pretrain-vitl-14-v0.5
+  depth_anything:
+    root: /home/user/Project/Depth-Anything-V2/metric_depth
+    checkpoint: /home/user/Project/Depth-Anything-V2/metric_depth/checkpoints/depth_anything_v2_metric_hypersim_vitb.pth
+    encoder: vitb
     device: cuda
-    inference_hz: 2.0
-    display_hz: 20.0
-    max_depth_m: 10.0
-    resolution_level: 6
-    use_fp16: true
+    inference_hz: 10.5
+    input_size: 644
+    model_max_depth_m: 20.0
+    publish_max_depth_m: 20.0
+    use_amp: true
     ready_timeout_s: 180.0
   data_exporter:
     frequency_hz: 50
@@ -168,16 +180,74 @@ launch_inference:
   lavira_global_target: blue basket
   lavira_qwenvl_model: qwen3-vl-32b-instruct
   lavira_qwenvl_base_url: https://dashscope-intl.aliyuncs.com/compatible-mode/v1
-  lavira_warmup: true
   lavira_debug: false
   lavira_host: '*'
   lavira_control_input: gateway
   lavira_camera_timeout_ms: 15000
-  lavira_depth_port: 5564
-  lingbot_ready_timeout: 180.0
+  depth_anything_port: 5564
+  depth_anything_ready_timeout: 180.0
   lavira_qwenvl_timeout_seconds: 180.0
   lavira_min_confidence: 0.6
   lavira_output_root: outputs/object_nav
+  base_pose_enabled: true
+  base_pose_task: *vla_task_prompt
+  base_pose_mode: dual_raw_yoloe_servo
+  base_pose_vision_backend: codex
+  base_pose_model: gpt-5.6-sol
+  base_pose_qwenvl_model: qwen3-vl-plus
+  base_pose_qwenvl_base_url: https://dashscope-intl.aliyuncs.com/compatible-mode/v1
+  base_pose_qwenvl_thinking_budget: 500
+  base_pose_reasoning_effort: xhigh
+  base_pose_codex_fast: true
+  base_pose_codex_timeout_seconds: 600.0
+  base_pose_camera_stream: ego_view
+  base_pose_yoloe_depth_stream: camera/ego_view_depth
+  base_pose_camera_intrinsics_path: gear_sonic/config/camera_intrinsics.json
+  base_pose_camera_pitch_deg: -38.0
+  base_pose_camera_roll_deg: 0.0
+  base_pose_camera_yaw_deg: 0.0
+  base_pose_camera_forward_offset_m: 0.0
+  base_pose_camera_lateral_offset_m: 0.0
+  base_pose_dual_head_camera_stream: ego_view
+  base_pose_dual_head_depth_stream: camera/ego_view_depth
+  base_pose_dual_chest_camera_stream: chest_view
+  base_pose_dual_chest_depth_stream: derived/depth_anything/chest_view
+  base_pose_dual_chest_camera_pitch_deg: -3.0
+  base_pose_dual_chest_camera_roll_deg: 0.0
+  base_pose_dual_chest_camera_yaw_deg: 0.0
+  base_pose_dual_chest_camera_forward_offset_m: 0.0
+  base_pose_dual_chest_camera_lateral_offset_m: 0.0
+  base_pose_dual_match_tolerance_frames: 30
+  base_pose_dual_initialization_grace_s: 30.0
+  base_pose_dual_qwenvl_fallback_model: qwen3-vl-8b-instruct
+  base_pose_camera_timeout_ms: 15000
+  base_pose_planner_hz: 20.0
+  base_pose_output_root: outputs/base_pose_adjustment
+  base_pose_yoloe_model_path: tools/yoloe26m/weights/yoloe-26m-seg.pt
+  base_pose_yoloe_device: '0'
+  base_pose_yoloe_confidence: 0.25
+  base_pose_yoloe_imgsz: 640
+  base_pose_raw_reference_update_interval_frames: 5
+  base_pose_raw_reference_update_min_confidence: 0.35
+  base_pose_raw_reference_update_min_iou: 0.50
+  base_pose_raw_servo_hz: 10.0
+  base_pose_raw_head_target_distance_m: 0.90
+  base_pose_raw_chest_target_distance_m: 0.80
+  base_pose_raw_forward_tolerance_m: 0.10
+  base_pose_raw_lateral_tolerance_m: 0.10
+  base_pose_raw_min_linear_speed_m_s: 0.40
+  base_pose_raw_max_lateral_speed_m_s: 0.40
+  base_pose_raw_min_yaw_speed_rad_s: 0.10
+  base_pose_raw_yaw_tolerance_deg: 8.0
+  base_pose_raw_yaw_coarse_speed_rad_s: 0.30
+  base_pose_raw_yaw_trim_speed_rad_s: 0.20
+  base_pose_raw_forward_recenter_yaw_speed_rad_s: 0.30
+  base_pose_raw_horizontal_guard_fraction: 0.25
+  base_pose_raw_horizontal_recovery_fraction: 0.30
+  base_pose_raw_camera_stale_s: 0.40
+  base_pose_raw_max_run_s: 180.0
+  base_pose_raw_post_stop_sample_s: 3.0
+  base_pose_raw_allow_missing_table: 0
   navdp_root: /home/user/Project/NavDP/baselines/x-navdp
   navdp_checkpoint: /home/user/Project/NavDP/baselines/x-navdp/checkpoints/x-navdp_posttrain.ckpt
   fastlio_workspace: /home/user/Project/fastlio_humanoid_ws

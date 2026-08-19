@@ -10,7 +10,18 @@ import zmq
 from gear_sonic.runtime.sensor_gateway import SensorGatewayCore, VisualizationZmqIngress
 from gear_sonic.runtime.shared_memory import read_shared_memory_frame
 from gear_sonic.runtime.snapshot import SnapshotRequest
-from gear_sonic.runtime.visualization import VISUALIZATION_SCHEMA, VisualizationPublisher
+from gear_sonic.runtime.visualization import (
+    NAVDP_ACTOR_RAY_STREAM,
+    NAVDP_SLAM_2D_STREAM,
+    VISUALIZATION_SCHEMA,
+    VISUALIZATION_STREAMS,
+    VisualizationPublisher,
+)
+
+
+def test_visualization_contract_exposes_split_navdp_panels() -> None:
+    assert NAVDP_ACTOR_RAY_STREAM in VISUALIZATION_STREAMS
+    assert NAVDP_SLAM_2D_STREAM in VISUALIZATION_STREAMS
 
 
 def test_visualization_ingress_stores_jpeg_in_sensor_gateway_shared_memory() -> None:

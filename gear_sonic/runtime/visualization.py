@@ -12,10 +12,15 @@ import zmq
 from gear_sonic.camera.constants import PRODUCTION_JPEG_QUALITY
 
 VISUALIZATION_SCHEMA = "sonic.visualization_frame"
+NAVDP_NAVIGATION_STREAM = "visualization/navdp_navigation"
+NAVDP_ACTOR_RAY_STREAM = "visualization/navdp_actor_ray"
+NAVDP_SLAM_2D_STREAM = "visualization/navdp_slam_2d"
+NAVDP_HEAD_RGBD_STREAM = "visualization/navdp_head_rgbd"
 VISUALIZATION_STREAMS = (
-    "visualization/navdp_navigation",
-    "visualization/navdp_head_rgbd",
-    "visualization/lingbot_depth",
+    NAVDP_NAVIGATION_STREAM,
+    NAVDP_ACTOR_RAY_STREAM,
+    NAVDP_SLAM_2D_STREAM,
+    NAVDP_HEAD_RGBD_STREAM,
 )
 
 

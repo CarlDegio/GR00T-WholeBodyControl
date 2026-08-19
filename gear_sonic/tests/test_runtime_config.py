@@ -8,7 +8,8 @@ from gear_sonic.runtime.config import load_runtime_profile
 from gear_sonic.runtime.endpoints import ENDPOINTS
 from gear_sonic.scripts.lavira_planner import LaviraPlannerConfig
 from gear_sonic.scripts.navdp_planner import NavDPPlannerConfig, XNAVDP_G1_MPC_DEFAULTS
-from gear_sonic.scripts.run_lingbot_depth_viewer import LingBotDepthViewerConfig
+from gear_sonic.scripts.planner_velocity_executor import PlannerVelocityExecutorConfig
+from gear_sonic.scripts.run_depth_anything import DepthAnythingConfig
 from gear_sonic.scripts.run_vla_inference import InferenceConfig
 
 
@@ -27,10 +28,8 @@ def test_default_profile_reproduces_current_topology_and_timing() -> None:
     assert profile.component("vla") == {
         "embodiment_tag": "unitree_g1_sonic",
         "prompt": (
-            "Approach the tabletop if necessary, then use the right hand to pick up "
-            "the paper ball and place it into the blue plastic basket, use the left "
-            "hand to place another paper ball into the same basket, and finally "
-            "return both arms to the sides of the body."
+            "Move in front of the table, grasp the medicine bottle, and place it "
+            "into the blue basket."
         ),
         "inference_hz": 2.0,
         "action_publish_hz": 50,
@@ -42,7 +41,7 @@ def test_default_profile_reproduces_current_topology_and_timing() -> None:
     }
     assert profile.component("navdp")["control_hz"] == 20.0
     assert profile.component("navdp")["mpc_hz"] == 10.0
-    assert profile.component("lingbot_depth")["inference_hz"] == 2.0
+    assert profile.component("depth_anything")["inference_hz"] == 10.5
     assert profile.component("data_exporter") == {
         "frequency_hz": 50,
         "sensor_gateway_poll_hz": 50.0,
@@ -56,8 +55,9 @@ def test_profile_parameters_match_current_process_defaults() -> None:
     profile = load_runtime_profile()
     lavira = LaviraPlannerConfig(mission="", global_target="")
     navdp = NavDPPlannerConfig()
+    executor = PlannerVelocityExecutorConfig()
     vla = InferenceConfig()
-    lingbot = LingBotDepthViewerConfig()
+    depth_anything = DepthAnythingConfig()
 
     vla_profile = profile.component("vla")
     assert vla_profile["sensor_gateway_poll_hz"] == vla.sensor_gateway_poll_hz
@@ -96,7 +96,6 @@ def test_profile_parameters_match_current_process_defaults() -> None:
         navdp_profile["sensor_gateway_max_skew_ms"]
         == navdp.sensor_gateway_max_skew_ms
     )
-    assert navdp_profile["radar_timeout_s"] == navdp.radar_timeout_s
     assert navdp_profile["odometry_timeout_s"] == navdp.odom_timeout_s
     assert navdp_profile["trajectory_timeout_s"] == navdp.trajectory_timeout_s
     assert navdp_profile["visualize"] is navdp.visualize
@@ -105,14 +104,30 @@ def test_profile_parameters_match_current_process_defaults() -> None:
     assert navdp_profile["actorray_record_fps"] == navdp.actorray_record_fps
     assert profile.component("xnavdp_mpc") == XNAVDP_G1_MPC_DEFAULTS
 
-    lingbot_profile = profile.component("lingbot_depth")
-    assert lingbot_profile["model"] == lingbot.model
-    assert lingbot_profile["device"] == lingbot.device
-    assert lingbot_profile["inference_hz"] == lingbot.inference_hz
-    assert lingbot_profile["display_hz"] == lingbot.display_hz
-    assert lingbot_profile["max_depth_m"] == lingbot.max_depth_m
-    assert lingbot_profile["resolution_level"] == lingbot.resolution_level
-    assert lingbot_profile["use_fp16"] is lingbot.use_fp16
+    executor_profile = profile.component("planner_executor")
+    assert executor_profile["control_hz"] == executor.control_hz
+    assert executor_profile["radar_timeout_s"] == executor.radar_timeout_s
+    assert (
+        executor_profile["manual_velocity_timeout_s"]
+        == executor.manual_velocity_timeout_s
+    )
+    assert (
+        executor_profile["navdp_velocity_timeout_s"]
+        == executor.navdp_velocity_timeout_s
+    )
+    assert executor.orientation_output_endpoint == ""
+    assert executor.runtime_status_endpoint == "tcp://*:5570"
+
+    depth_profile = profile.component("depth_anything")
+    assert depth_profile["root"] == depth_anything.depth_anything_root
+    assert depth_profile["checkpoint"] == depth_anything.checkpoint
+    assert depth_profile["encoder"] == depth_anything.encoder
+    assert depth_profile["device"] == depth_anything.device
+    assert depth_profile["inference_hz"] == depth_anything.inference_hz
+    assert depth_profile["input_size"] == depth_anything.input_size
+    assert depth_profile["model_max_depth_m"] == depth_anything.model_max_depth_m
+    assert depth_profile["publish_max_depth_m"] == depth_anything.publish_max_depth_m
+    assert depth_profile["use_amp"] is depth_anything.use_amp
 
 
 def test_partial_overlay_changes_only_selected_values(tmp_path) -> None:

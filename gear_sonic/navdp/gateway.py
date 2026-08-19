@@ -34,7 +34,7 @@ def _bind_endpoint(name: str) -> str:
 class NavDPPlannerConfig:
     command_endpoint: str = _DEFAULT_PROFILE.endpoint_uri("navigation_command")
     status_endpoint: str = _bind_endpoint("navigation_status")
-    output_endpoint: str = _bind_endpoint("planner_relay")
+    output_endpoint: str = _bind_endpoint("navdp_velocity")
     navdp_server: str = _DEFAULT_PROFILE.endpoint_uri("xnavdp_http")
     sensor_gateway_endpoint: str = _DEFAULT_PROFILE.endpoint_uri(
         "sensor_gateway_metadata"
@@ -55,7 +55,6 @@ class NavDPPlannerConfig:
     heading_preview_s: float = float(_NAVDP_DEFAULTS["heading_preview_s"])
     goal_tolerance_m: float = float(_NAVDP_DEFAULTS["goal_tolerance_m"])
     navdp_stop_threshold: float = float(_NAVDP_DEFAULTS["stop_threshold"])
-    radar_timeout_s: float = float(_NAVDP_DEFAULTS["radar_timeout_s"])
     odom_timeout_s: float = float(_NAVDP_DEFAULTS["odometry_timeout_s"])
     trajectory_timeout_s: float = float(_NAVDP_DEFAULTS["trajectory_timeout_s"])
     navdp_request_timeout_s: float = float(_NAVDP_DEFAULTS["request_timeout_s"])

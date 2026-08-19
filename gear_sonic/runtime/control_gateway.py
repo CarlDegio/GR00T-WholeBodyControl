@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import math
 from typing import Callable, Mapping
 
 from gear_sonic.runtime.contracts import MessageMetadata, OperatorCommand
@@ -19,7 +20,7 @@ CONSOLE_COMMAND_NAMES = {
     "]": "toggle_right_hand_initial_pose",
 }
 PROMPT_PREFIX = "prompt:"
-NAVIGATION_KEYS = frozenset({"w", "a", "s", "d", "q", "e", "n", " "})
+NAVIGATION_KEYS = frozenset({"w", "a", "s", "d", "q", "e", "n", "b", " "})
 MANUAL_NAVIGATION_VELOCITIES = {
     "w": (0.3, 0.0, 0.0),
     "s": (-0.3, 0.0, 0.0),
@@ -28,6 +29,7 @@ MANUAL_NAVIGATION_VELOCITIES = {
     "q": (0.0, 0.0, 0.5),
     "e": (0.0, 0.0, -0.5),
 }
+BASE_POSE_RUNTIME_STATUS_COMMAND = "base_pose_runtime_status"
 RECORDING_ALIASES = {
     "record-start": "c",
     "record-success": "e",
@@ -184,35 +186,58 @@ class NavigationControlAction:
     mode: str
     velocity: tuple[float, float, float] | None = None
     agent_event: str | None = None
+    reason: str = ""
 
 
 class NavigationControlState:
     """Own manual-key timing and the generation shared by Agent and NavDP."""
 
-    def __init__(self, *, manual_hold_s: float = 0.55) -> None:
-        if manual_hold_s <= 0.0:
-            raise ValueError("manual_hold_s must be positive")
+    def __init__(
+        self,
+        *,
+        manual_hold_s: float = 0.55,
+        base_pose_command_timeout_s: float = 0.35,
+    ) -> None:
+        if manual_hold_s <= 0.0 or base_pose_command_timeout_s <= 0.0:
+            raise ValueError("navigation command timeouts must be positive")
         self.manual_hold_s = float(manual_hold_s)
+        self.base_pose_command_timeout_s = float(base_pose_command_timeout_s)
         self.generation = 0
         self.mode = "listen_wasd"
         self.manual_velocity = (0.0, 0.0, 0.0)
         self.manual_deadline = 0.0
 
+    @property
+    def owner(self) -> str | None:
+        if self.mode.startswith("lavira_"):
+            return "lavira"
+        if self.mode.startswith("base_pose_"):
+            return "base_pose"
+        return None
+
+    def _busy(self) -> NavigationControlAction:
+        return NavigationControlAction(
+            self.generation,
+            "ignored",
+            reason=f"navigation_busy:{self.owner or self.mode}",
+        )
+
     def handle_key(self, key: str, *, now: float) -> NavigationControlAction:
         normalized = key.lower()
         if normalized not in NAVIGATION_KEYS:
             raise ValueError(f"unsupported navigation key: {key!r}")
-        if normalized == "n":
+        if normalized in {"n", "b"}:
             if self.mode != "listen_wasd":
-                return NavigationControlAction(self.generation, "ignored")
+                return self._busy()
             self.generation += 1
             self.manual_velocity = (0.0, 0.0, 0.0)
             self.manual_deadline = 0.0
-            self.mode = "nav_pending"
+            is_lavira = normalized == "n"
+            self.mode = "lavira_pending" if is_lavira else "base_pose_inference"
             return NavigationControlAction(
                 self.generation,
                 "stop",
-                agent_event="start_navigation",
+                agent_event="start_navigation" if is_lavira else "start_base_pose",
             )
         if normalized == " ":
             self.generation += 1
@@ -225,7 +250,7 @@ class NavigationControlState:
                 agent_event="cancel_navigation",
             )
         if self.mode != "listen_wasd":
-            return NavigationControlAction(self.generation, "ignored")
+            return self._busy()
         self.manual_velocity = MANUAL_NAVIGATION_VELOCITIES[normalized]
         self.manual_deadline = float(now) + self.manual_hold_s
         return NavigationControlAction(
@@ -247,20 +272,92 @@ class NavigationControlState:
                 "manual_velocity",
                 velocity=self.manual_velocity,
             )
+        if (
+            self.mode == "base_pose_motion"
+            and self.manual_deadline > 0.0
+            and float(now) >= self.manual_deadline
+        ):
+            self.generation += 1
+            self.manual_velocity = (0.0, 0.0, 0.0)
+            self.manual_deadline = 0.0
+            self.mode = "listen_wasd"
+            return NavigationControlAction(
+                self.generation,
+                "stop",
+                agent_event="cancel_navigation",
+                reason="base_pose_velocity_timeout",
+            )
         return None
 
     def accept_goal(self, parameters: Mapping[str, object]) -> NavigationControlAction:
         generation = int(parameters["generation"])
-        if generation != self.generation or self.mode != "nav_pending":
+        if generation != self.generation or self.mode != "lavira_pending":
             raise ValueError("stale or unexpected navigation goal")
-        self.mode = "nav"
+        self.mode = "lavira_nav"
         return NavigationControlAction(generation, "nav_goal")
 
-    def accept_status(self, payload: Mapping[str, object]) -> bool:
+    def accept_lavira_rgbd_captured(self, parameters: Mapping[str, object]) -> bool:
+        """Validate LaViRA's DA lease release without changing navigation state."""
+
+        generation = int(parameters["generation"])
+        return generation == self.generation and self.mode == "lavira_pending"
+
+    def accept_base_pose_velocity(
+        self,
+        parameters: Mapping[str, object],
+        *,
+        now: float,
+    ) -> NavigationControlAction:
+        generation = int(parameters["generation"])
+        if generation != self.generation or self.mode not in {
+            "base_pose_inference",
+            "base_pose_motion",
+        }:
+            raise ValueError("stale or unexpected base-pose velocity")
+        raw_velocity = parameters.get("velocity")
+        if not isinstance(raw_velocity, (list, tuple)) or len(raw_velocity) != 3:
+            raise ValueError("base_pose_velocity requires [vx, vy, wz]")
+        velocity = tuple(float(value) for value in raw_velocity)
+        if not all(math.isfinite(value) for value in velocity):
+            raise ValueError("base-pose velocity must be finite")
+        vx, vy, wz = velocity
+        motion_profile = str(parameters.get("motion_profile", "sequence"))
+        if motion_profile == "sequence":
+            unsafe = abs(vx) > 0.300001 or abs(vy) > 0.000001 or abs(wz) > 0.400001
+        elif motion_profile == "yoloe_servo":
+            unsafe = (
+                abs(vx) > 0.400001
+                or abs(vy) > 0.400001
+                or abs(wz) > 0.300001
+                or (abs(vx) > 0.000001 and abs(vy) > 0.000001)
+            )
+        else:
+            raise ValueError("unsupported base-pose motion profile")
+        if unsafe:
+            raise ValueError("base-pose velocity exceeds the planner safety envelope")
+        self.mode = "base_pose_motion"
+        self.manual_velocity = velocity
+        self.manual_deadline = float(now) + self.base_pose_command_timeout_s
+        return NavigationControlAction(
+            generation,
+            "manual_velocity",
+            velocity=velocity,
+        )
+
+    def accept_status(
+        self,
+        payload: Mapping[str, object],
+        *,
+        owner: str | None = None,
+    ) -> bool:
         if int(payload.get("generation", -1)) != self.generation:
+            return False
+        if owner is not None and self.owner != owner:
             return False
         if payload.get("state") in {"reached", "failed", "stopped"}:
             self.mode = "listen_wasd"
+            self.manual_velocity = (0.0, 0.0, 0.0)
+            self.manual_deadline = 0.0
         return True
 
 

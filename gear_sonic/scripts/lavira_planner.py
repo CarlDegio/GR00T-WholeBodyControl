@@ -30,7 +30,6 @@ class LaviraPlannerConfig:
     global_target: str
     qwenvl_model: str = "qwen3-vl-32b-instruct"
     qwenvl_base_url: str = "https://dashscope-intl.aliyuncs.com/compatible-mode/v1"
-    warmup: bool = True
     debug: bool = False
     camera_timeout_ms: int = 15000
     sensor_gateway_endpoint: str = "tcp://127.0.0.1:5560"
@@ -193,29 +192,35 @@ def run_inference_worker(
 ) -> None:
     runner: ObjectNavRunner | None = None
     try:
-        if runtime.config.warmup and not runtime.stop_event.is_set():
-            try:
-                runner = factory()
-                runtime.logger("[LaViRA] warmup started")
-                runner.warmup()
-                runtime.logger("[LaViRA] warmup complete")
-            except Exception as exc:
-                # Warmup is an optimization, not the lifetime of the planner.
-                # Keep the worker alive so a later NAV request either retries
-                # successfully or returns a visible error to the state machine.
-                runtime.logger(f"[LaViRA] warmup failed: {exc}")
-                if runner is not None:
-                    runner.close()
-                runner = None
         while not runtime.stop_event.is_set():
             generation = runtime.requests.get()
             if generation is None:
                 break
+            released = False
+
+            def release_depth() -> None:
+                nonlocal released
+                if released:
+                    return
+                released = True
+                runtime.submit_intent(
+                    "lavira_rgbd_captured",
+                    {"generation": generation},
+                )
+
             try:
                 runner = runner or factory()
-                item = WorkerResult(generation, runner.run_once(), None)
+                item = WorkerResult(
+                    generation,
+                    runner.run_once(rgbd_capture_complete=release_depth),
+                    None,
+                )
             except Exception as exc:
                 item = WorkerResult(generation, None, str(exc))
+            finally:
+                # Custom/test runners may fail before invoking the camera callback.
+                # Releasing twice is prevented above, so every request is fail-closed.
+                release_depth()
             runtime.publish_worker_result(item)
     finally:
         if runner is not None:

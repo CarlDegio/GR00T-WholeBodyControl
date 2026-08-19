@@ -51,7 +51,7 @@ visible.
 python gear_sonic/scripts/run_sensor_gateway.py \
   --camera-host 127.0.0.1 --camera-port 5555 \
   --rpc-bind-host 127.0.0.1 \
-  --no-enable-lingbot-depth --no-enable-cpp-state --no-enable-ros \
+  --no-enable-depth-anything --no-enable-cpp-state --no-enable-ros \
   --no-enable-visualization --no-enable-vla-timing
 ```
 
@@ -250,7 +250,7 @@ for this video check.
    ```bash
    python gear_sonic/scripts/run_sensor_gateway.py \
      --camera-host 192.168.123.164 --camera-port 5555 \
-     --no-enable-lingbot-depth --no-enable-cpp-state --no-enable-ros \
+     --no-enable-depth-anything --no-enable-cpp-state --no-enable-ros \
      --no-enable-visualization --no-enable-vla-timing
    ```
 
