@@ -58,6 +58,7 @@ class BasePoseAgentConfig:
     dual_chest_camera_forward_offset_m: float = 0.0
     dual_chest_camera_lateral_offset_m: float = 0.0
     dual_match_tolerance_frames: int = 30
+    dual_head_reacquire_frames: int = 10
     dual_initialization_grace_s: float = 30.0
     dual_qwenvl_fallback_model: str = "qwen3-vl-8b-instruct"
 

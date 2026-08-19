@@ -12,7 +12,10 @@ from gear_sonic.runtime.control_gateway import (
     OperatorConsoleRouter,
     normalize_console_line,
 )
-from gear_sonic.scripts.run_control_gateway import resolve_control_gateway_settings
+from gear_sonic.scripts.run_control_gateway import (
+    build_base_pose_runtime_status,
+    resolve_control_gateway_settings,
+)
 
 
 def test_console_translation_normalizes_prompt_and_single_key_input() -> None:
@@ -231,3 +234,27 @@ def test_yoloe_base_pose_profile_allows_bounded_single_axis_lateral_servo() -> N
             },
             now=1.2,
         )
+
+
+def test_base_pose_viewer_overlay_is_telemetry_only() -> None:
+    state = NavigationControlState()
+    started = state.handle_key("b", now=1.0)
+    parameters = {
+        "generation": started.generation,
+        "velocity": [0.0, 0.0, 0.2],
+        "motion_profile": "yoloe_servo",
+        "action": "visual_servo",
+        "camera_stream": "ego_view",
+        "viewer_overlay": {
+            "target_bbox_xyxy": [10.0, 20.0, 30.0, 40.0],
+            "image_size": [64, 48],
+        },
+    }
+
+    action = state.accept_base_pose_velocity(parameters, now=1.1)
+    status = build_base_pose_runtime_status(action, parameters)
+
+    assert action.velocity == pytest.approx((0.0, 0.0, 0.2))
+    assert status["generation"] == started.generation
+    assert status["velocity"] == [0.0, 0.0, 0.2]
+    assert status["viewer_overlay"] == parameters["viewer_overlay"]

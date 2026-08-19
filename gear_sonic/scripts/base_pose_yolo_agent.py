@@ -68,15 +68,21 @@ class GatewayRawServoAdapter:
         if not isinstance(velocity, Mapping):
             raise ValueError("YOLOE servo output has no velocity object")
         command = [float(velocity[name]) for name in ("vx", "vy", "wz")]
+        parameters: dict[str, object] = {
+            "generation": self.gateway_generation,
+            "velocity": command,
+            "action": str(payload.get("action", "visual_servo")),
+            "motion_profile": "yoloe_servo",
+            "camera_stream": str(payload.get("camera_stream", "")),
+        }
+        viewer_overlay = payload.get("viewer_overlay")
+        if viewer_overlay is not None:
+            if not isinstance(viewer_overlay, Mapping):
+                raise ValueError("YOLOE servo viewer_overlay must be an object")
+            parameters["viewer_overlay"] = dict(viewer_overlay)
         self.submit_intent(
             "base_pose_velocity",
-            {
-                "generation": self.gateway_generation,
-                "velocity": command,
-                "action": str(payload.get("action", "visual_servo")),
-                "motion_profile": "yoloe_servo",
-                "camera_stream": str(payload.get("camera_stream", "")),
-            },
+            parameters,
         )
 
     def start(self, generation: int, *, now: float | None = None) -> bool:

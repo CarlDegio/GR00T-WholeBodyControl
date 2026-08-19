@@ -183,6 +183,7 @@ class TargetGeometry:
     valid_depth_pixels: int
     valid_ratio: float
     median_depth_m: float
+    lateral_anchor_px: tuple[float, float] | None = None
 
 
 @dataclass(frozen=True)
@@ -203,6 +204,7 @@ class TableGeometry:
 class ServoPhase(str, Enum):
     FORWARD_APPROACH = "forward_approach"
     FORWARD_RECENTER = "forward_recenter"
+    VERTICAL_RECENTER = "vertical_recenter"
     YAW_ALIGN = "yaw_align"
     RECENTER = "recenter"
     YAW_TRIM = "yaw_trim"
@@ -223,6 +225,7 @@ class RawServoObservation:
     image_width: int = 640
     image_height: int = 480
     table_geometry_error: str | None = None
+    desk_mask: np.ndarray | None = None
 
 
 @dataclass(frozen=True)
@@ -1146,6 +1149,7 @@ def estimate_target_geometry(
     body = calibration.camera_to_body(_deproject(u, v, z, calibration))
     median = np.median(body, axis=0)
     right_m = float(-median[1])
+    lateral_anchor_px = None
     if bbox_xyxy is not None:
         # The lateral loop follows the requested box center; mask depth supplies
         # a robust range rather than a fragile center pixel.
@@ -1159,6 +1163,7 @@ def estimate_target_geometry(
             calibration,
         )
         right_m = float(-calibration.camera_to_body(center_camera)[0, 1])
+        lateral_anchor_px = (float(u_center), float(v_center))
     return TargetGeometry(
         forward_m=float(median[0]),
         right_m=right_m,
@@ -1166,95 +1171,306 @@ def estimate_target_geometry(
         valid_depth_pixels=int(z.size),
         valid_ratio=float(valid_ratio),
         median_depth_m=float(np.median(z)),
+        lateral_anchor_px=lateral_anchor_px,
     )
 
 
-def _ransac_line(
-    points: np.ndarray,
+_TABLE_EDGE_GAUSSIAN_KERNEL = 5
+_TABLE_EDGE_CANNY_LOW = 50
+_TABLE_EDGE_CANNY_HIGH = 150
+_TABLE_EDGE_HOUGH_THRESHOLD = 25
+_TABLE_EDGE_MIN_LENGTH_PX = 45.0
+_TABLE_EDGE_HOUGH_MAX_LINE_GAP_PX = 12
+_TABLE_EDGE_DEPTH_SAMPLES = 20
+
+
+@dataclass(frozen=True)
+class _TLSSegment:
+    points: np.ndarray
+    center: np.ndarray
+    direction: np.ndarray
+    residual_q90: float
+    residual_median: float
+    length: float
+    endpoint_a: np.ndarray
+    endpoint_b: np.ndarray
+
+
+@dataclass(frozen=True)
+class _PixelLineSegment:
+    endpoint_a: np.ndarray
+    endpoint_b: np.ndarray
+    length: float
+
+
+def _fit_tls_segment(points: np.ndarray) -> _TLSSegment:
+    values = np.asarray(points, dtype=np.float64)
+    if values.ndim != 2 or values.shape[1] != 2 or len(values) < 2:
+        raise ValueError("TLS line fitting requires at least two 2D points")
+    center = np.mean(values, axis=0)
+    centered = values - center
+    if np.allclose(centered, 0.0):
+        direction = np.array([1.0, 0.0], dtype=np.float64)
+    else:
+        _, _, vh = np.linalg.svd(centered, full_matrices=False)
+        direction = vh[0]
+    direction /= max(float(np.linalg.norm(direction)), 1e-12)
+    normal = np.array([-direction[1], direction[0]])
+    residuals = np.abs(centered @ normal)
+    projection = centered @ direction
+    minimum = float(np.min(projection))
+    maximum = float(np.max(projection))
+    return _TLSSegment(
+        points=values,
+        center=center,
+        direction=direction,
+        residual_q90=float(np.quantile(residuals, 0.90)),
+        residual_median=float(np.median(residuals)),
+        length=maximum - minimum,
+        endpoint_a=center + minimum * direction,
+        endpoint_b=center + maximum * direction,
+    )
+
+
+def _rgb_mask_edge_intersection(
+    rgb: np.ndarray,
+    mask: np.ndarray,
     *,
-    threshold_m: float = 0.02,
-    iterations: int = 240,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, float, np.ndarray]:
-    if len(points) < 50:
-        raise ValueError("table edge has fewer than 50 depth points")
-    source_indices = np.arange(len(points), dtype=int)
-    if len(points) > 2500:
-        indices = np.linspace(0, len(points) - 1, 2500, dtype=int)
-        points = points[indices]
-        source_indices = source_indices[indices]
-    rng = np.random.default_rng(0)
-    best: tuple[float, np.ndarray, np.ndarray] | None = None
-    for _ in range(iterations):
-        a, b = points[rng.choice(len(points), size=2, replace=False)]
-        direction = b - a
-        norm = float(np.linalg.norm(direction))
-        if norm < 0.10:
+    exclusion_mask: np.ndarray | None = None,
+) -> np.ndarray:
+    image = np.asarray(rgb)
+    binary = np.asarray(mask) > 0
+    if image.ndim != 3 or image.shape[2] != 3:
+        raise ValueError("table-edge RGB image must have three channels")
+    if binary.ndim != 2 or binary.shape != image.shape[:2]:
+        raise ValueError("table mask is not aligned to RGB")
+    effective_mask = binary.copy()
+    if exclusion_mask is not None:
+        excluded = np.asarray(exclusion_mask) > 0
+        if excluded.shape != binary.shape:
+            raise ValueError("table-edge exclusion mask is not aligned")
+        effective_mask[excluded] = False
+
+    gray = cv2.cvtColor(image, cv2.COLOR_RGB2GRAY)
+    blurred = cv2.GaussianBlur(
+        gray,
+        (_TABLE_EDGE_GAUSSIAN_KERNEL, _TABLE_EDGE_GAUSSIAN_KERNEL),
+        0,
+    )
+    edges = cv2.Canny(
+        blurred,
+        _TABLE_EDGE_CANNY_LOW,
+        _TABLE_EDGE_CANNY_HIGH,
+        apertureSize=3,
+        L2gradient=True,
+    )
+    intersection = np.zeros_like(edges)
+    intersection[effective_mask] = edges[effective_mask]
+    return intersection
+
+
+def _rgb_mask_line_segments(
+    rgb: np.ndarray,
+    mask: np.ndarray,
+    *,
+    exclusion_mask: np.ndarray | None = None,
+) -> list[_PixelLineSegment]:
+    intersection = _rgb_mask_edge_intersection(
+        rgb,
+        mask,
+        exclusion_mask=exclusion_mask,
+    )
+    detected = cv2.HoughLinesP(
+        intersection,
+        rho=1.0,
+        theta=np.pi / 180.0,
+        threshold=_TABLE_EDGE_HOUGH_THRESHOLD,
+        minLineLength=_TABLE_EDGE_MIN_LENGTH_PX,
+        maxLineGap=_TABLE_EDGE_HOUGH_MAX_LINE_GAP_PX,
+    )
+    segments: list[_PixelLineSegment] = []
+    if detected is not None:
+        for x1, y1, x2, y2 in detected[:, 0, :]:
+            endpoint_a = np.array([x1, y1], dtype=np.float64)
+            endpoint_b = np.array([x2, y2], dtype=np.float64)
+            length = float(np.linalg.norm(endpoint_b - endpoint_a))
+            if length > _TABLE_EDGE_MIN_LENGTH_PX:
+                segments.append(
+                    _PixelLineSegment(
+                        endpoint_a=endpoint_a,
+                        endpoint_b=endpoint_b,
+                        length=length,
+                    )
+                )
+    return sorted(segments, key=lambda segment: segment.length, reverse=True)
+
+
+def _select_nearest_pixel_segment(
+    segments: Sequence[_PixelLineSegment],
+    *,
+    depth_raw: np.ndarray,
+    depth_scale_m: float,
+) -> tuple[_PixelLineSegment, np.ndarray, np.ndarray]:
+    if depth_raw.ndim != 2 or not math.isfinite(depth_scale_m):
+        raise ValueError("table-edge depth source is invalid")
+    best: tuple[
+        float, _PixelLineSegment, np.ndarray, np.ndarray
+    ] | None = None
+    for segment in segments:
+        sampled_pixels = np.rint(
+            np.linspace(
+                segment.endpoint_a,
+                segment.endpoint_b,
+                _TABLE_EDGE_DEPTH_SAMPLES,
+            )
+        ).astype(int)
+        sampled_u = sampled_pixels[:, 0]
+        sampled_v = sampled_pixels[:, 1]
+        if not (
+            np.all((0 <= sampled_v) & (sampled_v < depth_raw.shape[0]))
+            and np.all((0 <= sampled_u) & (sampled_u < depth_raw.shape[1]))
+        ):
             continue
-        direction /= norm
-        distance = np.abs(
-            (points[:, 0] - a[0]) * direction[1]
-            - (points[:, 1] - a[1]) * direction[0]
+        sampled_depth_m = (
+            depth_raw[sampled_v, sampled_u].astype(np.float64)
+            * depth_scale_m
         )
-        inliers = distance <= threshold_m
-        count = int(np.count_nonzero(inliers))
-        if count < 50:
+        if not np.all(
+            np.isfinite(sampled_depth_m)
+            & (sampled_depth_m >= 0.15)
+            & (sampled_depth_m <= 4.0)
+        ):
             continue
-        center_range = float(np.linalg.norm(np.median(points[inliers], axis=0)))
-        score = count / max(0.25, center_range)
-        if best is None or score > best[0]:
-            best = (score, inliers, direction.copy())
+        mean_depth_m = float(np.mean(sampled_depth_m))
+        if (
+            best is None
+            or mean_depth_m < best[0]
+            or (
+                mean_depth_m == best[0]
+                and segment.length > best[1].length
+            )
+        ):
+            best = (
+                mean_depth_m,
+                segment,
+                sampled_pixels,
+                sampled_depth_m,
+            )
     if best is None:
-        raise ValueError("no stable table-edge line found")
-    inlier_points = points[best[1]]
-    inlier_indices = source_indices[best[1]]
-    center = np.mean(inlier_points, axis=0)
-    _, _, vh = np.linalg.svd(inlier_points - center, full_matrices=False)
-    direction = vh[0]
-    projection = (inlier_points - center) @ direction
-    length = float(np.max(projection) - np.min(projection))
-    residual = np.abs(
-        (inlier_points[:, 0] - center[0]) * direction[1]
-        - (inlier_points[:, 1] - center[1]) * direction[0]
+        raise ValueError(
+            "no RGB-mask table-edge line has 20 valid sampled depths"
+        )
+    return best[1], best[2], best[3]
+
+
+def _largest_filled_component(mask: np.ndarray) -> np.ndarray:
+    binary = (np.asarray(mask) > 0).astype(np.uint8)
+    if binary.ndim != 2:
+        raise ValueError("table mask must be two-dimensional")
+    component_count, labels, stats, _ = cv2.connectedComponentsWithStats(
+        binary,
+        connectivity=8,
     )
-    return (
-        center,
-        direction,
-        inlier_points,
-        float(np.median(residual)),
-        inlier_indices,
+    if component_count <= 1:
+        return binary
+
+    largest_label = 1 + int(
+        np.argmax(stats[1:, cv2.CC_STAT_AREA])
     )
+    largest = (labels == largest_label).astype(np.uint8)
+
+    padded = np.pad(largest, 1, mode="constant", constant_values=0)
+    flooded = padded.copy()
+    cv2.floodFill(flooded, None, (0, 0), 2)
+    holes = flooded[1:-1, 1:-1] == 0
+    largest[holes] = 1
+    return largest
+
+
+def _binary_mask_row_spans(
+    mask: np.ndarray,
+) -> tuple[tuple[int, int, int], ...]:
+    """Encode a binary mask as (row, start, exclusive-end) runs."""
+    binary = np.asarray(mask) > 0
+    if binary.ndim != 2:
+        raise ValueError("desk mask must be two-dimensional")
+    spans: list[tuple[int, int, int]] = []
+    for row_index, row in enumerate(binary):
+        padded = np.pad(row, (1, 1), mode="constant", constant_values=False)
+        transitions = np.flatnonzero(padded[1:] != padded[:-1])
+        spans.extend(
+            (int(row_index), int(start), int(end))
+            for start, end in zip(transitions[::2], transitions[1::2])
+        )
+    return tuple(spans)
 
 
 def estimate_table_geometry(
     snapshot: AlignedRGBDSnapshot,
     mask: np.ndarray,
     calibration: RawServoCalibration,
+    *,
+    target_mask: np.ndarray | None = None,
 ) -> TableGeometry:
     calibration.validate_snapshot(snapshot)
     assert snapshot.depth_raw is not None
     assert snapshot.depth_scale_m is not None
-    binary = np.asarray(mask, dtype=np.uint8)
+    binary = _largest_filled_component(mask)
     if binary.shape != snapshot.depth_raw.shape:
         raise ValueError("table mask is not aligned to RGB-D")
-    contour = binary - cv2.erode(binary, np.ones((7, 7), np.uint8), iterations=1)
-    depth_m = snapshot.depth_raw.astype(np.float64) * snapshot.depth_scale_m
-    valid = (contour > 0) & np.isfinite(depth_m) & (depth_m >= 0.15) & (depth_m <= 4.0)
-    v, u = np.nonzero(valid)
-    if len(u) < 50:
-        raise ValueError("table contour has fewer than 50 valid depth points")
-    z = depth_m[v, u]
-    body = calibration.camera_to_body(_deproject(u, v, z, calibration))
-    center, direction, inliers, residual, inlier_indices = _ransac_line(
-        body[:, :2]
+
+    target_exclusion: np.ndarray | None = None
+    if target_mask is not None:
+        target_binary = np.asarray(target_mask, dtype=np.uint8)
+        if target_binary.shape != binary.shape:
+            raise ValueError("target mask is not aligned to RGB-D")
+        exclusion_radius_px = 20
+        exclusion_kernel = cv2.getStructuringElement(
+            cv2.MORPH_ELLIPSE,
+            (2 * exclusion_radius_px + 1, 2 * exclusion_radius_px + 1),
+        )
+        target_exclusion = cv2.dilate(
+            target_binary,
+            exclusion_kernel,
+            iterations=1,
+        )
+
+    segments = _rgb_mask_line_segments(
+        snapshot.rgb,
+        binary,
+        exclusion_mask=target_exclusion,
     )
-    projection = (inliers - center) @ direction
+    candidates = [
+        segment
+        for segment in segments
+        if segment.length > _TABLE_EDGE_MIN_LENGTH_PX
+    ]
+    if not candidates:
+        raise ValueError(
+            "RGB edge and table mask intersection has no line longer than 45 px"
+        )
+    selected, sampled_pixels, sampled_depth_m = _select_nearest_pixel_segment(
+        candidates,
+        depth_raw=snapshot.depth_raw,
+        depth_scale_m=snapshot.depth_scale_m,
+    )
+
+    sampled_u = sampled_pixels[:, 0].astype(np.float64)
+    sampled_v = sampled_pixels[:, 1].astype(np.float64)
+    camera = _deproject(
+        sampled_u,
+        sampled_v,
+        sampled_depth_m,
+        calibration,
+    )
+    camera_forward_left = np.column_stack((camera[:, 2], -camera[:, 0]))
+    metric_line = _fit_tls_segment(camera_forward_left)
+    center = metric_line.center
+    direction = metric_line.direction.copy()
+    if float(direction @ (camera_forward_left[-1] - camera_forward_left[0])) < 0.0:
+        direction = -direction
+    projection = (camera_forward_left - center) @ direction
     length = float(np.max(projection) - np.min(projection))
-    if length < 0.20:
-        raise ValueError(f"table edge is too short: {length:.3f}m")
-    if len(inliers) < 50:
-        raise ValueError("table edge has fewer than 50 RANSAC inliers")
-    if residual > 0.02:
-        raise ValueError(f"table edge residual is too high: {residual:.3f}m")
     normal = np.array([-direction[1], direction[0]])
     if float(normal @ center) < 0.0:
         normal = -normal
@@ -1265,10 +1481,7 @@ def estimate_table_geometry(
         for index in endpoint_indices
     )
     line_endpoints_px = tuple(
-        (
-            float(u[inlier_indices[index]]),
-            float(v[inlier_indices[index]]),
-        )
+        tuple(float(item) for item in sampled_pixels[index])
         for index in endpoint_indices
     )
     if line_endpoints_px[1] < line_endpoints_px[0]:
@@ -1280,8 +1493,8 @@ def estimate_table_geometry(
     return TableGeometry(
         yaw_error_rad=yaw,
         line_length_m=length,
-        inlier_count=int(len(inliers)),
-        residual_m=residual,
+        inlier_count=int(round(selected.length)) + 1,
+        residual_m=metric_line.residual_median,
         line_center_xy_m=(float(center[0]), float(center[1])),
         line_endpoints_xy_m=line_endpoints_xy_m,
         line_endpoints_px=line_endpoints_px,
@@ -1406,10 +1619,12 @@ class VisualServoController:
     ) -> None:
         if initial_phase not in {
             ServoPhase.FORWARD_APPROACH,
+            ServoPhase.VERTICAL_RECENTER,
             ServoPhase.YAW_ALIGN,
         }:
             raise ValueError(
-                "initial servo phase must be forward_approach or yaw_align"
+                "initial servo phase must be forward_approach, "
+                "vertical_recenter, or yaw_align"
             )
         self.start_time = float(now)
         self.last_update_time = float(now)
@@ -1423,6 +1638,9 @@ class VisualServoController:
         self.stable_frames = 0
         self.forward_approach_stable_frames = 0
         self.forward_recenter_next_calibration_at: float | None = None
+        self.vertical_recenter_started_at: float | None = None
+        self.vertical_recenter_elapsed_s = 0.0
+        self.vertical_recenter_stable_frames = 0
         self.yaw_stable_frames = 0
         self.recenter_stable_frames = 0
         self.desired_heading_rad: float | None = None
@@ -1716,6 +1934,9 @@ class VisualServoController:
         if self.phase is ServoPhase.POST_STOP_SAMPLING:
             self._post_stop_sampling_complete(now)
             return self.terminal
+        if self.phase is ServoPhase.VERTICAL_RECENTER:
+            self._vertical_recenter_timed_out(now)
+            return self.terminal
         self._check_limits(now)
         return self.terminal
 
@@ -1744,6 +1965,84 @@ class VisualServoController:
         x1, _, x2, _ = observation.target_bbox_xyxy
         center = 0.5 * (x1 + x2)
         return self.recovery_low_fraction * width <= center <= self.recovery_high_fraction * width
+
+    @staticmethod
+    def _vertical_height_from_bottom(
+        observation: RawServoObservation,
+    ) -> float | None:
+        height = float(observation.image_height)
+        if height <= 0.0:
+            return None
+        _, y1, _, y2 = observation.target_bbox_xyxy
+        center_y = 0.5 * (y1 + y2)
+        return 1.0 - center_y / height
+
+    @staticmethod
+    def _vertical_bottom_fraction(
+        observation: RawServoObservation,
+    ) -> float | None:
+        height = float(observation.image_height)
+        if height <= 0.0:
+            return None
+        _, _, _, y2 = observation.target_bbox_xyxy
+        return float(y2) / height
+
+    def _vertical_recenter_timed_out(self, now: float) -> bool:
+        started_at = self.vertical_recenter_started_at
+        if started_at is None:
+            return False
+        self.vertical_recenter_elapsed_s = max(
+            0.0, float(now) - started_at
+        )
+        if self.vertical_recenter_elapsed_s < 0.7:
+            return False
+        self._transition(
+            ServoPhase.YAW_ALIGN,
+            "vertical recenter completed after 0.7 seconds",
+        )
+        return True
+
+    def _vertical_recenter_command(self) -> ServoCommand:
+        return ServoCommand(
+            self.min_linear_speed_m_s,
+            0.0,
+            0.0,
+            self.command_ttl_s,
+        )
+
+    def _update_vertical_recenter(
+        self,
+        observation: RawServoObservation,
+        *,
+        now: float,
+    ) -> ServoCommand:
+        height_from_bottom = self._vertical_height_from_bottom(observation)
+        if self.vertical_recenter_started_at is None:
+            if (
+                height_from_bottom is None
+                or height_from_bottom <= 0.90
+            ):
+                return self._transition(
+                    ServoPhase.YAW_ALIGN,
+                    "vertical recenter not required after chest-to-head switch",
+                )
+            self.vertical_recenter_started_at = float(now)
+            self.vertical_recenter_elapsed_s = 0.0
+        elif self._vertical_recenter_timed_out(now):
+            return self.current
+
+        bottom_fraction = self._vertical_bottom_fraction(observation)
+        if bottom_fraction is not None and bottom_fraction >= 0.80:
+            self.vertical_recenter_stable_frames = 1
+            return self._transition(
+                ServoPhase.YAW_ALIGN,
+                "target box bottom reached 80 percent image height",
+            )
+        self.vertical_recenter_stable_frames = 0
+
+        self.invalid_frames = 0
+        self.current = self._vertical_recenter_command()
+        return self.current
 
     def _forward_approach_vx(self, forward_error: float) -> float:
         if forward_error <= self.forward_tolerance_m + 1.0e-12:
@@ -1839,6 +2138,8 @@ class VisualServoController:
         limited = self._check_limits(now)
         if limited is not None:
             return limited
+        if self.phase is ServoPhase.VERTICAL_RECENTER:
+            return self._update_vertical_recenter(observation, now=now)
         forward_error, right_error, visual_yaw_error = self._update_filter(
             observation
         )
@@ -2071,6 +2372,13 @@ class VisualServoController:
         limited = self._check_limits(now)
         if limited is not None:
             return limited
+        if self.phase is ServoPhase.VERTICAL_RECENTER:
+            self.vertical_recenter_stable_frames = 0
+            self.invalid_frames = 0
+            if self._vertical_recenter_timed_out(now):
+                return self.current
+            self.current = self._vertical_recenter_command()
+            return self.current
         self.stable_frames = 0
         self.forward_approach_stable_frames = 0
         self.forward_recenter_next_calibration_at = None
@@ -2088,6 +2396,11 @@ def build_servo_velocity_message(
     *,
     action: str,
     camera_stream: str | None = None,
+    viewer_target_bbox_xyxy: Sequence[float] | None = None,
+    viewer_target_lateral_anchor_px: Sequence[float] | None = None,
+    viewer_table_edge_endpoints_px: Sequence[Sequence[float]] | None = None,
+    viewer_desk_mask_row_spans: Sequence[Sequence[int]] | None = None,
+    viewer_image_size: tuple[int, int] | None = None,
 ) -> str:
     payload = {
         "action": action,
@@ -2111,6 +2424,32 @@ def build_servo_velocity_message(
     }
     if camera_stream:
         payload["camera_stream"] = str(camera_stream)
+    if viewer_target_bbox_xyxy is not None:
+        overlay: dict[str, Any] = {
+            "target_bbox_xyxy": [
+                float(value) for value in viewer_target_bbox_xyxy
+            ],
+        }
+        if viewer_target_lateral_anchor_px is not None:
+            overlay["target_lateral_anchor_px"] = [
+                float(value) for value in viewer_target_lateral_anchor_px
+            ]
+        if viewer_table_edge_endpoints_px is not None:
+            overlay["table_edge_endpoints_px"] = [
+                [float(value) for value in point]
+                for point in viewer_table_edge_endpoints_px
+            ]
+        if viewer_desk_mask_row_spans:
+            overlay["desk_mask_row_spans"] = [
+                [int(value) for value in span]
+                for span in viewer_desk_mask_row_spans
+            ]
+        if viewer_image_size is not None:
+            overlay["image_size"] = [
+                int(viewer_image_size[0]),
+                int(viewer_image_size[1]),
+            ]
+        payload["viewer_overlay"] = overlay
     return json.dumps(payload, separators=(",", ":"))
 
 
@@ -2341,9 +2680,16 @@ def _observation(
 ) -> RawServoObservation:
     table = None
     table_error = None
+    desk_mask = None
     if surface is not None:
+        desk_mask = _largest_filled_component(surface.mask)
         try:
-            table = estimate_table_geometry(snapshot, surface.mask, calibration)
+            table = estimate_table_geometry(
+                snapshot,
+                desk_mask,
+                calibration,
+                target_mask=target.mask,
+            )
         except ValueError as exc:
             table = None
             table_error = str(exc)
@@ -2362,6 +2708,7 @@ def _observation(
         image_width=int(snapshot.rgb.shape[1]),
         image_height=int(snapshot.rgb.shape[0]),
         table_geometry_error=table_error,
+        desk_mask=desk_mask,
     )
 
 
@@ -2392,6 +2739,11 @@ def _diagnostic_frame(
             "valid_depth_pixels": observation.target.valid_depth_pixels,
             "valid_ratio": observation.target.valid_ratio,
             "median_depth_m": observation.target.median_depth_m,
+            "lateral_anchor_px": (
+                None
+                if observation.target.lateral_anchor_px is None
+                else list(observation.target.lateral_anchor_px)
+            ),
         }
         if observation.table is not None:
             table_geometry = {
@@ -2432,6 +2784,11 @@ def _diagnostic_frame(
         target_confidence=None if target is None else target.confidence,
         surface_bbox_xyxy=None if surface is None else surface.bbox_xyxy,
         surface_mask=None if surface is None else surface.mask.copy(),
+        completed_surface_mask=(
+            None
+            if observation is None or observation.desk_mask is None
+            else observation.desk_mask.copy()
+        ),
         surface_track_id=None if surface is None else surface.track_id,
         surface_confidence=None if surface is None else surface.confidence,
         target_geometry=target_geometry,
@@ -3131,6 +3488,18 @@ class RawServoRuntime:
         self.last_applied_frame_index: int | None = None
         self.current_attempt_id = 0
         self.active_camera_stream: str | None = None
+        self.vertical_recenter_armed = False
+        self.viewer_target_bbox_xyxy: (
+            tuple[float, float, float, float] | None
+        ) = None
+        self.viewer_target_lateral_anchor_px: tuple[float, float] | None = None
+        self.viewer_table_edge_endpoints_px: (
+            tuple[tuple[float, float], tuple[float, float]] | None
+        ) = None
+        self.viewer_desk_mask_row_spans: (
+            tuple[tuple[int, int, int], ...] | None
+        ) = None
+        self.viewer_image_size: tuple[int, int] | None = None
         self.navigation_started_at: float | None = None
         self.soft_stale = False
         self.next_publish_at: float | None = None
@@ -3146,6 +3515,28 @@ class RawServoRuntime:
             return None
         stream = str(value).strip()
         return stream or None
+
+    def _is_vertical_recenter_switch(
+        self,
+        *,
+        previous_stream: str | None,
+        next_stream: str | None,
+        details: Mapping[str, Any],
+    ) -> bool:
+        if self.config.mode != "dual_raw_yoloe_servo":
+            return False
+        chest_stream = str(
+            getattr(self.config, "dual_chest_camera_stream", "chest_view")
+        )
+        head_stream = str(
+            getattr(self.config, "dual_head_camera_stream", "ego_view")
+        )
+        stage = str(details.get("failover_stage") or "")
+        return (
+            previous_stream == chest_stream
+            and next_stream == head_stream
+            and stage in {"head_monitor", "head_monitor_qwen"}
+        )
 
     def _reset_controller(self, now: float) -> None:
         chest_stream = str(
@@ -3168,8 +3559,56 @@ class RawServoRuntime:
             initial_phase=(
                 ServoPhase.FORWARD_APPROACH
                 if chest_camera_active
+                else ServoPhase.VERTICAL_RECENTER
+                if self.vertical_recenter_armed
                 else ServoPhase.YAW_ALIGN
             ),
+        )
+
+    def _clear_viewer_overlay(self) -> None:
+        self.viewer_target_bbox_xyxy = None
+        self.viewer_target_lateral_anchor_px = None
+        self.viewer_table_edge_endpoints_px = None
+        self.viewer_desk_mask_row_spans = None
+        self.viewer_image_size = None
+
+    def _set_viewer_overlay(self, observation: RawServoObservation) -> None:
+        self.viewer_target_bbox_xyxy = tuple(
+            float(value) for value in observation.target_bbox_xyxy
+        )
+        self.viewer_target_lateral_anchor_px = (
+            None
+            if observation.target.lateral_anchor_px is None
+            else tuple(
+                float(value) for value in observation.target.lateral_anchor_px
+            )
+        )
+        self.viewer_table_edge_endpoints_px = (
+            None
+            if observation.table is None
+            or observation.table.line_endpoints_px is None
+            else tuple(
+                tuple(float(value) for value in point)
+                for point in observation.table.line_endpoints_px
+            )
+        )
+        if observation.desk_mask is None:
+            self.viewer_desk_mask_row_spans = None
+        else:
+            expected_shape = (
+                int(observation.image_height),
+                int(observation.image_width),
+            )
+            if observation.desk_mask.shape != expected_shape:
+                raise ValueError(
+                    "desk mask shape does not match viewer image size"
+                )
+            self.viewer_desk_mask_row_spans = _binary_mask_row_spans(
+                observation.desk_mask
+            )
+        self.viewer_image_size = (
+            int(observation.image_width),
+            int(observation.image_height),
         )
 
     def _publish(self, command: ServoCommand, action: str) -> None:
@@ -3184,6 +3623,17 @@ class RawServoRuntime:
                 command,
                 action=action,
                 camera_stream=active_camera_stream,
+                viewer_target_bbox_xyxy=self.viewer_target_bbox_xyxy,
+                viewer_target_lateral_anchor_px=(
+                    self.viewer_target_lateral_anchor_px
+                ),
+                viewer_table_edge_endpoints_px=(
+                    self.viewer_table_edge_endpoints_px
+                ),
+                viewer_desk_mask_row_spans=(
+                    self.viewer_desk_mask_row_spans
+                ),
+                viewer_image_size=self.viewer_image_size,
             )
         )
 
@@ -3265,6 +3715,13 @@ class RawServoRuntime:
             "forward_approach_stable_frames": (
                 self.controller.forward_approach_stable_frames
             ),
+            "vertical_recenter_armed": self.vertical_recenter_armed,
+            "vertical_recenter_elapsed_s": (
+                self.controller.vertical_recenter_elapsed_s
+            ),
+            "vertical_recenter_stable_frames": (
+                self.controller.vertical_recenter_stable_frames
+            ),
             "stable_frames": self.controller.stable_frames,
             "yaw_stable_frames": self.controller.yaw_stable_frames,
             "recenter_stable_frames": self.controller.recenter_stable_frames,
@@ -3328,6 +3785,8 @@ class RawServoRuntime:
         self.phase = "idle"
         self.navigation_started_at = None
         self.current_attempt_id = 0
+        self._clear_viewer_overlay()
+        self.vertical_recenter_armed = False
         self.active_camera_stream = None
         self.last_observation_at = None
         self.soft_stale = False
@@ -3360,6 +3819,8 @@ class RawServoRuntime:
         self.phase = "inference"
         self.navigation_started_at = None
         self.current_attempt_id = 0
+        self._clear_viewer_overlay()
+        self.vertical_recenter_armed = False
         self.active_camera_stream = None
         self.output_dir = None
         self.soft_stale = False
@@ -3379,6 +3840,8 @@ class RawServoRuntime:
         self.phase = "idle"
         self.navigation_started_at = None
         self.current_attempt_id = 0
+        self._clear_viewer_overlay()
+        self.vertical_recenter_armed = False
         self.active_camera_stream = None
         self.last_observation_at = None
         self.soft_stale = False
@@ -3460,6 +3923,7 @@ class RawServoRuntime:
             and event.kind in {"recovering", "switching", "error"}
         ):
             self.controller.current = self._zero()
+            self._clear_viewer_overlay()
             self._record(
                 "post_stop_sampling_worker_event_ignored",
                 worker_event=event.kind,
@@ -3483,6 +3947,7 @@ class RawServoRuntime:
             self.controller.recenter_stable_frames = 0
             command = self._zero()
             self.controller.current = command
+            self._clear_viewer_overlay()
             self._publish(command, "hold")
             self.next_publish_at = float(now) + 1.0 / self.config.planner_hz
             self._record(
@@ -3512,7 +3977,15 @@ class RawServoRuntime:
                 return False
             self._drain_waiting_observations()
             self.current_attempt_id = attempt_id
-            self.active_camera_stream = self._event_camera_stream(details)
+            previous_stream = self.active_camera_stream
+            next_stream = self._event_camera_stream(details)
+            self.vertical_recenter_armed = self._is_vertical_recenter_switch(
+                previous_stream=previous_stream,
+                next_stream=next_stream,
+                details=details,
+            )
+            self._clear_viewer_overlay()
+            self.active_camera_stream = next_stream
             self.phase = "switching"
             self._reset_controller(now)
             self.last_observation_at = None
@@ -3548,6 +4021,7 @@ class RawServoRuntime:
             event_camera_stream = self._event_camera_stream(details)
             if event_camera_stream is not None:
                 self.active_camera_stream = event_camera_stream
+            self._clear_viewer_overlay()
             if self.navigation_started_at is None:
                 self.navigation_started_at = produced_at
                 self._record(
@@ -3580,6 +4054,7 @@ class RawServoRuntime:
             self.phase = "aligning"
             self._reset_controller(now)
             self.last_observation_at = float(now)
+            self._set_viewer_overlay(event.observation)
             command = self.controller.update(
                 event.observation, now=now, orientation=orientation
             )
@@ -3595,6 +4070,7 @@ class RawServoRuntime:
                 recovered_from_soft_stale = True
                 self._record("camera_soft_recovered")
                 self.logger("[RawServo] RESUME camera stream recovered")
+            self._set_viewer_overlay(event.observation)
             command = self.controller.update(
                 event.observation, now=now, orientation=orientation
             )
@@ -3603,6 +4079,7 @@ class RawServoRuntime:
                 self._discard_event_diagnostic(event)
                 return False
             self.last_observation_at = produced_at
+            self._clear_viewer_overlay()
             command = self.controller.note_invalid(
                 event.error or "invalid perception",
                 hard=event.hard,
@@ -3612,6 +4089,11 @@ class RawServoRuntime:
         else:
             self._discard_event_diagnostic(event)
             return False
+        if (
+            previous_phase is ServoPhase.VERTICAL_RECENTER
+            and self.controller.phase is not ServoPhase.VERTICAL_RECENTER
+        ):
+            self.vertical_recenter_armed = False
         _submit_diagnostic_decision(
             self._diagnostics,
             event,
@@ -3639,6 +4121,12 @@ class RawServoRuntime:
             ),
             forward_approach_stable_frames=(
                 self.controller.forward_approach_stable_frames
+            ),
+            vertical_recenter_elapsed_s=(
+                self.controller.vertical_recenter_elapsed_s
+            ),
+            vertical_recenter_stable_frames=(
+                self.controller.vertical_recenter_stable_frames
             ),
             transition_reason=self.controller.last_transition_reason,
             visual_yaw_error_rad=self.controller.last_visual_yaw_error_rad,
@@ -3740,13 +4228,20 @@ class RawServoRuntime:
         ):
             self._finish("maximum run time reached", timestamp)
             return self._zero()
-        if self.phase == "aligning" and self.controller.stop_if_timed_out(
-            now=timestamp
-        ):
-            self._finish(
-                self.controller.terminal_reason or "maximum run time reached", timestamp
-            )
-            return self._zero()
+        if self.phase == "aligning":
+            terminal = self.controller.stop_if_timed_out(now=timestamp)
+            if (
+                self.vertical_recenter_armed
+                and self.controller.phase is not ServoPhase.VERTICAL_RECENTER
+            ):
+                self.vertical_recenter_armed = False
+            if terminal:
+                self._finish(
+                    self.controller.terminal_reason
+                    or "maximum run time reached",
+                    timestamp,
+                )
+                return self._zero()
         if timestamp + 1.0e-12 < self.next_publish_at:
             return None
         if (
@@ -3758,6 +4253,7 @@ class RawServoRuntime:
                 self.soft_stale = True
                 self.controller._integrate(timestamp)
                 self.controller.current = self._zero()
+                self._clear_viewer_overlay()
                 self._record("camera_soft_stale")
                 self.logger("[RawServo] HOLD camera stream soft stale")
         command = (

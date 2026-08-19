@@ -5,8 +5,9 @@ from __future__ import annotations
 
 import argparse
 from dataclasses import dataclass
+import math
 import time
-from typing import Mapping
+from typing import Any, Mapping
 
 import cv2
 import numpy as np
@@ -73,6 +74,127 @@ def _camera_stream_name(value: object) -> str | None:
     return name if name.startswith("camera/") else f"camera/{name}"
 
 
+def _finite_tuple(
+    value: Any,
+    *,
+    length: int,
+    description: str,
+) -> tuple[float, ...]:
+    if not isinstance(value, (list, tuple)) or len(value) != length:
+        raise ValueError(f"Base Pose {description} must contain {length} values")
+    try:
+        result = tuple(float(item) for item in value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            f"Base Pose {description} contains invalid values"
+        ) from exc
+    if not all(math.isfinite(item) for item in result):
+        raise ValueError(f"Base Pose {description} must be finite")
+    return result
+
+
+def parse_base_pose_viewer_overlay(
+    payload: Mapping[str, Any],
+) -> tuple[
+    tuple[float, float, float, float] | None,
+    tuple[float, float] | None,
+    tuple[tuple[float, float], tuple[float, float]] | None,
+    tuple[tuple[int, int, int], ...] | None,
+    tuple[int, int] | None,
+]:
+    """Validate optional BasePose geometry carried through ControlGateway."""
+
+    raw_overlay = payload.get("viewer_overlay")
+    if raw_overlay is None:
+        return None, None, None, None, None
+    if not isinstance(raw_overlay, Mapping):
+        raise ValueError("Base Pose viewer overlay must be an object")
+
+    raw_bbox = _finite_tuple(
+        raw_overlay.get("target_bbox_xyxy"),
+        length=4,
+        description="viewer target bbox",
+    )
+    target_bbox = (raw_bbox[0], raw_bbox[1], raw_bbox[2], raw_bbox[3])
+    if target_bbox[2] < target_bbox[0] or target_bbox[3] < target_bbox[1]:
+        raise ValueError("Base Pose viewer target bbox has invalid corner order")
+
+    target_lateral_anchor = None
+    raw_anchor = raw_overlay.get("target_lateral_anchor_px")
+    if raw_anchor is not None:
+        anchor = _finite_tuple(
+            raw_anchor,
+            length=2,
+            description="viewer target lateral anchor",
+        )
+        target_lateral_anchor = (anchor[0], anchor[1])
+
+    table_edge = None
+    raw_edge = raw_overlay.get("table_edge_endpoints_px")
+    if raw_edge is not None:
+        if not isinstance(raw_edge, (list, tuple)) or len(raw_edge) != 2:
+            raise ValueError(
+                "Base Pose viewer table edge must contain two endpoints"
+            )
+        start = _finite_tuple(
+            raw_edge[0], length=2, description="viewer table edge start"
+        )
+        end = _finite_tuple(
+            raw_edge[1], length=2, description="viewer table edge end"
+        )
+        table_edge = ((start[0], start[1]), (end[0], end[1]))
+
+    image_size = None
+    raw_size = raw_overlay.get("image_size")
+    if raw_size is not None:
+        size = _finite_tuple(
+            raw_size, length=2, description="viewer image size"
+        )
+        width, height = int(size[0]), int(size[1])
+        if width <= 0 or height <= 0 or (width, height) != size:
+            raise ValueError(
+                "Base Pose viewer image size must contain positive integers"
+            )
+        image_size = (width, height)
+
+    desk_mask_row_spans = None
+    raw_spans = raw_overlay.get("desk_mask_row_spans")
+    if raw_spans is not None:
+        if image_size is None:
+            raise ValueError(
+                "Base Pose viewer desk mask requires an image size"
+            )
+        if not isinstance(raw_spans, (list, tuple)):
+            raise ValueError("Base Pose viewer desk mask spans must be a list")
+        parsed_spans: list[tuple[int, int, int]] = []
+        for raw_span in raw_spans:
+            values = _finite_tuple(
+                raw_span,
+                length=3,
+                description="viewer desk mask row span",
+            )
+            row, start, end = (int(value) for value in values)
+            if (row, start, end) != values:
+                raise ValueError(
+                    "Base Pose viewer desk mask spans must contain integers"
+                )
+            width, height = image_size
+            if not (0 <= row < height and 0 <= start < end <= width):
+                raise ValueError(
+                    "Base Pose viewer desk mask span is outside the image"
+                )
+            parsed_spans.append((row, start, end))
+        desk_mask_row_spans = tuple(parsed_spans)
+
+    return (
+        target_bbox,
+        target_lateral_anchor,
+        table_edge,
+        desk_mask_row_spans,
+        image_size,
+    )
+
+
 @dataclass
 class NavigationViewerState:
     """Merge control lifecycle events with final executor velocity telemetry."""
@@ -88,6 +210,29 @@ class NavigationViewerState:
     reason: str = ""
     safety_reason: str = "stopped"
     updated_at: float = 0.0
+    target_bbox_xyxy: tuple[float, float, float, float] | None = None
+    target_lateral_anchor_px: tuple[float, float] | None = None
+    table_edge_endpoints_px: (
+        tuple[tuple[float, float], tuple[float, float]] | None
+    ) = None
+    desk_mask_row_spans: tuple[tuple[int, int, int], ...] | None = None
+    overlay_image_size: tuple[int, int] | None = None
+
+    def clear_base_pose_overlay(self) -> None:
+        self.target_bbox_xyxy = None
+        self.target_lateral_anchor_px = None
+        self.table_edge_endpoints_px = None
+        self.desk_mask_row_spans = None
+        self.overlay_image_size = None
+
+    def set_base_pose_overlay(self, parameters: Mapping[str, Any]) -> None:
+        (
+            self.target_bbox_xyxy,
+            self.target_lateral_anchor_px,
+            self.table_edge_endpoints_px,
+            self.desk_mask_row_spans,
+            self.overlay_image_size,
+        ) = parse_base_pose_viewer_overlay(parameters)
 
     def accept_control(
         self,
@@ -114,6 +259,7 @@ class NavigationViewerState:
             return False
         timestamp = time.monotonic() if now is None else float(now)
         if command.name == "start_navigation":
+            self.clear_base_pose_overlay()
             self.owner = "navdp"
             self.active = True
             self.generation = generation
@@ -127,6 +273,7 @@ class NavigationViewerState:
             self.updated_at = timestamp
             return True
         if command.name == "start_base_pose":
+            self.clear_base_pose_overlay()
             self.owner = "basepose"
             self.active = True
             self.generation = generation
@@ -142,6 +289,7 @@ class NavigationViewerState:
         if command.name == "cancel_navigation":
             if self.owner == "idle":
                 return False
+            self.clear_base_pose_overlay()
             self.active = False
             self.generation = generation
             self.state = "stopped"
@@ -154,6 +302,7 @@ class NavigationViewerState:
             return True
 
         if command.name == "navigation_status":
+            self.clear_base_pose_overlay()
             self.owner = "navdp"
             self.generation = generation
             self.state = str(parameters.get("state", "active"))
@@ -167,6 +316,7 @@ class NavigationViewerState:
             return True
 
         state = str(parameters.get("state", "motion"))
+        self.set_base_pose_overlay(parameters)
         camera_stream = _camera_stream_name(parameters.get("camera_stream"))
         self.owner = "basepose"
         self.active = state not in NAVIGATION_TERMINAL_STATES
@@ -181,6 +331,7 @@ class NavigationViewerState:
             )
         )
         if not self.active:
+            self.clear_base_pose_overlay()
             self.requested_velocity = (0.0, 0.0, 0.0)
             self.velocity = (0.0, 0.0, 0.0)
         self.reason = str(parameters.get("reason", ""))
@@ -214,6 +365,7 @@ class NavigationViewerState:
 
         if owner != "idle" and not protected_terminal:
             if owner != self.owner or status.generation > self.generation:
+                self.clear_base_pose_overlay()
                 self.camera_stream = None
                 self.reason = ""
             self.owner = owner
@@ -229,6 +381,7 @@ class NavigationViewerState:
             elif self.state in {"idle", "stopped"}:
                 self.state = "motion"
         elif status.generation > self.generation:
+            self.clear_base_pose_overlay()
             self.generation = status.generation
             if self.owner != "idle":
                 self.active = False
@@ -240,6 +393,8 @@ class NavigationViewerState:
         self.velocity = status.velocity
         self.safety_reason = status.reason
         self.updated_at = timestamp
+        if self.owner != "basepose":
+            self.clear_base_pose_overlay()
         return True
 
     @staticmethod
@@ -350,6 +505,155 @@ def _labeled_letterbox(
     return output
 
 
+def _outlined_text(
+    image: np.ndarray,
+    text: str,
+    origin: tuple[int, int],
+    color: tuple[int, int, int],
+) -> None:
+    cv2.putText(
+        image,
+        text,
+        origin,
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.55,
+        (0, 0, 0),
+        4,
+        cv2.LINE_AA,
+    )
+    cv2.putText(
+        image,
+        text,
+        origin,
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.55,
+        color,
+        2,
+        cv2.LINE_AA,
+    )
+
+
+def draw_base_pose_overlays(
+    image_bgr: np.ndarray,
+    camera_stream: str,
+    state: NavigationViewerState,
+) -> np.ndarray:
+    """Draw the exact target and desk geometry consumed by BasePose."""
+
+    if (
+        image_bgr.ndim != 3
+        or image_bgr.shape[2] != 3
+        or camera_stream != state.camera_stream
+        or not state.active
+        or state.target_bbox_xyxy is None
+    ):
+        return image_bgr
+    height, width = image_bgr.shape[:2]
+    source_width, source_height = state.overlay_image_size or (width, height)
+    scale_x = width / source_width
+    scale_y = height / source_height
+
+    def point(x: float, y: float) -> tuple[int, int]:
+        return (
+            min(width - 1, max(0, int(round(x * scale_x)))),
+            min(height - 1, max(0, int(round(y * scale_y)))),
+        )
+
+    if state.desk_mask_row_spans:
+        source_mask = np.zeros((source_height, source_width), dtype=np.uint8)
+        for row, start, end in state.desk_mask_row_spans:
+            source_mask[row, start:end] = 255
+        display_mask = (
+            source_mask
+            if (source_width, source_height) == (width, height)
+            else cv2.resize(
+                source_mask,
+                (width, height),
+                interpolation=cv2.INTER_NEAREST,
+            )
+        )
+        desk_color = (255, 128, 0)
+        color_layer = np.empty_like(image_bgr)
+        color_layer[:] = desk_color
+        blended = cv2.addWeighted(image_bgr, 0.72, color_layer, 0.28, 0.0)
+        np.copyto(image_bgr, blended, where=(display_mask > 0)[..., None])
+        contours, _ = cv2.findContours(
+            display_mask,
+            cv2.RETR_EXTERNAL,
+            cv2.CHAIN_APPROX_SIMPLE,
+        )
+        cv2.drawContours(
+            image_bgr,
+            contours,
+            -1,
+            desk_color,
+            2,
+            cv2.LINE_AA,
+        )
+
+    x1, y1, x2, y2 = state.target_bbox_xyxy
+    target_start = point(x1, y1)
+    target_end = point(x2, y2)
+    target_color = (0, 255, 0)
+    cv2.rectangle(
+        image_bgr,
+        target_start,
+        target_end,
+        target_color,
+        3,
+        cv2.LINE_AA,
+    )
+    if state.target_lateral_anchor_px is not None:
+        cv2.drawMarker(
+            image_bgr,
+            point(*state.target_lateral_anchor_px),
+            target_color,
+            cv2.MARKER_CROSS,
+            16,
+            2,
+            cv2.LINE_AA,
+        )
+    _outlined_text(
+        image_bgr,
+        "TARGET (F/R)",
+        (target_start[0], max(18, target_start[1] - 7)),
+        target_color,
+    )
+
+    if state.table_edge_endpoints_px is not None:
+        edge_start = point(*state.table_edge_endpoints_px[0])
+        edge_end = point(*state.table_edge_endpoints_px[1])
+        edge_color = (0, 0, 255)
+        cv2.line(
+            image_bgr,
+            edge_start,
+            edge_end,
+            edge_color,
+            3,
+            cv2.LINE_AA,
+        )
+        for endpoint in (edge_start, edge_end):
+            cv2.circle(
+                image_bgr,
+                endpoint,
+                5,
+                (0, 255, 255),
+                -1,
+                cv2.LINE_AA,
+            )
+        edge_center = (
+            (edge_start[0] + edge_end[0]) // 2,
+            (edge_start[1] + edge_end[1]) // 2,
+        )
+        _outlined_text(
+            image_bgr,
+            "TABLE EDGE (YAW)",
+            (max(0, edge_center[0] - 75), max(18, edge_center[1] - 8)),
+            edge_color,
+        )
+    return image_bgr
+
+
 def _draw_navigation_status(
     canvas: np.ndarray,
     state: NavigationViewerState | None,
@@ -426,8 +730,19 @@ def compose_visualization_canvas(
         top_height,
         "RIGHT WRIST RGB",
     )
+    head_source = frames.get(HEAD_RGB_STREAM, empty)
+    chest_source = frames.get(CHEST_RGB_STREAM, empty)
+    if navigation is not None:
+        if head_source.size:
+            head_source = draw_base_pose_overlays(
+                head_source.copy(), HEAD_RGB_STREAM, navigation
+            )
+        if chest_source.size:
+            chest_source = draw_base_pose_overlays(
+                chest_source.copy(), CHEST_RGB_STREAM, navigation
+            )
     head_rgb = _labeled_letterbox(
-        frames.get(HEAD_RGB_STREAM, empty),
+        head_source,
         bottom_widths[0],
         bottom_height,
         "HEAD RGB",
@@ -437,7 +752,7 @@ def compose_visualization_canvas(
         ),
     )
     chest = _labeled_letterbox(
-        frames.get(CHEST_RGB_STREAM, empty),
+        chest_source,
         bottom_widths[1],
         bottom_height,
         "CHEST RGB",
@@ -579,7 +894,10 @@ def main() -> None:
                     command = control_subscriber.read_command()
                     if command is None:
                         break
-                    navigation_state.accept_control(command)
+                    try:
+                        navigation_state.accept_control(command)
+                    except ValueError:
+                        continue
                 while True:
                     try:
                         payload = navigation_status_subscriber.recv(zmq.NOBLOCK)

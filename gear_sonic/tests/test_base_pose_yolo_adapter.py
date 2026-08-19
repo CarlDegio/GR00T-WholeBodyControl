@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import math
 
 import numpy as np
@@ -76,6 +77,43 @@ def test_yolo_adapter_rebases_internal_worker_to_gateway_generation(tmp_path) ->
     assert intents[-1][1]["velocity"] == [0.0, 0.0, 0.0]
 
 
+def test_yolo_adapter_forwards_viewer_overlay_without_touching_velocity(
+    tmp_path,
+) -> None:
+    intents: list[tuple[str, dict[str, object]]] = []
+    adapter = GatewayRawServoAdapter(
+        BasePoseAgentConfig(
+            task="align to the red tote",
+            mode="raw_yoloe_servo",
+            output_root=str(tmp_path),
+        ),
+        submit_intent=lambda name, values: intents.append((name, dict(values))),
+    )
+    assert adapter.start(2, now=1.0)
+    overlay = {
+        "target_bbox_xyxy": [10.0, 20.0, 30.0, 40.0],
+        "target_lateral_anchor_px": [20.0, 30.0],
+        "table_edge_endpoints_px": [[0.0, 35.0], [50.0, 35.0]],
+        "desk_mask_row_spans": [[35, 0, 50]],
+        "image_size": [64, 48],
+    }
+
+    adapter._publish(
+        json.dumps(
+            {
+                "action": "visual_servo",
+                "camera_stream": "ego_view",
+                "velocity": {"vx": 0.0, "vy": 0.0, "wz": 0.2},
+                "viewer_overlay": overlay,
+            }
+        )
+    )
+
+    assert intents[-1][0] == "base_pose_velocity"
+    assert intents[-1][1]["velocity"] == [0.0, 0.0, 0.2]
+    assert intents[-1][1]["viewer_overlay"] == overlay
+
+
 def test_yolo_adapter_injects_agent_near_orientation_provider(tmp_path) -> None:
     provider = lambda _now: {
         "actual_heading_rad": 0.1,
@@ -122,12 +160,12 @@ def test_yolo_adapter_reports_terminal_worker_failure_once(tmp_path) -> None:
     ]
 
 
-def test_yolo_grounding_contract_keeps_one_tight_normalized_target() -> None:
+def test_yolo_grounding_contract_preserves_model_target_prompt() -> None:
     target = validate_raw_servo_target(
         {
             "status": "READY",
             "primary_target": {
-                "text_prompt": "blue basket",
+                "text_prompt": "red tote returned by codex",
                 "bbox_2d": [250, 200, 750, 800],
             },
             "manipulation_anchor": "basket opening",
@@ -137,7 +175,7 @@ def test_yolo_grounding_contract_keeps_one_tight_normalized_target() -> None:
         }
     )
 
-    assert target.target_prompt == "blue basket"
+    assert target.target_prompt == "red tote returned by codex"
     assert target.target_bbox == (250.0, 200.0, 750.0, 800.0)
 
 

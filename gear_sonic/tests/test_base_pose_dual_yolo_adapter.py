@@ -19,6 +19,7 @@ from gear_sonic.scripts.base_pose_yolo_agent import (
 from gear_sonic.utils.inference.base_pose_dual_visual_servo import (
     DualCameraFailoverCoordinator,
     DualCameraReference,
+    HeadCameraTextMonitor,
     dual_calibrations_from_config,
     run_dual_raw_servo_worker,
 )
@@ -31,6 +32,7 @@ from gear_sonic.utils.inference.base_pose_visual_servo import (
     RawServoCalibration,
     RawServoEvent,
     ServoPhase,
+    TrackedInstance,
     run_raw_servo_worker,
 )
 
@@ -61,6 +63,7 @@ def test_dual_mode_is_the_agent_near_aligned_default() -> None:
     assert config.dual_chest_depth_stream == "camera/chest_view_depth"
     assert config.dual_chest_camera_pitch_deg == pytest.approx(-3.0)
     assert config.dual_match_tolerance_frames == 30
+    assert config.dual_head_reacquire_frames == 10
     assert config.dual_initialization_grace_s == pytest.approx(30.0)
 
 
@@ -86,7 +89,17 @@ def test_dual_failover_matches_agent_near_camera_order() -> None:
     assert initial.live_stream == HEAD
     coordinator.mark_success(initial)
 
-    alternate_text = coordinator.advance_after_failure(initial)
+    origin_text = coordinator.advance_after_failure(initial)
+    assert origin_text is not None
+    assert origin_text.live_stream == HEAD
+    assert origin_text.stage == "origin_text"
+
+    origin_qwen = coordinator.advance_after_failure(origin_text)
+    assert origin_qwen is not None
+    assert origin_qwen.live_stream == HEAD
+    assert origin_qwen.stage == "origin_qwen"
+
+    alternate_text = coordinator.advance_after_failure(origin_qwen)
     assert alternate_text is not None
     assert alternate_text.live_stream == CHEST
     assert alternate_text.reference is chest
@@ -96,17 +109,53 @@ def test_dual_failover_matches_agent_near_camera_order() -> None:
     assert alternate_qwen is not None
     assert alternate_qwen.live_stream == CHEST
     assert alternate_qwen.stage == "alternate_qwen"
+    assert coordinator.advance_after_failure(alternate_qwen) is None
 
-    origin_text = coordinator.advance_after_failure(alternate_qwen)
-    assert origin_text is not None
-    assert origin_text.live_stream == HEAD
-    assert origin_text.stage == "origin_text"
 
-    origin_qwen = coordinator.advance_after_failure(origin_text)
-    assert origin_qwen is not None
-    assert origin_qwen.live_stream == HEAD
-    assert origin_qwen.stage == "origin_qwen"
-    assert coordinator.advance_after_failure(origin_qwen) is None
+def test_head_monitor_reuses_initialized_dynamic_target_prompt() -> None:
+    target = TrackedInstance(
+        1,
+        0,
+        "red tote returned by qwen",
+        0.9,
+        (1.0, 0.0, 4.0, 3.0),
+        np.ones((4, 6), dtype=np.uint8),
+    )
+    desk = TrackedInstance(
+        2,
+        1,
+        "desk",
+        0.8,
+        (0.0, 1.0, 6.0, 4.0),
+        np.ones((4, 6), dtype=np.uint8),
+    )
+
+    class Tracker:
+        def __init__(self) -> None:
+            self.prompts: list[tuple[str, str]] = []
+
+        def start_all_text(self, *, target_prompt: str, surface_prompt: str):
+            self.prompts.append((target_prompt, surface_prompt))
+
+        def track(self, _rgb):
+            return [target, desk]
+
+    tracker = Tracker()
+    monitor = HeadCameraTextMonitor(
+        tracker,
+        "red tote returned by qwen",
+        required_target_frames=2,
+    )
+    monitor.start()
+    first = monitor.inspect(_worker_snapshot(HEAD, 1))
+    second = monitor.inspect(_worker_snapshot(HEAD, 2))
+
+    assert tracker.prompts == [("red tote returned by qwen", "desk")]
+    assert not first.triggered
+    assert second.triggered
+    assert second.reference is not None
+    assert second.reference.kind == "head_monitor"
+    assert second.reference.target_prompt == "red tote returned by qwen"
 
 
 def test_dual_calibration_uses_head_and_chest_mounts() -> None:
@@ -211,6 +260,16 @@ def test_dual_runtime_uses_camera_specific_standoff_and_initial_phase(tmp_path) 
     adapter.runtime._reset_controller(2.0)
     assert adapter.runtime.controller.target_distance_m == pytest.approx(0.8)
     assert adapter.runtime.controller.phase is ServoPhase.FORWARD_APPROACH
+
+    assert adapter.runtime._is_vertical_recenter_switch(
+        previous_stream=CHEST,
+        next_stream=HEAD,
+        details={"failover_stage": "head_monitor"},
+    )
+    adapter.runtime.vertical_recenter_armed = True
+    adapter.runtime.active_camera_stream = HEAD
+    adapter.runtime._reset_controller(3.0)
+    assert adapter.runtime.controller.phase is ServoPhase.VERTICAL_RECENTER
 
 
 def _worker_snapshot(stream_name: str, marker: int) -> object:
@@ -331,10 +390,10 @@ def test_dual_worker_exhausts_the_agent_near_failover_sequence(tmp_path: Path) -
     terminal = [event for event in emitted if event.kind == "error"]
     assert switching, [(event.kind, event.error) for event in emitted]
     assert [event.details["live_stream"] for event in switching] == [
-        CHEST,
-        CHEST,
         HEAD,
         HEAD,
+        CHEST,
+        CHEST,
     ]
     assert len(terminal) == 1
     assert "both-camera Qwen failover exhausted" in (terminal[0].error or "")

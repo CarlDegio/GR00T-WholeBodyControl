@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import numpy as np
+import pytest
 
 from gear_sonic.planner_control import NavigationRuntimeStatus
 from gear_sonic.runtime.contracts import MessageMetadata, OperatorCommand
@@ -14,7 +15,9 @@ from gear_sonic.scripts.run_operator_cv_viewer import (
     SLAM_2D_STREAM,
     NavigationViewerState,
     compose_visualization_canvas,
+    draw_base_pose_overlays,
     gateway_frame_to_bgr,
+    parse_base_pose_viewer_overlay,
 )
 
 
@@ -122,6 +125,66 @@ def test_base_pose_status_selects_camera_and_tracks_safe_velocity() -> None:
     assert not state.active
     assert state.action == "stop"
     assert state.reason == "aligned"
+
+
+def test_base_pose_status_draws_target_desk_and_table_on_active_camera() -> None:
+    state = NavigationViewerState()
+    state.accept_control(
+        _command("start_base_pose", {"generation": 4}, sequence=0), now=1.0
+    )
+    overlay = {
+        "target_bbox_xyxy": [10.0, 10.0, 30.0, 30.0],
+        "target_lateral_anchor_px": [20.0, 20.0],
+        "table_edge_endpoints_px": [[5.0, 35.0], [55.0, 35.0]],
+        "desk_mask_row_spans": [[32, 4, 60], [33, 4, 60]],
+        "image_size": [64, 48],
+    }
+    assert state.accept_control(
+        _command(
+            "base_pose_runtime_status",
+            {
+                "generation": 4,
+                "state": "motion",
+                "camera_stream": "ego_view",
+                "viewer_overlay": overlay,
+            },
+            sequence=1,
+        ),
+        now=1.1,
+    )
+    source = np.zeros((48, 64, 3), dtype=np.uint8)
+
+    head = draw_base_pose_overlays(source.copy(), HEAD_RGB_STREAM, state)
+    chest = draw_base_pose_overlays(source.copy(), CHEST_RGB_STREAM, state)
+
+    assert np.any(head)
+    assert not np.any(chest)
+    np.testing.assert_array_equal(head[10, 10], (0, 255, 0))
+    np.testing.assert_array_equal(head[35, 40], (0, 0, 255))
+    assert state.desk_mask_row_spans == ((32, 4, 60), (33, 4, 60))
+
+    state.accept_control(
+        _command(
+            "base_pose_runtime_status",
+            {"generation": 4, "state": "reached"},
+            sequence=2,
+        ),
+        now=1.2,
+    )
+    assert state.target_bbox_xyxy is None
+
+
+def test_base_pose_viewer_rejects_mask_span_outside_source_image() -> None:
+    with pytest.raises(ValueError, match="outside the image"):
+        parse_base_pose_viewer_overlay(
+            {
+                "viewer_overlay": {
+                    "target_bbox_xyxy": [1.0, 1.0, 4.0, 3.0],
+                    "desk_mask_row_spans": [[48, 0, 64]],
+                    "image_size": [64, 48],
+                }
+            }
+        )
 
 
 def test_composer_highlights_only_the_active_base_pose_camera() -> None:

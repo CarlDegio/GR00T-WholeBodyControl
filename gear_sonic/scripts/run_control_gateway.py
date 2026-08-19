@@ -7,6 +7,7 @@ import argparse
 from dataclasses import dataclass
 import json
 import time
+from typing import Mapping
 
 import zmq
 
@@ -37,6 +38,27 @@ class ControlGatewaySettings:
     navigation_status_endpoint: str
     command_ttl_ms: int
     heartbeat_hz: float
+
+
+def build_base_pose_runtime_status(
+    action: NavigationControlAction,
+    parameters: Mapping[str, object],
+) -> dict[str, object]:
+    """Build viewer telemetry without feeding overlays into motion validation."""
+
+    status: dict[str, object] = {
+        "generation": action.generation,
+        "state": "motion",
+        "velocity": list(action.velocity or (0.0, 0.0, 0.0)),
+        "action": str(parameters.get("action", "visual_servo")),
+        "camera_stream": str(parameters.get("camera_stream", "")),
+    }
+    viewer_overlay = parameters.get("viewer_overlay")
+    if viewer_overlay is not None:
+        if not isinstance(viewer_overlay, Mapping):
+            raise ValueError("base-pose viewer_overlay must be an object")
+        status["viewer_overlay"] = dict(viewer_overlay)
+    return status
 
 
 def build_argument_parser() -> argparse.ArgumentParser:
@@ -324,19 +346,10 @@ def run_control_gateway(settings: ControlGatewaySettings) -> None:
                             )
                             dispatch_navigation_event(
                                 BASE_POSE_RUNTIME_STATUS_COMMAND,
-                                {
-                                    "generation": action.generation,
-                                    "state": "motion",
-                                    "velocity": list(
-                                        action.velocity or (0.0, 0.0, 0.0)
-                                    ),
-                                    "action": str(
-                                        command.parameters.get("action", "visual_servo")
-                                    ),
-                                    "camera_stream": str(
-                                        command.parameters.get("camera_stream", "")
-                                    ),
-                                },
+                                build_base_pose_runtime_status(
+                                    action,
+                                    command.parameters,
+                                ),
                             )
                         elif command.name == "base_pose_status":
                             if command.metadata.source != "base_pose_agent":
