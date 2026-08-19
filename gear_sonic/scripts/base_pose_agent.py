@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run raw-depth YOLOE BasePose through the unified ControlGateway."""
+"""Run YOLOE BasePose with raw head and RGB-estimated chest depth."""
 
 from __future__ import annotations
 
@@ -51,7 +51,7 @@ class BasePoseAgentConfig:
     dual_head_camera_stream: str = "ego_view"
     dual_head_depth_stream: str = "camera/ego_view_depth"
     dual_chest_camera_stream: str = "chest_view"
-    dual_chest_depth_stream: str = "camera/chest_view_depth"
+    dual_chest_depth_stream: str = "derived/depth_anything/chest_view"
     dual_chest_camera_pitch_deg: float = -3.0
     dual_chest_camera_roll_deg: float = 0.0
     dual_chest_camera_yaw_deg: float = 0.0

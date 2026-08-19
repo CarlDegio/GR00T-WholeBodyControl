@@ -296,6 +296,12 @@ class NavigationControlState:
         self.mode = "lavira_nav"
         return NavigationControlAction(generation, "nav_goal")
 
+    def accept_lavira_rgbd_captured(self, parameters: Mapping[str, object]) -> bool:
+        """Validate LaViRA's DA lease release without changing navigation state."""
+
+        generation = int(parameters["generation"])
+        return generation == self.generation and self.mode == "lavira_pending"
+
     def accept_base_pose_velocity(
         self,
         parameters: Mapping[str, object],

@@ -17,7 +17,7 @@ from gear_sonic.runtime.config import load_runtime_profile
 from gear_sonic.runtime.sensor_gateway import (
     CameraZmqIngress,
     CppStateZmqIngress,
-    LingBotDepthZmqIngress,
+    DepthAnythingZmqIngress,
     Ros2SensorIngress,
     SensorGatewayCore,
     SensorGatewayRpcServer,
@@ -37,7 +37,7 @@ CONTROL_OUTPUTS_ENABLED = False
 class SensorGatewaySettings:
     profile_name: str
     camera_endpoint: str
-    lingbot_depth_endpoint: str
+    depth_anything_endpoint: str
     cpp_state_endpoint: str
     rpc_bind_endpoint: str
     visualization_bind_endpoint: str
@@ -51,7 +51,7 @@ class SensorGatewaySettings:
     health_print_interval_s: float
     expected_hz: dict[str, float]
     enable_camera: bool
-    enable_lingbot_depth: bool
+    enable_depth_anything: bool
     enable_cpp_state: bool
     enable_ros: bool
     enable_visualization: bool
@@ -104,9 +104,9 @@ def resolve_sensor_gateway_settings(args: argparse.Namespace) -> SensorGatewaySe
             component["vla_timing_expected_hz"],
             "vla_timing_expected_hz",
         ),
-        "lingbot_depth": _positive(
-            profile.component("lingbot_depth")["inference_hz"],
-            "lingbot_depth.inference_hz",
+        "depth_anything": _positive(
+            profile.component("depth_anything")["inference_hz"],
+            "depth_anything.inference_hz",
         ),
     }
     slot_count = int(component["shared_memory_slots"])
@@ -122,10 +122,10 @@ def resolve_sensor_gateway_settings(args: argparse.Namespace) -> SensorGatewaySe
             args.camera_host,
             args.camera_port,
         ),
-        lingbot_depth_endpoint=endpoint_uri(
-            "lingbot_depth",
-            args.lingbot_depth_host,
-            args.lingbot_depth_port,
+        depth_anything_endpoint=endpoint_uri(
+            "depth_anything",
+            args.depth_anything_host,
+            args.depth_anything_port,
         ),
         cpp_state_endpoint=endpoint_uri(
             "cpp_state",
@@ -161,7 +161,7 @@ def resolve_sensor_gateway_settings(args: argparse.Namespace) -> SensorGatewaySe
         health_print_interval_s=float(args.health_print_interval_s),
         expected_hz=expected_hz,
         enable_camera=bool(args.enable_camera),
-        enable_lingbot_depth=bool(args.enable_lingbot_depth),
+        enable_depth_anything=bool(args.enable_depth_anything),
         enable_cpp_state=bool(args.enable_cpp_state),
         enable_ros=bool(args.enable_ros),
         enable_visualization=bool(args.enable_visualization),
@@ -182,8 +182,8 @@ def build_argument_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--camera-host", default="")
     parser.add_argument("--camera-port", type=int, default=0)
-    parser.add_argument("--lingbot-depth-host", default="")
-    parser.add_argument("--lingbot-depth-port", type=int, default=0)
+    parser.add_argument("--depth-anything-host", default="")
+    parser.add_argument("--depth-anything-port", type=int, default=0)
     parser.add_argument("--cpp-state-host", default="")
     parser.add_argument("--cpp-state-port", type=int, default=0)
     parser.add_argument("--rpc-bind-host", default="")
@@ -199,7 +199,7 @@ def build_argument_parser() -> argparse.ArgumentParser:
         default=True,
     )
     parser.add_argument(
-        "--enable-lingbot-depth",
+        "--enable-depth-anything",
         action=argparse.BooleanOptionalAction,
         default=True,
     )
@@ -258,7 +258,11 @@ def _health_dashboard_text(
     sources = payload.get("streams", {})
     rows = (
         ("Camera", settings.camera_endpoint, "source/camera_server"),
-        ("LingBot depth", settings.lingbot_depth_endpoint, "source/lingbot_depth"),
+        (
+            "DA metric depth",
+            settings.depth_anything_endpoint,
+            "source/depth_anything",
+        ),
         ("C++ state", settings.cpp_state_endpoint, "source/cpp_state"),
         ("Visualization", settings.visualization_bind_endpoint, "source/visualization_ingress"),
         ("VLA timing", settings.vla_timing_bind_endpoint, "source/vla_timing"),
@@ -364,7 +368,7 @@ def run_sensor_gateway(settings: SensorGatewaySettings) -> None:
     )
     rpc: SensorGatewayRpcServer | None = None
     camera: CameraZmqIngress | None = None
-    lingbot_depth: LingBotDepthZmqIngress | None = None
+    depth_anything: DepthAnythingZmqIngress | None = None
     cpp_state: CppStateZmqIngress | None = None
     ros: Ros2SensorIngress | None = None
     visualization: VisualizationZmqIngress | None = None
@@ -407,12 +411,12 @@ def run_sensor_gateway(settings: SensorGatewaySettings) -> None:
                 expected_hz=settings.expected_hz["camera"],
                 preview_rgb=settings.enable_rgb_preview,
             )
-        if settings.enable_lingbot_depth:
-            lingbot_depth = LingBotDepthZmqIngress(
+        if settings.enable_depth_anything:
+            depth_anything = DepthAnythingZmqIngress(
                 context,
-                settings.lingbot_depth_endpoint,
+                settings.depth_anything_endpoint,
                 core,
-                expected_hz=settings.expected_hz["lingbot_depth"],
+                expected_hz=settings.expected_hz["depth_anything"],
             )
         if settings.enable_cpp_state:
             cpp_state = CppStateZmqIngress(
@@ -447,10 +451,11 @@ def run_sensor_gateway(settings: SensorGatewaySettings) -> None:
             print(f"[SensorGateway] VLA timing PULL: {settings.vla_timing_bind_endpoint}")
         if camera is not None:
             print(f"[SensorGateway] camera SUB: {settings.camera_endpoint}")
-        if lingbot_depth is not None:
+        if depth_anything is not None:
             print(
-                "[SensorGateway] LingBot depth SUB: "
-                f"{settings.lingbot_depth_endpoint} -> derived/lingbot_depth"
+                "[SensorGateway] Depth Anything SUB: "
+                f"{settings.depth_anything_endpoint} -> "
+                "derived/depth_anything/chest_view"
             )
         if cpp_state is not None:
             print(f"[SensorGateway] C++ state SUB: {settings.cpp_state_endpoint}")
@@ -470,14 +475,14 @@ def run_sensor_gateway(settings: SensorGatewaySettings) -> None:
                         str(exc),
                         expected_hz=settings.expected_hz["camera"],
                     )
-            if lingbot_depth is not None:
+            if depth_anything is not None:
                 try:
-                    lingbot_depth.poll_once()
+                    depth_anything.poll_once()
                 except Exception as exc:
                     core.record_failure(
-                        "source/lingbot_depth",
+                        "source/depth_anything",
                         str(exc),
-                        expected_hz=settings.expected_hz["lingbot_depth"],
+                        expected_hz=settings.expected_hz["depth_anything"],
                     )
             if cpp_state is not None:
                 try:
@@ -531,8 +536,8 @@ def run_sensor_gateway(settings: SensorGatewaySettings) -> None:
             cpp_state.close()
         if camera is not None:
             camera.close()
-        if lingbot_depth is not None:
-            lingbot_depth.close()
+        if depth_anything is not None:
+            depth_anything.close()
         if rpc is not None:
             rpc.close()
         core.close()

@@ -171,6 +171,18 @@ def test_b_starts_base_pose_and_rejects_lavira_until_space() -> None:
     assert rejected.generation == started.generation
 
 
+def test_lavira_rgbd_release_is_valid_only_during_pending_target_confirmation() -> None:
+    state = NavigationControlState()
+    started = state.handle_key("n", now=1.0)
+
+    assert state.accept_lavira_rgbd_captured({"generation": started.generation})
+    assert state.mode == "lavira_pending"
+    state.accept_goal({"generation": started.generation})
+    assert not state.accept_lavira_rgbd_captured(
+        {"generation": started.generation}
+    )
+
+
 def test_base_pose_velocity_is_bounded_and_times_out_safe() -> None:
     state = NavigationControlState(base_pose_command_timeout_s=0.2)
     started = state.handle_key("b", now=1.0)

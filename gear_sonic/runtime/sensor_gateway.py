@@ -22,6 +22,9 @@ from gear_sonic.runtime.snapshot import SensorSnapshotStore, SnapshotRequest
 from gear_sonic.runtime.visualization import VISUALIZATION_SCHEMA, VISUALIZATION_STREAMS
 
 
+DEPTH_ANYTHING_STATUS_TYPE = "sonic.depth_anything_status"
+
+
 @dataclass
 class _RetiredRing:
     expires_ns: int
@@ -88,6 +91,13 @@ class SensorGatewayCore:
                 received_ns=receive_time,
                 source_timestamp_ns=source_timestamp_ns,
             )
+
+    def set_endpoint_idle(self, endpoint: str, idle: bool) -> None:
+        with self._lock:
+            monitor = self._health.get(endpoint)
+            if monitor is None:
+                raise KeyError(f"endpoint is not registered: {endpoint}")
+            monitor.set_idle(idle)
 
     def publish_array(
         self,
@@ -431,10 +441,10 @@ class CameraZmqIngress:
         self.socket.close(linger=0)
 
 
-class LingBotDepthZmqIngress:
-    """Register LingBot completed depth as a derived shared-memory stream."""
+class DepthAnythingZmqIngress:
+    """Register RGB-estimated metric chest depth as a derived stream."""
 
-    STREAM = "derived/lingbot_depth"
+    STREAM = "derived/depth_anything/chest_view"
 
     def __init__(
         self,
@@ -452,7 +462,7 @@ class LingBotDepthZmqIngress:
         self.socket.setsockopt(zmq.LINGER, 0)
         self.socket.connect(endpoint)
         self.core.register_endpoint(
-            "source/lingbot_depth", expected_hz=self.expected_hz
+            "source/depth_anything", expected_hz=self.expected_hz
         )
 
     def poll_once(self, timeout_ms: int = 0) -> int:
@@ -460,13 +470,23 @@ class LingBotDepthZmqIngress:
             return 0
         received_ns = time.monotonic_ns()
         payload = msgpack.unpackb(self.socket.recv(), raw=False)
+        if payload.get("type") == DEPTH_ANYTHING_STATUS_TYPE:
+            active = bool(payload.get("active", False))
+            self.core.observe_endpoint(
+                "source/depth_anything",
+                expected_hz=self.expected_hz,
+                received_ns=received_ns,
+            )
+            self.core.set_endpoint_idle("source/depth_anything", not active)
+            return 1
         schema = ImageMessageSchema.deserialize(payload)
         depth = schema.images.get("chest_view_depth")
         if not isinstance(depth, np.ndarray):
-            raise ValueError("LingBot payload is missing chest_view_depth")
+            raise ValueError("Depth Anything payload is missing chest_view_depth")
         if depth.ndim != 2 or depth.dtype != np.uint16:
             raise ValueError(
-                f"LingBot depth must be HxW uint16, got {depth.shape} {depth.dtype}"
+                f"Depth Anything depth must be HxW uint16, got "
+                f"{depth.shape} {depth.dtype}"
             )
         timestamp_s = float(
             schema.timestamps.get(
@@ -474,8 +494,23 @@ class LingBotDepthZmqIngress:
             )
         )
         camera_info = dict(schema.camera_info.get("chest_view", {}))
+        depth_source = str(camera_info.get("depth_source", ""))
+        if not depth_source.startswith("depth-anything-v2-metric-"):
+            raise ValueError(
+                "Depth Anything payload has invalid depth_source: "
+                f"{depth_source!r}"
+            )
+        if not bool(camera_info.get("metric_model_output", False)):
+            raise ValueError("Depth Anything payload is not marked as metric output")
+        if bool(camera_info.get("uses_raw_depth", True)):
+            raise ValueError("Depth Anything payload must not use raw depth")
+        if float(camera_info.get("depth_scale_m", 0.0)) != 0.001:
+            raise ValueError("Depth Anything uint16 payload must use millimetres")
+        if camera_info.get("inference_owner") not in {"lavira", "base_pose"}:
+            raise ValueError("Depth Anything payload has no active inference owner")
+        self.core.set_endpoint_idle("source/depth_anything", False)
         self.core.observe_endpoint(
-            "source/lingbot_depth",
+            "source/depth_anything",
             expected_hz=self.expected_hz,
             received_ns=received_ns,
         )
@@ -489,7 +524,7 @@ class LingBotDepthZmqIngress:
             attributes={
                 "encoding": "numpy",
                 "camera_info": camera_info,
-                "depth_source": "lingbot-depth",
+                "depth_source": depth_source,
             },
         )
         return 1

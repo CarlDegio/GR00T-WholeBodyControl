@@ -145,7 +145,7 @@ On your workstation, SensorGateway connects to the robot's camera server over th
 source .venv_teleop/bin/activate
 python gear_sonic/scripts/run_sensor_gateway.py \
     --camera-host 192.168.123.164 --camera-port 5555 \
-    --no-enable-lingbot-depth --no-enable-ros \
+    --no-enable-depth-anything --no-enable-ros \
     --no-enable-visualization --no-enable-vla-timing
 
 source .venv_data_collection/bin/activate
@@ -353,7 +353,7 @@ python gear_sonic/scripts/pico_manager_thread_server.py --manager
 ```bash
 source .venv_teleop/bin/activate
 python gear_sonic/scripts/run_sensor_gateway.py \
-    --no-enable-lingbot-depth --no-enable-ros \
+    --no-enable-depth-anything --no-enable-ros \
     --no-enable-visualization --no-enable-vla-timing
 ```
 

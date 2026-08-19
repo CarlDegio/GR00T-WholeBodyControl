@@ -526,6 +526,27 @@ def test_successful_cycle_captures_five_frames_and_writes_diagnostics(tmp_path: 
     assert json.loads((output_dir / "object_nav_commands.json").read_text()) == result.commands
 
 
+def test_da_release_callback_runs_after_rgbd_capture_before_qwen_policy(
+    tmp_path: Path,
+) -> None:
+    events: list[str] = []
+
+    class OrderedCodex(FakeCodex):
+        def locate(self, **kwargs):
+            events.append("policy")
+            return super().locate(**kwargs)
+
+    runner = ObjectNavRunner(
+        ObjectNavConfig("find chair", "chair", output_root=str(tmp_path)),
+        camera=FakeCamera([snapshot(index) for index in range(1, 6)]),
+        codex=OrderedCodex(policy()),
+    )
+
+    runner.run_once(rgbd_capture_complete=lambda: events.append("depth_released"))
+
+    assert events == ["depth_released", "policy"]
+
+
 def test_object_nav_warmup_runs_iteration_zero_without_returning_motion(
     tmp_path: Path,
 ) -> None:

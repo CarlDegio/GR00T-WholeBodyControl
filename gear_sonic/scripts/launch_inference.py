@@ -202,9 +202,6 @@ class InferenceLaunchConfig:
     lavira_qwenvl_base_url: str = "https://dashscope-intl.aliyuncs.com/compatible-mode/v1"
     """DashScope OpenAI-compatible endpoint; key comes from DASHSCOPE_API_KEY."""
 
-    lavira_warmup: bool = True
-    """Run one discarded Luna request in the background at startup."""
-
     lavira_debug: bool = False
     """Enable LaViRA debug logging."""
 
@@ -215,13 +212,13 @@ class InferenceLaunchConfig:
     """LaViRA navigation keys come from its own pane or ControlGateway."""
 
     lavira_camera_timeout_ms: int = 15000
-    """LaViRA pure LingBot RGB-D receive timeout (ms)."""
+    """LaViRA metric RGB-D receive timeout (ms)."""
 
-    lavira_depth_port: int = 5564
-    """Local pure LingBot completed RGB-D stream consumed by LaViRA."""
+    depth_anything_port: int = 5564
+    """Local Depth Anything metric-depth publisher port."""
 
-    lingbot_ready_timeout: float = 180.0
-    """Maximum time to wait for the independent LingBot pane to publish its first frame."""
+    depth_anything_ready_timeout: float = 180.0
+    """Maximum time to wait for the metric model to become ready."""
 
     lavira_codex_timeout_seconds: float = 180.0
     """LaViRA Codex policy timeout (s)."""
@@ -263,7 +260,7 @@ class InferenceLaunchConfig:
     base_pose_dual_head_camera_stream: str = "ego_view"
     base_pose_dual_head_depth_stream: str = "camera/ego_view_depth"
     base_pose_dual_chest_camera_stream: str = "chest_view"
-    base_pose_dual_chest_depth_stream: str = "camera/chest_view_depth"
+    base_pose_dual_chest_depth_stream: str = "derived/depth_anything/chest_view"
     base_pose_dual_chest_camera_pitch_deg: float = -3.0
     base_pose_dual_chest_camera_roll_deg: float = 0.0
     base_pose_dual_chest_camera_yaw_deg: float = 0.0
@@ -413,7 +410,7 @@ def parse_inference_launch_config(
 
 
 SESSION_NAME = "sonic_inference"
-LINGBOT_READY_FILE = Path("/tmp/sonic_lingbot_ready")
+DEPTH_ANYTHING_READY_FILE = Path("/tmp/sonic_depth_anything_ready")
 
 
 def _runtime_profile(config: InferenceLaunchConfig):
@@ -612,7 +609,6 @@ def build_planner_input_command(config: InferenceLaunchConfig, repo_root: Path) 
         )
 
     debug = "--debug " if config.lavira_debug else ""
-    warmup = "" if config.lavira_warmup else "--no-warmup "
     vision_backend = ""
     local_env = ""
     if config.lavira_vision_backend == "qwenvl":
@@ -623,18 +619,18 @@ def build_planner_input_command(config: InferenceLaunchConfig, repo_root: Path) 
             f"--qwenvl-base-url {shlex.quote(config.lavira_qwenvl_base_url)} "
         )
     quoted_root = shlex.quote(str(repo_root))
-    ready_file = shlex.quote(str(LINGBOT_READY_FILE))
+    ready_file = shlex.quote(str(DEPTH_ANYTHING_READY_FILE))
     return (
         f"cd {quoted_root} && "
         f"{local_env}"
-        f"timeout {config.lingbot_ready_timeout}s sh -c "
+        f"timeout {config.depth_anything_ready_timeout}s sh -c "
         f"'while [ ! -f {ready_file} ]; do sleep 0.2; done' || "
-        "{ echo '[LaViRA] LingBot did not become ready' >&2; exit 1; }; "
+        "{ echo '[LaViRA] Depth Anything did not become ready' >&2; exit 1; }; "
         f".venv_inference/bin/python gear_sonic/scripts/lavira_planner.py "
         f"--mission {shlex.quote(config.lavira_mission)} "
         f"--global-target {shlex.quote(config.lavira_global_target)} "
         f"--model {shlex.quote(config.lavira_model)} "
-        f"{vision_backend}{debug}{warmup}"
+        f"{vision_backend}{debug}"
         f"--camera-timeout-ms {config.lavira_camera_timeout_ms} "
         f"--sensor-gateway-endpoint tcp://127.0.0.1:{config.sensor_gateway_port} "
         f"--sensor-gateway-request-timeout-ms "
@@ -762,19 +758,28 @@ def build_base_pose_agent_command(
     )
 
 
-def build_lingbot_command(config: InferenceLaunchConfig, repo_root: Path) -> str:
-    """Build the independent background LingBot depth-completion process."""
+def build_depth_anything_command(
+    config: InferenceLaunchConfig, repo_root: Path
+) -> str:
+    """Build the shared RGB-only metric chest-depth process."""
     quoted_root = shlex.quote(str(repo_root))
-    ready_file = shlex.quote(str(LINGBOT_READY_FILE))
+    ready_file = shlex.quote(str(DEPTH_ANYTHING_READY_FILE))
+    settings = _runtime_profile(config).component("depth_anything")
     return (
-        f"PYTHONPATH={quoted_root} {quoted_root}/.venv_lingbot_depth/bin/python "
-        "gear_sonic/scripts/run_lingbot_depth_viewer.py "
+        f"PYTHONPATH={quoted_root} {quoted_root}/.venv_depth_anything/bin/python "
+        "gear_sonic/scripts/run_depth_anything.py "
         f"--sensor-gateway-endpoint tcp://127.0.0.1:{config.sensor_gateway_port} "
-        f"--publish-port {config.lavira_depth_port} --ready-file {ready_file} "
-        "--no-visualize --visualization-gateway-endpoint "
-        f"tcp://127.0.0.1:{config.sensor_gateway_visualization_port} "
-        "--control-gateway-endpoint tcp://127.0.0.1:"
-        f"{config.control_gateway_dispatch_port}"
+        f"--control-gateway-endpoint tcp://127.0.0.1:{config.control_gateway_dispatch_port} "
+        f"--publish-port {config.depth_anything_port} --ready-file {ready_file} "
+        f"--depth-anything-root {shlex.quote(str(settings['root']))} "
+        f"--checkpoint {shlex.quote(str(settings['checkpoint']))} "
+        f"--encoder {shlex.quote(str(settings['encoder']))} "
+        f"--device {shlex.quote(str(settings['device']))} "
+        f"--inference-hz {settings['inference_hz']} "
+        f"--input-size {settings['input_size']} "
+        f"--model-max-depth-m {settings['model_max_depth_m']} "
+        f"--publish-max-depth-m {settings['publish_max_depth_m']} "
+        + ("--use-amp" if settings["use_amp"] else "--no-use-amp")
     )
 
 
@@ -979,20 +984,23 @@ def build_sensor_gateway_command(config: InferenceLaunchConfig, repo_root: Path)
                 "/tmp/sonic_opencv_viewer.log",
             )
         )
-    if config.keyboard_planner and config.planner_input == "lavira":
+    depth_anything_required = config.base_pose_enabled or (
+        config.keyboard_planner and config.planner_input == "lavira"
+    )
+    if depth_anything_required:
         background_commands.append(
             (
-                "lingbot_pid",
-                build_lingbot_command(config, repo_root),
-                "/tmp/sonic_lingbot.log",
+                "depth_anything_pid",
+                build_depth_anything_command(config, repo_root),
+                "/tmp/sonic_depth_anything.log",
             )
         )
     if not background_commands:
         return setup + gateway
 
     ready_file_setup = (
-        f"rm -f {shlex.quote(str(LINGBOT_READY_FILE))}; "
-        if config.keyboard_planner and config.planner_input == "lavira"
+        f"rm -f {shlex.quote(str(DEPTH_ANYTHING_READY_FILE))}; "
+        if depth_anything_required
         else ""
     )
     launch_background = "".join(
@@ -1008,7 +1016,8 @@ def build_sensor_gateway_command(config: InferenceLaunchConfig, repo_root: Path)
         + gateway
         + f"; gateway_status=$?; kill {pid_names} 2>/dev/null; "
         + f"wait {pid_names} 2>/dev/null; "
-        + f"rm -f {shlex.quote(str(LINGBOT_READY_FILE))}; (exit $gateway_status)"
+        + f"rm -f {shlex.quote(str(DEPTH_ANYTHING_READY_FILE))}; "
+        + "(exit $gateway_status)"
     )
 
 
@@ -1073,6 +1082,22 @@ def _check_prerequisites(config: InferenceLaunchConfig):
     if not (repo_root / ".venv_teleop" / "bin" / "activate").exists():
         errors.append(".venv_teleop not found. Run: bash install_scripts/install_pico.sh")
 
+    depth_anything_required = config.base_pose_enabled or (
+        config.keyboard_planner and config.planner_input == "lavira"
+    )
+    if depth_anything_required:
+        depth_settings = _runtime_profile(config).component("depth_anything")
+        for path, label in (
+            (Path(str(depth_settings["root"])), "Depth Anything metric source"),
+            (Path(str(depth_settings["checkpoint"])), "Depth Anything Base checkpoint"),
+            (
+                repo_root / ".venv_depth_anything" / "bin" / "python",
+                "Depth Anything Python",
+            ),
+        ):
+            if not path.exists():
+                errors.append(f"{label} not found: {path}")
+
     if config.planner_input == "lavira":
         if not config.lavira_mission.strip():
             errors.append("--lavira-mission is required when --planner-input lavira")
@@ -1126,7 +1151,7 @@ def _check_prerequisites(config: InferenceLaunchConfig):
             if not head or not chest or head == chest:
                 errors.append("dual Base-Pose camera streams must be distinct")
             expected_head_depth = f"camera/{head}_depth"
-            expected_chest_depth = f"camera/{chest}_depth"
+            expected_chest_depth = f"derived/depth_anything/{chest}"
             if config.base_pose_dual_head_depth_stream != expected_head_depth:
                 errors.append(
                     "dual head raw depth must match its RGB: "
@@ -1134,7 +1159,7 @@ def _check_prerequisites(config: InferenceLaunchConfig):
                 )
             if config.base_pose_dual_chest_depth_stream != expected_chest_depth:
                 errors.append(
-                    "dual chest raw depth must match its RGB: "
+                    "dual chest depth must use metric Depth Anything: "
                     f"--base-pose-dual-chest-depth-stream {expected_chest_depth}"
                 )
             if config.base_pose_dual_match_tolerance_frames <= 0:
@@ -1444,7 +1469,7 @@ def main(config: InferenceLaunchConfig):
     runtime_panes = pane_ids[6:]
     runtime_index = 0
     print(
-        "Starting SensorGateway with background ROS/OpenCV/LingBot services "
+        "Starting SensorGateway with background ROS/OpenCV/Depth Anything services "
         f"(pane {6 + runtime_index})..."
     )
     _send_to_pane(

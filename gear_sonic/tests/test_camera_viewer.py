@@ -204,7 +204,7 @@ def test_data_collection_launcher_enables_sensor_gateway_rgb_preview() -> None:
         "--profile '/tmp/runtime profile.yaml' "
         "--camera-host 192.168.123.164 --camera-port 5555 "
         "--enable-rgb-preview "
-        "--no-enable-lingbot-depth --no-enable-ros "
+        "--no-enable-depth-anything --no-enable-ros "
         "--no-enable-visualization --no-enable-vla-timing"
     )
 

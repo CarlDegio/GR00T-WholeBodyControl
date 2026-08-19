@@ -26,7 +26,7 @@ def test_current_inference_profile_has_unique_ports() -> None:
     assert get_endpoint("navigation_command").port == 5558
     assert get_endpoint("navigation_status").port == 5559
     assert get_endpoint("planner_relay").port == 5563
-    assert get_endpoint("lingbot_depth").port == 5564
+    assert get_endpoint("depth_anything").port == 5564
     assert get_endpoint("navigation_runtime_status").port == 5570
     assert get_endpoint("xnavdp_http").port == 19999
 

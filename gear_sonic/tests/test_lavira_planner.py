@@ -96,7 +96,7 @@ def test_current_generation_status_returns_to_listen_but_stale_status_is_ignored
     assert runtime.phase == "listen_wasd"
 
 
-def test_warmup_failure_does_not_kill_inference_worker() -> None:
+def test_worker_does_not_warm_up_and_releases_da_after_rgbd_capture() -> None:
     intents: list[tuple[str, dict]] = []
     logs: list[str] = []
     runtime = LaviraPlannerRuntime(
@@ -106,25 +106,24 @@ def test_warmup_failure_does_not_kill_inference_worker() -> None:
     )
 
     class Runner:
-        def __init__(self, *, fail_warmup: bool) -> None:
-            self.fail_warmup = fail_warmup
+        def __init__(self) -> None:
+            self.warmup_called = False
 
         def warmup(self) -> None:
-            if self.fail_warmup:
-                raise RuntimeError("missing API key")
+            self.warmup_called = True
+            raise AssertionError("demand-scheduled LaViRA must not warm up")
 
-        def run_once(self) -> ObjectNavResult:
+        def run_once(self, *, rgbd_capture_complete) -> ObjectNavResult:
+            rgbd_capture_complete()
             return nav_result()
 
         def close(self) -> None:
             pass
 
-    attempts = 0
+    runner = Runner()
 
     def factory() -> Runner:
-        nonlocal attempts
-        attempts += 1
-        return Runner(fail_warmup=attempts == 1)
+        return runner
 
     worker = threading.Thread(target=run_inference_worker, args=(factory, runtime))
     worker.start()
@@ -135,5 +134,5 @@ def test_warmup_failure_does_not_kill_inference_worker() -> None:
 
     assert result.result is not None
     assert result.error is None
-    assert attempts == 2
-    assert any("warmup failed: missing API key" in message for message in logs)
+    assert not runner.warmup_called
+    assert ("lavira_rgbd_captured", {"generation": 1}) in intents

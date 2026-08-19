@@ -201,11 +201,15 @@ class AlignedRGBDCamera:
                 raise BasePoseCameraError(
                     f"depth_source must be {self.required_depth_source!r}, got {depth_source!r}"
                 )
-            if self.required_depth_source == "lingbot-depth" and not math.isclose(
-                depth_scale_m, 0.001, rel_tol=0.0, abs_tol=1.0e-9
+            if (
+                self.required_depth_source is not None
+                and self.required_depth_source.startswith("depth-anything-v2-metric-")
+                and not math.isclose(
+                    depth_scale_m, 0.001, rel_tol=0.0, abs_tol=1.0e-9
+                )
             ):
                 raise BasePoseCameraError(
-                    "LingBot enhanced uint16 depth must use millimeter units"
+                    "Depth Anything uint16 depth must use millimetre units"
                 )
         elif self.require_depth:
             raise BasePoseCameraError(f"camera payload requires {self.depth_key}")

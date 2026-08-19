@@ -62,6 +62,25 @@ def test_endpoint_failure_and_recovery_are_explicit() -> None:
     assert recovered.last_error == ""
 
 
+def test_intentionally_idle_model_is_not_reported_stale_until_heartbeat_dies() -> None:
+    monitor = EndpointHealthMonitor(
+        "depth_anything",
+        expected_hz=10.0,
+        stale_after_s=0.3,
+        down_after_s=1.0,
+        started_ns=0,
+    )
+    monitor.observe(received_ns=100_000_000)
+    monitor.set_idle(True)
+
+    assert monitor.snapshot(now_ns=500_000_000).state is EndpointState.IDLE
+    assert monitor.snapshot(now_ns=1_200_000_000).state is EndpointState.DOWN
+
+    monitor.observe(received_ns=1_300_000_000)
+    monitor.set_idle(False)
+    assert monitor.snapshot(now_ns=1_350_000_000).state is EndpointState.HEALTHY
+
+
 def test_out_of_order_sequence_is_not_counted_as_packet_loss() -> None:
     monitor = EndpointHealthMonitor("camera_server", expected_hz=30.0, started_ns=0)
     monitor.observe(received_ns=10, sequence=4)

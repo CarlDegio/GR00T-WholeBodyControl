@@ -11,6 +11,7 @@ import time
 class EndpointState(str, Enum):
     WAITING = "waiting"
     HEALTHY = "healthy"
+    IDLE = "idle"
     STALE = "stale"
     DOWN = "down"
 
@@ -87,6 +88,12 @@ class EndpointHealthMonitor:
         self._failure_count = 0
         self._consecutive_failures = 0
         self._last_error = ""
+        self._idle = False
+
+    def set_idle(self, idle: bool) -> None:
+        """Mark a reachable model endpoint as intentionally not producing data."""
+
+        self._idle = bool(idle)
 
     def observe(
         self,
@@ -147,6 +154,8 @@ class EndpointHealthMonitor:
 
         if self._consecutive_failures:
             state = EndpointState.DOWN
+        elif self._idle and last_age_s is not None and last_age_s < self.down_after_s:
+            state = EndpointState.IDLE
         elif last_age_s is None:
             startup_age_s = (current_time - self.started_ns) / 1_000_000_000.0
             state = EndpointState.WAITING if startup_age_s < self.down_after_s else EndpointState.DOWN

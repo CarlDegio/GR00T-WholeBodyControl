@@ -662,6 +662,10 @@ class YoloePersistentTracker:
         self.confidence = float(confidence)
         self.imgsz = int(imgsz)
         self.device = device
+        resident_device = f"cuda:{device}" if str(device).isdigit() else str(device)
+        # Move weights to CUDA now, but do not create a predictor or run a
+        # forward pass until BasePose owns the planner control state.
+        self.model.to(resident_device)
         self.class_names: tuple[str, str] | None = None
         self._initial_surface_embedding: Any | None = None
 
@@ -2461,7 +2465,16 @@ def run_raw_servo_worker(
 ) -> None:
     calibration = calibration_from_config(config)
     camera: AlignedRGBDCamera | None = None
-    tracker: Any | None = None
+    tracker: Any = (
+        tracker_factory()
+        if tracker_factory is not None
+        else YoloePersistentTracker(
+            config.raw_yoloe_model_path,
+            confidence=config.raw_yoloe_confidence,
+            imgsz=config.raw_yoloe_imgsz,
+            device=config.raw_yoloe_device,
+        )
+    )
     reference_updater: Any | None = None
     try:
         while not stop_event.is_set():
@@ -2523,17 +2536,6 @@ def run_raw_servo_worker(
                             min_confidence=config.raw_reference_update_min_confidence,
                             min_iou=config.raw_reference_update_min_iou,
                         )
-                if tracker is None:
-                    tracker = (
-                        tracker_factory()
-                        if tracker_factory
-                        else YoloePersistentTracker(
-                            config.raw_yoloe_model_path,
-                            confidence=config.raw_yoloe_confidence,
-                            imgsz=config.raw_yoloe_imgsz,
-                            device=config.raw_yoloe_device,
-                        )
-                    )
                 reference_update_gate = (
                     TargetReferenceUpdateGate(
                         interval_frames=config.raw_reference_update_interval_frames,
