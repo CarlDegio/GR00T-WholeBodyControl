@@ -1,9 +1,7 @@
 #!/usr/bin/env python3
-"""Evaluate YOLOE table detection with text prompts on collected RGB frames.
+"""Detect tables with the fixed YOLOE text prompt ``desk``.
 
-When --source is omitted, the newest BasePose ``review_samples/raw`` directory
-under ``outputs/base_pose_adjustment`` is used. This makes the default command
-exercise recently collected robot-camera data rather than a downloaded demo.
+With no --source, the script tests the newest collected BasePose RGB samples.
 """
 
 from __future__ import annotations
@@ -11,7 +9,6 @@ from __future__ import annotations
 import argparse
 import json
 import math
-import re
 import statistics
 import sys
 from dataclasses import asdict, dataclass
@@ -24,12 +21,12 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 REPO_ROOT = SCRIPT_DIR.parents[1]
 DEFAULT_MODEL = SCRIPT_DIR / "weights" / "yoloe-26m-seg.pt"
 DEFAULT_OUTPUT_ROOT = SCRIPT_DIR / "outputs"
+TABLE_PROMPT = "desk"
 IMAGE_SUFFIXES = {".bmp", ".jpeg", ".jpg", ".png", ".tif", ".tiff", ".webp"}
 
 
 @dataclass(frozen=True)
-class PromptMetrics:
-    prompt: str
+class DetectionMetrics:
     images_tested: int
     frames_with_detection: int
     frame_detection_rate: float
@@ -43,10 +40,7 @@ class PromptMetrics:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description=(
-            "Run YOLOE open-vocabulary table detection on current collected frames "
-            "and compare text prompts."
-        )
+        description="Detect tables with YOLOE using the fixed text prompt 'desk'."
     )
     parser.add_argument(
         "--source",
@@ -55,12 +49,6 @@ def parse_args() -> argparse.Namespace:
             "Image or directory of images. Defaults to the newest "
             "outputs/base_pose_adjustment/*/review_samples/raw directory."
         ),
-    )
-    parser.add_argument(
-        "--prompts",
-        nargs="+",
-        default=["table", "desk", "wooden table", "wooden desk"],
-        help="Text prompts evaluated independently (default: %(default)s).",
     )
     parser.add_argument("--model", type=Path, default=DEFAULT_MODEL)
     parser.add_argument(
@@ -82,20 +70,12 @@ def parse_args() -> argparse.Namespace:
         help="Ultralytics device such as 0 or cpu; auto-selects CUDA when available.",
     )
     parser.add_argument(
-        "--no-half", action="store_true", help="Disable FP16 on CUDA."
-    )
-    parser.add_argument(
         "--contact-sheet-size",
         type=int,
         default=16,
-        help="Maximum annotated frames in each prompt contact sheet; 0 disables it.",
+        help="Maximum annotated frames in the contact sheet; 0 disables it.",
     )
     return parser.parse_args()
-
-
-def _prompt_slug(prompt: str) -> str:
-    slug = re.sub(r"[^a-zA-Z0-9]+", "_", prompt.strip()).strip("_").lower()
-    return slug or "prompt"
 
 
 def _new_output_dir(requested: Path | None) -> Path:
@@ -104,15 +84,16 @@ def _new_output_dir(requested: Path | None) -> Path:
         path.mkdir(parents=True, exist_ok=False)
         return path
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-    path = DEFAULT_OUTPUT_ROOT / f"text_prompt_table_{timestamp}"
+    path = DEFAULT_OUTPUT_ROOT / f"text_prompt_desk_{timestamp}"
     path.mkdir(parents=True, exist_ok=False)
     return path.resolve()
 
 
 def discover_latest_base_pose_frames(repo_root: Path = REPO_ROOT) -> Path:
     candidates = []
-    pattern = "outputs/base_pose_adjustment/*/review_samples/raw"
-    for directory in repo_root.glob(pattern):
+    for directory in repo_root.glob(
+        "outputs/base_pose_adjustment/*/review_samples/raw"
+    ):
         if directory.is_dir() and any(
             item.is_file() and item.suffix.lower() in IMAGE_SUFFIXES
             for item in directory.iterdir()
@@ -150,39 +131,10 @@ def uniformly_sample(items: Sequence[Path], limit: int) -> list[Path]:
         return list(items)
     if limit == 1:
         return [items[len(items) // 2]]
-    indices = [round(index * (len(items) - 1) / (limit - 1)) for index in range(limit)]
+    indices = [
+        round(index * (len(items) - 1) / (limit - 1)) for index in range(limit)
+    ]
     return [items[index] for index in indices]
-
-
-def _mean_or_none(values: Sequence[float]) -> float | None:
-    return statistics.fmean(values) if values else None
-
-
-def summarize_prompt(prompt: str, frames: Sequence[dict[str, Any]]) -> PromptMetrics:
-    confidences = [
-        float(detection["confidence"])
-        for frame in frames
-        for detection in frame["detections"]
-    ]
-    inference_times = [
-        float(frame["speed_ms"]["inference"])
-        for frame in frames
-        if frame["speed_ms"].get("inference") is not None
-    ]
-    frames_with_detection = sum(bool(frame["detections"]) for frame in frames)
-    mean_inference_ms = _mean_or_none(inference_times)
-    return PromptMetrics(
-        prompt=prompt,
-        images_tested=len(frames),
-        frames_with_detection=frames_with_detection,
-        frame_detection_rate=frames_with_detection / len(frames) if frames else 0.0,
-        total_detections=len(confidences),
-        mean_confidence=_mean_or_none(confidences),
-        median_confidence=statistics.median(confidences) if confidences else None,
-        max_confidence=max(confidences) if confidences else None,
-        mean_inference_ms=mean_inference_ms,
-        throughput_fps=(1000.0 / mean_inference_ms) if mean_inference_ms else None,
-    )
 
 
 def _finite_float(value: Any) -> float | None:
@@ -192,7 +144,7 @@ def _finite_float(value: Any) -> float | None:
     return number if math.isfinite(number) else None
 
 
-def _result_record(result: Any, image_path: Path, annotated_path: Path) -> dict[str, Any]:
+def result_record(result: Any, image_path: Path, annotated_path: Path) -> dict[str, Any]:
     boxes = result.boxes
     xyxy = boxes.xyxy.detach().cpu().tolist() if boxes is not None else []
     confidences = boxes.conf.detach().cpu().tolist() if boxes is not None else []
@@ -227,28 +179,49 @@ def _result_record(result: Any, image_path: Path, annotated_path: Path) -> dict[
     }
 
 
-def _selected_evenly(items: Sequence[Path], limit: int) -> list[Path]:
-    if limit <= 0:
-        return []
-    return uniformly_sample(items, min(limit, len(items)))
+def summarize(frames: Sequence[dict[str, Any]]) -> DetectionMetrics:
+    confidences = [
+        float(detection["confidence"])
+        for frame in frames
+        for detection in frame["detections"]
+    ]
+    inference_times = [
+        float(frame["speed_ms"]["inference"])
+        for frame in frames
+        if frame["speed_ms"].get("inference") is not None
+    ]
+    frames_with_detection = sum(bool(frame["detections"]) for frame in frames)
+    mean_inference_ms = (
+        statistics.fmean(inference_times) if inference_times else None
+    )
+    return DetectionMetrics(
+        images_tested=len(frames),
+        frames_with_detection=frames_with_detection,
+        frame_detection_rate=frames_with_detection / len(frames) if frames else 0.0,
+        total_detections=len(confidences),
+        mean_confidence=statistics.fmean(confidences) if confidences else None,
+        median_confidence=statistics.median(confidences) if confidences else None,
+        max_confidence=max(confidences) if confidences else None,
+        mean_inference_ms=mean_inference_ms,
+        throughput_fps=(1000.0 / mean_inference_ms) if mean_inference_ms else None,
+    )
 
 
 def write_contact_sheet(paths: Sequence[Path], output_path: Path) -> None:
     import cv2
     import numpy as np
 
-    selected = list(paths)
-    if not selected:
+    if not paths:
         return
-    columns = min(4, len(selected))
-    rows = math.ceil(len(selected) / columns)
+    columns = min(4, len(paths))
+    rows = math.ceil(len(paths) / columns)
     tile_width, tile_height, label_height = 320, 240, 28
     sheet = np.full(
         (rows * (tile_height + label_height), columns * tile_width, 3),
         245,
         dtype=np.uint8,
     )
-    for index, path in enumerate(selected):
+    for index, path in enumerate(paths):
         image = cv2.imread(str(path), cv2.IMREAD_COLOR)
         if image is None:
             continue
@@ -275,64 +248,37 @@ def _format_optional(value: float | None, digits: int = 3) -> str:
     return "-" if value is None else f"{value:.{digits}f}"
 
 
-def write_markdown_report(
+def write_report(
     output_path: Path,
     *,
     source: Path,
     model_path: Path,
     conf: float,
-    metrics: Sequence[PromptMetrics],
+    metrics: DetectionMetrics,
 ) -> None:
-    ranked = sorted(
-        metrics,
-        key=lambda item: (
-            item.frame_detection_rate,
-            item.mean_confidence if item.mean_confidence is not None else -1.0,
-        ),
-        reverse=True,
-    )
     lines = [
-        "# YOLOE text-prompt table evaluation",
+        "# YOLOE fixed-prompt table evaluation",
         "",
+        "- Logical target: `table`",
+        f"- Fixed YOLOE text prompt: `{TABLE_PROMPT}`",
         f"- Source: `{source}`",
         f"- Model: `{model_path}`",
         f"- Confidence threshold: `{conf}`",
+        f"- Images tested: `{metrics.images_tested}`",
+        f"- Frames detected: `{metrics.frames_with_detection}`",
+        f"- Frame detection rate: `{metrics.frame_detection_rate:.1%}`",
+        f"- Total detections: `{metrics.total_detections}`",
+        f"- Mean confidence: `{_format_optional(metrics.mean_confidence)}`",
+        f"- Mean inference: `{_format_optional(metrics.mean_inference_ms, 1)} ms`",
         "",
-        "| Prompt | Images | Frames detected | Detection rate | Detections | "
-        "Mean confidence | Mean inference (ms) |",
-        "|---|---:|---:|---:|---:|---:|---:|",
+        "> This dataset has no table ground-truth annotations. Detection rate and "
+        "confidence are screening metrics, not precision, recall, or mAP.",
+        "",
     ]
-    for item in metrics:
-        lines.append(
-            f"| `{item.prompt}` | {item.images_tested} | "
-            f"{item.frames_with_detection} | {item.frame_detection_rate:.1%} | "
-            f"{item.total_detections} | {_format_optional(item.mean_confidence)} | "
-            f"{_format_optional(item.mean_inference_ms, 1)} |"
-        )
-    if ranked:
-        lines.extend(
-            [
-                "",
-                f"Best proxy result: `{ranked[0].prompt}` with "
-                f"{ranked[0].frame_detection_rate:.1%} frame detection rate.",
-            ]
-        )
-    lines.extend(
-        [
-            "",
-            "> This dataset has no table ground-truth annotations. Detection rate and "
-            "confidence are screening metrics, not precision, recall, or mAP. Review "
-            "the contact sheets for false positives and mask quality.",
-            "",
-        ]
-    )
     output_path.write_text("\n".join(lines), encoding="utf-8")
 
 
-def _validate_args(args: argparse.Namespace) -> list[str]:
-    prompts = [prompt.strip() for prompt in args.prompts if prompt.strip()]
-    if not prompts:
-        raise ValueError("at least one non-empty --prompts value is required")
+def validate_args(args: argparse.Namespace) -> None:
     if not 0.0 < args.conf <= 1.0:
         raise ValueError("--conf must be in (0, 1]")
     if not 0.0 < args.iou <= 1.0:
@@ -343,11 +289,10 @@ def _validate_args(args: argparse.Namespace) -> list[str]:
         raise ValueError("--max-images must be non-negative")
     if args.contact_sheet_size < 0:
         raise ValueError("--contact-sheet-size must be non-negative")
-    return prompts
 
 
 def run(args: argparse.Namespace) -> Path:
-    prompts = _validate_args(args)
+    validate_args(args)
     model_path = args.model.expanduser().resolve()
     if not model_path.is_file():
         raise FileNotFoundError(
@@ -361,88 +306,91 @@ def run(args: argparse.Namespace) -> Path:
     all_images = collect_images(source)
     images = uniformly_sample(all_images, args.max_images)
     output_dir = _new_output_dir(args.output)
+    annotated_dir = output_dir / "annotated"
+    annotated_dir.mkdir()
 
     import cv2
     import torch
     from ultralytics import YOLOE
 
     device = args.device or ("0" if torch.cuda.is_available() else "cpu")
-    use_half = not args.no_half and device != "cpu"
+    print(f"Target: table; fixed text prompt: {TABLE_PROMPT}")
     print(f"Source: {source}")
     print(f"Images: {len(images)} selected from {len(all_images)}")
-    print(f"Device: {device}; FP16: {use_half}")
+    print(f"Device: {device}")
     print(f"Output: {output_dir}")
 
     model = YOLOE(str(model_path))
-    all_metrics: list[PromptMetrics] = []
-    for prompt_index, prompt in enumerate(prompts, start=1):
-        prompt_dir = output_dir / f"prompt_{prompt_index:02d}_{_prompt_slug(prompt)}"
-        annotated_dir = prompt_dir / "annotated"
-        annotated_dir.mkdir(parents=True)
-        embeddings = model.get_text_pe([prompt])
-        model.set_classes([prompt], embeddings=embeddings)
-        results: Iterable[Any] = model.predict(
-            source=[str(path) for path in images],
-            stream=True,
-            device=device,
-            imgsz=args.imgsz,
-            conf=args.conf,
-            iou=args.iou,
-            half=use_half,
-            verbose=False,
+    embeddings = model.get_text_pe([TABLE_PROMPT])
+    model.set_classes([TABLE_PROMPT], embeddings=embeddings)
+    results: Iterable[Any] = model.predict(
+        source=[str(path) for path in images],
+        stream=True,
+        device=device,
+        imgsz=args.imgsz,
+        conf=args.conf,
+        iou=args.iou,
+        verbose=False,
+    )
+
+    frames: list[dict[str, Any]] = []
+    annotated_paths: list[Path] = []
+    for image_index, (image_path, result) in enumerate(zip(images, results)):
+        annotated_path = annotated_dir / (
+            f"{image_index:04d}_{image_path.stem}_annotated.jpg"
         )
-        frame_records: list[dict[str, Any]] = []
-        annotated_paths: list[Path] = []
-        for image_index, (image_path, result) in enumerate(zip(images, results)):
-            annotated_path = annotated_dir / (
-                f"{image_index:04d}_{image_path.stem}_annotated.jpg"
-            )
-            if not cv2.imwrite(str(annotated_path), result.plot()):
-                raise OSError(f"failed to write annotated image: {annotated_path}")
-            annotated_paths.append(annotated_path)
-            frame_records.append(_result_record(result, image_path, annotated_path))
-        if len(frame_records) != len(images):
-            raise RuntimeError(
-                f"YOLOE returned {len(frame_records)} results for {len(images)} images"
-            )
-        metrics = summarize_prompt(prompt, frame_records)
-        all_metrics.append(metrics)
-        prompt_run = {"metrics": asdict(metrics), "frames": frame_records}
-        (prompt_dir / "detections.json").write_text(
-            json.dumps(prompt_run, ensure_ascii=False, indent=2), encoding="utf-8"
-        )
-        sheet_paths = _selected_evenly(annotated_paths, args.contact_sheet_size)
-        if sheet_paths:
-            write_contact_sheet(sheet_paths, prompt_dir / "contact_sheet.jpg")
-        print(
-            f"[{prompt}] {metrics.frames_with_detection}/{metrics.images_tested} "
-            f"frames ({metrics.frame_detection_rate:.1%}), "
-            f"{metrics.total_detections} detections, "
-            f"mean conf={_format_optional(metrics.mean_confidence)}"
+        if not cv2.imwrite(str(annotated_path), result.plot()):
+            raise OSError(f"failed to write annotated image: {annotated_path}")
+        annotated_paths.append(annotated_path)
+        frames.append(result_record(result, image_path, annotated_path))
+    if len(frames) != len(images):
+        raise RuntimeError(
+            f"YOLOE returned {len(frames)} results for {len(images)} images"
         )
 
+    metrics = summarize(frames)
+    detections = {
+        "logical_target": "table",
+        "text_prompt": TABLE_PROMPT,
+        "metrics": asdict(metrics),
+        "frames": frames,
+    }
+    (output_dir / "detections.json").write_text(
+        json.dumps(detections, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
     summary = {
+        "logical_target": "table",
+        "text_prompt": TABLE_PROMPT,
         "source": str(source),
         "model": str(model_path),
         "device": str(device),
-        "half": use_half,
         "imgsz": args.imgsz,
         "confidence_threshold": args.conf,
         "iou_threshold": args.iou,
         "available_images": len(all_images),
         "sampled_images": [str(path) for path in images],
-        "metrics": [asdict(item) for item in all_metrics],
+        "metrics": asdict(metrics),
         "ground_truth_available": False,
     }
     (output_dir / "summary.json").write_text(
         json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8"
     )
-    write_markdown_report(
+    if args.contact_sheet_size:
+        sheet_paths = uniformly_sample(
+            annotated_paths, min(args.contact_sheet_size, len(annotated_paths))
+        )
+        write_contact_sheet(sheet_paths, output_dir / "contact_sheet.jpg")
+    write_report(
         output_dir / "report.md",
         source=source,
         model_path=model_path,
         conf=args.conf,
-        metrics=all_metrics,
+        metrics=metrics,
+    )
+    print(
+        f"Detected {metrics.frames_with_detection}/{metrics.images_tested} frames "
+        f"({metrics.frame_detection_rate:.1%}), "
+        f"mean confidence={_format_optional(metrics.mean_confidence)}"
     )
     return output_dir
 

@@ -184,50 +184,30 @@ def test_distance_handoff_is_terminal_only_until_head_initializes() -> None:
     assert (head_text.live_stream, head_text.stage) == (HEAD, "origin_text")
 
 
-@pytest.mark.parametrize(
-    ("stream_name", "expected_calls", "expected_table_bboxes"),
-    (
-        (CHEST, 1, ()),
-        (HEAD, 2, ((50.0, 300.0, 950.0, 900.0),)),
-    ),
-)
-def test_initial_reference_table_requirement_depends_on_camera(
+@pytest.mark.parametrize("stream_name", (CHEST, HEAD))
+def test_initial_reference_grounds_only_target_and_uses_text_desk(
     tmp_path: Path,
     stream_name: str,
-    expected_calls: int,
-    expected_table_bboxes: tuple[tuple[float, float, float, float], ...],
 ) -> None:
-    class TargetAndTableClient:
+    class TargetClient:
         def __init__(self) -> None:
             self.calls = 0
 
         def run(self, *, schema, **_kwargs):
             self.calls += 1
-            if "primary_target" in schema["properties"]:
-                return {
-                    "status": "READY",
-                    "primary_target": {
-                        "text_prompt": "blue basket",
-                        "bbox_2d": [100.0, 100.0, 400.0, 600.0],
-                    },
-                    "manipulation_anchor": "basket center",
-                    "selection_reason": "stable task target",
-                    "confidence": 0.9,
-                    "limitations": "",
-                }
             return {
                 "status": "READY",
-                "target": "desk",
-                "boxes": [
-                    {
-                        "bbox_2d": [50.0, 300.0, 950.0, 900.0],
-                        "confidence": 0.9,
-                    }
-                ],
+                "primary_target": {
+                    "text_prompt": "blue basket",
+                    "bbox_2d": [100.0, 100.0, 400.0, 600.0],
+                },
+                "manipulation_anchor": "basket center",
+                "selection_reason": "stable task target",
+                "confidence": 0.9,
                 "limitations": "",
             }
 
-    client = TargetAndTableClient()
+    client = TargetClient()
     config = BasePoseAgentConfig(task="approach the blue basket")
     reference = _ground_camera_reference(
         config,
@@ -246,12 +226,10 @@ def test_initial_reference_table_requirement_depends_on_camera(
         client_factory=lambda: client,
     )
 
-    assert client.calls == expected_calls
+    assert client.calls == 1
     assert reference.stream_name == stream_name
-    assert reference.table_bboxes == expected_table_bboxes
-    assert (tmp_path / stream_name / "table_prompt.txt").exists() == (
-        stream_name == HEAD
-    )
+    assert reference.table_bboxes == ()
+    assert not (tmp_path / stream_name / "table_prompt.txt").exists()
 
 
 def test_head_monitor_without_table_requires_zero_hold_before_qwen() -> None:
@@ -287,10 +265,10 @@ def test_head_monitor_reuses_initialized_dynamic_target_prompt() -> None:
 
     class Tracker:
         def __init__(self) -> None:
-            self.prompts: list[tuple[str, str]] = []
+            self.prompts: list[str] = []
 
-        def start_all_text(self, *, target_prompt: str, surface_prompt: str):
-            self.prompts.append((target_prompt, surface_prompt))
+        def start_all_text(self, *, target_prompt: str):
+            self.prompts.append(target_prompt)
 
         def track(self, _rgb):
             return [target, desk]
@@ -305,7 +283,7 @@ def test_head_monitor_reuses_initialized_dynamic_target_prompt() -> None:
     first = monitor.inspect(_worker_snapshot(HEAD, 1))
     second = monitor.inspect(_worker_snapshot(HEAD, 2))
 
-    assert tracker.prompts == [("red tote returned by qwen", "desk")]
+    assert tracker.prompts == ["red tote returned by qwen"]
     assert not first.triggered
     assert second.triggered
     assert second.reference is not None
@@ -637,7 +615,7 @@ def _qwen_reference(
 
 def test_dual_worker_exhausts_the_agent_near_failover_sequence(tmp_path: Path) -> None:
     class MissingTracker:
-        def start(self, _rgb, **_kwargs):
+        def start_target(self, _rgb, **_kwargs):
             return {}
 
         def start_text(self, _rgb, **_kwargs):
@@ -820,7 +798,7 @@ def test_chest_distance_handoff_qwen_failure_does_not_return_to_chest(
             self.start_calls = 0
             self.track_calls = 0
 
-        def start(self, _rgb, **_kwargs):
+        def start_target(self, _rgb, **_kwargs):
             self.start_calls += 1
             return {}
 
@@ -1005,7 +983,7 @@ def test_head_monitor_tenth_frame_wins_over_same_frame_chest_distance(
     )
 
     class Tracker:
-        def start(self, _rgb, **_kwargs):
+        def start_target(self, _rgb, **_kwargs):
             return {}
 
         def track(self, _rgb):

@@ -52,7 +52,6 @@ from gear_sonic.utils.inference.base_pose_visual_servo_diagnostics import (
 
 
 DEFAULT_DUAL_QWEN_FALLBACK_MODEL = "qwen3-vl-8b-instruct"
-DUAL_TEXT_SURFACE_PROMPT = "desk"
 CHEST_HANDOFF_REQUIRED_FRAMES = 3
 CHEST_HANDOFF_QWEN_STAGE = "chest_distance_qwen"
 CHEST_HANDOFF_FAILURE_REASON = "head_target_not_found_after_chest_handoff"
@@ -79,7 +78,7 @@ def _reference_bbox(
 
 @dataclass(frozen=True)
 class DualCameraReference:
-    """One coherent target prompt with optional desk boxes from the same frame."""
+    """One coherent target reference; BasePose detects desks from fixed text."""
 
     stream_name: str
     rgb: np.ndarray
@@ -423,23 +422,19 @@ def _ground_camera_reference(
     _save_png(rgb_path, snapshot.rgb, rgb=True)
     assert snapshot.depth_raw is not None
     _save_png(stream_dir / "initial_depth_raw.png", snapshot.depth_raw)
-    chest_stream = str(
-        getattr(config, "dual_chest_camera_stream", "chest_view")
-    )
-    spec, table_bboxes = ground_raw_servo_references(
+    spec = ground_raw_servo_references(
         config,
         rgb_path,
         stream_dir,
         client_factory=client_factory,
         calibration=calibration,
-        require_table=stream_name != chest_stream,
     )
     return DualCameraReference(
         stream_name=stream_name,
         rgb=snapshot.rgb,
         target_prompt=spec.target_prompt,
         target_bbox=spec.target_bbox,
-        table_bboxes=table_bboxes,
+        table_bboxes=(),
         camera_timestamp=snapshot.timestamp,
         kind="initial",
     )
@@ -718,23 +713,19 @@ def ground_qwen_fallback_reference(
         qwenvl_thinking_budget=config.qwenvl_thinking_budget,
         qwenvl_timeout_seconds=config.qwenvl_timeout_seconds,
     )
-    chest_stream = str(
-        getattr(config, "dual_chest_camera_stream", "chest_view")
-    )
-    spec, table_bboxes = ground_raw_servo_references(
+    spec = ground_raw_servo_references(
         qwen_config,
         rgb_path,
         workdir,
         client_factory=client_factory,
         calibration=calibration,
-        require_table=stream_name != chest_stream,
     )
     reference = DualCameraReference(
         stream_name=stream_name,
         rgb=snapshot.rgb,
         target_prompt=spec.target_prompt,
         target_bbox=spec.target_bbox,
-        table_bboxes=table_bboxes,
+        table_bboxes=(),
         camera_timestamp=snapshot.timestamp,
         kind="qwen",
     )
@@ -1212,7 +1203,6 @@ class HeadCameraTextMonitor:
         self.target_streak = 0
         self.tracker.start_all_text(
             target_prompt=self.target_prompt,
-            surface_prompt=DUAL_TEXT_SURFACE_PROMPT,
         )
 
     def note_missing_frame(self) -> None:
@@ -1234,43 +1224,34 @@ class HeadCameraTextMonitor:
             return HeadCameraMonitorResult(streak, False, None, target, surface)
 
         self.target_streak = 0
-        reference = None
-        if surface is not None:
-            height, width = snapshot.rgb.shape[:2]
-            reference = DualCameraReference(
-                stream_name=snapshot.depth_aligned_to,
-                rgb=snapshot.rgb,
-                target_prompt=self.target_prompt,
-                target_bbox=_pixel_bbox_to_normalized(
-                    target.bbox_xyxy, width=width, height=height
-                ),
-                table_bboxes=(
-                    _pixel_bbox_to_normalized(
-                        surface.bbox_xyxy, width=width, height=height
-                    ),
-                ),
-                camera_timestamp=snapshot.timestamp,
-                kind="head_monitor",
-            )
+        height, width = snapshot.rgb.shape[:2]
+        reference = DualCameraReference(
+            stream_name=snapshot.depth_aligned_to,
+            rgb=snapshot.rgb,
+            target_prompt=self.target_prompt,
+            target_bbox=_pixel_bbox_to_normalized(
+                target.bbox_xyxy, width=width, height=height
+            ),
+            table_bboxes=(),
+            camera_timestamp=snapshot.timestamp,
+            kind="head_monitor",
+        )
         return HeadCameraMonitorResult(streak, True, reference, target, surface)
 
 
 def _attempt_prompt_mode(attempt: DualCameraAttempt) -> str:
     if _attempt_uses_all_text(attempt):
         return "target_text_surface_text"
-    if _attempt_uses_target_text(attempt):
-        return "target_text_surface_visual"
-    if _attempt_uses_surface_text(attempt):
-        return "target_visual_surface_text"
-    return "visual"
+    return "target_visual_surface_text"
 
 
 def _attempt_uses_target_text(attempt: DualCameraAttempt) -> bool:
     return attempt.stage in {"origin_text", "alternate_text"}
 
 
-def _attempt_uses_surface_text(attempt: DualCameraAttempt) -> bool:
-    return attempt.stage == "alternate_text" or not attempt.reference.table_bboxes
+def _attempt_uses_surface_text(_attempt: DualCameraAttempt) -> bool:
+    """The BasePose surface class is always the fixed ``desk`` text prompt."""
+    return True
 
 
 def _attempt_uses_all_text(attempt: DualCameraAttempt) -> bool:
@@ -1544,24 +1525,6 @@ def run_dual_raw_servo_worker(
                 if reference_updater is None:
                     if latest_reference_updater_factory is not None:
                         reference_updater = latest_reference_updater_factory()
-                    elif (
-                        tracker_factory is None
-                        and config.raw_reference_update_interval_frames > 0
-                    ):
-                        reference_updater = AsyncDualReferenceUpdater(
-                            lambda: YoloeDualReferenceEncoder(
-                                config.raw_yoloe_model_path,
-                                confidence=config.raw_yoloe_confidence,
-                                imgsz=config.raw_yoloe_imgsz,
-                                device=config.raw_yoloe_device,
-                            ),
-                            min_confidence=(
-                                config.raw_reference_update_min_confidence
-                            ),
-                            min_iou=getattr(
-                                config, "raw_reference_update_min_iou", 0.5
-                            ),
-                        )
                 attempt = coordinator.start()
                 frame_index = -1
                 next_frame_at = time.monotonic()
@@ -1620,30 +1583,12 @@ def run_dual_raw_servo_worker(
                         if _attempt_uses_all_text(attempt):
                             tracker.start_all_text(
                                 target_prompt=attempt.reference.target_prompt,
-                                surface_prompt=DUAL_TEXT_SURFACE_PROMPT,
                             )
-                        elif _attempt_uses_target_text(attempt):
-                            tracker.start_text(
-                                attempt.reference.rgb,
-                                target_prompt=attempt.reference.target_prompt,
-                                target_bbox=attempt.reference.target_bbox,
-                                surface_prompt=DUAL_TEXT_SURFACE_PROMPT,
-                                surface_bboxes=attempt.reference.table_bboxes,
-                            )
-                        elif not attempt.reference.table_bboxes:
+                        else:
                             tracker.start_target(
                                 attempt.reference.rgb,
                                 target_prompt=attempt.reference.target_prompt,
                                 target_bbox=attempt.reference.target_bbox,
-                                surface_prompt=DUAL_TEXT_SURFACE_PROMPT,
-                            )
-                        else:
-                            tracker.start(
-                                attempt.reference.rgb,
-                                target_prompt=attempt.reference.target_prompt,
-                                target_bbox=attempt.reference.target_bbox,
-                                surface_prompt=DUAL_TEXT_SURFACE_PROMPT,
-                                surface_bboxes=attempt.reference.table_bboxes,
                             )
                         if attempt.live_stream == stream_names[1]:
                             if head_monitor_tracker is None:

@@ -19,6 +19,51 @@ from gear_sonic.utils.inference.base_pose_visual_servo import (
 )
 
 
+def test_yoloe_tracker_always_uses_desk_for_surface_text() -> None:
+    class Embedding:
+        ndim = 3
+
+        def __init__(self, class_count: int) -> None:
+            self.shape = (1, class_count, 8)
+
+        def __getitem__(self, key):
+            class_slice = key[1]
+            start, stop, step = class_slice.indices(self.shape[1])
+            return Embedding(len(range(start, stop, step)))
+
+        def detach(self):
+            return self
+
+        def clone(self):
+            return self
+
+    class Model:
+        predictor = object()
+
+        def __init__(self) -> None:
+            self.requested_texts: list[str] = []
+            self.classes: list[str] = []
+
+        def get_text_pe(self, texts):
+            self.requested_texts = list(texts)
+            return Embedding(len(texts))
+
+        def set_classes(self, classes, *, embeddings):
+            self.classes = list(classes)
+
+    tracker = object.__new__(raw_servo.YoloePersistentTracker)
+    tracker.model = Model()
+    tracker.class_names = None
+    tracker._initial_surface_embedding = None
+
+    artifact = tracker.start_all_text(target_prompt="blue basket")
+
+    assert tracker.model.requested_texts == ["blue basket", "desk"]
+    assert tracker.model.classes == ["blue basket", "desk"]
+    assert tracker.class_names == ("blue basket", "desk")
+    assert artifact["prompt_mode"] == "target_text_surface_text"
+
+
 def _observation(
     *,
     bbox: tuple[float, float, float, float],
