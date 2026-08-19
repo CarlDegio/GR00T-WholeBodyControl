@@ -13,6 +13,7 @@ from gear_sonic.camera.calibration import DEFAULT_CAMERA_INTRINSICS_PATH
 @dataclass
 class BasePoseAgentConfig:
     task: str
+    target_prompt: str = "bluebasket"
     surface_prompt: str = "desk"
     mode: Literal[
         "raw_yoloe_servo",
@@ -93,6 +94,9 @@ class BasePoseAgentConfig:
     raw_allow_missing_table: Literal[0, 1] = 0
 
     def __post_init__(self) -> None:
+        self.target_prompt = str(self.target_prompt).strip()
+        if not self.target_prompt:
+            raise ValueError("target_prompt must be non-empty")
         self.surface_prompt = str(self.surface_prompt).strip()
         if not self.surface_prompt:
             raise ValueError("surface_prompt must be non-empty")

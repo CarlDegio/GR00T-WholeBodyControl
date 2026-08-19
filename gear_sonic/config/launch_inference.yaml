@@ -192,6 +192,7 @@ launch_inference:
   base_pose_enabled: true
   base_pose_task: >-
     align to the blue basket
+  base_pose_target_prompt: bluebasket
   base_pose_surface_prompt: desk
   base_pose_mode: dual_raw_yoloe_servo
   base_pose_qwenvl_model: qwen3-vl-plus

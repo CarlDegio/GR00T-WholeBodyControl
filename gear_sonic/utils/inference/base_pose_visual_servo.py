@@ -8,6 +8,7 @@ servo using persistent YOLOE track IDs and aligned RealSense depth.
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from enum import Enum
 from pathlib import Path
@@ -16,6 +17,7 @@ import math
 import os
 import queue
 import re
+import tempfile
 import threading
 import time
 from typing import Any, Callable, Mapping, Sequence
@@ -35,7 +37,6 @@ from gear_sonic.utils.inference.base_pose import (
     QwenVLStructuredVisionClient,
     _atomic_write_bytes,
     _write_json,
-    _write_text,
 )
 from gear_sonic.utils.inference.base_pose_visual_servo_diagnostics import (
     AsyncFrameDiagnosticsWriter,
@@ -661,8 +662,25 @@ class YoloePersistentTracker:
         # Move weights to CUDA now, but do not create a predictor or run a
         # forward pass until BasePose owns the planner control state.
         self.model.to(resident_device)
+        self._torch = torch
+        self._resident_device = resident_device
+        with torch.cuda.device(resident_device):
+            self._inference_stream = torch.cuda.Stream()
+        self._inference_stream.wait_stream(
+            torch.cuda.current_stream(device=resident_device)
+        )
         self.class_names: tuple[str, str] | None = None
         self._initial_surface_embedding: Any | None = None
+
+    def _model_updated(self) -> None:
+        """Make this tracker's CUDA stream wait for prompt/model updates."""
+
+        stream = getattr(self, "_inference_stream", None)
+        if stream is None:
+            return
+        stream.wait_stream(
+            self._torch.cuda.current_stream(device=self._resident_device)
+        )
 
     def start_all_text(
         self,
@@ -683,6 +701,7 @@ class YoloePersistentTracker:
         self._initial_surface_embedding = embeddings[:, 1:2].detach().clone()
         self.model.set_classes(list(self.class_names), embeddings=embeddings)
         self.model.predictor = None
+        self._model_updated()
         return {
             "class_names": list(self.class_names),
             "prompt_mode": "target_text_surface_text",
@@ -768,6 +787,7 @@ class YoloePersistentTracker:
         self._initial_surface_embedding = surface_embedding.detach().clone()
         self.model.set_classes(list(self.class_names), embeddings=embeddings)
         self.model.predictor = None
+        self._model_updated()
         return {
             "class_names": list(self.class_names),
             "prompt_mode": "target_visual_surface_text",
@@ -870,6 +890,7 @@ class YoloePersistentTracker:
         # between operator requests.
         self.model.set_classes(list(self.class_names), embeddings=embeddings)
         self.model.predictor = None
+        self._model_updated()
         return {
             "class_names": list(self.class_names),
             "reference_boxes_xyxy": prompt_boxes.tolist(),
@@ -900,6 +921,7 @@ class YoloePersistentTracker:
             )
         hybrid = torch.cat((target, surface), dim=1)
         self.model.set_classes(list(self.class_names), embeddings=hybrid)
+        self._model_updated()
 
     def install_surface_embedding(self, embedding: Any) -> None:
         """Atomically replace surface PE while retaining target PE and tracker state."""
@@ -927,6 +949,7 @@ class YoloePersistentTracker:
         self._initial_surface_embedding = surface.detach().clone()
         hybrid = torch.cat((target, surface), dim=1)
         self.model.set_classes(list(self.class_names), embeddings=hybrid)
+        self._model_updated()
 
     def install_reference_embeddings(
         self,
@@ -967,10 +990,23 @@ class YoloePersistentTracker:
         self._initial_surface_embedding = surface.detach().clone()
         hybrid = torch.cat((target, surface), dim=1)
         self.model.set_classes(list(self.class_names), embeddings=hybrid)
+        self._model_updated()
 
     def track(self, rgb: np.ndarray) -> list[TrackedInstance]:
         if self.class_names is None:
             raise RuntimeError("YOLOE classes have not been initialized")
+        try:
+            with self._torch.cuda.stream(self._inference_stream):
+                instances = self._track_on_current_cuda_stream(rgb)
+        finally:
+            # Returned masks and metadata are CPU-owned. Synchronizing also
+            # makes prompt refreshes safe as soon as this method returns.
+            self._inference_stream.synchronize()
+        return instances
+
+    def _track_on_current_cuda_stream(
+        self, rgb: np.ndarray
+    ) -> list[TrackedInstance]:
         from ultralytics.utils import ops
 
         bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
@@ -2811,6 +2847,20 @@ def _save_png(path: Path, image: np.ndarray, *, rgb: bool = False) -> None:
     _atomic_write_bytes(path, encoded.tobytes())
 
 
+@contextmanager
+def _temporary_png(image: np.ndarray, *, rgb: bool = False):
+    """Expose an image to a path-only model client without retaining it."""
+
+    descriptor, raw_path = tempfile.mkstemp(prefix="base_pose_", suffix=".png")
+    os.close(descriptor)
+    path = Path(raw_path)
+    try:
+        _save_png(path, image, rgb=rgb)
+        yield path
+    finally:
+        path.unlink(missing_ok=True)
+
+
 def _client_from_config(config: Any) -> Any:
     """Build the sole BasePose grounding backend: Qwen-VL."""
 
@@ -2861,7 +2911,7 @@ def ground_raw_servo_references(
         config.task,
         calibration if calibration is not None else calibration_from_config(config),
     )
-    _write_text(workdir / "target_prompt.txt", target_prompt)
+    _write_json(workdir / "target_prompt.json", {"prompt": target_prompt})
 
     def make_client() -> Any:
         if client_factory is not None:
@@ -2944,12 +2994,14 @@ def _observation(
     target: TrackedInstance,
     surface: TrackedInstance | None,
     calibration: RawServoCalibration,
+    *,
+    include_table_geometry: bool = True,
 ) -> RawServoObservation:
     table = None
     table_error = None
     desk_mask = None
     table_rgb_edges = None
-    if surface is not None:
+    if surface is not None and include_table_geometry:
         table, table_error, desk_mask, table_rgb_edges = (
             _surface_geometry_components(
                 snapshot,
@@ -3158,16 +3210,14 @@ def run_raw_servo_worker(
                     / f"raw_yoloe_{stamp}_g{generation}"
                 )
                 output_dir.mkdir(parents=True, exist_ok=False)
-                rgb_path = output_dir / "initial_rgb.png"
-                _save_png(rgb_path, snapshot.rgb, rgb=True)
                 assert snapshot.depth_raw is not None
-                _save_png(output_dir / "initial_depth_raw.png", snapshot.depth_raw)
-                spec = ground_raw_servo_references(
-                    config,
-                    rgb_path,
-                    output_dir,
-                    client_factory=client_factory,
-                )
+                with _temporary_png(snapshot.rgb, rgb=True) as rgb_path:
+                    spec = ground_raw_servo_references(
+                        config,
+                        rgb_path,
+                        output_dir,
+                        client_factory=client_factory,
+                    )
                 if not gate.is_active(generation):
                     continue
                 if reference_updater is None:
@@ -3853,7 +3903,7 @@ class RawServoRuntime:
         details: Mapping[str, Any],
         observation: RawServoObservation,
     ) -> bool:
-        """Whether this event combines chest x/y with live head desk yaw."""
+        """Whether chest x/y uses live or briefly propagated head desk yaw."""
 
         if self.config.mode != "dual_raw_yoloe_servo":
             return False
@@ -3874,12 +3924,21 @@ class RawServoRuntime:
             and bool(yaw_source.get("valid", False))
             else None
         )
-        return (
+        live_joint_observation = (
             target_stream == chest_stream
             and yaw_stream == head_stream
             and observation.table is not None
             and observation.table_camera_stream == head_stream
         )
+        head_yaw_loss = details.get("head_yaw_loss")
+        propagated_joint_observation = (
+            target_stream == chest_stream
+            and isinstance(yaw_source, Mapping)
+            and self._event_camera_stream(yaw_source) == head_stream
+            and isinstance(head_yaw_loss, Mapping)
+            and head_yaw_loss.get("stage") == "grace"
+        )
+        return live_joint_observation or propagated_joint_observation
 
     def _target_distance_for_stream(self, stream: str | None) -> float:
         chest_stream = str(
@@ -3962,6 +4021,33 @@ class RawServoRuntime:
                 "[RawServo] RESUME chest approach after "
                 f"{missing_frames} consecutive head-target misses"
             )
+        return command
+
+    def _apply_head_yaw_loss_hold(
+        self,
+        command: ServoCommand,
+        details: Mapping[str, Any],
+    ) -> ServoCommand:
+        """Hold zero during the second ten-frame head-yaw loss window."""
+
+        if self.config.mode != "dual_raw_yoloe_servo":
+            return command
+        chest_stream = str(
+            getattr(self.config, "dual_chest_camera_stream", "chest_view")
+        )
+        target_stream = (
+            self._event_control_source_stream(details)
+            or self.control_source_stream
+        )
+        head_yaw_loss = details.get("head_yaw_loss")
+        if (
+            target_stream != chest_stream
+            or not isinstance(head_yaw_loss, Mapping)
+            or head_yaw_loss.get("stage") not in {"zero_hold", "switch_state"}
+        ):
+            return command
+        command = self._zero()
+        self.controller.current = command
         return command
 
     def _reset_controller(self, now: float) -> None:
@@ -4690,6 +4776,7 @@ class RawServoRuntime:
             self._discard_event_diagnostic(event)
             return False
         command = self._apply_head_monitor_hold(command, details)
+        command = self._apply_head_yaw_loss_hold(command, details)
         if (
             previous_phase is ServoPhase.VERTICAL_RECENTER
             and self.controller.phase is not ServoPhase.VERTICAL_RECENTER

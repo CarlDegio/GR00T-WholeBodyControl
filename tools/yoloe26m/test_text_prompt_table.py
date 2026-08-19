@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Detect tables with the fixed YOLOE text prompt ``desk``.
+"""Evaluate a YOLOE text prompt on collected RGB images.
 
 With no --source, the script tests the newest collected BasePose RGB samples.
 """
@@ -9,6 +9,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import re
 import statistics
 import sys
 from dataclasses import asdict, dataclass
@@ -21,7 +22,8 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 REPO_ROOT = SCRIPT_DIR.parents[1]
 DEFAULT_MODEL = SCRIPT_DIR / "weights" / "yoloe-26m-seg.pt"
 DEFAULT_OUTPUT_ROOT = SCRIPT_DIR / "outputs"
-TABLE_PROMPT = "desk"
+DEFAULT_TEXT_PROMPT = "desk"
+DEFAULT_LOGICAL_TARGET = "table"
 IMAGE_SUFFIXES = {".bmp", ".jpeg", ".jpg", ".png", ".tif", ".tiff", ".webp"}
 
 
@@ -40,7 +42,7 @@ class DetectionMetrics:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Detect tables with YOLOE using the fixed text prompt 'desk'."
+        description="Evaluate a YOLOE text prompt on RGB images."
     )
     parser.add_argument(
         "--source",
@@ -51,6 +53,16 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument("--model", type=Path, default=DEFAULT_MODEL)
+    parser.add_argument(
+        "--prompt",
+        default=DEFAULT_TEXT_PROMPT,
+        help=f"Exact YOLOE text prompt (default: {DEFAULT_TEXT_PROMPT!r}).",
+    )
+    parser.add_argument(
+        "--logical-target",
+        default=DEFAULT_LOGICAL_TARGET,
+        help=f"Human-readable target name for reports (default: {DEFAULT_LOGICAL_TARGET!r}).",
+    )
     parser.add_argument(
         "--output",
         type=Path,
@@ -78,13 +90,14 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def _new_output_dir(requested: Path | None) -> Path:
+def _new_output_dir(requested: Path | None, prompt: str) -> Path:
     if requested is not None:
         path = requested.expanduser().resolve()
         path.mkdir(parents=True, exist_ok=False)
         return path
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-    path = DEFAULT_OUTPUT_ROOT / f"text_prompt_desk_{timestamp}"
+    prompt_slug = re.sub(r"[^a-zA-Z0-9]+", "_", prompt).strip("_").lower()
+    path = DEFAULT_OUTPUT_ROOT / f"text_prompt_{prompt_slug or 'unnamed'}_{timestamp}"
     path.mkdir(parents=True, exist_ok=False)
     return path.resolve()
 
@@ -255,12 +268,14 @@ def write_report(
     model_path: Path,
     conf: float,
     metrics: DetectionMetrics,
+    logical_target: str,
+    text_prompt: str,
 ) -> None:
     lines = [
-        "# YOLOE fixed-prompt table evaluation",
+        "# YOLOE text-prompt evaluation",
         "",
-        "- Logical target: `table`",
-        f"- Fixed YOLOE text prompt: `{TABLE_PROMPT}`",
+        f"- Logical target: `{logical_target}`",
+        f"- Exact YOLOE text prompt: `{text_prompt}`",
         f"- Source: `{source}`",
         f"- Model: `{model_path}`",
         f"- Confidence threshold: `{conf}`",
@@ -271,7 +286,7 @@ def write_report(
         f"- Mean confidence: `{_format_optional(metrics.mean_confidence)}`",
         f"- Mean inference: `{_format_optional(metrics.mean_inference_ms, 1)} ms`",
         "",
-        "> This dataset has no table ground-truth annotations. Detection rate and "
+        "> This dataset has no ground-truth annotations. Detection rate and "
         "confidence are screening metrics, not precision, recall, or mAP.",
         "",
     ]
@@ -289,10 +304,16 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--max-images must be non-negative")
     if args.contact_sheet_size < 0:
         raise ValueError("--contact-sheet-size must be non-negative")
+    if not args.prompt.strip():
+        raise ValueError("--prompt must not be empty")
+    if not args.logical_target.strip():
+        raise ValueError("--logical-target must not be empty")
 
 
 def run(args: argparse.Namespace) -> Path:
     validate_args(args)
+    text_prompt = args.prompt.strip()
+    logical_target = args.logical_target.strip()
     model_path = args.model.expanduser().resolve()
     if not model_path.is_file():
         raise FileNotFoundError(
@@ -305,7 +326,7 @@ def run(args: argparse.Namespace) -> Path:
     )
     all_images = collect_images(source)
     images = uniformly_sample(all_images, args.max_images)
-    output_dir = _new_output_dir(args.output)
+    output_dir = _new_output_dir(args.output, text_prompt)
     annotated_dir = output_dir / "annotated"
     annotated_dir.mkdir()
 
@@ -314,15 +335,15 @@ def run(args: argparse.Namespace) -> Path:
     from ultralytics import YOLOE
 
     device = args.device or ("0" if torch.cuda.is_available() else "cpu")
-    print(f"Target: table; fixed text prompt: {TABLE_PROMPT}")
+    print(f"Target: {logical_target}; exact text prompt: {text_prompt}")
     print(f"Source: {source}")
     print(f"Images: {len(images)} selected from {len(all_images)}")
     print(f"Device: {device}")
     print(f"Output: {output_dir}")
 
     model = YOLOE(str(model_path))
-    embeddings = model.get_text_pe([TABLE_PROMPT])
-    model.set_classes([TABLE_PROMPT], embeddings=embeddings)
+    embeddings = model.get_text_pe([text_prompt])
+    model.set_classes([text_prompt], embeddings=embeddings)
     results: Iterable[Any] = model.predict(
         source=[str(path) for path in images],
         stream=True,
@@ -350,8 +371,8 @@ def run(args: argparse.Namespace) -> Path:
 
     metrics = summarize(frames)
     detections = {
-        "logical_target": "table",
-        "text_prompt": TABLE_PROMPT,
+        "logical_target": logical_target,
+        "text_prompt": text_prompt,
         "metrics": asdict(metrics),
         "frames": frames,
     }
@@ -359,8 +380,8 @@ def run(args: argparse.Namespace) -> Path:
         json.dumps(detections, ensure_ascii=False, indent=2), encoding="utf-8"
     )
     summary = {
-        "logical_target": "table",
-        "text_prompt": TABLE_PROMPT,
+        "logical_target": logical_target,
+        "text_prompt": text_prompt,
         "source": str(source),
         "model": str(model_path),
         "device": str(device),
@@ -386,6 +407,8 @@ def run(args: argparse.Namespace) -> Path:
         model_path=model_path,
         conf=args.conf,
         metrics=metrics,
+        logical_target=logical_target,
+        text_prompt=text_prompt,
     )
     print(
         f"Detected {metrics.frames_with_detection}/{metrics.images_tested} frames "

@@ -231,6 +231,9 @@ class InferenceLaunchConfig:
     base_pose_task: str = ""
     """Fixed manipulation task used whenever B starts Base-Pose alignment."""
 
+    base_pose_target_prompt: str = "bluebasket"
+    """Exact YOLOE text prompt for the Base-Pose target."""
+
     base_pose_surface_prompt: str = "desk"
     """YOLOE text prompt for the Base-Pose support surface."""
 
@@ -701,6 +704,7 @@ def build_base_pose_agent_command(
         f"--camera-lateral-offset-m {config.base_pose_camera_lateral_offset_m} "
         f"{dual}"
         f"--raw-yoloe-model-path {shlex.quote(config.base_pose_yoloe_model_path)} "
+        f"--target-prompt {shlex.quote(config.base_pose_target_prompt)} "
         f"--surface-prompt {shlex.quote(config.base_pose_surface_prompt)} "
         f"--raw-yoloe-device {shlex.quote(config.base_pose_yoloe_device)} "
         f"--raw-yoloe-confidence {config.base_pose_yoloe_confidence} "
@@ -1174,6 +1178,10 @@ def _check_prerequisites(config: InferenceLaunchConfig):
     if config.base_pose_enabled:
         if not config.base_pose_task.strip():
             errors.append("--base-pose-task is required when Base-Pose is enabled")
+        if not config.base_pose_target_prompt.strip():
+            errors.append(
+                "--base-pose-target-prompt is required when Base-Pose is enabled"
+            )
         if not config.base_pose_surface_prompt.strip():
             errors.append(
                 "--base-pose-surface-prompt is required when Base-Pose is enabled"

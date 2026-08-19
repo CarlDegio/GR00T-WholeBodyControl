@@ -10,6 +10,8 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 
+import gear_sonic.utils.inference.base_pose_dual_visual_servo as dual_servo
+import gear_sonic.utils.inference.base_pose_visual_servo as visual_servo
 from gear_sonic.runtime.client import SensorGatewayClientError
 from gear_sonic.runtime.snapshot import TimestampBasis
 from gear_sonic.scripts.base_pose_agent import BasePoseAgentConfig
@@ -72,6 +74,7 @@ def test_dual_mode_is_the_agent_near_aligned_default() -> None:
     assert not hasattr(config, "codex_timeout_seconds")
     assert config.qwenvl_model == "qwen3-vl-plus"
     assert config.qwenvl_timeout_seconds == pytest.approx(600.0)
+    assert config.target_prompt == "bluebasket"
     assert config.surface_prompt == "desk"
     assert config.dual_head_camera_stream == HEAD
     assert config.dual_head_depth_stream == "camera/ego_view_depth"
@@ -167,9 +170,12 @@ def test_initial_reference_grounds_only_target_and_uses_text_desk(
     class TargetClient:
         def __init__(self) -> None:
             self.calls = 0
+            self.image_path: Path | None = None
 
-        def run(self, *, schema, **_kwargs):
+        def run(self, *, schema, image_paths, **_kwargs):
             self.calls += 1
+            self.image_path = Path(image_paths[0])
+            assert self.image_path.is_file()
             return {
                 "status": "READY",
                 "primary_target": {
@@ -202,6 +208,13 @@ def test_initial_reference_grounds_only_target_and_uses_text_desk(
     )
 
     assert client.calls == 1
+    assert client.image_path is not None
+    assert not client.image_path.exists()
+    assert all(
+        path.suffix in {".json", ".jsonl"}
+        for path in tmp_path.rglob("*")
+        if path.is_file()
+    )
     assert reference.stream_name == stream_name
     assert reference.target_prompt == "blue basket"
     assert reference.table_bboxes == ()
@@ -682,14 +695,17 @@ def _qwen_reference(
 
 
 def test_dual_worker_exhausts_the_agent_near_failover_sequence(tmp_path: Path) -> None:
+    started_text_prompts: list[str] = []
+
     class MissingTracker:
         def start_target(self, _rgb, **_kwargs):
-            return {}
+            raise AssertionError("dual BasePose must not use a visual target prompt")
 
         def start_text(self, _rgb, **_kwargs):
             return {}
 
-        def start_all_text(self, **_kwargs):
+        def start_all_text(self, *, target_prompt: str):
+            started_text_prompts.append(target_prompt)
             return {}
 
         def track(self, _rgb):
@@ -743,6 +759,11 @@ def test_dual_worker_exhausts_the_agent_near_failover_sequence(tmp_path: Path) -
         emitted.append(events.get_nowait())
     switching = [event for event in emitted if event.kind == "switching"]
     terminal = [event for event in emitted if event.kind == "error"]
+    detecting = [event for event in emitted if event.kind == "detecting"]
+    assert started_text_prompts
+    assert set(started_text_prompts) == {"bluebasket"}
+    assert detecting[0].details["prompt_mode"] == "target_text_surface_text"
+    assert detecting[0].details["target_prompt"] == "bluebasket"
     assert switching, [(event.kind, event.error) for event in emitted]
     assert [event.details["live_stream"] for event in switching] == [
         HEAD,
@@ -845,6 +866,125 @@ def test_runtime_allows_joint_completion_regardless_of_live_stream(
     assert runtime.controller.current.velocity == (0.0, 0.0, 0.0)
     assert runtime.controller.target_distance_m == pytest.approx(0.7)
     assert runtime.phase == "idle"
+
+
+@pytest.mark.parametrize(
+    ("missing_frames", "expected_stage"),
+    (
+        (1, "grace"),
+        (9, "grace"),
+        (10, "zero_hold"),
+        (19, "zero_hold"),
+        (20, "switch_state"),
+    ),
+)
+def test_joint_head_yaw_loss_policy_boundaries(
+    missing_frames: int,
+    expected_stage: str,
+) -> None:
+    details = dual_servo._joint_head_yaw_loss_details(missing_frames)
+
+    assert details == {
+        "missing_frames": missing_frames,
+        "grace_frames": 10,
+        "zero_hold_frames": 10,
+        "switch_frame": 20,
+        "stage": expected_stage,
+    }
+
+
+def test_runtime_keeps_bidirectional_chest_control_for_nine_head_yaw_misses(
+    tmp_path: Path,
+) -> None:
+    runtime = RawServoRuntime(
+        BasePoseAgentConfig(
+            task="align",
+            output_root=str(tmp_path),
+            raw_chest_target_distance_m=0.7,
+            raw_forward_tolerance_m=0.07,
+        ),
+        publish=lambda _message: None,
+        logger=lambda _message: None,
+    )
+    assert runtime.handle_key("n", now=0.0) == "started"
+    common = {
+        "attempt_id": 1,
+        "live_stream": CHEST,
+        "failover_stage": "initial",
+        "control_source_stream": CHEST,
+    }
+    live_yaw = {
+        **common,
+        "yaw_source": {"stream": HEAD, "valid": True, "realtime": True},
+    }
+    assert runtime.accept_event(
+        RawServoEvent(1, "detecting", details=common),
+        now=0.01,
+    )
+    assert runtime.accept_event(
+        RawServoEvent(
+            1,
+            "initialized",
+            observation=_joint_observation(0.5),
+            details=live_yaw,
+        ),
+        now=0.02,
+    )
+    assert runtime.controller.current.vx < 0.0
+
+    for missing_frames in range(1, 10):
+        loss = dual_servo._joint_head_yaw_loss_details(missing_frames)
+        assert runtime.accept_event(
+            RawServoEvent(
+                1,
+                "observation",
+                observation=_handoff_observation(0.5),
+                details={
+                    **common,
+                    "yaw_source": {
+                        "stream": HEAD,
+                        "valid": False,
+                        "realtime": True,
+                        "error": "missing tracked desk for live head yaw",
+                    },
+                    "head_yaw_loss": loss,
+                },
+            ),
+            now=0.02 + 0.01 * missing_frames,
+        )
+        assert runtime.controller.current.vx < 0.0
+
+    for missing_frames in range(10, 20):
+        loss = dual_servo._joint_head_yaw_loss_details(missing_frames)
+        assert runtime.accept_event(
+            RawServoEvent(
+                1,
+                "observation",
+                observation=_handoff_observation(0.5),
+                details={
+                    **common,
+                    "yaw_source": {
+                        "stream": HEAD,
+                        "valid": False,
+                        "realtime": True,
+                    },
+                    "head_yaw_loss": loss,
+                },
+            ),
+            now=0.02 + 0.01 * missing_frames,
+        )
+        assert runtime.controller.current.velocity == (0.0, 0.0, 0.0)
+
+    assert runtime.accept_event(
+        RawServoEvent(
+            1,
+            "observation",
+            observation=_joint_observation(0.5),
+            details=live_yaw,
+        ),
+        now=0.22,
+    )
+    assert runtime.controller.current.vx < 0.0
 
 
 def test_joint_chest_loss_coasts_four_frames_then_holds_zero(
@@ -1092,7 +1232,7 @@ def test_close_chest_distance_does_not_trigger_head_handoff(
             self.start_calls = 0
             self.track_calls = 0
 
-        def start_target(self, _rgb, **_kwargs):
+        def start_all_text(self, **_kwargs):
             self.start_calls += 1
             return {}
 
@@ -1200,6 +1340,7 @@ def test_close_chest_distance_does_not_trigger_head_handoff(
 
 def test_head_monitor_keeps_chest_position_when_live_head_yaw_is_valid(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     from gear_sonic.utils.inference.base_pose import AlignedRGBDSnapshot
 
@@ -1275,12 +1416,31 @@ def test_head_monitor_keeps_chest_position_when_live_head_yaw_is_valid(
         (0.0, 70.0, float(width), float(height)),
         np.ones((height, width), dtype=np.uint8),
     )
+    tracking_barrier = threading.Barrier(2)
+    geometry_streams: list[str] = []
+    original_surface_geometry = visual_servo._surface_geometry_components
+
+    def counting_surface_geometry(snapshot_value, *args, **kwargs):
+        geometry_streams.append(snapshot_value.depth_aligned_to)
+        return original_surface_geometry(snapshot_value, *args, **kwargs)
+
+    monkeypatch.setattr(
+        dual_servo,
+        "_surface_geometry_components",
+        counting_surface_geometry,
+    )
+    monkeypatch.setattr(
+        visual_servo,
+        "_surface_geometry_components",
+        counting_surface_geometry,
+    )
 
     class Tracker:
-        def start_target(self, _rgb, **_kwargs):
+        def start_all_text(self, **_kwargs):
             return {}
 
         def track(self, _rgb):
+            tracking_barrier.wait(timeout=1.0)
             return [target, desk]
 
     class MonitorTracker:
@@ -1288,6 +1448,7 @@ def test_head_monitor_keeps_chest_position_when_live_head_yaw_is_valid(
             return None
 
         def track(self, _rgb):
+            tracking_barrier.wait(timeout=1.0)
             return [target, desk]
 
     config = BasePoseAgentConfig(
@@ -1361,6 +1522,16 @@ def test_head_monitor_keeps_chest_position_when_live_head_yaw_is_valid(
     )
     assert all(event.details["yaw_source"]["valid"] for event in observations)
     assert all(
+        event.details["parallel_perception"]["enabled"]
+        for event in observations
+    )
+    assert all(
+        event.details["parallel_perception"]["chest_table_geometry_skipped"]
+        for event in observations
+    )
+    assert geometry_streams
+    assert set(geometry_streams) == {HEAD}
+    assert all(
         event.details["head_monitor"]["status"] == "joint_tracking"
         for event in observations
     )
@@ -1378,6 +1549,183 @@ def test_head_monitor_keeps_chest_position_when_live_head_yaw_is_valid(
         if event.details is not None
     )
     assert all(event.kind != "switching" for event in emitted)
+    assert not worker.is_alive()
+    assert camera.closed
+
+
+def test_worker_switches_state_after_twenty_joint_head_yaw_misses(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    target = TrackedInstance(
+        1,
+        0,
+        "blue basket",
+        0.9,
+        (1.0, 0.0, 5.0, 3.0),
+        np.ones((4, 6), dtype=np.uint8),
+    )
+    desk = TrackedInstance(
+        2,
+        1,
+        "desk",
+        0.9,
+        (0.0, 1.0, 6.0, 4.0),
+        np.ones((4, 6), dtype=np.uint8),
+    )
+    table = TableGeometry(0.0, 1.0, 20, 0.0, (1.0, 0.0))
+
+    def observe_chest(snapshot, *_args, **_kwargs):
+        observation = replace(
+            _handoff_observation(0.5),
+            camera_timestamp=snapshot.timestamp,
+            target_bbox_xyxy=target.bbox_xyxy,
+            image_width=6,
+            image_height=4,
+        )
+        return target, None, observation, False, False
+
+    monkeypatch.setattr(
+        dual_servo,
+        "_observe_tracked_snapshot",
+        observe_chest,
+    )
+    monkeypatch.setattr(
+        dual_servo,
+        "_surface_geometry_components",
+        lambda *_args, **_kwargs: (
+            table,
+            None,
+            np.ones((4, 6), dtype=np.uint8),
+            None,
+        ),
+    )
+
+    class Camera:
+        def __init__(self) -> None:
+            self.marker = 0
+            self.closed = False
+
+        def capture(self) -> DualBasePoseCapture:
+            return DualBasePoseCapture(
+                snapshots={CHEST: _worker_snapshot(CHEST, 0)},
+                errors={HEAD: "initial head grounding unavailable"},
+            )
+
+        def _next(self, stream_name: str):
+            self.marker += 1
+            return _worker_snapshot(stream_name, self.marker)
+
+        def capture_stream(self, stream_name: str, *, timeout_ms: int):
+            assert timeout_ms > 0
+            return self._next(stream_name)
+
+        def poll_stream(self, stream_name: str):
+            return self._next(stream_name)
+
+        def close(self) -> None:
+            self.closed = True
+
+    class ChestTracker:
+        def start_target(self, _rgb, **_kwargs):
+            return {}
+
+        def start_all_text(self, **_kwargs):
+            return {}
+
+    class HeadMonitorTracker:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def start_all_text(self, **_kwargs):
+            return {}
+
+        def track(self, _rgb):
+            self.calls += 1
+            return [target, desk] if self.calls == 1 else [target]
+
+    config = BasePoseAgentConfig(
+        task="align to the blue basket",
+        output_root=str(tmp_path),
+        raw_servo_hz=10000.0,
+    )
+    chest_reference = DualCameraReference(
+        stream_name=CHEST,
+        rgb=_worker_snapshot(CHEST, 0).rgb,
+        target_prompt="blue basket",
+        target_bbox=(100.0, 100.0, 900.0, 900.0),
+        table_bboxes=(),
+        camera_timestamp=0.0,
+    )
+    requests: queue.Queue[int | None] = queue.Queue()
+    requests.put(1)
+    events: queue.Queue[RawServoEvent] = queue.Queue()
+    gate = GenerationGate()
+    gate.activate(1)
+    camera = Camera()
+    calibration = RawServoCalibration(6, 4, 100.0, 101.0, 2.5, 1.5)
+    worker = threading.Thread(
+        target=run_dual_raw_servo_worker,
+        args=(config, requests, events, gate, threading.Event()),
+        kwargs={
+            "camera_factory": lambda: camera,
+            "tracker_factory": ChestTracker,
+            "head_monitor_tracker_factory": HeadMonitorTracker,
+            "calibration_factory": lambda _config: {
+                HEAD: calibration,
+                CHEST: calibration,
+            },
+            "reference_factory": lambda *_args, **_kwargs: (
+                {CHEST: chest_reference},
+                {HEAD: "initial head grounding unavailable"},
+            ),
+            "table_required": lambda: False,
+        },
+        daemon=True,
+    )
+    worker.start()
+
+    emitted: list[RawServoEvent] = []
+    switching: RawServoEvent | None = None
+    for _ in range(80):
+        event = events.get(timeout=3.0)
+        emitted.append(event)
+        if (
+            event.kind == "switching"
+            and event.details is not None
+            and event.details.get("head_yaw_loss") is not None
+        ):
+            switching = event
+            break
+    gate.cancel(1)
+    requests.put(None)
+    worker.join(timeout=3.0)
+
+    loss_events = [
+        event
+        for event in emitted
+        if event.kind in {"initialized", "observation"}
+        and event.details is not None
+        and event.details.get("head_yaw_loss") is not None
+    ]
+    assert [
+        event.details["head_yaw_loss"]["missing_frames"]
+        for event in loss_events
+    ] == list(range(1, 20))
+    assert [
+        event.details["head_yaw_loss"]["stage"] for event in loss_events
+    ] == ["grace"] * 9 + ["zero_hold"] * 10
+    assert switching is not None
+    assert switching.details is not None
+    assert switching.details["live_stream"] == HEAD
+    assert switching.details["head_yaw_loss"] == {
+        "missing_frames": 20,
+        "grace_frames": 10,
+        "zero_hold_frames": 10,
+        "switch_frame": 20,
+        "stage": "switch_state",
+    }
+    assert all(event.kind != HEAD_MONITOR_HOLD_EVENT for event in emitted)
     assert not worker.is_alive()
     assert camera.closed
 
@@ -1454,7 +1802,7 @@ def test_head_stage_keeps_chest_basket_until_it_becomes_invalid(
         def __init__(self) -> None:
             self.calls = 0
 
-        def start_target(self, _rgb, **_kwargs):
+        def start_all_text(self, **_kwargs):
             return {}
 
         def track(self, _rgb):
@@ -1470,7 +1818,7 @@ def test_head_stage_keeps_chest_basket_until_it_becomes_invalid(
             self.started = False
             self.calls = 0
 
-        def start_target(self, _rgb, **_kwargs):
+        def start_all_text(self, **_kwargs):
             self.started = True
             return {}
 
@@ -1617,7 +1965,7 @@ def test_head_stage_keeps_chest_basket_until_it_becomes_invalid(
         CHEST,
         HEAD,
         CHEST,
-        CHEST,
+        HEAD,
     ]
     assert all(event.kind != "switching" for event in emitted)
     assert not worker.is_alive()

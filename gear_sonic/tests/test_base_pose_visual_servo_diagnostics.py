@@ -48,6 +48,31 @@ def test_writer_serializes_nonfinite_controller_values_as_null(tmp_path) -> None
     assert record["command"]["vx"] is None
 
 
+def test_writer_defaults_to_json_only_without_image_artifacts(tmp_path) -> None:
+    writer = FrameDiagnosticsWriter(tmp_path, review_stride=1)
+
+    writer.write(
+        _frame(0),
+        control_applied=False,
+        controller_state=None,
+        command=None,
+    )
+
+    record = json.loads((tmp_path / "raw_servo_frames.jsonl").read_text())
+    assert not (tmp_path / "review_samples").exists()
+    assert record["review_artifacts"] == {
+        "sampled": False,
+        "raw_rgb": None,
+        "raw_depth": None,
+        "depth_scale_m": None,
+        "table_rgb_edges": None,
+        "target_mask": None,
+        "table_mask": None,
+        "table_completed_mask": None,
+        "table_edge_overlay": None,
+    }
+
+
 def test_async_writer_failure_does_not_stop_later_frames(tmp_path) -> None:
     written: list[int] = []
     logs: list[str] = []
@@ -91,7 +116,9 @@ def test_writer_saves_completed_table_mask_losslessly(tmp_path) -> None:
         surface_mask=original,
         completed_surface_mask=completed,
     )
-    writer = FrameDiagnosticsWriter(tmp_path, review_stride=5)
+    writer = FrameDiagnosticsWriter(
+        tmp_path, review_stride=5, save_images=True
+    )
 
     writer.write(
         frame,
@@ -123,7 +150,9 @@ def test_writer_saves_paired_rgb_depth_and_rgb_edges(tmp_path) -> None:
         depth_scale_m=0.001,
         table_rgb_edges=edges,
     )
-    writer = FrameDiagnosticsWriter(tmp_path, review_stride=5)
+    writer = FrameDiagnosticsWriter(
+        tmp_path, review_stride=5, save_images=True
+    )
 
     writer.write(
         frame,

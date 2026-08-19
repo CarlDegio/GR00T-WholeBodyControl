@@ -275,9 +275,10 @@ def test_yaml_contains_every_launch_parameter() -> None:
     assert loaded.lavira_qwenvl_model == "qwen3-vl-32b-instruct"
     assert loaded.base_pose_enabled is True
     assert loaded.base_pose_task == "align to the blue basket"
+    assert loaded.base_pose_target_prompt == "bluebasket"
     assert loaded.base_pose_surface_prompt == "desk"
     assert loaded.base_pose_dual_chest_depth_stream == "camera/chest_view_depth"
-    assert loaded.base_pose_raw_min_linear_speed_m_s == pytest.approx(0.4)
+    assert loaded.base_pose_raw_min_linear_speed_m_s == pytest.approx(0.35)
     assert loaded.base_pose_raw_max_lateral_speed_m_s == pytest.approx(0.4)
     assert loaded.base_pose_mode == "dual_raw_yoloe_servo"
     assert not hasattr(loaded, "base_pose_vision_backend")
@@ -493,12 +494,14 @@ def test_base_pose_agent_uses_gateway_arbitration_and_fixed_task() -> None:
     config = InferenceLaunchConfig(
         base_pose_enabled=True,
         base_pose_task="align with the medicine bottle and basket",
+        base_pose_target_prompt="bluebasket",
         base_pose_surface_prompt="work bench",
     )
     command = build_base_pose_agent_command(config, Path("/workspace/sonic"))
 
     assert "gear_sonic/scripts/base_pose_agent.py" in command
     assert "--task 'align with the medicine bottle and basket'" in command
+    assert "--target-prompt bluebasket" in command
     assert "--surface-prompt 'work bench'" in command
     assert "--mode dual_raw_yoloe_servo" in command
     assert "--dual-head-camera-stream ego_view" in command

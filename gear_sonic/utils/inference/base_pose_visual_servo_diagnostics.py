@@ -78,14 +78,21 @@ def _phase_name(value: Any) -> str | None:
 
 
 class FrameDiagnosticsWriter:
-    """Write frame telemetry and sampled source artifacts for offline review."""
+    """Write frame telemetry, with image artifacts disabled by default."""
 
-    def __init__(self, output_dir: str | Path, *, review_stride: int = 5):
+    def __init__(
+        self,
+        output_dir: str | Path,
+        *,
+        review_stride: int = 5,
+        save_images: bool = False,
+    ):
         if review_stride <= 0:
             raise ValueError("review_stride must be positive")
         self.output_dir = Path(output_dir).resolve()
         self.jsonl_path = self.output_dir / "raw_servo_frames.jsonl"
         self.review_stride = int(review_stride)
+        self.save_images = bool(save_images)
         self.review_raw_dir = self.output_dir / "review_samples" / "raw"
         self.review_depth_dir = self.output_dir / "review_samples" / "depth"
         self.review_edges_dir = self.output_dir / "review_samples" / "edges"
@@ -139,6 +146,8 @@ class FrameDiagnosticsWriter:
             "table_completed_mask": None,
             "table_edge_overlay": None,
         }
+        if not self.save_images:
+            return result
         if frame.frame_index % self.review_stride:
             return result
         self.review_raw_dir.mkdir(parents=True, exist_ok=True)
