@@ -203,6 +203,8 @@ def run_base_pose_yolo_agent(config: Any) -> None:
             request_timeout_ms=config.sensor_gateway_request_timeout_ms,
             max_age_ms=config.sensor_gateway_max_age_ms,
             max_skew_ms=config.sensor_gateway_max_skew_ms,
+            buffer_size=config.dual_rgbd_buffer_size,
+            poll_hz=config.dual_rgbd_poll_hz,
         )
         stream_summary = (
             f"head={config.dual_head_camera_stream}/"
@@ -251,6 +253,9 @@ def run_base_pose_yolo_agent(config: Any) -> None:
             if command is not None:
                 generation = int(command.parameters.get("generation", -1))
                 if command.name == "start_base_pose":
+                    begin_generation = getattr(camera, "begin_generation", None)
+                    if callable(begin_generation):
+                        begin_generation(generation)
                     adapter.start(generation)
                 else:
                     adapter.cancel(generation, "operator_stop")

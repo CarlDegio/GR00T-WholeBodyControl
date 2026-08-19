@@ -58,6 +58,8 @@ uv venv .venv_inference --python "$MANAGED_PY" --prompt gear_sonic_inference
 source .venv_inference/bin/activate
 echo "[INFO] Installing gear_sonic[inference] (this may take a few minutes) …"
 uv pip install -e "gear_sonic[inference]"
+echo "[INFO] Preparing YOLOE and its pinned CLIP text encoder …"
+bash tools/yoloe26m/setup.sh
 
 echo ""
 echo "══════════════════════════════════════════════════════════════"

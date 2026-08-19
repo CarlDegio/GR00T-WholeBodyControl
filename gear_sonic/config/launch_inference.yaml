@@ -192,14 +192,10 @@ launch_inference:
   base_pose_enabled: true
   base_pose_task: *vla_task_prompt
   base_pose_mode: dual_raw_yoloe_servo
-  base_pose_vision_backend: codex
-  base_pose_model: gpt-5.6-sol
   base_pose_qwenvl_model: qwen3-vl-plus
   base_pose_qwenvl_base_url: https://dashscope-intl.aliyuncs.com/compatible-mode/v1
   base_pose_qwenvl_thinking_budget: 500
-  base_pose_reasoning_effort: xhigh
-  base_pose_codex_fast: true
-  base_pose_codex_timeout_seconds: 600.0
+  base_pose_qwenvl_timeout_seconds: 600.0
   base_pose_camera_stream: ego_view
   base_pose_yoloe_depth_stream: camera/ego_view_depth
   base_pose_camera_intrinsics_path: gear_sonic/config/camera_intrinsics.json
@@ -220,6 +216,8 @@ launch_inference:
   base_pose_dual_match_tolerance_frames: 30
   base_pose_dual_initialization_grace_s: 30.0
   base_pose_dual_qwenvl_fallback_model: qwen3-vl-8b-instruct
+  base_pose_dual_rgbd_buffer_size: 8
+  base_pose_dual_rgbd_poll_hz: 60.0
   base_pose_camera_timeout_ms: 15000
   base_pose_planner_hz: 20.0
   base_pose_output_root: outputs/base_pose_adjustment

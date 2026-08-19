@@ -8,7 +8,6 @@ import base64
 import json
 import math
 import os
-import subprocess
 import sys
 import tempfile
 import time
@@ -25,9 +24,6 @@ from gear_sonic.camera.calibration import (
 )
 from gear_sonic.camera.sensor_server import ImageMessageSchema
 
-
-HTTP_PROXY_KEYS = ("http_proxy", "https_proxy", "HTTP_PROXY", "HTTPS_PROXY")
-ALL_PROXY_KEYS = ("all_proxy", "ALL_PROXY")
 
 DEFAULT_QWENVL_PLUS_MODEL = "qwen3-vl-plus"
 DEFAULT_QWENVL_BASE_URL = (
@@ -359,124 +355,6 @@ class DualAlignedRGBDCamera:
     def close(self) -> None:
         self._socket.close()
         self._context.term()
-
-
-class CodexStructuredVisionClient:
-    """Execute a read-only Codex CLI request with one or more images."""
-
-    def __init__(
-        self,
-        *,
-        model: str = "gpt-5.6-sol",
-        reasoning_effort: str = "xhigh",
-        fast: bool = True,
-        timeout_seconds: float = 600.0,
-        codex_bin: str | None = None,
-        runner: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
-    ):
-        self.model = model
-        self.reasoning_effort = reasoning_effort
-        self.fast = bool(fast)
-        self.timeout_seconds = float(timeout_seconds)
-        self.codex_bin = codex_bin or os.environ.get("CODEX_BIN", "codex")
-        self.runner = runner
-        self._authenticated = False
-
-    @staticmethod
-    def _subprocess_env() -> dict[str, str]:
-        child_env = os.environ.copy()
-        http_proxy = os.environ.get("BASE_POSE_CODEX_HTTP_PROXY")
-        all_proxy = os.environ.get("BASE_POSE_CODEX_ALL_PROXY")
-        for keys, value in ((HTTP_PROXY_KEYS, http_proxy), (ALL_PROXY_KEYS, all_proxy)):
-            if value is None:
-                continue
-            for key in keys:
-                if value:
-                    child_env[key] = value
-                else:
-                    child_env.pop(key, None)
-        return child_env
-
-    def _check_login(self) -> None:
-        if self._authenticated:
-            return
-        result = self.runner(
-            [self.codex_bin, "login", "status"],
-            capture_output=True,
-            text=True,
-            timeout=min(15.0, self.timeout_seconds),
-            check=False,
-            env=self._subprocess_env(),
-        )
-        login_text = f"{result.stdout or ''}\n{result.stderr or ''}".lower()
-        if result.returncode != 0 or "chatgpt" not in login_text:
-            raise RuntimeError(
-                "Codex CLI must be logged in with a ChatGPT subscription"
-            )
-        self._authenticated = True
-
-    def run(
-        self,
-        *,
-        prompt: str,
-        image_paths: Sequence[str | Path],
-        schema: Mapping[str, Any],
-        schema_filename: str,
-        cwd: str | Path,
-    ) -> dict[str, Any]:
-        self._check_login()
-        resolved_images = [Path(path).resolve() for path in image_paths]
-        for path in resolved_images:
-            if not path.is_file():
-                raise FileNotFoundError(f"model image input not found: {path}")
-        workdir = Path(cwd).resolve()
-        schema_path = workdir / schema_filename
-        _write_json(schema_path, schema)
-        command = [
-            self.codex_bin,
-            "--ask-for-approval",
-            "never",
-            "exec",
-            "--ephemeral",
-            "--ignore-user-config",
-            "--ignore-rules",
-            "--sandbox",
-            "read-only",
-            "--skip-git-repo-check",
-            "--color",
-            "never",
-            "--model",
-            self.model,
-            "--config",
-            f'model_reasoning_effort="{self.reasoning_effort}"',
-        ]
-        command.extend(
-            ("--config", f"features.fast_mode={str(self.fast).lower()}")
-        )
-        if self.fast:
-            command.extend(("--config", 'service_tier="fast"'))
-        for path in resolved_images:
-            command.extend(("--image", str(path)))
-        command.extend(("--output-schema", str(schema_path), prompt))
-        result = self.runner(
-            command,
-            capture_output=True,
-            text=True,
-            timeout=self.timeout_seconds,
-            check=False,
-            cwd=str(workdir),
-            env=self._subprocess_env(),
-        )
-        if result.returncode != 0:
-            message = (result.stderr or result.stdout or "unknown error").strip()
-            raise RuntimeError(f"Codex base-pose policy failed: {message}")
-        try:
-            value = json.loads(result.stdout)
-        except json.JSONDecodeError as exc:
-            raise BasePoseValidationError("Codex output is not valid JSON") from exc
-        if not isinstance(value, dict):
-            raise BasePoseValidationError("Codex output must be a JSON object")
-        return value
 
 
 def _dashscope_api_key(env_file: str | Path | None = None) -> str:

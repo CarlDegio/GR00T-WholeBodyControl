@@ -33,7 +33,6 @@ from gear_sonic.utils.inference.base_pose import (
     AlignedRGBDSnapshot,
     BasePoseCameraError,
     BasePoseValidationError,
-    CodexStructuredVisionClient,
     QwenVLStructuredVisionClient,
     _atomic_write_bytes,
     _write_json,
@@ -379,13 +378,25 @@ def validate_raw_servo_dependencies(config: Any) -> None:
     os.environ.setdefault("YOLO_CONFIG_DIR", str(model_path.parents[1] / "config"))
     os.environ.setdefault("YOLO_AUTOINSTALL", "false")
     try:
+        import clip  # noqa: F401
         import lap  # noqa: F401
         import torch
-        import ultralytics  # noqa: F401
+        from ultralytics.utils import WEIGHTS_DIR
     except ImportError as exc:
         raise RuntimeError(
-            "raw YOLOE servo requires ultralytics, torch, and lap in .venv_inference"
+            "raw YOLOE servo requires ultralytics, torch, lap, and the pinned "
+            "Ultralytics CLIP fork in .venv_inference; run "
+            "bash tools/yoloe26m/setup.sh"
         ) from exc
+    text_encoder_candidates = (
+        Path("mobileclip2_b.ts").resolve(),
+        Path(WEIGHTS_DIR) / "mobileclip2_b.ts",
+    )
+    if not any(path.is_file() for path in text_encoder_candidates):
+        raise FileNotFoundError(
+            "YOLOE MobileCLIP2 text encoder not found. "
+            "Run: bash tools/yoloe26m/setup.sh"
+        )
     if not torch.cuda.is_available():
         raise RuntimeError("raw YOLOE servo requires a CUDA GPU")
 
@@ -2555,21 +2566,16 @@ def _save_png(path: Path, image: np.ndarray, *, rgb: bool = False) -> None:
 
 
 def _client_from_config(config: Any) -> Any:
-    if config.vision_backend == "qwenvl":
-        return QwenVLStructuredVisionClient(
-            model=config.qwenvl_model,
-            base_url=config.qwenvl_base_url,
-            thinking_budget=config.qwenvl_thinking_budget,
-            enable_thinking=bool(
-                getattr(config, "qwenvl_enable_thinking", True)
-            ),
-            timeout_seconds=config.codex_timeout_seconds,
-        )
-    return CodexStructuredVisionClient(
-        model=config.model,
-        reasoning_effort=config.reasoning_effort,
-        fast=config.codex_fast,
-        timeout_seconds=config.codex_timeout_seconds,
+    """Build the sole BasePose grounding backend: Qwen-VL."""
+
+    return QwenVLStructuredVisionClient(
+        model=config.qwenvl_model,
+        base_url=config.qwenvl_base_url,
+        thinking_budget=config.qwenvl_thinking_budget,
+        enable_thinking=bool(
+            getattr(config, "qwenvl_enable_thinking", True)
+        ),
+        timeout_seconds=config.qwenvl_timeout_seconds,
     )
 
 

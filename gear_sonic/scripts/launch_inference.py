@@ -236,14 +236,10 @@ class InferenceLaunchConfig:
     ] = "dual_raw_yoloe_servo"
     """Agent-near raw-depth YOLOE mode."""
 
-    base_pose_vision_backend: Literal["codex", "qwenvl"] = "codex"
-    base_pose_model: str = "gpt-5.6-sol"
     base_pose_qwenvl_model: str = "qwen3-vl-plus"
     base_pose_qwenvl_base_url: str = "https://dashscope-intl.aliyuncs.com/compatible-mode/v1"
     base_pose_qwenvl_thinking_budget: int = 500
-    base_pose_reasoning_effort: str = "xhigh"
-    base_pose_codex_fast: bool = True
-    base_pose_codex_timeout_seconds: float = 600.0
+    base_pose_qwenvl_timeout_seconds: float = 600.0
     base_pose_camera_stream: str = "ego_view"
     base_pose_yoloe_depth_stream: str = "camera/ego_view_depth"
     base_pose_camera_intrinsics_path: str = "gear_sonic/config/camera_intrinsics.json"
@@ -264,6 +260,8 @@ class InferenceLaunchConfig:
     base_pose_dual_match_tolerance_frames: int = 30
     base_pose_dual_initialization_grace_s: float = 30.0
     base_pose_dual_qwenvl_fallback_model: str = "qwen3-vl-8b-instruct"
+    base_pose_dual_rgbd_buffer_size: int = 8
+    base_pose_dual_rgbd_poll_hz: float = 60.0
     base_pose_camera_timeout_ms: int = 15000
     base_pose_planner_hz: float = 20.0
     base_pose_output_root: str = "outputs/base_pose_adjustment"
@@ -642,16 +640,13 @@ def build_base_pose_agent_command(
     """Build the independent ControlGateway-backed Base-Pose agent."""
 
     quoted_root = shlex.quote(str(repo_root))
-    local_env = ""
-    backend = f"--vision-backend {config.base_pose_vision_backend} "
-    if config.base_pose_vision_backend == "qwenvl":
-        local_env = "set -a; [ ! -f .env.local ] || . ./.env.local; set +a; "
-        backend += (
-            f"--qwenvl-model {shlex.quote(config.base_pose_qwenvl_model)} "
-            f"--qwenvl-base-url {shlex.quote(config.base_pose_qwenvl_base_url)} "
-            f"--qwenvl-thinking-budget {config.base_pose_qwenvl_thinking_budget} "
-        )
-    codex_fast = "" if config.base_pose_codex_fast else "--no-codex-fast "
+    local_env = "set -a; [ ! -f .env.local ] || . ./.env.local; set +a; "
+    qwen = (
+        f"--qwenvl-model {shlex.quote(config.base_pose_qwenvl_model)} "
+        f"--qwenvl-base-url {shlex.quote(config.base_pose_qwenvl_base_url)} "
+        f"--qwenvl-thinking-budget {config.base_pose_qwenvl_thinking_budget} "
+        f"--qwenvl-timeout-seconds {config.base_pose_qwenvl_timeout_seconds} "
+    )
     dual = ""
     if config.base_pose_mode == "dual_raw_yoloe_servo":
         dual = (
@@ -679,6 +674,8 @@ def build_base_pose_agent_command(
             f"{config.base_pose_dual_initialization_grace_s} "
             f"--dual-qwenvl-fallback-model "
             f"{shlex.quote(config.base_pose_dual_qwenvl_fallback_model)} "
+            f"--dual-rgbd-buffer-size {config.base_pose_dual_rgbd_buffer_size} "
+            f"--dual-rgbd-poll-hz {config.base_pose_dual_rgbd_poll_hz} "
         )
     yoloe = (
         f"--camera-intrinsics-path {shlex.quote(config.base_pose_camera_intrinsics_path)} "
@@ -727,11 +724,7 @@ def build_base_pose_agent_command(
         f"cd {quoted_root} && {local_env}"
         ".venv_inference/bin/python gear_sonic/scripts/base_pose_agent.py "
         f"--task {shlex.quote(config.base_pose_task)} "
-        f"--mode {config.base_pose_mode} {backend}"
-        f"--model {shlex.quote(config.base_pose_model)} "
-        f"--reasoning-effort {shlex.quote(config.base_pose_reasoning_effort)} "
-        f"{codex_fast}"
-        f"--codex-timeout-seconds {config.base_pose_codex_timeout_seconds} "
+        f"--mode {config.base_pose_mode} {qwen}"
         f"--camera-stream {shlex.quote(config.base_pose_camera_stream)} "
         f"--depth-stream {shlex.quote(config.base_pose_yoloe_depth_stream)} "
         f"--camera-timeout-ms {config.base_pose_camera_timeout_ms} "
@@ -1193,6 +1186,10 @@ def _check_prerequisites(config: InferenceLaunchConfig):
                 errors.append("dual match tolerance must be positive")
             if config.base_pose_dual_initialization_grace_s <= 0.0:
                 errors.append("dual initialization grace must be positive")
+            if config.base_pose_dual_rgbd_buffer_size <= 0:
+                errors.append("dual RGB-D buffer size must be positive")
+            if config.base_pose_dual_rgbd_poll_hz <= 0.0:
+                errors.append("dual RGB-D poll frequency must be positive")
             if config.base_pose_raw_reference_update_interval_frames <= 0:
                 errors.append(
                     "dual Base-Pose reference update interval must be positive"
@@ -1252,8 +1249,7 @@ def _check_prerequisites(config: InferenceLaunchConfig):
             if not path.is_file():
                 errors.append(f"Base-Pose {label} not found: {path}")
         if (
-            config.base_pose_vision_backend == "qwenvl"
-            and not os.environ.get("DASHSCOPE_API_KEY", "").strip()
+            not os.environ.get("DASHSCOPE_API_KEY", "").strip()
             and not _dotenv_has_nonempty_value(
                 repo_root / ".env.local", "DASHSCOPE_API_KEY"
             )
@@ -1261,6 +1257,25 @@ def _check_prerequisites(config: InferenceLaunchConfig):
             errors.append(
                 "Base-Pose Qwen-VL requires DASHSCOPE_API_KEY in the launcher "
                 "environment or the gitignored .env.local file"
+            )
+        inference_python = repo_root / ".venv_inference" / "bin" / "python"
+        if inference_python.is_file():
+            clip_check = subprocess.run(
+                [str(inference_python), "-c", "import clip"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                check=False,
+            )
+            if clip_check.returncode != 0:
+                errors.append(
+                    "Base-Pose YOLOE text recovery requires the pinned "
+                    "Ultralytics CLIP fork. Run: bash tools/yoloe26m/setup.sh"
+                )
+        mobileclip_path = repo_root / "mobileclip2_b.ts"
+        if not mobileclip_path.is_file():
+            errors.append(
+                "Base-Pose MobileCLIP2 text encoder not found: "
+                f"{mobileclip_path}. Run: bash tools/yoloe26m/setup.sh"
             )
 
     deploy_dir = repo_root / "gear_sonic_deploy"

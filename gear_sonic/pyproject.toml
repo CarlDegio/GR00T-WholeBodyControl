@@ -92,6 +92,7 @@ inference = [
     "opencv-python",
     "scipy",
     "ultralytics==8.4.117",
+    "clip @ git+https://github.com/ultralytics/CLIP.git@488e81a6711eea7346872b46ea928b367da8889d",
     "lap",
     "gr00t @ git+https://github.com/NVIDIA/Isaac-GR00T.git@n1.7-release",
 ]

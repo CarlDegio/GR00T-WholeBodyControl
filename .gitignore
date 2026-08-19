@@ -55,6 +55,7 @@ cover/
 
 # Django stuff:
 *.log
+mobileclip2_b.ts
 local_settings.py
 db.sqlite3
 db.sqlite3-journal

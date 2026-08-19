@@ -498,14 +498,10 @@ def _ground_dual_in_threads(
 
 _PROCESS_CONFIG_FIELDS = (
     "task",
-    "vision_backend",
-    "model",
-    "reasoning_effort",
-    "codex_fast",
-    "codex_timeout_seconds",
     "qwenvl_model",
     "qwenvl_base_url",
     "qwenvl_thinking_budget",
+    "qwenvl_timeout_seconds",
 )
 
 
@@ -690,12 +686,11 @@ def ground_qwen_fallback_reference(
         raise ValueError("dual Qwen fallback model must be non-empty")
     qwen_config = SimpleNamespace(
         task=config.task,
-        vision_backend="qwenvl",
         qwenvl_model=qwen_model,
         qwenvl_base_url=config.qwenvl_base_url,
         qwenvl_enable_thinking=False,
         qwenvl_thinking_budget=config.qwenvl_thinking_budget,
-        codex_timeout_seconds=config.codex_timeout_seconds,
+        qwenvl_timeout_seconds=config.qwenvl_timeout_seconds,
     )
     spec, table_bboxes = ground_raw_servo_references(
         qwen_config,
@@ -1218,6 +1213,31 @@ def _attempt_uses_surface_text(attempt: DualCameraAttempt) -> bool:
     return attempt.stage == "alternate_text"
 
 
+def _capture_camera_stream(
+    camera: Any,
+    stream_name: str,
+    *,
+    timeout_ms: int,
+) -> AlignedRGBDSnapshot:
+    capture_stream = getattr(camera, "capture_stream", None)
+    if callable(capture_stream):
+        return capture_stream(stream_name, timeout_ms=timeout_ms)
+    return camera.capture().require(stream_name)
+
+
+def _poll_camera_stream(
+    camera: Any,
+    stream_name: str,
+) -> AlignedRGBDSnapshot | None:
+    poll_stream = getattr(camera, "poll_stream", None)
+    if callable(poll_stream):
+        return poll_stream(stream_name)
+    try:
+        return camera.capture().require(stream_name)
+    except BasePoseCameraError:
+        return None
+
+
 def _attempt_details(
     attempt: DualCameraAttempt,
     **extra: Any,
@@ -1486,8 +1506,10 @@ def run_dual_raw_servo_worker(
                                 attempt.attempt_id, None
                             )
                             if qwen_snapshot is None:
-                                qwen_snapshot = camera.capture().require(
-                                    attempt.live_stream
+                                qwen_snapshot = _capture_camera_stream(
+                                    camera,
+                                    attempt.live_stream,
+                                    timeout_ms=int(config.camera_timeout_ms),
                                 )
                             qwen_calibration = calibrations[attempt.live_stream]
                             qwen_output_dir = (
@@ -1614,15 +1636,28 @@ def run_dual_raw_servo_worker(
                         previous_surface_id = surface_id
                         monitor_details: dict[str, Any] = {}
                         try:
-                            capture = camera.capture()
-                            snapshot = capture.require(attempt.live_stream)
+                            snapshot = _capture_camera_stream(
+                                camera,
+                                attempt.live_stream,
+                                timeout_ms=max(
+                                    1,
+                                    int(float(config.raw_camera_stale_s) * 1000.0),
+                                ),
+                            )
                             frame_index += 1
                             if (
                                 attempt.live_stream == stream_names[1]
                                 and head_monitor is not None
                             ):
                                 try:
-                                    head_snapshot = capture.require(stream_names[0])
+                                    head_snapshot = _poll_camera_stream(
+                                        camera,
+                                        stream_names[0],
+                                    )
+                                    if head_snapshot is None:
+                                        raise BasePoseCameraError(
+                                            "waiting for newer head-monitor RGB-D"
+                                        )
                                     calibrations[stream_names[0]].validate_snapshot(
                                         head_snapshot
                                     )

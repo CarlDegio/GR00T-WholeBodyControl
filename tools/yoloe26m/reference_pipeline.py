@@ -429,45 +429,30 @@ def run_yoloe_visual_prompt(
 
 
 def create_grounding_client(
-    backend: str,
     *,
-    codex_model: str = "gpt-5.6-sol",
-    codex_reasoning_effort: str = "xhigh",
-    codex_fast: bool = True,
     timeout_seconds: float = 600.0,
     qwen_model: str | None = None,
     qwen_base_url: str | None = None,
     qwen_thinking_budget: int = 500,
 ):
-    """Create one of the existing BasePose structured-vision clients."""
+    """Create the Qwen-VL structured-vision client used by BasePose."""
     from gear_sonic.utils.inference.base_pose import (
         DEFAULT_QWENVL_BASE_URL,
         DEFAULT_QWENVL_PLUS_MODEL,
-        CodexStructuredVisionClient,
         QwenVLStructuredVisionClient,
     )
 
-    if backend == "codex":
-        return CodexStructuredVisionClient(
-            model=codex_model,
-            reasoning_effort=codex_reasoning_effort,
-            fast=codex_fast,
-            timeout_seconds=timeout_seconds,
-        )
-    if backend == "qwenvl":
-        return QwenVLStructuredVisionClient(
-            model=qwen_model or DEFAULT_QWENVL_PLUS_MODEL,
-            base_url=qwen_base_url or DEFAULT_QWENVL_BASE_URL,
-            timeout_seconds=timeout_seconds,
-            thinking_budget=qwen_thinking_budget,
-        )
-    raise ValueError(f"unsupported grounding backend: {backend}")
+    return QwenVLStructuredVisionClient(
+        model=qwen_model or DEFAULT_QWENVL_PLUS_MODEL,
+        base_url=qwen_base_url or DEFAULT_QWENVL_BASE_URL,
+        timeout_seconds=timeout_seconds,
+        thinking_budget=qwen_thinking_budget,
+    )
 
 
 def run_auto_reference_pipeline(
     config: YoloVisualPromptConfig,
     *,
-    backend: str,
     client: Any | None = None,
     yolo_runner: Callable[
         [YoloVisualPromptConfig, list[PixelBox]], DetectionSummary
@@ -477,8 +462,6 @@ def run_auto_reference_pipeline(
     target = config.target_name.strip()
     if not target:
         raise ValueError("target must be non-empty")
-    if backend not in {"codex", "qwenvl"}:
-        raise ValueError(f"unsupported grounding backend: {backend}")
     run_dir = config.run_dir.expanduser().resolve()
     if not run_dir.is_dir():
         raise FileNotFoundError(f"run directory not found: {run_dir}")
@@ -494,7 +477,7 @@ def run_auto_reference_pipeline(
     prompt = build_grounding_prompt(target)
     (run_dir / "grounding_prompt.txt").write_text(prompt, encoding="utf-8")
     _write_json(run_dir / "grounding_schema.json", GROUNDING_SCHEMA)
-    selected_client = client or create_grounding_client(backend)
+    selected_client = client or create_grounding_client()
     response = selected_client.run(
         prompt=prompt,
         image_paths=[reference_path],

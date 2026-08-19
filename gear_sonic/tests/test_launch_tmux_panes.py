@@ -252,6 +252,10 @@ def test_yaml_contains_every_launch_parameter() -> None:
     assert loaded.base_pose_enabled is True
     assert loaded.base_pose_task == loaded.prompt
     assert loaded.base_pose_mode == "dual_raw_yoloe_servo"
+    assert not hasattr(loaded, "base_pose_vision_backend")
+    assert not hasattr(loaded, "base_pose_model")
+    assert not hasattr(loaded, "base_pose_codex_fast")
+    assert loaded.base_pose_qwenvl_model == "qwen3-vl-plus"
     assert loaded.slam_debug is False
 
 
@@ -476,6 +480,13 @@ def test_base_pose_agent_uses_gateway_arbitration_and_fixed_task() -> None:
     assert "--sensor-gateway-endpoint tcp://127.0.0.1:5560" in command
     assert "--control-gateway-endpoint tcp://127.0.0.1:5565" in command
     assert "--control-gateway-intent-endpoint tcp://127.0.0.1:5561" in command
+    assert ". ./.env.local" in command
+    assert "--qwenvl-model qwen3-vl-plus" in command
+    assert "--qwenvl-timeout-seconds 600.0" in command
+    assert "--dual-rgbd-buffer-size 8" in command
+    assert "--dual-rgbd-poll-hz 60.0" in command
+    assert "--vision-backend" not in command
+    assert "codex" not in command.lower()
     assert "--port 5558" not in command
 
 
@@ -484,13 +495,13 @@ def test_base_pose_qwenvl_command_loads_local_key_without_persisting_by_default(
         InferenceLaunchConfig(
             base_pose_enabled=True,
             base_pose_task="align",
-            base_pose_vision_backend="qwenvl",
         ),
         Path("/workspace/sonic"),
     )
 
     assert ". ./.env.local" in command
-    assert "--vision-backend qwenvl" in command
+    assert "--vision-backend" not in command
+    assert "codex" not in command.lower()
     assert "--qwenvl-thinking-budget 500" in command
     assert "--persist-diagnostics" not in command
 

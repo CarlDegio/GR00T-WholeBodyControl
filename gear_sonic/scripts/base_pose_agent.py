@@ -16,16 +16,12 @@ class BasePoseAgentConfig:
         "raw_yoloe_servo",
         "dual_raw_yoloe_servo",
     ] = "dual_raw_yoloe_servo"
-    vision_backend: Literal["codex", "qwenvl"] = "codex"
-    model: str = "gpt-5.6-sol"
     qwenvl_model: str = "qwen3-vl-plus"
     qwenvl_base_url: str = (
         "https://dashscope-intl.aliyuncs.com/compatible-mode/v1"
     )
     qwenvl_thinking_budget: int = 500
-    reasoning_effort: str = "xhigh"
-    codex_fast: bool = True
-    codex_timeout_seconds: float = 600.0
+    qwenvl_timeout_seconds: float = 600.0
     planner_hz: float = 20.0
     final_stop_count: int = 3
 
@@ -61,6 +57,8 @@ class BasePoseAgentConfig:
     dual_head_reacquire_frames: int = 10
     dual_initialization_grace_s: float = 30.0
     dual_qwenvl_fallback_model: str = "qwen3-vl-8b-instruct"
+    dual_rgbd_buffer_size: int = 8
+    dual_rgbd_poll_hz: float = 60.0
 
     output_root: str = "outputs/base_pose_adjustment"
     raw_yoloe_model_path: str = "tools/yoloe26m/weights/yoloe-26m-seg.pt"

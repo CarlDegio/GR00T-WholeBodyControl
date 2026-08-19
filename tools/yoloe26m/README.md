@@ -126,21 +126,7 @@ python tools/yoloe26m/visual_prompt.py /absolute/path/to/second.jpg \
 坐标、换算为原图像素后，不暂停地让 YOLOE 识别第二张图。首层返回
 `NOT_FOUND`、`UNSURE`、空框、越界框或错误目标时，脚本会在加载 YOLOE 前报错退出。
 
-完整命令 2：GPT-5.6 Sol，`xhigh` 推理强度。它复用 BasePose 的 Codex CLI 和当前
-ChatGPT 登录，不需要另外保存 API key。
-
-~~~bash
-cd /home/wang/projects/GR00T-WholeBodyControl
-source .venv_inference/bin/activate
-python tools/yoloe26m/auto_refer_detect.py /absolute/path/to/second.jpg \
-  --refer-image /absolute/path/to/first.jpg \
-  --target "blue basket" \
-  --backend codex \
-  --codex-model gpt-5.6-sol \
-  --codex-reasoning-effort xhigh
-~~~
-
-完整命令 3：Qwen-VL Plus。它复用 BasePose 的 DashScope OpenAI-compatible API、
+完整命令 2：Qwen-VL Plus。它复用 BasePose 的 DashScope OpenAI-compatible API、
 模型和 key 查找逻辑：优先读取 `DASHSCOPE_API_KEY`，否则读取
 `.venv_inference/.env`。
 
@@ -149,12 +135,11 @@ cd /home/wang/projects/GR00T-WholeBodyControl
 source .venv_inference/bin/activate
 python tools/yoloe26m/auto_refer_detect.py /absolute/path/to/second.jpg \
   --refer-image /absolute/path/to/first.jpg \
-  --target "blue basket" \
-  --backend qwenvl
+  --target "blue basket"
 ~~~
 
-每次运行自动写入 `tools/yoloe26m/outputs/<target-slug><number>/`。手工、Codex
-和 Qwen 共用同一个编号序列；例如已有 `table1` 时下一次 table 任务创建
+每次运行自动写入 `tools/yoloe26m/outputs/<target-slug><number>/`。手工和 Qwen
+共用同一个编号序列；例如已有 `table1` 时下一次 table 任务创建
 `table2`，已有 `table1` 和 `table3` 时创建 `table4`。`blue basket` 会转换成
 `blue_basket1`。已有目录永远不会被覆盖或复用。
 

@@ -16,6 +16,7 @@ from gear_sonic.scripts.base_pose_yolo_agent import (
     GatewayRawServoAdapter,
     raw_servo_worker_for_mode,
 )
+from gear_sonic.utils.inference.base_pose import BasePoseCameraError
 from gear_sonic.utils.inference.base_pose_dual_visual_servo import (
     DualCameraFailoverCoordinator,
     DualCameraReference,
@@ -56,7 +57,13 @@ def test_dual_mode_is_the_agent_near_aligned_default() -> None:
     config = BasePoseAgentConfig(task="align")
 
     assert config.mode == "dual_raw_yoloe_servo"
-    assert config.reasoning_effort == "xhigh"
+    assert not hasattr(config, "vision_backend")
+    assert not hasattr(config, "model")
+    assert not hasattr(config, "reasoning_effort")
+    assert not hasattr(config, "codex_fast")
+    assert not hasattr(config, "codex_timeout_seconds")
+    assert config.qwenvl_model == "qwen3-vl-plus"
+    assert config.qwenvl_timeout_seconds == pytest.approx(600.0)
     assert config.dual_head_camera_stream == HEAD
     assert config.dual_head_depth_stream == "camera/ego_view_depth"
     assert config.dual_chest_camera_stream == CHEST
@@ -68,6 +75,8 @@ def test_dual_mode_is_the_agent_near_aligned_default() -> None:
     assert config.dual_match_tolerance_frames == 30
     assert config.dual_head_reacquire_frames == 10
     assert config.dual_initialization_grace_s == pytest.approx(30.0)
+    assert config.dual_rgbd_buffer_size == 8
+    assert config.dual_rgbd_poll_hz == pytest.approx(60.0)
 
 
 def test_dual_worker_selection_keeps_single_mode_available() -> None:
@@ -174,14 +183,26 @@ def test_dual_calibration_uses_head_and_chest_mounts() -> None:
 
 
 class _FakeDualGatewayClient:
-    def __init__(self) -> None:
-        self.calls = {HEAD: 0, CHEST: 0}
+    def __init__(self, stream_name: str) -> None:
+        self.stream_name = stream_name
+        self.timestamp_ns: int | None = None
+        self.generation = 1
+        self.lock = threading.Lock()
         self.closed = False
 
+    def publish(self, timestamp_ns: int, *, generation: int = 1) -> None:
+        with self.lock:
+            self.timestamp_ns = timestamp_ns
+            self.generation = generation
+
     @staticmethod
-    def _materialized(stream_name: str, timestamp_ns: int):
+    def _materialized(
+        stream_name: str,
+        depth_stream: str,
+        timestamp_ns: int,
+        generation: int,
+    ):
         rgb_stream = f"camera/{stream_name}"
-        depth_stream = f"camera/{stream_name}_depth"
         camera_info = {
             "fx": 100.0,
             "fy": 101.0,
@@ -192,9 +213,21 @@ class _FakeDualGatewayClient:
             "depth_scale_m": 0.001,
             "depth_aligned_to": stream_name,
         }
+        if depth_stream.startswith("derived/depth_anything/"):
+            camera_info.update(
+                {
+                    "depth_source": "depth-anything-v2-metric-hypersim-vitb",
+                    "uses_raw_depth": False,
+                    "inference_owner": "base_pose",
+                    "inference_generation": generation,
+                }
+            )
         frame = lambda: SimpleNamespace(
             source_timestamp_ns=timestamp_ns,
-            attributes={"camera_info": camera_info},
+            attributes={
+                "camera_info": camera_info,
+                "depth_source": camera_info.get("depth_source", ""),
+            },
         )
         return SimpleNamespace(
             snapshot=SimpleNamespace(
@@ -211,40 +244,90 @@ class _FakeDualGatewayClient:
         assert request.timestamp_basis is TimestampBasis.SOURCE
         rgb_stream = request.streams[0]
         stream_name = rgb_stream.removeprefix("camera/")
-        self.calls[stream_name] += 1
-        if stream_name == CHEST and self.calls[stream_name] == 1:
-            raise SensorGatewayClientError("chest unavailable")
-        timestamp_ns = 1_000_000_000 if stream_name == HEAD else 2_000_000_000
-        return self._materialized(stream_name, timestamp_ns)
+        assert stream_name == self.stream_name
+        with self.lock:
+            timestamp_ns = self.timestamp_ns
+            generation = self.generation
+        if timestamp_ns is None:
+            raise SensorGatewayClientError(f"{stream_name} unavailable")
+        return self._materialized(
+            stream_name,
+            request.streams[1],
+            timestamp_ns,
+            generation,
+        )
 
     def close(self) -> None:
         self.closed = True
 
 
 def test_dual_gateway_does_not_let_one_camera_block_the_other() -> None:
-    client = _FakeDualGatewayClient()
+    clients: dict[str, _FakeDualGatewayClient] = {}
+
+    def client_factory(stream_name: str) -> _FakeDualGatewayClient:
+        client = _FakeDualGatewayClient(stream_name)
+        clients[stream_name] = client
+        return client
+
     camera = SensorGatewayDualBasePoseCamera(
         "inproc://unused",
         stream_depths={
             HEAD: "camera/ego_view_depth",
-            CHEST: "camera/chest_view_depth",
+            CHEST: "derived/depth_anything/chest_view",
         },
-        timeout_ms=100,
-        client=client,
+        timeout_ms=60,
+        poll_hz=200.0,
+        client_factory=client_factory,
     )
+    clients[HEAD].publish(1_000_000_000)
 
     head_only = camera.capture()
     assert set(head_only.snapshots) == {HEAD}
-    assert "chest unavailable" in head_only.errors[CHEST]
+    assert "chest_view unavailable" in head_only.errors[CHEST]
     assert head_only.require(HEAD).depth_aligned_to == HEAD
 
-    chest_only = camera.capture()
-    assert set(chest_only.snapshots) == {CHEST}
-    assert "waiting for newer ego_view" in chest_only.errors[HEAD]
-    assert chest_only.require(CHEST).depth_aligned_to == CHEST
+    # A ready chest frame must remain available after an unrelated head read.
+    clients[CHEST].publish(2_000_000_000)
+    clients[HEAD].publish(3_000_000_000)
+    head = camera.capture_stream(HEAD)
+    chest = camera.capture_stream(CHEST)
+    assert head.timestamp == pytest.approx(3.0)
+    assert chest.timestamp == pytest.approx(2.0)
+    assert chest.depth_aligned_to == CHEST
 
     camera.close()
-    assert not client.closed
+    assert all(client.closed for client in clients.values())
+
+
+def test_dual_gateway_rejects_depth_from_an_old_base_pose_generation() -> None:
+    clients: dict[str, _FakeDualGatewayClient] = {}
+
+    def client_factory(stream_name: str) -> _FakeDualGatewayClient:
+        client = _FakeDualGatewayClient(stream_name)
+        clients[stream_name] = client
+        return client
+
+    camera = SensorGatewayDualBasePoseCamera(
+        "inproc://unused",
+        stream_depths={
+            HEAD: "camera/ego_view_depth",
+            CHEST: "derived/depth_anything/chest_view",
+        },
+        timeout_ms=60,
+        poll_hz=200.0,
+        client_factory=client_factory,
+    )
+    try:
+        camera.begin_generation(7)
+        clients[CHEST].publish(2_000_000_000, generation=6)
+        with pytest.raises(BasePoseCameraError, match="generation 6"):
+            camera.capture_stream(CHEST)
+
+        clients[CHEST].publish(3_000_000_000, generation=7)
+        chest = camera.capture_stream(CHEST)
+        assert chest.timestamp == pytest.approx(3.0)
+    finally:
+        camera.close()
 
 
 def test_dual_runtime_uses_camera_specific_standoff_and_initial_phase(tmp_path) -> None:
