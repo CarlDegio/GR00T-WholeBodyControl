@@ -56,6 +56,9 @@ DUAL_TEXT_SURFACE_PROMPT = "desk"
 CHEST_HANDOFF_REQUIRED_FRAMES = 3
 CHEST_HANDOFF_QWEN_STAGE = "chest_distance_qwen"
 CHEST_HANDOFF_FAILURE_REASON = "head_target_not_found_after_chest_handoff"
+QWEN_HOLD_STAGES = frozenset(
+    {"head_monitor_qwen", CHEST_HANDOFF_QWEN_STAGE}
+)
 
 
 def _reference_bbox(
@@ -420,13 +423,16 @@ def _ground_camera_reference(
     _save_png(rgb_path, snapshot.rgb, rgb=True)
     assert snapshot.depth_raw is not None
     _save_png(stream_dir / "initial_depth_raw.png", snapshot.depth_raw)
+    chest_stream = str(
+        getattr(config, "dual_chest_camera_stream", "chest_view")
+    )
     spec, table_bboxes = ground_raw_servo_references(
         config,
         rgb_path,
         stream_dir,
         client_factory=client_factory,
         calibration=calibration,
-        require_table=True,
+        require_table=stream_name != chest_stream,
     )
     return DualCameraReference(
         stream_name=stream_name,
@@ -712,13 +718,16 @@ def ground_qwen_fallback_reference(
         qwenvl_thinking_budget=config.qwenvl_thinking_budget,
         qwenvl_timeout_seconds=config.qwenvl_timeout_seconds,
     )
+    chest_stream = str(
+        getattr(config, "dual_chest_camera_stream", "chest_view")
+    )
     spec, table_bboxes = ground_raw_servo_references(
         qwen_config,
         rgb_path,
         workdir,
         client_factory=client_factory,
         calibration=calibration,
-        require_table=True,
+        require_table=stream_name != chest_stream,
     )
     reference = DualCameraReference(
         stream_name=stream_name,
@@ -1810,11 +1819,11 @@ def run_dual_raw_servo_worker(
                             calibration.validate_snapshot(snapshot)
                             instances = list(tracker.track(snapshot.rgb))
                             chest_active = attempt.live_stream == stream_names[1]
-                            # Chest initialization still validates its desk
-                            # reference, but the far-range approach becomes
-                            # target-only after the first valid observation.
+                            # Chest is a target-only far-approach camera from
+                            # its first live frame onward.  Head tracking keeps
+                            # the phase-dependent table requirement.
                             require_table = (
-                                not initialized
+                                False
                                 if chest_active
                                 else table_required is None
                                 or bool(table_required())
@@ -2228,10 +2237,13 @@ def run_dual_raw_servo_worker(
                         generation_finished = True
                         break
                     attempt = next_attempt
-                    distance_handoff = (
-                        attempt.stage == CHEST_HANDOFF_QWEN_STAGE
+                    qwen_handoff_requires_hold = (
+                        attempt.stage in QWEN_HOLD_STAGES
                     )
-                    if distance_handoff and handoff_hold_event is not None:
+                    if (
+                        qwen_handoff_requires_hold
+                        and handoff_hold_event is not None
+                    ):
                         handoff_hold_event.clear()
                     _publish_worker_event(
                         events,
@@ -2247,7 +2259,10 @@ def run_dual_raw_servo_worker(
                             frame=failure_frame,
                         ),
                     )
-                    if distance_handoff and handoff_hold_event is not None:
+                    if (
+                        qwen_handoff_requires_hold
+                        and handoff_hold_event is not None
+                    ):
                         while (
                             gate.is_active(generation)
                             and not stop_event.is_set()

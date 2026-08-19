@@ -68,6 +68,31 @@ python tools/yoloe26m/infer.py 0 \
 提示词建议使用简短的英文类别名。标注后的图片或视频保存在
 tools/yoloe26m/outputs/。模型输出同时包含检测框和像素级实例掩码。
 
+### 用当前采集数据测试桌子检测
+
+以下命令会自动选择 `outputs/base_pose_adjustment/` 下最新一组
+`review_samples/raw` 实机 RGB 帧，分别用多个文本 prompt 检测桌子：
+
+~~~bash
+source .venv_inference/bin/activate
+python tools/yoloe26m/test_text_prompt_table.py
+~~~
+
+也可以指定数据目录、提示词、阈值和采样数：
+
+~~~bash
+python tools/yoloe26m/test_text_prompt_table.py \
+  --source /path/to/rgb_frames \
+  --prompts table desk "wooden table" \
+  --conf 0.10 \
+  --max-images 30
+~~~
+
+结果保存在 `tools/yoloe26m/outputs/text_prompt_table_<时间>/`：`report.md` 和
+`summary.json` 汇总各 prompt 的逐帧检出率、置信度与耗时；每个 prompt 子目录还包含
+逐帧结构化检测结果、标注图及 `contact_sheet.jpg`。当前采集数据没有人工桌子标注，
+因此检出率只能用于 prompt 筛选，不能当作 precision、recall 或 mAP。
+
 ## 性能测试
 
 ~~~bash

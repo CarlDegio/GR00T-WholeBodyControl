@@ -24,6 +24,7 @@ from gear_sonic.utils.inference.base_pose_dual_visual_servo import (
     DualCameraFailoverCoordinator,
     DualCameraReference,
     HeadCameraTextMonitor,
+    QWEN_HOLD_STAGES,
     _ground_camera_reference,
     dual_calibrations_from_config,
     run_dual_raw_servo_worker,
@@ -183,7 +184,19 @@ def test_distance_handoff_is_terminal_only_until_head_initializes() -> None:
     assert (head_text.live_stream, head_text.stage) == (HEAD, "origin_text")
 
 
-def test_chest_initial_reference_requires_a_table(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    ("stream_name", "expected_calls", "expected_table_bboxes"),
+    (
+        (CHEST, 1, ()),
+        (HEAD, 2, ((50.0, 300.0, 950.0, 900.0),)),
+    ),
+)
+def test_initial_reference_table_requirement_depends_on_camera(
+    tmp_path: Path,
+    stream_name: str,
+    expected_calls: int,
+    expected_table_bboxes: tuple[tuple[float, float, float, float], ...],
+) -> None:
     class TargetAndTableClient:
         def __init__(self) -> None:
             self.calls = 0
@@ -218,8 +231,8 @@ def test_chest_initial_reference_requires_a_table(tmp_path: Path) -> None:
     config = BasePoseAgentConfig(task="approach the blue basket")
     reference = _ground_camera_reference(
         config,
-        CHEST,
-        _worker_snapshot(CHEST, 1),
+        stream_name,
+        _worker_snapshot(stream_name, 1),
         RawServoCalibration(
             6,
             4,
@@ -233,10 +246,25 @@ def test_chest_initial_reference_requires_a_table(tmp_path: Path) -> None:
         client_factory=lambda: client,
     )
 
-    assert client.calls == 2
-    assert reference.stream_name == CHEST
-    assert reference.table_bboxes == ((50.0, 300.0, 950.0, 900.0),)
-    assert (tmp_path / CHEST / "table_prompt.txt").is_file()
+    assert client.calls == expected_calls
+    assert reference.stream_name == stream_name
+    assert reference.table_bboxes == expected_table_bboxes
+    assert (tmp_path / stream_name / "table_prompt.txt").exists() == (
+        stream_name == HEAD
+    )
+
+
+def test_head_monitor_without_table_requires_zero_hold_before_qwen() -> None:
+    coordinator = DualCameraFailoverCoordinator(
+        (HEAD, CHEST),
+        {CHEST: _reference(CHEST, 2)},
+    )
+
+    attempt = coordinator.begin_head_monitor_reacquisition(use_qwen=True)
+
+    assert attempt.stage == "head_monitor_qwen"
+    assert attempt.stage in QWEN_HOLD_STAGES
+    assert CHEST_HANDOFF_QWEN_STAGE in QWEN_HOLD_STAGES
 
 
 def test_head_monitor_reuses_initialized_dynamic_target_prompt() -> None:
@@ -798,7 +826,7 @@ def test_chest_distance_handoff_qwen_failure_does_not_return_to_chest(
 
         def track(self, _rgb):
             self.track_calls += 1
-            return [target, desk] if self.track_calls == 1 else [target]
+            return [target]
 
     config = BasePoseAgentConfig(
         task="approach the blue basket",
@@ -880,7 +908,7 @@ def test_chest_distance_handoff_qwen_failure_does_not_return_to_chest(
 
     assert len(applied) == 2
     assert applied[0].observation is not None
-    assert applied[0].observation.table is not None
+    assert applied[0].observation.table is None
     assert applied[1].observation is not None
     assert applied[1].observation.table is None
     assert len(switching) == 1
