@@ -225,6 +225,7 @@ class RawServoObservation:
     image_height: int = 480
     table_geometry_error: str | None = None
     desk_mask: np.ndarray | None = None
+    table_rgb_edges: np.ndarray | None = None
 
 
 @dataclass(frozen=True)
@@ -1286,6 +1287,7 @@ _TABLE_EDGE_HOUGH_THRESHOLD = 25
 _TABLE_EDGE_MIN_LENGTH_PX = 45.0
 _TABLE_EDGE_HOUGH_MAX_LINE_GAP_PX = 12
 _TABLE_EDGE_DEPTH_SAMPLES = 20
+_TABLE_EDGE_TARGET_EXCLUSION_RADIUS_PX = 20
 
 
 @dataclass(frozen=True)
@@ -1373,6 +1375,21 @@ def _rgb_mask_edge_intersection(
     return intersection
 
 
+def _table_edge_target_exclusion(
+    target_mask: np.ndarray,
+    expected_shape: tuple[int, int],
+) -> np.ndarray:
+    target_binary = np.asarray(target_mask, dtype=np.uint8)
+    if target_binary.shape != expected_shape:
+        raise ValueError("target mask is not aligned to RGB-D")
+    radius = _TABLE_EDGE_TARGET_EXCLUSION_RADIUS_PX
+    exclusion_kernel = cv2.getStructuringElement(
+        cv2.MORPH_ELLIPSE,
+        (2 * radius + 1, 2 * radius + 1),
+    )
+    return cv2.dilate(target_binary, exclusion_kernel, iterations=1)
+
+
 def _rgb_mask_line_segments(
     rgb: np.ndarray,
     mask: np.ndarray,
@@ -1384,6 +1401,12 @@ def _rgb_mask_line_segments(
         mask,
         exclusion_mask=exclusion_mask,
     )
+    return _rgb_edge_line_segments(intersection)
+
+
+def _rgb_edge_line_segments(
+    intersection: np.ndarray,
+) -> list[_PixelLineSegment]:
     detected = cv2.HoughLinesP(
         intersection,
         rho=1.0,
@@ -1515,6 +1538,7 @@ def estimate_table_geometry(
     calibration: RawServoCalibration,
     *,
     target_mask: np.ndarray | None = None,
+    edge_intersection: np.ndarray | None = None,
 ) -> TableGeometry:
     calibration.validate_snapshot(snapshot)
     assert snapshot.depth_raw is not None
@@ -1523,27 +1547,22 @@ def estimate_table_geometry(
     if binary.shape != snapshot.depth_raw.shape:
         raise ValueError("table mask is not aligned to RGB-D")
 
-    target_exclusion: np.ndarray | None = None
-    if target_mask is not None:
-        target_binary = np.asarray(target_mask, dtype=np.uint8)
-        if target_binary.shape != binary.shape:
-            raise ValueError("target mask is not aligned to RGB-D")
-        exclusion_radius_px = 20
-        exclusion_kernel = cv2.getStructuringElement(
-            cv2.MORPH_ELLIPSE,
-            (2 * exclusion_radius_px + 1, 2 * exclusion_radius_px + 1),
+    if edge_intersection is None:
+        target_exclusion = (
+            None
+            if target_mask is None
+            else _table_edge_target_exclusion(target_mask, binary.shape)
         )
-        target_exclusion = cv2.dilate(
-            target_binary,
-            exclusion_kernel,
-            iterations=1,
+        segments = _rgb_mask_line_segments(
+            snapshot.rgb,
+            binary,
+            exclusion_mask=target_exclusion,
         )
-
-    segments = _rgb_mask_line_segments(
-        snapshot.rgb,
-        binary,
-        exclusion_mask=target_exclusion,
-    )
+    else:
+        intersection = np.asarray(edge_intersection)
+        if intersection.ndim != 2 or intersection.shape != binary.shape:
+            raise ValueError("table RGB edge image is not aligned to RGB-D")
+        segments = _rgb_edge_line_segments(intersection)
     candidates = [
         segment
         for segment in segments
@@ -2786,14 +2805,25 @@ def _observation(
     table = None
     table_error = None
     desk_mask = None
+    table_rgb_edges = None
     if surface is not None:
         desk_mask = _largest_filled_component(surface.mask)
         try:
+            target_exclusion = _table_edge_target_exclusion(
+                target.mask,
+                desk_mask.shape,
+            )
+            table_rgb_edges = _rgb_mask_edge_intersection(
+                snapshot.rgb,
+                desk_mask,
+                exclusion_mask=target_exclusion,
+            )
             table = estimate_table_geometry(
                 snapshot,
                 desk_mask,
                 calibration,
                 target_mask=target.mask,
+                edge_intersection=table_rgb_edges,
             )
         except ValueError as exc:
             table = None
@@ -2814,6 +2844,7 @@ def _observation(
         image_height=int(snapshot.rgb.shape[0]),
         table_geometry_error=table_error,
         desk_mask=desk_mask,
+        table_rgb_edges=table_rgb_edges,
     )
 
 
@@ -2877,6 +2908,15 @@ def _diagnostic_frame(
         frame_index=frame_index,
         camera_timestamp=snapshot.timestamp,
         rgb=snapshot.rgb.copy(),
+        depth_raw=(
+            None if snapshot.depth_raw is None else snapshot.depth_raw.copy()
+        ),
+        depth_scale_m=snapshot.depth_scale_m,
+        table_rgb_edges=(
+            None
+            if observation is None or observation.table_rgb_edges is None
+            else observation.table_rgb_edges.copy()
+        ),
         camera_stream=camera_stream,
         attempt_id=attempt_id,
         failover_stage=failover_stage,

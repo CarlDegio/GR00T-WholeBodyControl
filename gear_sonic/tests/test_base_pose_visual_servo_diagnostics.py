@@ -105,3 +105,50 @@ def test_writer_saves_completed_table_mask_losslessly(tmp_path) -> None:
     assert relative == "review_samples/masks/000005_table_completed.png"
     saved = cv2.imread(str(tmp_path / relative), cv2.IMREAD_UNCHANGED)
     np.testing.assert_array_equal(saved, completed * 255)
+
+
+def test_writer_saves_paired_rgb_depth_and_rgb_edges(tmp_path) -> None:
+    rgb = np.zeros((4, 6, 3), dtype=np.uint8)
+    rgb[:, :, 0] = 17
+    rgb[:, :, 1] = 83
+    rgb[:, :, 2] = 149
+    depth = np.arange(24, dtype=np.uint16).reshape(4, 6) * 37
+    edges = np.zeros((4, 6), dtype=np.uint8)
+    edges[2, 1:5] = 255
+    frame = DetectionFrameData(
+        frame_index=5,
+        camera_timestamp=5.0,
+        rgb=rgb,
+        depth_raw=depth,
+        depth_scale_m=0.001,
+        table_rgb_edges=edges,
+    )
+    writer = FrameDiagnosticsWriter(tmp_path, review_stride=5)
+
+    writer.write(
+        frame,
+        control_applied=False,
+        controller_state=None,
+        command=None,
+    )
+
+    record = json.loads((tmp_path / "raw_servo_frames.jsonl").read_text())
+    artifacts = record["review_artifacts"]
+    assert artifacts["raw_rgb"] == "review_samples/raw/000005.png"
+    assert artifacts["raw_depth"] == "review_samples/depth/000005.png"
+    assert artifacts["table_rgb_edges"] == (
+        "review_samples/edges/000005_table_rgb.png"
+    )
+    assert artifacts["depth_scale_m"] == 0.001
+    saved_rgb = cv2.imread(
+        str(tmp_path / artifacts["raw_rgb"]), cv2.IMREAD_COLOR
+    )
+    saved_depth = cv2.imread(
+        str(tmp_path / artifacts["raw_depth"]), cv2.IMREAD_UNCHANGED
+    )
+    saved_edges = cv2.imread(
+        str(tmp_path / artifacts["table_rgb_edges"]), cv2.IMREAD_UNCHANGED
+    )
+    np.testing.assert_array_equal(saved_rgb, cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR))
+    np.testing.assert_array_equal(saved_depth, depth)
+    np.testing.assert_array_equal(saved_edges, edges)

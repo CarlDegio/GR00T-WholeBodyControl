@@ -21,6 +21,9 @@ class DetectionFrameData:
     frame_index: int
     camera_timestamp: float
     rgb: np.ndarray
+    depth_raw: np.ndarray | None = field(default=None, repr=False)
+    depth_scale_m: float | None = None
+    table_rgb_edges: np.ndarray | None = field(default=None, repr=False)
     camera_stream: str | None = None
     attempt_id: int | None = None
     failover_stage: str | None = None
@@ -84,6 +87,8 @@ class FrameDiagnosticsWriter:
         self.jsonl_path = self.output_dir / "raw_servo_frames.jsonl"
         self.review_stride = int(review_stride)
         self.review_raw_dir = self.output_dir / "review_samples" / "raw"
+        self.review_depth_dir = self.output_dir / "review_samples" / "depth"
+        self.review_edges_dir = self.output_dir / "review_samples" / "edges"
         self.review_masks_dir = self.output_dir / "review_samples" / "masks"
 
     @staticmethod
@@ -126,6 +131,9 @@ class FrameDiagnosticsWriter:
         result: dict[str, Any] = {
             "sampled": False,
             "raw_rgb": None,
+            "raw_depth": None,
+            "depth_scale_m": None,
+            "table_rgb_edges": None,
             "target_mask": None,
             "table_mask": None,
             "table_completed_mask": None,
@@ -134,6 +142,8 @@ class FrameDiagnosticsWriter:
         if frame.frame_index % self.review_stride:
             return result
         self.review_raw_dir.mkdir(parents=True, exist_ok=True)
+        self.review_depth_dir.mkdir(parents=True, exist_ok=True)
+        self.review_edges_dir.mkdir(parents=True, exist_ok=True)
         self.review_masks_dir.mkdir(parents=True, exist_ok=True)
         stem = f"{int(frame.frame_index):06d}"
         raw_relative = Path("review_samples") / "raw" / f"{stem}.png"
@@ -143,6 +153,32 @@ class FrameDiagnosticsWriter:
             self._encode_png(raw_bgr, name=f"review RGB {stem}"),
         )
         result.update(sampled=True, raw_rgb=raw_relative.as_posix())
+        if frame.depth_raw is not None:
+            depth = np.asarray(frame.depth_raw)
+            if depth.shape != frame.rgb.shape[:2] or depth.dtype != np.uint16:
+                raise ValueError("review depth must be aligned uint16 RGB-D")
+            depth_relative = Path("review_samples") / "depth" / f"{stem}.png"
+            _atomic_write_bytes(
+                self.output_dir / depth_relative,
+                self._encode_png(depth, name=f"review raw depth {stem}"),
+            )
+            result["raw_depth"] = depth_relative.as_posix()
+            result["depth_scale_m"] = _optional_float(frame.depth_scale_m)
+        if frame.table_rgb_edges is not None:
+            edge_image = np.asarray(frame.table_rgb_edges)
+            if edge_image.shape != frame.rgb.shape[:2]:
+                raise ValueError("table RGB edge image shape does not match RGB")
+            edge_relative = (
+                Path("review_samples") / "edges" / f"{stem}_table_rgb.png"
+            )
+            _atomic_write_bytes(
+                self.output_dir / edge_relative,
+                self._encode_png(
+                    edge_image.astype(np.uint8, copy=False),
+                    name=f"review table RGB edges {stem}",
+                ),
+            )
+            result["table_rgb_edges"] = edge_relative.as_posix()
         for key, suffix, mask in (
             ("target_mask", "target", frame.target_mask),
             ("table_mask", "table", frame.surface_mask),
@@ -322,6 +358,14 @@ def _owned_frame(frame: DetectionFrameData) -> DetectionFrameData:
     return replace(
         frame,
         rgb=np.asarray(frame.rgb).copy(),
+        depth_raw=(
+            None if frame.depth_raw is None else np.asarray(frame.depth_raw).copy()
+        ),
+        table_rgb_edges=(
+            None
+            if frame.table_rgb_edges is None
+            else np.asarray(frame.table_rgb_edges).copy()
+        ),
         target_mask=(
             None if frame.target_mask is None else np.asarray(frame.target_mask).copy()
         ),
