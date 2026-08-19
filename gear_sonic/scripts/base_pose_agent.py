@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import math
 from typing import Literal
 
 from gear_sonic.camera.calibration import DEFAULT_CAMERA_INTRINSICS_PATH
@@ -70,7 +71,7 @@ class BasePoseAgentConfig:
     raw_reference_update_min_iou: float = 0.50
     raw_servo_hz: float = 10.0
     raw_head_target_distance_m: float = 0.90
-    raw_chest_target_distance_m: float = 0.80
+    raw_chest_handoff_distance_m: float = 0.65
     raw_forward_tolerance_m: float = 0.10
     raw_lateral_tolerance_m: float = 0.10
     raw_min_linear_speed_m_s: float = 0.40
@@ -88,6 +89,15 @@ class BasePoseAgentConfig:
     raw_max_run_s: float = 180.0
     raw_post_stop_sample_s: float = 3.0
     raw_allow_missing_table: Literal[0, 1] = 0
+
+    def __post_init__(self) -> None:
+        if (
+            not math.isfinite(self.raw_chest_handoff_distance_m)
+            or self.raw_chest_handoff_distance_m <= 0.0
+        ):
+            raise ValueError(
+                "raw_chest_handoff_distance_m must be finite and positive"
+            )
 
 
 def main(config: BasePoseAgentConfig) -> None:

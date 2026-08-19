@@ -15,6 +15,7 @@ from gear_sonic.runtime.config import load_runtime_profile
 from gear_sonic.runtime.endpoints import get_endpoint
 from gear_sonic.scripts.launch_inference import (
     InferenceLaunchConfig,
+    _check_prerequisites,
     _clear_stale_fastlio_processes,
     _dotenv_has_nonempty_value,
     _inference_pane_count,
@@ -485,9 +486,31 @@ def test_base_pose_agent_uses_gateway_arbitration_and_fixed_task() -> None:
     assert "--qwenvl-timeout-seconds 600.0" in command
     assert "--dual-rgbd-buffer-size 8" in command
     assert "--dual-rgbd-poll-hz 60.0" in command
+    assert "--raw-chest-handoff-distance-m 0.65" in command
+    assert "--raw-chest-target-distance-m" not in command
     assert "--vision-backend" not in command
     assert "codex" not in command.lower()
     assert "--port 5558" not in command
+
+
+@pytest.mark.parametrize("distance", [0.0, float("nan"), float("inf")])
+def test_launcher_rejects_invalid_chest_handoff_distance(
+    distance: float,
+    capsys,
+) -> None:
+    config = InferenceLaunchConfig(
+        base_pose_enabled=True,
+        base_pose_task="align",
+        base_pose_raw_chest_handoff_distance_m=distance,
+        data_exporter=False,
+    )
+
+    with pytest.raises(SystemExit):
+        _check_prerequisites(config)
+
+    assert "Base-Pose chest handoff distance must be finite and positive" in (
+        capsys.readouterr().out
+    )
 
 
 def test_base_pose_qwenvl_command_loads_local_key_without_persisting_by_default() -> None:

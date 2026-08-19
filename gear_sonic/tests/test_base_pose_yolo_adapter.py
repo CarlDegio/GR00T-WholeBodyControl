@@ -160,6 +160,46 @@ def test_yolo_adapter_reports_terminal_worker_failure_once(tmp_path) -> None:
     ]
 
 
+def test_chest_handoff_failure_stops_before_reporting_failed(tmp_path) -> None:
+    intents: list[tuple[str, dict[str, object]]] = []
+    adapter = GatewayRawServoAdapter(
+        BasePoseAgentConfig(
+            task="align to the basket",
+            output_root=str(tmp_path),
+        ),
+        submit_intent=lambda name, values: intents.append((name, dict(values))),
+        monotonic=lambda: 10.0,
+    )
+    assert adapter.start(4, now=10.0)
+    adapter.runtime.events.put(
+        RawServoEvent(
+            4,
+            "error",
+            error="head_target_not_found_after_chest_handoff",
+            hard=True,
+        )
+    )
+
+    adapter.tick(now=10.1)
+    adapter.tick(now=10.2)
+
+    velocities = [
+        values for name, values in intents if name == "base_pose_velocity"
+    ]
+    assert velocities
+    assert all(values["velocity"] == [0.0, 0.0, 0.0] for values in velocities)
+    assert [values["action"] for values in velocities].count("stop") == 3
+    statuses = [values for name, values in intents if name == "base_pose_status"]
+    assert statuses == [
+        {
+            "generation": 4,
+            "state": "failed",
+            "reason": "head_target_not_found_after_chest_handoff",
+        }
+    ]
+    assert intents[-1][0] == "base_pose_status"
+
+
 def test_yolo_grounding_contract_preserves_model_target_prompt() -> None:
     target = validate_raw_servo_target(
         {

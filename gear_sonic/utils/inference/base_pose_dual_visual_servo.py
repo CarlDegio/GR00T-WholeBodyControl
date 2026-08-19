@@ -33,6 +33,7 @@ from gear_sonic.utils.inference.base_pose_visual_servo import (
     GenerationGate,
     RawServoEvent,
     RawServoCalibration,
+    RawServoObservation,
     TrackedInstance,
     YoloePersistentTracker,
     YoloeTargetReferenceEncoder,
@@ -52,6 +53,9 @@ from gear_sonic.utils.inference.base_pose_visual_servo_diagnostics import (
 
 DEFAULT_DUAL_QWEN_FALLBACK_MODEL = "qwen3-vl-8b-instruct"
 DUAL_TEXT_SURFACE_PROMPT = "desk"
+CHEST_HANDOFF_REQUIRED_FRAMES = 3
+CHEST_HANDOFF_QWEN_STAGE = "chest_distance_qwen"
+CHEST_HANDOFF_FAILURE_REASON = "head_target_not_found_after_chest_handoff"
 
 
 def _reference_bbox(
@@ -225,6 +229,17 @@ class DualCameraFailoverCoordinator:
             origin_stream=head_stream,
         )
 
+    def begin_chest_distance_handoff(self) -> DualCameraAttempt:
+        """Start the head-Qwen handoff that must initialize before recovery."""
+
+        head_stream, chest_stream = self.stream_names
+        return self._attempt(
+            head_stream,
+            self._initial_reference(head_stream),
+            stage=CHEST_HANDOFF_QWEN_STAGE,
+            origin_stream=chest_stream,
+        )
+
     def _recovery_sequence(
         self,
         origin_stream: str,
@@ -250,6 +265,11 @@ class DualCameraFailoverCoordinator:
         self,
         attempt: DualCameraAttempt,
     ) -> DualCameraAttempt | None:
+        if (
+            attempt.stage == CHEST_HANDOFF_QWEN_STAGE
+            and self._active_attempt_id != attempt.attempt_id
+        ):
+            return None
         if (
             attempt.stage == "head_monitor_qwen"
             and self._active_attempt_id != attempt.attempt_id
@@ -406,7 +426,7 @@ def _ground_camera_reference(
         stream_dir,
         client_factory=client_factory,
         calibration=calibration,
-        require_table=stream_name != str(config.dual_chest_camera_stream),
+        require_table=True,
     )
     return DualCameraReference(
         stream_name=stream_name,
@@ -698,7 +718,7 @@ def ground_qwen_fallback_reference(
         workdir,
         client_factory=client_factory,
         calibration=calibration,
-        require_table=stream_name != str(config.dual_chest_camera_stream),
+        require_table=True,
     )
     reference = DualCameraReference(
         stream_name=stream_name,
@@ -1130,6 +1150,34 @@ class HeadCameraMonitorResult:
     surface: TrackedInstance | None
 
 
+@dataclass
+class ChestDistanceHandoffGate:
+    """Require consecutive raw chest-forward measurements before handoff."""
+
+    distance_m: float
+    required_frames: int = CHEST_HANDOFF_REQUIRED_FRAMES
+    streak: int = 0
+
+    def __post_init__(self) -> None:
+        self.distance_m = float(self.distance_m)
+        self.required_frames = int(self.required_frames)
+        if not math.isfinite(self.distance_m) or self.distance_m <= 0.0:
+            raise ValueError("chest handoff distance must be finite and positive")
+        if self.required_frames <= 0:
+            raise ValueError("chest handoff frame count must be positive")
+
+    def reset(self) -> None:
+        self.streak = 0
+
+    def observe(self, observation: RawServoObservation) -> bool:
+        forward_m = float(observation.target.forward_m)
+        if math.isfinite(forward_m) and forward_m <= self.distance_m:
+            self.streak += 1
+        else:
+            self.reset()
+        return self.streak >= self.required_frames
+
+
 class HeadCameraTextMonitor:
     """Track the head stream with the initial target prompt while chest is active."""
 
@@ -1325,6 +1373,7 @@ def run_dual_raw_servo_worker(
     head_monitor_tracker_factory: Callable[[], Any] | None = None,
     latest_reference_updater_factory: Callable[[], Any] | None = None,
     qwen_reference_factory: Callable[..., DualCameraReference] | None = None,
+    handoff_hold_event: threading.Event | None = None,
     calibration_factory: (
         Callable[[Any], Mapping[str, RawServoCalibration]] | None
     ) = None,
@@ -1350,6 +1399,12 @@ def run_dual_raw_servo_worker(
     head_reacquire_frames = int(getattr(config, "dual_head_reacquire_frames", 10))
     if head_reacquire_frames <= 0:
         raise ValueError("dual head reacquisition frame count must be positive")
+    chest_handoff_distance_m = float(config.raw_chest_handoff_distance_m)
+    if (
+        not math.isfinite(chest_handoff_distance_m)
+        or chest_handoff_distance_m <= 0.0
+    ):
+        raise ValueError("chest handoff distance must be finite and positive")
 
     camera: Any | None = None
     tracker: Any = (
@@ -1508,6 +1563,7 @@ def run_dual_raw_servo_worker(
                             "origin_qwen",
                             "alternate_qwen",
                             "head_monitor_qwen",
+                            CHEST_HANDOFF_QWEN_STAGE,
                         }:
                             qwen_snapshot = pending_head_qwen.pop(
                                 attempt.attempt_id, None
@@ -1629,6 +1685,11 @@ def run_dual_raw_servo_worker(
                     failure_frame = None
                     preempt_attempt: DualCameraAttempt | None = None
                     switch_details: dict[str, Any] = {}
+                    chest_handoff_gate = (
+                        ChestDistanceHandoffGate(chest_handoff_distance_m)
+                        if attempt.live_stream == stream_names[1]
+                        else None
+                    )
                     while (
                         not failure_reason
                         and gate.is_active(generation)
@@ -1649,6 +1710,7 @@ def run_dual_raw_servo_worker(
                         previous_target_id = target_id
                         previous_surface_id = surface_id
                         monitor_details: dict[str, Any] = {}
+                        head_snapshot: AlignedRGBDSnapshot | None = None
                         try:
                             snapshot = _capture_camera_stream(
                                 camera,
@@ -1747,12 +1809,13 @@ def run_dual_raw_servo_worker(
                             calibration = calibrations[attempt.live_stream]
                             calibration.validate_snapshot(snapshot)
                             instances = list(tracker.track(snapshot.rgb))
-                            # Chest starts target-only and approaches without desk
-                            # geometry. Once initialized, the controller callback
-                            # re-enables the desk only for phases such as yaw align.
+                            chest_active = attempt.live_stream == stream_names[1]
+                            # Chest initialization still validates its desk
+                            # reference, but the far-range approach becomes
+                            # target-only after the first valid observation.
                             require_table = (
-                                attempt.live_stream != stream_names[1]
-                                if not initialized
+                                not initialized
+                                if chest_active
                                 else table_required is None
                                 or bool(table_required())
                             )
@@ -1804,6 +1867,8 @@ def run_dual_raw_servo_worker(
                             perception_error = ""
 
                         if perception_error:
+                            if chest_handoff_gate is not None:
+                                chest_handoff_gate.reset()
                             diagnostic_frame = (
                                 None
                                 if snapshot is None
@@ -1852,6 +1917,49 @@ def run_dual_raw_servo_worker(
                         assert target is not None
                         assert observation is not None
                         invalid_frames = 0
+                        if (
+                            chest_handoff_gate is not None
+                            and chest_handoff_gate.observe(observation)
+                        ):
+                            preempt_attempt = (
+                                coordinator.begin_chest_distance_handoff()
+                            )
+                            if head_snapshot is not None:
+                                pending_head_qwen[
+                                    preempt_attempt.attempt_id
+                                ] = head_snapshot
+                            raw_forward_m = float(
+                                observation.target.forward_m
+                            )
+                            failure_reason = (
+                                "chest target forward distance reached "
+                                f"{raw_forward_m:.3f}m <= "
+                                f"{chest_handoff_distance_m:.3f}m for "
+                                f"{CHEST_HANDOFF_REQUIRED_FRAMES} consecutive "
+                                "frames; requesting head Qwen"
+                            )
+                            switch_details = {
+                                **monitor_details,
+                                "chest_distance_handoff": {
+                                    "raw_forward_m": raw_forward_m,
+                                    "threshold_m": chest_handoff_distance_m,
+                                    "streak": chest_handoff_gate.streak,
+                                    "required_frames": (
+                                        CHEST_HANDOFF_REQUIRED_FRAMES
+                                    ),
+                                },
+                            }
+                            failure_frame = _diagnostic_frame(
+                                frame_index,
+                                snapshot,
+                                target,
+                                surface,
+                                observation,
+                                kind="switching",
+                                error=failure_reason,
+                                **_attempt_frame_details(preempt_attempt),
+                            )
+                            break
                         if not initialized:
                             coordinator.mark_success(attempt)
                             initialized = True
@@ -2089,6 +2197,14 @@ def run_dual_raw_servo_worker(
                         or coordinator.advance_after_failure(attempt)
                     )
                     if next_attempt is None:
+                        terminal_error = (
+                            CHEST_HANDOFF_FAILURE_REASON
+                            if attempt.stage == CHEST_HANDOFF_QWEN_STAGE
+                            else (
+                                "both-camera Qwen failover exhausted: "
+                                f"{failure_reason or 'perception failed'}"
+                            )
+                        )
                         _publish_worker_event(
                             events,
                             observation_events,
@@ -2097,12 +2213,14 @@ def run_dual_raw_servo_worker(
                                 generation,
                                 "error",
                                 output_dir=str(output_dir),
-                                error=(
-                                    "both-camera Qwen failover exhausted: "
-                                    f"{failure_reason or 'perception failed'}"
-                                ),
+                                error=terminal_error,
                                 hard=True,
-                                details=_attempt_details(attempt),
+                                details=_attempt_details(
+                                    attempt,
+                                    terminal_cause=(
+                                        failure_reason or "perception failed"
+                                    ),
+                                ),
                                 frame=failure_frame,
                             ),
                         )
@@ -2110,6 +2228,11 @@ def run_dual_raw_servo_worker(
                         generation_finished = True
                         break
                     attempt = next_attempt
+                    distance_handoff = (
+                        attempt.stage == CHEST_HANDOFF_QWEN_STAGE
+                    )
+                    if distance_handoff and handoff_hold_event is not None:
+                        handoff_hold_event.clear()
                     _publish_worker_event(
                         events,
                         observation_events,
@@ -2124,6 +2247,13 @@ def run_dual_raw_servo_worker(
                             frame=failure_frame,
                         ),
                     )
+                    if distance_handoff and handoff_hold_event is not None:
+                        while (
+                            gate.is_active(generation)
+                            and not stop_event.is_set()
+                            and not handoff_hold_event.wait(timeout=0.05)
+                        ):
+                            pass
                 if generation_finished:
                     continue
             except Exception as exc:

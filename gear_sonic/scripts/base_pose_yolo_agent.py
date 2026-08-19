@@ -224,6 +224,14 @@ def run_base_pose_yolo_agent(config: Any) -> None:
             max_skew_ms=config.sensor_gateway_max_skew_ms,
         )
         stream_summary = f"stream={config.camera_stream}/{config.depth_stream}"
+    worker_kwargs: dict[str, Any] = {
+        "observation_events": adapter.runtime.observation_events,
+        "diagnostics": adapter.runtime.diagnostics,
+        "camera_factory": lambda: camera,
+        "table_required": lambda: adapter.runtime.controller.table_required,
+    }
+    if dual_mode:
+        worker_kwargs["handoff_hold_event"] = adapter.runtime.handoff_hold_ready
     worker = threading.Thread(
         target=worker_target,
         args=(
@@ -233,12 +241,7 @@ def run_base_pose_yolo_agent(config: Any) -> None:
             adapter.runtime.gate,
             adapter.runtime.stop_event,
         ),
-        kwargs={
-            "observation_events": adapter.runtime.observation_events,
-            "diagnostics": adapter.runtime.diagnostics,
-            "camera_factory": lambda: camera,
-            "table_required": lambda: adapter.runtime.controller.table_required,
-        },
+        kwargs=worker_kwargs,
         name="base-pose-dual-yoloe" if dual_mode else "base-pose-yoloe",
         daemon=True,
     )

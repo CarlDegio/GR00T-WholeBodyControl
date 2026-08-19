@@ -230,7 +230,7 @@ launch_inference:
   base_pose_raw_reference_update_min_iou: 0.50
   base_pose_raw_servo_hz: 10.0
   base_pose_raw_head_target_distance_m: 0.90
-  base_pose_raw_chest_target_distance_m: 0.80
+  base_pose_raw_chest_handoff_distance_m: 0.65
   base_pose_raw_forward_tolerance_m: 0.10
   base_pose_raw_lateral_tolerance_m: 0.10
   base_pose_raw_min_linear_speed_m_s: 0.40

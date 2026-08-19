@@ -22,6 +22,7 @@ Usage (from repo root — no venv activation needed):
 import argparse
 from dataclasses import dataclass, fields
 from pathlib import Path
+import math
 import os
 import shlex
 import shutil
@@ -274,7 +275,7 @@ class InferenceLaunchConfig:
     base_pose_raw_reference_update_min_iou: float = 0.50
     base_pose_raw_servo_hz: float = 10.0
     base_pose_raw_head_target_distance_m: float = 0.90
-    base_pose_raw_chest_target_distance_m: float = 0.80
+    base_pose_raw_chest_handoff_distance_m: float = 0.65
     base_pose_raw_forward_tolerance_m: float = 0.10
     base_pose_raw_lateral_tolerance_m: float = 0.10
     base_pose_raw_min_linear_speed_m_s: float = 0.40
@@ -697,8 +698,8 @@ def build_base_pose_agent_command(
         f"{config.base_pose_raw_reference_update_min_iou} "
         f"--raw-servo-hz {config.base_pose_raw_servo_hz} "
         f"--raw-head-target-distance-m {config.base_pose_raw_head_target_distance_m} "
-        f"--raw-chest-target-distance-m "
-        f"{config.base_pose_raw_chest_target_distance_m} "
+        f"--raw-chest-handoff-distance-m "
+        f"{config.base_pose_raw_chest_handoff_distance_m} "
         f"--raw-forward-tolerance-m {config.base_pose_raw_forward_tolerance_m} "
         f"--raw-lateral-tolerance-m {config.base_pose_raw_lateral_tolerance_m} "
         f"--raw-min-linear-speed-m-s {config.base_pose_raw_min_linear_speed_m_s} "
@@ -1200,7 +1201,10 @@ def _check_prerequisites(config: InferenceLaunchConfig):
             (config.base_pose_yoloe_confidence, "YOLOE confidence"),
             (config.base_pose_raw_servo_hz, "raw servo frequency"),
             (config.base_pose_raw_head_target_distance_m, "head target distance"),
-            (config.base_pose_raw_chest_target_distance_m, "chest target distance"),
+            (
+                config.base_pose_raw_chest_handoff_distance_m,
+                "chest handoff distance",
+            ),
             (config.base_pose_raw_forward_tolerance_m, "forward tolerance"),
             (config.base_pose_raw_lateral_tolerance_m, "lateral tolerance"),
             (config.base_pose_raw_min_linear_speed_m_s, "minimum linear speed"),
@@ -1216,8 +1220,8 @@ def _check_prerequisites(config: InferenceLaunchConfig):
             (config.base_pose_raw_camera_stale_s, "camera stale timeout"),
             (config.base_pose_raw_max_run_s, "maximum run time"),
         ):
-            if value <= 0.0:
-                errors.append(f"Base-Pose {label} must be positive")
+            if not math.isfinite(value) or value <= 0.0:
+                errors.append(f"Base-Pose {label} must be finite and positive")
         if not 0.0 < config.base_pose_yoloe_confidence <= 1.0:
             errors.append("Base-Pose YOLOE confidence must be in (0, 1]")
         if config.base_pose_yoloe_imgsz <= 0:

@@ -1647,6 +1647,7 @@ class VisualServoController:
         forward_recenter_yaw_speed_rad_s: float = 0.30,
         post_stop_sample_s: float = 0.0,
         allow_missing_table: bool = False,
+        chest_approach_only: bool = False,
         horizontal_guard_fraction: float = 0.25,
         horizontal_recovery_fraction: float = 0.30,
     ):
@@ -1722,6 +1723,7 @@ class VisualServoController:
         self.yaw_coarse_speed_rad_s = yaw_coarse_speed
         self.yaw_trim_speed_rad_s = yaw_trim_speed
         self.allow_missing_table = bool(allow_missing_table)
+        self.chest_approach_only = bool(chest_approach_only)
         self.post_stop_sample_s = post_stop_duration
         self.guard_fraction = guard_fraction
         self.recovery_low_fraction = recovery_fraction
@@ -1740,6 +1742,8 @@ class VisualServoController:
         *,
         initial_phase: ServoPhase = ServoPhase.YAW_ALIGN,
     ) -> None:
+        if self.chest_approach_only:
+            initial_phase = ServoPhase.FORWARD_APPROACH
         if initial_phase not in {
             ServoPhase.FORWARD_APPROACH,
             ServoPhase.VERTICAL_RECENTER,
@@ -1790,6 +1794,8 @@ class VisualServoController:
 
     @property
     def table_required(self) -> bool:
+        if self.chest_approach_only:
+            return False
         if self.allow_missing_table:
             return False
         if self.phase is ServoPhase.POST_STOP_SAMPLING:
@@ -1805,6 +1811,13 @@ class VisualServoController:
         return ServoCommand(0.0, 0.0, 0.0, self.command_ttl_s)
 
     def _transition(self, phase: ServoPhase, reason: str) -> ServoCommand:
+        if self.chest_approach_only and phase not in {
+            ServoPhase.FORWARD_APPROACH,
+            ServoPhase.FORWARD_RECENTER,
+        }:
+            raise RuntimeError(
+                f"chest approach controller cannot enter {phase.value}"
+            )
         self.phase = phase
         self.last_transition_reason = reason
         self.current = self._zero()
@@ -2168,6 +2181,8 @@ class VisualServoController:
         return self.current
 
     def _forward_approach_vx(self, forward_error: float) -> float:
+        if self.chest_approach_only:
+            return math.nextafter(self.min_linear_speed_m_s, math.inf)
         if forward_error <= self.forward_tolerance_m + 1.0e-12:
             return 0.0
         desired_vx = self._clip(0.5 * forward_error, 0.20)
@@ -2194,10 +2209,18 @@ class VisualServoController:
         )
         if self._target_center_recovered(observation):
             self.resume_phase = None
-            return self._transition(
+            self._transition(
                 ServoPhase.FORWARD_APPROACH,
                 "basket rotation-recentered during forward approach",
             )
+            if self.chest_approach_only:
+                self.current = ServoCommand(
+                    self._forward_approach_vx(self.last_errors[0]),
+                    0.0,
+                    0.0,
+                    self.command_ttl_s,
+                )
+            return self.current
 
         width = float(observation.image_width)
         if width <= 0.0:
@@ -2319,6 +2342,15 @@ class VisualServoController:
                 )
                 return self._update_forward_recenter(observation, now=now)
             self.invalid_frames = 0
+            if self.chest_approach_only:
+                self.forward_approach_stable_frames = 0
+                self.current = ServoCommand(
+                    self._forward_approach_vx(forward_error),
+                    0.0,
+                    0.0,
+                    self.command_ttl_s,
+                )
+                return self.current
             forward_reached = (
                 forward_error <= self.forward_tolerance_m + 1.0e-12
             )
@@ -3632,6 +3664,7 @@ class RawServoRuntime:
         self.current_attempt_id = 0
         self.active_camera_stream: str | None = None
         self.vertical_recenter_armed = False
+        self.handoff_hold_ready = threading.Event()
         self.viewer_target_bbox_xyxy: (
             tuple[float, float, float, float] | None
         ) = None
@@ -3674,11 +3707,9 @@ class RawServoRuntime:
         head_stream = str(
             getattr(self.config, "dual_head_camera_stream", "ego_view")
         )
-        stage = str(details.get("failover_stage") or "")
         return (
             previous_stream == chest_stream
             and next_stream == head_stream
-            and stage in {"head_monitor", "head_monitor_qwen"}
         )
 
     def _reset_controller(self, now: float) -> None:
@@ -3692,10 +3723,9 @@ class RawServoRuntime:
         ):
             active_stream = str(getattr(self.config, "camera_stream", "ego_view"))
         chest_camera_active = active_stream == chest_stream
+        self.controller.chest_approach_only = chest_camera_active
         self.controller.target_distance_m = float(
-            self.config.raw_chest_target_distance_m
-            if chest_camera_active
-            else self.config.raw_head_target_distance_m
+            self.config.raw_head_target_distance_m
         )
         self.controller.reset(
             now,
@@ -3841,6 +3871,7 @@ class RawServoRuntime:
             "yaw_correction_context": self.controller.yaw_correction_context,
             "transition_reason": self.controller.last_transition_reason,
             "target_distance_m": self.controller.target_distance_m,
+            "chest_approach_only": self.controller.chest_approach_only,
             "filtered_errors": list(self.controller.last_errors),
             "visual_yaw_error_rad": self.controller.last_visual_yaw_error_rad,
             "desired_heading_rad": self.controller.desired_heading_rad,
@@ -3925,6 +3956,7 @@ class RawServoRuntime:
             post_stop_invalid_sample_count=self.controller.post_stop_invalid_sample_count,
         )
         self.gate.cancel(self.generation)
+        self.handoff_hold_ready.set()
         self.phase = "idle"
         self.navigation_started_at = None
         self.current_attempt_id = 0
@@ -3952,6 +3984,7 @@ class RawServoRuntime:
         if self.phase != "idle" or self.stop_event.is_set():
             self.logger("[RawServo] BUSY request rejected")
             return "busy"
+        self.handoff_hold_ready.clear()
         candidate = self.generation + 1
         try:
             self.requests.put_nowait(candidate)
@@ -3978,6 +4011,7 @@ class RawServoRuntime:
 
     def cancel(self, reason: str, now: float) -> None:
         self.gate.cancel()
+        self.handoff_hold_ready.set()
         self._drain_waiting_observations()
         self.generation += 1
         self.phase = "idle"
@@ -4122,11 +4156,15 @@ class RawServoRuntime:
             self.current_attempt_id = attempt_id
             previous_stream = self.active_camera_stream
             next_stream = self._event_camera_stream(details)
-            self.vertical_recenter_armed = self._is_vertical_recenter_switch(
+            arm_vertical_recenter = self._is_vertical_recenter_switch(
                 previous_stream=previous_stream,
                 next_stream=next_stream,
                 details=details,
             )
+            if arm_vertical_recenter:
+                self.vertical_recenter_armed = True
+            elif next_stream != previous_stream:
+                self.vertical_recenter_armed = False
             self._clear_viewer_overlay()
             self.active_camera_stream = next_stream
             self.phase = "switching"
@@ -4136,6 +4174,7 @@ class RawServoRuntime:
             self.last_applied_frame_index = None
             command = self._zero()
             self._publish(command, "hold")
+            self.handoff_hold_ready.set()
             self.next_publish_at = float(now) + 1.0 / self.config.planner_hz
             self._record(
                 "camera_switching",
@@ -4151,8 +4190,10 @@ class RawServoRuntime:
         if event.kind == "error":
             self._discard_event_diagnostic(event)
             self.logger(f"[RawServo] FAILURE {event.error}")
-            self.controller.reset(now)
-            self.controller.note_invalid(event.error or "worker error", hard=True, now=now)
+            self._reset_controller(now)
+            self.controller.note_invalid(
+                event.error or "worker error", hard=True, now=now
+            )
             self._finish(self.controller.terminal_reason or "worker error", now)
             return True
         if event.kind == "detecting":

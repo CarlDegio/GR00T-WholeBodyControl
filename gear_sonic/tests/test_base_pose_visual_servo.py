@@ -309,6 +309,47 @@ def test_diagnostic_frame_carries_completed_desk_mask_by_value() -> None:
     assert np.count_nonzero(frame.completed_surface_mask) == 20_000
 
 
+def test_chest_approach_mode_never_enters_head_alignment_states() -> None:
+    controller = VisualServoController(
+        chest_approach_only=True,
+        min_linear_speed_m_s=0.4,
+    )
+    controller.reset(0.0, initial_phase=ServoPhase.FORWARD_APPROACH)
+    centered = _observation(bbox=(240.0, 120.0, 400.0, 360.0))
+    centered = replace(
+        centered,
+        target=replace(
+            centered.target,
+            forward_m=0.4,
+            body_xyz_m=(0.4, 0.0, 0.5),
+            median_depth_m=0.4,
+        ),
+    )
+
+    for frame in range(20):
+        command = controller.update(centered, now=0.1 * (frame + 1))
+        assert controller.phase is ServoPhase.FORWARD_APPROACH
+        assert command.vx > 0.4
+        assert command.vy == 0.0
+        assert command.wz == 0.0
+
+    guarded = replace(
+        centered,
+        target_bbox_xyxy=(0.0, 120.0, 100.0, 360.0),
+    )
+    command = controller.update(guarded, now=2.1)
+    assert controller.phase is ServoPhase.FORWARD_RECENTER
+    assert command.vx > 0.4
+    assert command.vy == 0.0
+    assert command.wz > 0.0
+
+    command = controller.update(centered, now=2.7)
+    assert controller.phase is ServoPhase.FORWARD_APPROACH
+    assert command.vx > 0.4
+    assert command.vy == 0.0
+    assert command.wz == 0.0
+
+
 def test_vertical_recenter_uses_only_configured_forward_speed() -> None:
     controller = VisualServoController(min_linear_speed_m_s=0.22)
     controller.reset(1.0, initial_phase=ServoPhase.VERTICAL_RECENTER)
