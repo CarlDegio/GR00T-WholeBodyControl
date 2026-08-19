@@ -30,6 +30,9 @@ def diagnostic_frame(frame_index: int, *, include_table: bool) -> DetectionFrame
     target_mask[12:32, 24:44] = True
     table_mask = np.zeros((48, 64), dtype=bool)
     table_mask[4:42, 2:62] = True
+    table_mask[10:15, 20:25] = False
+    completed_table_mask = table_mask.copy()
+    completed_table_mask[10:15, 20:25] = True
     return DetectionFrameData(
         frame_index=frame_index,
         camera_timestamp=float(frame_index),
@@ -40,6 +43,7 @@ def diagnostic_frame(frame_index: int, *, include_table: bool) -> DetectionFrame
         target_confidence=0.91,
         surface_bbox_xyxy=(2.0, 4.0, 62.0, 42.0) if include_table else None,
         surface_mask=table_mask if include_table else None,
+        completed_surface_mask=completed_table_mask if include_table else None,
         surface_track_id=22 if include_table else None,
         surface_confidence=0.81 if include_table else None,
     )
@@ -212,6 +216,7 @@ def test_writer_saves_lossless_review_artifacts_every_five_frames(tmp_path) -> N
         "raw_rgb": None,
         "target_mask": None,
         "table_mask": None,
+        "table_completed_mask": None,
         "table_edge_overlay": None,
     }
     assert (tmp_path / "review_samples/raw/000000.png").is_file()
@@ -230,6 +235,16 @@ def test_writer_saves_lossless_review_artifacts_every_five_frames(tmp_path) -> N
     expected = diagnostic_frame(5, include_table=True).target_mask
     assert expected is not None
     np.testing.assert_array_equal(restored_mask, expected.astype(np.uint8) * 255)
+    completed_mask = cv2.imread(
+        str(tmp_path / "review_samples/masks/000005_table_completed.png"),
+        cv2.IMREAD_UNCHANGED,
+    )
+    expected_completed = diagnostic_frame(5, include_table=True).completed_surface_mask
+    assert expected_completed is not None
+    np.testing.assert_array_equal(
+        completed_mask,
+        expected_completed.astype(np.uint8) * 255,
+    )
 
 
 def test_writer_draws_recorded_table_edge_in_separate_mask_overlay(tmp_path) -> None:
@@ -281,6 +296,7 @@ def test_sampled_frame_records_null_for_missing_table_mask(tmp_path) -> None:
     assert review["raw_rgb"] == "review_samples/raw/000005.png"
     assert review["target_mask"] == "review_samples/masks/000005_target.png"
     assert review["table_mask"] is None
+    assert review["table_completed_mask"] is None
     assert review["table_edge_overlay"] is None
 
 

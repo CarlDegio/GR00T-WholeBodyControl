@@ -589,6 +589,99 @@ def test_table_mask_depth_recovers_front_facing_horizontal_edge() -> None:
     )
 
 
+def test_ransac_selects_line_with_minimum_mean_of_twenty_depths() -> None:
+    midpoint_near_points = np.column_stack(
+        (
+            np.full(80, 1.5),
+            np.linspace(-0.4, 0.4, 80),
+        )
+    )
+    lower_mean_points = np.column_stack(
+        (
+            np.full(160, 0.5),
+            np.linspace(-0.5, 0.5, 160),
+        )
+    )
+    points = np.vstack((midpoint_near_points, lower_mean_points))
+    midpoint_near_pixels = np.column_stack(
+        (
+            np.rint(np.linspace(100, 300, 80)).astype(int),
+            np.full(80, 100),
+        )
+    )
+    lower_mean_pixels = np.column_stack(
+        (
+            np.rint(np.linspace(350, 600, 160)).astype(int),
+            np.full(160, 200),
+        )
+    )
+    pixels = np.vstack((midpoint_near_pixels, lower_mean_pixels))
+    depth_raw = np.full((480, 640), 2000, dtype=np.uint16)
+    depth_raw[100, :] = 1500
+    depth_raw[100, 190:211] = 500
+    depth_raw[200, :] = 1000
+
+    center, _direction, inliers, _residual, indices = raw_servo._ransac_line(
+        points,
+        source_pixels=pixels,
+        depth_raw=depth_raw,
+        depth_scale_m=0.001,
+    )
+
+    assert center[0] == pytest.approx(0.5)
+    assert len(inliers) == 160
+    assert np.all(indices >= 80)
+
+
+def test_table_geometry_does_not_transform_edge_points_to_body(
+    monkeypatch,
+) -> None:
+    def fail_camera_to_body(_self, _points):
+        raise AssertionError("table edge must remain in the camera frame")
+
+    monkeypatch.setattr(
+        RawServoCalibration,
+        "camera_to_body",
+        fail_camera_to_body,
+    )
+    mask = np.zeros((480, 640), dtype=bool)
+    mask[120:360, 100:540] = True
+
+    geometry = estimate_table_geometry(
+        snapshot(),
+        mask,
+        fixed_calibration(camera_pitch_deg=0.0),
+    )
+
+    assert geometry.line_endpoints_px is not None
+
+
+def test_table_geometry_accepts_selected_line_without_post_checks(
+    monkeypatch,
+) -> None:
+    def selected_line(_points, **_kwargs):
+        return (
+            np.array([1.0, 0.0]),
+            np.array([0.0, 1.0]),
+            np.array([[1.0, 0.0], [1.0, 0.05]]),
+            0.50,
+            np.array([0, 1]),
+        )
+
+    monkeypatch.setattr(raw_servo, "_ransac_line", selected_line)
+    mask = np.zeros((480, 640), dtype=bool)
+    mask[120:360, 100:540] = True
+
+    geometry = estimate_table_geometry(
+        snapshot(),
+        mask,
+        fixed_calibration(camera_pitch_deg=0.0),
+    )
+
+    assert geometry.line_length_m == pytest.approx(0.05)
+    assert geometry.inlier_count == 2
+    assert geometry.residual_m == pytest.approx(0.50)
+
 def test_table_mask_cleanup_keeps_largest_component_and_fills_holes() -> None:
     mask = np.zeros((30, 45), dtype=bool)
     mask[5:25, 5:25] = True
@@ -617,14 +710,27 @@ def test_observation_exposes_completed_desk_mask() -> None:
         2, 1, "desk", 0.8, (100.0, 120.0, 540.0, 360.0), desk_mask
     )
 
+    camera_snapshot = snapshot()
     value = _observation(
-        snapshot(), target, desk, fixed_calibration(camera_pitch_deg=0.0)
+        camera_snapshot, target, desk, fixed_calibration(camera_pitch_deg=0.0)
     )
 
     assert value.desk_mask is not None
     assert value.desk_mask.dtype == np.uint8
     assert np.all(value.desk_mask[180:220, 240:280] == 1)
     assert np.all(value.desk_mask[10:20, 10:20] == 0)
+    diagnostic = raw_servo._diagnostic_frame(
+        0,
+        camera_snapshot,
+        target,
+        desk,
+        value,
+        kind="observation",
+    )
+    np.testing.assert_array_equal(
+        diagnostic.completed_surface_mask,
+        value.desk_mask,
+    )
 
 
 def test_table_geometry_excludes_target_mask_dilated_by_twenty_pixels(

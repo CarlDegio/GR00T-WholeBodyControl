@@ -95,9 +95,14 @@ original-image pixels and passed in `visual_prompts`, with the primary target
 assigned class `0` and every desk box assigned class `1`. The resulting visual
 embeddings, rather than text-only class embeddings, are installed in YOLOE-26M
 before persistent BoT-SORT tracking begins at `10 Hz`. The primary box controls
-target centering and the eroded target mask provides robust raw-depth range; a
-RANSAC line fitted to valid table-mask contour depth controls yaw perpendicular
-to the near table edge.
+target centering and the eroded target mask provides robust raw-depth range.
+The desk contour is deprojected only into the camera forward-left plane; it is
+not transformed into the robot body frame. The fixed-seed 240-attempt RANSAC
+samples 20 evenly spaced RGB pixels along each candidate segment, reads their
+aligned raw depths, and selects the candidate with the smallest mean depth. All
+20 depths must be valid. That selected candidate controls yaw directly, without
+SVD refinement or subsequent
+length/inlier/residual rejection.
 
 The bounded controller publishes at `20 Hz` through the existing direct 5558
 relay. Its visual state machine is:
@@ -358,10 +363,13 @@ New records set `annotated_image` to `null`; the live runtime does not create
 post-update controller state and command. A waiting observation displaced by a
 newer frame, cancellation, or shutdown remains in the log with
 `control_applied=false` and null controller/command metadata. Every fifth frame
-still saves an unannotated RGB PNG and separate target/table mask PNGs under
-`review_samples/`.
-Successful table-edge estimates also record `line_endpoints_xy_m` and
-`line_endpoints_px` under `geometry.table`. For sampled frames, the diagnostic
+still saves an unannotated RGB PNG and separate target, original table, and
+completed table mask PNGs under `review_samples/`. The completed table mask
+uses the same largest-component selection and hole filling as runtime table
+geometry, with the `_table_completed.png` suffix.
+Successful table-edge estimates also record `line_endpoints_xy_m` in camera
+`(forward, left)` coordinates and `line_endpoints_px` under `geometry.table`.
+For sampled frames, the diagnostic
 thread writes a separate `*_table_edge.png` image with a red selected edge and
 yellow endpoints over the white table mask. The original binary `*_table.png`
 remains unchanged for replay and machine processing; overlay rendering and PNG
@@ -441,6 +449,7 @@ review_samples/
   masks/
     000000_target.png
     000000_table.png
+    000000_table_completed.png
     000005_target.png
 review_reconstructed/
   000000.jpg

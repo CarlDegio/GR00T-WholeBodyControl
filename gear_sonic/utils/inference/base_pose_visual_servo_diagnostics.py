@@ -33,6 +33,7 @@ class DetectionFrameData:
     target_confidence: float | None = None
     surface_bbox_xyxy: tuple[float, float, float, float] | None = None
     surface_mask: np.ndarray | None = field(default=None, repr=False)
+    completed_surface_mask: np.ndarray | None = field(default=None, repr=False)
     surface_track_id: int | None = None
     surface_confidence: float | None = None
     target_geometry: Mapping[str, Any] | None = None
@@ -127,6 +128,7 @@ class FrameDiagnosticsWriter:
             "raw_rgb": None,
             "target_mask": None,
             "table_mask": None,
+            "table_completed_mask": None,
             "table_edge_overlay": None,
         }
         if frame.frame_index % self.review_stride:
@@ -144,6 +146,11 @@ class FrameDiagnosticsWriter:
         for key, suffix, mask in (
             ("target_mask", "target", frame.target_mask),
             ("table_mask", "table", frame.surface_mask),
+            (
+                "table_completed_mask",
+                "table_completed",
+                frame.completed_surface_mask,
+            ),
         ):
             if mask is None:
                 continue
@@ -320,6 +327,11 @@ def _owned_frame(frame: DetectionFrameData) -> DetectionFrameData:
         ),
         surface_mask=(
             None if frame.surface_mask is None else np.asarray(frame.surface_mask).copy()
+        ),
+        completed_surface_mask=(
+            None
+            if frame.completed_surface_mask is None
+            else np.asarray(frame.completed_surface_mask).copy()
         ),
         target_geometry=(
             None if frame.target_geometry is None else dict(frame.target_geometry)

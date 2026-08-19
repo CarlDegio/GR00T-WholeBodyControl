@@ -1175,18 +1175,29 @@ def estimate_target_geometry(
 def _ransac_line(
     points: np.ndarray,
     *,
+    source_pixels: np.ndarray,
+    depth_raw: np.ndarray,
+    depth_scale_m: float,
     threshold_m: float = 0.02,
     iterations: int = 240,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, float, np.ndarray]:
     if len(points) < 50:
         raise ValueError("table edge has fewer than 50 depth points")
+    pixels = np.asarray(source_pixels)
+    if pixels.shape != (len(points), 2):
+        raise ValueError("table-edge source pixels must match points")
+    if depth_raw.ndim != 2 or not math.isfinite(depth_scale_m):
+        raise ValueError("table-edge midpoint depth source is invalid")
     source_indices = np.arange(len(points), dtype=int)
     if len(points) > 2500:
         indices = np.linspace(0, len(points) - 1, 2500, dtype=int)
         points = points[indices]
+        pixels = pixels[indices]
         source_indices = source_indices[indices]
     rng = np.random.default_rng(0)
-    best: tuple[float, np.ndarray, np.ndarray] | None = None
+    best: tuple[
+        float, np.ndarray, np.ndarray, np.ndarray, float
+    ] | None = None
     for _ in range(iterations):
         a, b = points[rng.choice(len(points), size=2, replace=False)]
         direction = b - a
@@ -1202,28 +1213,57 @@ def _ransac_line(
         count = int(np.count_nonzero(inliers))
         if count < 50:
             continue
-        center_range = float(np.linalg.norm(np.median(points[inliers], axis=0)))
-        score = count / max(0.25, center_range)
-        if best is None or score > best[0]:
-            best = (score, inliers, direction.copy())
+        inlier_points = points[inliers]
+        inlier_pixels = pixels[inliers]
+        projection = (inlier_points - a) @ direction
+        endpoint_indices = (
+            int(np.argmin(projection)),
+            int(np.argmax(projection)),
+        )
+        endpoint_pixels = inlier_pixels[np.asarray(endpoint_indices)]
+        sampled_pixels = np.rint(
+            np.linspace(endpoint_pixels[0], endpoint_pixels[1], 20)
+        ).astype(int)
+        sampled_u = sampled_pixels[:, 0]
+        sampled_v = sampled_pixels[:, 1]
+        if not (
+            np.all((0 <= sampled_v) & (sampled_v < depth_raw.shape[0]))
+            and np.all((0 <= sampled_u) & (sampled_u < depth_raw.shape[1]))
+        ):
+            continue
+        sampled_depth_m = (
+            depth_raw[sampled_v, sampled_u].astype(np.float64)
+            * depth_scale_m
+        )
+        if not np.all(
+            np.isfinite(sampled_depth_m)
+            & (sampled_depth_m >= 0.15)
+            & (sampled_depth_m <= 4.0)
+        ):
+            continue
+        mean_depth_m = float(np.mean(sampled_depth_m))
+        midpoint_projection = 0.5 * (
+            float(np.min(projection)) + float(np.max(projection))
+        )
+        center = a + midpoint_projection * direction
+        residual = float(np.median(distance[inliers]))
+        if best is None or mean_depth_m < best[0]:
+            best = (
+                mean_depth_m,
+                center,
+                direction.copy(),
+                inliers.copy(),
+                residual,
+            )
     if best is None:
-        raise ValueError("no stable table-edge line found")
-    inlier_points = points[best[1]]
-    inlier_indices = source_indices[best[1]]
-    center = np.mean(inlier_points, axis=0)
-    _, _, vh = np.linalg.svd(inlier_points - center, full_matrices=False)
-    direction = vh[0]
-    projection = (inlier_points - center) @ direction
-    length = float(np.max(projection) - np.min(projection))
-    residual = np.abs(
-        (inlier_points[:, 0] - center[0]) * direction[1]
-        - (inlier_points[:, 1] - center[1]) * direction[0]
-    )
+        raise ValueError("no table-edge line has 20 valid sampled depths")
+    inlier_points = points[best[3]]
+    inlier_indices = source_indices[best[3]]
     return (
-        center,
-        direction,
+        best[1],
+        best[2],
         inlier_points,
-        float(np.median(residual)),
+        best[4],
         inlier_indices,
     )
 
@@ -1305,18 +1345,16 @@ def estimate_table_geometry(
     if len(u) < 50:
         raise ValueError("table contour has fewer than 50 valid depth points")
     z = depth_m[v, u]
-    body = calibration.camera_to_body(_deproject(u, v, z, calibration))
+    camera = _deproject(u, v, z, calibration)
+    camera_forward_left = np.column_stack((camera[:, 2], -camera[:, 0]))
     center, direction, inliers, residual, inlier_indices = _ransac_line(
-        body[:, :2]
+        camera_forward_left,
+        source_pixels=np.column_stack((u, v)),
+        depth_raw=snapshot.depth_raw,
+        depth_scale_m=snapshot.depth_scale_m,
     )
     projection = (inliers - center) @ direction
     length = float(np.max(projection) - np.min(projection))
-    if length < 0.20:
-        raise ValueError(f"table edge is too short: {length:.3f}m")
-    if len(inliers) < 50:
-        raise ValueError("table edge has fewer than 50 RANSAC inliers")
-    if residual > 0.02:
-        raise ValueError(f"table edge residual is too high: {residual:.3f}m")
     normal = np.array([-direction[1], direction[0]])
     if float(normal @ center) < 0.0:
         normal = -normal
@@ -2633,6 +2671,11 @@ def _diagnostic_frame(
         target_confidence=None if target is None else target.confidence,
         surface_bbox_xyxy=None if surface is None else surface.bbox_xyxy,
         surface_mask=None if surface is None else surface.mask.copy(),
+        completed_surface_mask=(
+            None
+            if observation is None or observation.desk_mask is None
+            else observation.desk_mask.copy()
+        ),
         surface_track_id=None if surface is None else surface.track_id,
         surface_confidence=None if surface is None else surface.confidence,
         target_geometry=target_geometry,
