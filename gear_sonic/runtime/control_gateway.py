@@ -222,7 +222,13 @@ class NavigationControlState:
             reason=f"navigation_busy:{self.owner or self.mode}",
         )
 
-    def handle_key(self, key: str, *, now: float) -> NavigationControlAction:
+    def handle_key(
+        self,
+        key: str,
+        *,
+        now: float,
+        cancel_reason: str = "",
+    ) -> NavigationControlAction:
         normalized = key.lower()
         if normalized not in NAVIGATION_KEYS:
             raise ValueError(f"unsupported navigation key: {key!r}")
@@ -248,6 +254,7 @@ class NavigationControlState:
                 self.generation,
                 "stop",
                 agent_event="cancel_navigation",
+                reason=str(cancel_reason),
             )
         if self.mode != "listen_wasd":
             return self._busy()
@@ -312,6 +319,7 @@ class NavigationControlState:
         if generation != self.generation or self.mode not in {
             "base_pose_inference",
             "base_pose_motion",
+            "base_pose_stopping",
         }:
             raise ValueError("stale or unexpected base-pose velocity")
         raw_velocity = parameters.get("velocity")
@@ -335,12 +343,30 @@ class NavigationControlState:
             raise ValueError("unsupported base-pose motion profile")
         if unsafe:
             raise ValueError("base-pose velocity exceeds the planner safety envelope")
-        self.mode = "base_pose_motion"
+        action = str(parameters.get("action", "visual_servo"))
+        if action not in {"hold", "visual_servo", "stop"}:
+            raise ValueError("unsupported base-pose action")
+        if action in {"hold", "stop"} and any(
+            abs(value) > 0.000001 for value in velocity
+        ):
+            raise ValueError(f"base-pose {action} action must command zero velocity")
         self.manual_velocity = velocity
-        self.manual_deadline = float(now) + self.base_pose_command_timeout_s
+        if action == "visual_servo":
+            self.mode = "base_pose_motion"
+            self.manual_deadline = float(now) + self.base_pose_command_timeout_s
+            output_mode = "manual_velocity"
+        else:
+            # Initial/recovery inference may legitimately spend seconds in a
+            # remote model call.  A zero hold is already fail-safe, so only an
+            # actual visual-servo motion lease uses the 350 ms watchdog.
+            self.mode = (
+                "base_pose_inference" if action == "hold" else "base_pose_stopping"
+            )
+            self.manual_deadline = 0.0
+            output_mode = "stop"
         return NavigationControlAction(
             generation,
-            "manual_velocity",
+            output_mode,
             velocity=velocity,
         )
 

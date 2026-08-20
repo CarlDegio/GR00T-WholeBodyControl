@@ -10,8 +10,6 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 
-import gear_sonic.utils.inference.base_pose_dual_visual_servo as dual_servo
-import gear_sonic.utils.inference.base_pose_visual_servo as visual_servo
 from gear_sonic.runtime.client import SensorGatewayClientError
 from gear_sonic.runtime.snapshot import TimestampBasis
 from gear_sonic.scripts.base_pose_agent import BasePoseAgentConfig
@@ -20,11 +18,13 @@ from gear_sonic.scripts.base_pose_yolo_agent import (
     raw_servo_worker_for_mode,
 )
 from gear_sonic.utils.inference.base_pose import BasePoseCameraError
+import gear_sonic.utils.inference.base_pose_dual_visual_servo as dual_servo
 from gear_sonic.utils.inference.base_pose_dual_visual_servo import (
+    QWEN_HOLD_STAGES,
     DualCameraFailoverCoordinator,
     DualCameraReference,
     HeadCameraTextMonitor,
-    QWEN_HOLD_STAGES,
+    _claim_new_stream_snapshot,
     _ground_camera_reference,
     dual_calibrations_from_config,
     run_dual_raw_servo_worker,
@@ -33,9 +33,10 @@ from gear_sonic.utils.inference.base_pose_sensor import (
     DualBasePoseCapture,
     SensorGatewayDualBasePoseCamera,
 )
+import gear_sonic.utils.inference.base_pose_visual_servo as visual_servo
 from gear_sonic.utils.inference.base_pose_visual_servo import (
-    GenerationGate,
     HEAD_MONITOR_HOLD_EVENT,
+    GenerationGate,
     RawServoCalibration,
     RawServoEvent,
     RawServoObservation,
@@ -46,10 +47,32 @@ from gear_sonic.utils.inference.base_pose_visual_servo import (
     TrackedInstance,
     run_raw_servo_worker,
 )
-
+from gear_sonic.utils.inference.base_pose_visual_servo_diagnostics import (
+    DetectionFrameData,
+)
 
 HEAD = "ego_view"
 CHEST = "chest_view"
+
+
+def test_dual_perception_claims_only_strictly_newer_frames_per_stream() -> None:
+    claimed: dict[str, float] = {}
+
+    assert _claim_new_stream_snapshot(
+        claimed, CHEST, SimpleNamespace(timestamp=1.0)
+    )
+    assert not _claim_new_stream_snapshot(
+        claimed, CHEST, SimpleNamespace(timestamp=1.0)
+    )
+    assert not _claim_new_stream_snapshot(
+        claimed, CHEST, SimpleNamespace(timestamp=0.5)
+    )
+    assert _claim_new_stream_snapshot(
+        claimed, CHEST, SimpleNamespace(timestamp=2.0)
+    )
+    assert _claim_new_stream_snapshot(
+        claimed, HEAD, SimpleNamespace(timestamp=1.0)
+    )
 
 
 def _reference(stream_name: str, marker: int) -> DualCameraReference:
@@ -868,6 +891,75 @@ def test_runtime_allows_joint_completion_regardless_of_live_stream(
     assert runtime.phase == "idle"
 
 
+def test_runtime_marks_completion_capture_start_and_finish(tmp_path: Path) -> None:
+    markers: list[str | None] = []
+
+    class Diagnostics:
+        logger = staticmethod(lambda _message: None)
+
+        def submit_decision(self, *_args, completion_capture=None, **_kwargs):
+            markers.append(completion_capture)
+
+    runtime = RawServoRuntime(
+        BasePoseAgentConfig(
+            task="align",
+            output_root=str(tmp_path),
+            raw_chest_target_distance_m=0.7,
+            raw_post_stop_sample_s=3.0,
+        ),
+        publish=lambda _message: None,
+        logger=lambda _message: None,
+        diagnostics=Diagnostics(),
+    )
+    assert runtime.handle_key("n", now=0.0) == "started"
+    details = {
+        "attempt_id": 1,
+        "live_stream": HEAD,
+        "failover_stage": "initial",
+        "control_source_stream": CHEST,
+        "yaw_source": {"stream": HEAD, "valid": True, "realtime": True},
+    }
+    assert runtime.accept_event(
+        RawServoEvent(1, "detecting", details=details),
+        now=0.01,
+    )
+
+    def frame(index: int) -> DetectionFrameData:
+        return DetectionFrameData(
+            frame_index=index,
+            camera_timestamp=float(index),
+            camera_stream=CHEST,
+            rgb=np.zeros((4, 6, 3), dtype=np.uint8),
+        )
+
+    for index in range(5):
+        assert runtime.accept_event(
+            RawServoEvent(
+                1,
+                "initialized" if index == 0 else "observation",
+                observation=_joint_observation(0.7),
+                details=details,
+                frame=frame(index),
+            ),
+            now=0.02 + index * 0.01,
+        )
+    assert runtime.controller.phase is ServoPhase.POST_STOP_SAMPLING
+    assert markers[-1] == "start"
+
+    assert runtime.accept_event(
+        RawServoEvent(
+            1,
+            "observation",
+            observation=_joint_observation(0.7),
+            details=details,
+            frame=frame(5),
+        ),
+        now=3.07,
+    )
+    assert markers[-1] == "finish"
+    assert runtime.controller.terminal_reason == "aligned"
+
+
 @pytest.mark.parametrize(
     ("missing_frames", "expected_stage"),
     (
@@ -1250,7 +1342,8 @@ def test_close_chest_distance_does_not_trigger_head_handoff(
     config = BasePoseAgentConfig(
         task="approach the blue basket",
         output_root=str(tmp_path),
-        raw_servo_hz=10000.0,
+        # This legacy single-camera cadence must not throttle dual perception.
+        raw_servo_hz=0.1,
     )
     chest_reference = DualCameraReference(
         stream_name=CHEST,
@@ -1328,6 +1421,10 @@ def test_close_chest_distance_does_not_trigger_head_handoff(
     terminal = [event for event in emitted if event.kind == "error"]
 
     assert len(applied) >= 5
+    assert all(
+        event.details["perception_schedule"] == "new_frame_latest_only"
+        for event in applied
+    )
     assert all(event.observation is not None for event in applied)
     assert all(event.observation.table is None for event in applied)
     assert switching == []
@@ -1521,6 +1618,26 @@ def test_head_monitor_keeps_chest_position_when_live_head_yaw_is_valid(
         if event.observation is not None
     )
     assert all(event.details["yaw_source"]["valid"] for event in observations)
+    assert all(event.frame is not None for event in observations)
+    assert all(
+        len(event.frame.additional_camera_frames) == 1
+        for event in observations
+        if event.frame is not None
+    )
+    head_frames = [
+        event.frame.additional_camera_frames[0]
+        for event in observations
+        if event.frame is not None
+    ]
+    assert all(frame.camera_stream == HEAD for frame in head_frames)
+    assert all(frame.target_bbox_xyxy == target.bbox_xyxy for frame in head_frames)
+    assert all(frame.surface_mask is not None for frame in head_frames)
+    assert all(frame.table_geometry is not None for frame in head_frames)
+    assert all(
+        frame.table_geometry["line_endpoints_px"] is not None
+        for frame in head_frames
+        if frame.table_geometry is not None
+    )
     assert all(
         event.details["parallel_perception"]["enabled"]
         for event in observations

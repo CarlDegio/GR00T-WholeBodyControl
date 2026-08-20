@@ -7,6 +7,7 @@ import numpy as np
 
 from gear_sonic.utils.inference.base_pose_visual_servo_diagnostics import (
     AsyncFrameDiagnosticsWriter,
+    CameraFrameData,
     DetectionFrameData,
     FrameDiagnosticsWriter,
 )
@@ -181,3 +182,111 @@ def test_writer_saves_paired_rgb_depth_and_rgb_edges(tmp_path) -> None:
     np.testing.assert_array_equal(saved_rgb, cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR))
     np.testing.assert_array_equal(saved_depth, depth)
     np.testing.assert_array_equal(saved_edges, edges)
+
+
+def test_completion_capture_saves_three_context_frames_and_all_post_stop_views(
+    tmp_path,
+) -> None:
+    writer = FrameDiagnosticsWriter(tmp_path)
+    table_mask = np.zeros((24, 32), dtype=np.uint8)
+    table_mask[10:22, 2:30] = 1
+    table_edges = np.zeros_like(table_mask)
+    table_edges[14, 4:28] = 255
+    geometry = {"line_endpoints_px": [[4.0, 14.0], [27.0, 14.0]]}
+
+    def paired_frame(index: int) -> DetectionFrameData:
+        chest_rgb = np.full((24, 32, 3), (10 + index), dtype=np.uint8)
+        head_rgb = np.zeros((24, 32, 3), dtype=np.uint8)
+        head_rgb[:, :, 0] = 120 + index
+        return DetectionFrameData(
+            frame_index=index,
+            camera_timestamp=float(index),
+            camera_stream="chest_view",
+            rgb=chest_rgb,
+            target_bbox_xyxy=(8.0, 4.0, 20.0, 12.0),
+            surface_mask=table_mask,
+            additional_camera_frames=(
+                CameraFrameData(
+                    camera_stream="ego_view",
+                    camera_timestamp=float(index) + 0.01,
+                    rgb=head_rgb,
+                    target_bbox_xyxy=(5.0, 3.0, 18.0, 11.0),
+                    surface_mask=table_mask,
+                    completed_surface_mask=table_mask,
+                    table_rgb_edges=table_edges,
+                    table_geometry=geometry,
+                ),
+            ),
+        )
+
+    controller = {"phase": "post_stop_sampling"}
+    command = {"vx": 0.0, "vy": 0.0, "wz": 0.0, "duration_s": 0.15}
+    for index in range(6):
+        writer.write(
+            paired_frame(index),
+            control_applied=index != 3,
+            controller_state=None if index == 3 else controller,
+            command=None if index == 3 else command,
+            completion_capture=(
+                "start" if index == 2 else "finish" if index == 4 else None
+            ),
+        )
+
+    manifest = [
+        json.loads(line)
+        for line in (tmp_path / "completion_capture" / "manifest.jsonl")
+        .read_text()
+        .splitlines()
+    ]
+    completion = [item for item in manifest if item["stage"] == "completion"]
+    post_stop = [item for item in manifest if item["stage"] == "post_stop"]
+    assert len(completion) == 6
+    assert {item["frame_index"] for item in completion} == {0, 1, 2}
+    assert len(post_stop) == 4
+    assert {item["frame_index"] for item in post_stop} == {3, 4}
+    assert {item["camera_stream"] for item in manifest} == {
+        "chest_view",
+        "ego_view",
+    }
+    assert all((tmp_path / item["raw_rgb"]).is_file() for item in manifest)
+    assert all((tmp_path / item["overlay_rgb"]).is_file() for item in manifest)
+    assert not any(item["frame_index"] == 5 for item in manifest)
+
+    head = next(
+        item
+        for item in post_stop
+        if item["frame_index"] == 3 and item["camera_stream"] == "ego_view"
+    )
+    assert head["target_bbox_xyxy"] == [5.0, 3.0, 18.0, 11.0]
+    assert head["table_edge_endpoints_px"] == [[4.0, 14.0], [27.0, 14.0]]
+    assert (tmp_path / head["table_mask"]).is_file()
+    assert (tmp_path / head["table_completed_mask"]).is_file()
+    assert (tmp_path / head["table_rgb_edges"]).is_file()
+    raw = cv2.imread(str(tmp_path / head["raw_rgb"]), cv2.IMREAD_COLOR)
+    overlay = cv2.imread(str(tmp_path / head["overlay_rgb"]), cv2.IMREAD_COLOR)
+    assert raw is not None and overlay is not None
+    assert not np.array_equal(raw, overlay)
+
+
+def test_async_writer_forwards_completion_capture_marker(tmp_path) -> None:
+    markers: list[str | None] = []
+
+    class RecordingWriter:
+        def write(self, _frame, *, completion_capture=None, **_kwargs) -> None:
+            markers.append(completion_capture)
+
+    diagnostics = AsyncFrameDiagnosticsWriter(
+        writer_factory=lambda _output_dir: RecordingWriter()
+    )
+    diagnostics.submit_frame(1, tmp_path, _frame(0))
+    diagnostics.submit_decision(
+        1,
+        0,
+        control_applied=False,
+        controller_state=None,
+        command=None,
+        completion_capture="start",
+    )
+    diagnostics.close()
+
+    assert markers == ["start"]

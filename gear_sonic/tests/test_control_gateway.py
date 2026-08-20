@@ -188,8 +188,16 @@ def test_navigation_state_ignores_motion_and_repeat_n_during_nav() -> None:
     cancelled = state.handle_key(" ", now=1.2)
     assert cancelled.mode == "stop"
     assert cancelled.agent_event == "cancel_navigation"
+    assert cancelled.reason == ""
     assert cancelled.generation == started.generation + 1
     assert state.mode == "listen_wasd"
+
+    reasoned_cancel = state.handle_key(
+        " ",
+        now=1.3,
+        cancel_reason="slam_recovery:fastlio_stale",
+    )
+    assert reasoned_cancel.reason == "slam_recovery:fastlio_stale"
 
 
 def test_b_starts_base_pose_and_rejects_lavira_until_space() -> None:
@@ -222,7 +230,11 @@ def test_base_pose_velocity_is_bounded_and_times_out_safe() -> None:
     state = NavigationControlState(base_pose_command_timeout_s=0.2)
     started = state.handle_key("b", now=1.0)
     action = state.accept_base_pose_velocity(
-        {"generation": started.generation, "velocity": [0.3, 0.0, 0.0]},
+        {
+            "generation": started.generation,
+            "velocity": [0.3, 0.0, 0.0],
+            "action": "visual_servo",
+        },
         now=1.1,
     )
 
@@ -236,6 +248,72 @@ def test_base_pose_velocity_is_bounded_and_times_out_safe() -> None:
     assert timeout.reason == "base_pose_velocity_timeout"
     assert timeout.generation == started.generation + 1
     assert state.mode == "listen_wasd"
+
+
+def test_base_pose_inference_hold_does_not_arm_motion_watchdog() -> None:
+    state = NavigationControlState(base_pose_command_timeout_s=0.2)
+    started = state.handle_key("b", now=1.0)
+    parameters = {
+        "generation": started.generation,
+        "velocity": [0.0, 0.0, 0.0],
+        "motion_profile": "yoloe_servo",
+        "action": "hold",
+    }
+
+    action = state.accept_base_pose_velocity(parameters, now=1.1)
+    status = build_base_pose_runtime_status(action, parameters)
+
+    assert action.mode == "stop"
+    assert action.velocity == (0.0, 0.0, 0.0)
+    assert state.mode == "base_pose_inference"
+    assert state.manual_deadline == 0.0
+    assert state.tick(now=100.0) is None
+    assert status["state"] == "inference"
+    assert status["action"] == "hold"
+
+
+def test_base_pose_stop_disarms_existing_motion_watchdog() -> None:
+    state = NavigationControlState(base_pose_command_timeout_s=0.2)
+    started = state.handle_key("b", now=1.0)
+    state.accept_base_pose_velocity(
+        {
+            "generation": started.generation,
+            "velocity": [0.3, 0.0, 0.0],
+            "action": "visual_servo",
+        },
+        now=1.1,
+    )
+    parameters = {
+        "generation": started.generation,
+        "velocity": [0.0, 0.0, 0.0],
+        "action": "stop",
+    }
+
+    action = state.accept_base_pose_velocity(parameters, now=1.2)
+    status = build_base_pose_runtime_status(action, parameters)
+
+    assert action.mode == "stop"
+    assert state.mode == "base_pose_stopping"
+    assert state.manual_deadline == 0.0
+    assert state.tick(now=100.0) is None
+    assert status["state"] == "stopping"
+    assert status["action"] == "stop"
+
+
+def test_base_pose_hold_and_stop_require_zero_velocity() -> None:
+    state = NavigationControlState()
+    started = state.handle_key("b", now=1.0)
+
+    for action in ("hold", "stop"):
+        with pytest.raises(ValueError, match="must command zero velocity"):
+            state.accept_base_pose_velocity(
+                {
+                    "generation": started.generation,
+                    "velocity": [0.1, 0.0, 0.0],
+                    "action": action,
+                },
+                now=1.1,
+            )
 
 
 def test_base_pose_velocity_rejects_stale_or_unsafe_commands() -> None:

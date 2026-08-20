@@ -97,13 +97,35 @@ class GatewayRawServoAdapter:
         self._terminal_reported = False
         return self.runtime.handle_key("n", now=timestamp) == "started"
 
-    def cancel(self, generation: int, reason: str, *, now: float | None = None) -> None:
+    def cancel(
+        self,
+        generation: int,
+        reason: str,
+        *,
+        now: float | None = None,
+    ) -> bool:
         timestamp = self.monotonic() if now is None else float(now)
-        self.gateway_generation = max(self.gateway_generation, int(generation))
+        requested_generation = int(generation)
+        if requested_generation < self.gateway_generation:
+            self.logger(
+                "[BasePose/YOLOE] ignored stale cancel "
+                f"generation={requested_generation} "
+                f"active_generation={self.gateway_generation}"
+            )
+            return False
+        self.gateway_generation = requested_generation
         self._publish_enabled = False
+        if self.runtime.phase == "idle":
+            # Global navigation cancellation is also delivered while BasePose
+            # is inactive.  Keep generations aligned without reporting a fake
+            # operator stop or perturbing the runtime generation twice.
+            self.runtime.generation = self.gateway_generation
+            self._terminal_reported = True
+            return False
         self.runtime.cancel(reason, timestamp)
         self.runtime.generation = self.gateway_generation
         self._terminal_reported = True
+        return True
 
     def tick(self, *, now: float | None = None) -> None:
         timestamp = self.monotonic() if now is None else float(now)
@@ -265,7 +287,10 @@ def run_base_pose_yolo_agent(config: Any) -> None:
                         begin_generation(generation)
                     adapter.start(generation)
                 else:
-                    adapter.cancel(generation, "operator_stop")
+                    reason = str(
+                        command.parameters.get("reason") or "operator_stop"
+                    )
+                    adapter.cancel(generation, reason)
             adapter.tick()
             time.sleep(0.01)
     except KeyboardInterrupt:

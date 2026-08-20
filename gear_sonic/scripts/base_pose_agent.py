@@ -72,6 +72,7 @@ class BasePoseAgentConfig:
     raw_reference_update_interval_frames: int = 5
     raw_reference_update_min_confidence: float = 0.35
     raw_reference_update_min_iou: float = 0.50
+    # Single-camera cadence. Dual-camera perception is driven by each new frame.
     raw_servo_hz: float = 10.0
     raw_head_target_distance_m: float = 1.00
     raw_chest_target_distance_m: float = 0.80
@@ -83,7 +84,6 @@ class BasePoseAgentConfig:
     raw_yaw_tolerance_deg: float = 8.0
     raw_yaw_coarse_speed_rad_s: float = 0.30
     raw_yaw_trim_speed_rad_s: float = 0.20
-    raw_forward_recenter_yaw_speed_rad_s: float = 0.30
     raw_horizontal_guard_fraction: float = 0.25
     raw_horizontal_recovery_fraction: float = 0.30
     raw_orientation_telemetry_source: str = "tcp://127.0.0.1:5569"

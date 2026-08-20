@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
+from collections import deque
 from dataclasses import dataclass, field, replace
-from pathlib import Path
 import json
 import math
+from pathlib import Path
 import queue
 import threading
 from typing import Any, Callable, Mapping
@@ -14,6 +15,21 @@ import cv2
 import numpy as np
 
 from gear_sonic.utils.inference.base_pose import _atomic_write_bytes
+
+
+@dataclass(frozen=True)
+class CameraFrameData:
+    """Pixel-space diagnostics belonging to one physical camera frame."""
+
+    camera_stream: str
+    camera_timestamp: float
+    rgb: np.ndarray
+    target_bbox_xyxy: tuple[float, float, float, float] | None = None
+    target_mask: np.ndarray | None = field(default=None, repr=False)
+    surface_mask: np.ndarray | None = field(default=None, repr=False)
+    completed_surface_mask: np.ndarray | None = field(default=None, repr=False)
+    table_rgb_edges: np.ndarray | None = field(default=None, repr=False)
+    table_geometry: Mapping[str, Any] | None = None
 
 
 @dataclass(frozen=True)
@@ -42,6 +58,7 @@ class DetectionFrameData:
     target_geometry: Mapping[str, Any] | None = None
     table_geometry: Mapping[str, Any] | None = None
     table_geometry_error: str | None = None
+    additional_camera_frames: tuple[CameraFrameData, ...] = ()
     perception_kind: str = "observation"
     perception_error: str | None = None
 
@@ -97,6 +114,11 @@ class FrameDiagnosticsWriter:
         self.review_depth_dir = self.output_dir / "review_samples" / "depth"
         self.review_edges_dir = self.output_dir / "review_samples" / "edges"
         self.review_masks_dir = self.output_dir / "review_samples" / "masks"
+        self.completion_dir = self.output_dir / "completion_capture"
+        self.completion_manifest_path = self.completion_dir / "manifest.jsonl"
+        self._recent_applied_frames: deque[DetectionFrameData] = deque(maxlen=3)
+        self._completion_capture_active = False
+        self._completion_captured: set[tuple[str, int, str]] = set()
 
     @staticmethod
     def _encode_png(image: np.ndarray, *, name: str) -> bytes:
@@ -133,6 +155,254 @@ class FrameDiagnosticsWriter:
         cv2.circle(overlay, start, 5, (0, 255, 255), -1, cv2.LINE_AA)
         cv2.circle(overlay, end, 5, (0, 255, 255), -1, cv2.LINE_AA)
         return overlay
+
+    @staticmethod
+    def _safe_stream_name(value: str | None) -> str:
+        raw = "unknown" if value is None else str(value)
+        safe = "".join(
+            character if character.isalnum() or character in {"-", "_"} else "_"
+            for character in raw
+        ).strip("_")
+        return safe or "unknown"
+
+    @staticmethod
+    def _primary_camera_frame(frame: DetectionFrameData) -> CameraFrameData:
+        return CameraFrameData(
+            camera_stream=frame.camera_stream or "unknown",
+            camera_timestamp=frame.camera_timestamp,
+            rgb=frame.rgb,
+            target_bbox_xyxy=frame.target_bbox_xyxy,
+            target_mask=frame.target_mask,
+            surface_mask=frame.surface_mask,
+            completed_surface_mask=frame.completed_surface_mask,
+            table_rgb_edges=frame.table_rgb_edges,
+            table_geometry=frame.table_geometry,
+        )
+
+    @classmethod
+    def _camera_frames(cls, frame: DetectionFrameData) -> tuple[CameraFrameData, ...]:
+        ordered = (cls._primary_camera_frame(frame), *frame.additional_camera_frames)
+        result: list[CameraFrameData] = []
+        seen: set[str] = set()
+        for camera_frame in ordered:
+            stream = str(camera_frame.camera_stream)
+            if stream in seen:
+                continue
+            seen.add(stream)
+            result.append(camera_frame)
+        return tuple(result)
+
+    @staticmethod
+    def _validate_camera_frame(frame: CameraFrameData) -> np.ndarray:
+        rgb = np.asarray(frame.rgb)
+        if rgb.ndim != 3 or rgb.shape[2] != 3 or rgb.dtype != np.uint8:
+            raise ValueError("completion RGB must be uint8 HxWx3")
+        for name, value in (
+            ("target", frame.target_mask),
+            ("table", frame.surface_mask),
+            ("completed table", frame.completed_surface_mask),
+            ("table RGB edge", frame.table_rgb_edges),
+        ):
+            if value is not None and np.asarray(value).shape != rgb.shape[:2]:
+                raise ValueError(f"completion {name} image shape does not match RGB")
+        return rgb
+
+    @staticmethod
+    def _completion_overlay(frame: CameraFrameData) -> np.ndarray:
+        rgb = FrameDiagnosticsWriter._validate_camera_frame(frame)
+        overlay = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
+        table_mask = (
+            frame.surface_mask
+            if frame.surface_mask is not None
+            else frame.completed_surface_mask
+        )
+        if table_mask is not None:
+            selected = np.asarray(table_mask) > 0
+            tint = overlay.copy()
+            tint[selected] = (255, 170, 0)
+            overlay = cv2.addWeighted(tint, 0.35, overlay, 0.65, 0.0)
+        if frame.target_bbox_xyxy is not None:
+            bbox = np.asarray(frame.target_bbox_xyxy, dtype=np.float64)
+            if bbox.shape == (4,) and np.all(np.isfinite(bbox)):
+                height, width = overlay.shape[:2]
+                x1, y1, x2, y2 = np.rint(bbox).astype(int)
+                x1 = int(np.clip(x1, 0, width - 1))
+                x2 = int(np.clip(x2, 0, width - 1))
+                y1 = int(np.clip(y1, 0, height - 1))
+                y2 = int(np.clip(y2, 0, height - 1))
+                cv2.rectangle(
+                    overlay, (x1, y1), (x2, y2), (0, 255, 0), 3, cv2.LINE_AA
+                )
+                cv2.putText(
+                    overlay,
+                    "target",
+                    (x1, max(18, y1 - 7)),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.6,
+                    (0, 255, 0),
+                    2,
+                    cv2.LINE_AA,
+                )
+        geometry = frame.table_geometry
+        endpoints = None if geometry is None else geometry.get("line_endpoints_px")
+        if endpoints is not None:
+            values = np.asarray(endpoints, dtype=np.float64)
+            if values.shape == (2, 2) and np.all(np.isfinite(values)):
+                height, width = overlay.shape[:2]
+                points = np.rint(values).astype(int)
+                points[:, 0] = np.clip(points[:, 0], 0, width - 1)
+                points[:, 1] = np.clip(points[:, 1], 0, height - 1)
+                start = tuple(int(item) for item in points[0])
+                end = tuple(int(item) for item in points[1])
+                cv2.line(overlay, start, end, (0, 0, 255), 4, cv2.LINE_AA)
+                cv2.circle(overlay, start, 6, (0, 255, 255), -1, cv2.LINE_AA)
+                cv2.circle(overlay, end, 6, (0, 255, 255), -1, cv2.LINE_AA)
+        cv2.putText(
+            overlay,
+            str(frame.camera_stream),
+            (12, 26),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.7,
+            (255, 255, 255),
+            2,
+            cv2.LINE_AA,
+        )
+        return overlay
+
+    def _write_completion_frame(
+        self,
+        frame: DetectionFrameData,
+        *,
+        stage: str,
+    ) -> None:
+        for camera_frame in self._camera_frames(frame):
+            stream = self._safe_stream_name(camera_frame.camera_stream)
+            key = (stage, int(frame.frame_index), stream)
+            if key in self._completion_captured:
+                continue
+            self._completion_captured.add(key)
+            rgb = self._validate_camera_frame(camera_frame)
+            stage_dir = self.completion_dir / stage
+            stage_dir.mkdir(parents=True, exist_ok=True)
+            stem = f"{int(frame.frame_index):06d}_{stream}"
+            raw_relative = Path("completion_capture") / stage / f"{stem}_raw.png"
+            overlay_relative = (
+                Path("completion_capture") / stage / f"{stem}_overlay.png"
+            )
+            _atomic_write_bytes(
+                self.output_dir / raw_relative,
+                self._encode_png(
+                    cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR),
+                    name=f"completion raw RGB {stem}",
+                ),
+            )
+            _atomic_write_bytes(
+                self.output_dir / overlay_relative,
+                self._encode_png(
+                    self._completion_overlay(camera_frame),
+                    name=f"completion overlay {stem}",
+                ),
+            )
+            table_mask_relative: Path | None = None
+            table_mask = camera_frame.surface_mask
+            if table_mask is not None:
+                table_mask_relative = (
+                    Path("completion_capture") / stage / f"{stem}_table_mask.png"
+                )
+                binary = (np.asarray(table_mask) > 0).astype(np.uint8) * 255
+                _atomic_write_bytes(
+                    self.output_dir / table_mask_relative,
+                    self._encode_png(binary, name=f"completion table mask {stem}"),
+                )
+            completed_mask_relative: Path | None = None
+            if camera_frame.completed_surface_mask is not None:
+                completed_mask_relative = (
+                    Path("completion_capture")
+                    / stage
+                    / f"{stem}_table_completed_mask.png"
+                )
+                completed = (
+                    np.asarray(camera_frame.completed_surface_mask) > 0
+                ).astype(np.uint8) * 255
+                _atomic_write_bytes(
+                    self.output_dir / completed_mask_relative,
+                    self._encode_png(
+                        completed,
+                        name=f"completion completed table mask {stem}",
+                    ),
+                )
+            table_edges_relative: Path | None = None
+            if camera_frame.table_rgb_edges is not None:
+                table_edges_relative = (
+                    Path("completion_capture") / stage / f"{stem}_table_edges.png"
+                )
+                edges = np.asarray(camera_frame.table_rgb_edges).astype(
+                    np.uint8, copy=False
+                )
+                _atomic_write_bytes(
+                    self.output_dir / table_edges_relative,
+                    self._encode_png(edges, name=f"completion table edges {stem}"),
+                )
+            geometry = camera_frame.table_geometry
+            manifest_record = {
+                "stage": stage,
+                "frame_index": int(frame.frame_index),
+                "camera_stream": camera_frame.camera_stream,
+                "camera_timestamp": float(camera_frame.camera_timestamp),
+                "raw_rgb": raw_relative.as_posix(),
+                "overlay_rgb": overlay_relative.as_posix(),
+                "table_mask": (
+                    None
+                    if table_mask_relative is None
+                    else table_mask_relative.as_posix()
+                ),
+                "table_completed_mask": (
+                    None
+                    if completed_mask_relative is None
+                    else completed_mask_relative.as_posix()
+                ),
+                "table_rgb_edges": (
+                    None
+                    if table_edges_relative is None
+                    else table_edges_relative.as_posix()
+                ),
+                "target_bbox_xyxy": _bbox_json(camera_frame.target_bbox_xyxy),
+                "table_edge_endpoints_px": (
+                    None
+                    if geometry is None
+                    else geometry.get("line_endpoints_px")
+                ),
+            }
+            self.completion_dir.mkdir(parents=True, exist_ok=True)
+            with self.completion_manifest_path.open("a", encoding="utf-8") as handle:
+                handle.write(
+                    json.dumps(
+                        _json_compatible(manifest_record),
+                        ensure_ascii=False,
+                        allow_nan=False,
+                    )
+                    + "\n"
+                )
+                handle.flush()
+
+    def _capture_completion_images(
+        self,
+        frame: DetectionFrameData,
+        *,
+        control_applied: bool,
+        completion_capture: str | None,
+    ) -> None:
+        if control_applied:
+            self._recent_applied_frames.append(frame)
+        if completion_capture == "start":
+            for context_frame in self._recent_applied_frames:
+                self._write_completion_frame(context_frame, stage="completion")
+            self._completion_capture_active = True
+            return
+        if self._completion_capture_active:
+            self._write_completion_frame(frame, stage="post_stop")
+        if completion_capture == "finish":
+            self._completion_capture_active = False
 
     def _write_review_artifacts(self, frame: DetectionFrameData) -> dict[str, Any]:
         result: dict[str, Any] = {
@@ -283,12 +553,20 @@ class FrameDiagnosticsWriter:
         command: Mapping[str, Any] | None,
         control_applied: bool = True,
         orientation: Mapping[str, Any] | None = None,
+        completion_capture: str | None = None,
     ) -> None:
         applied = bool(control_applied)
         if applied and (controller_state is None or command is None):
             raise ValueError("applied diagnostic frame requires control metadata")
         controller = None if not applied else self._controller(controller_state)
         normalized_command = None if not applied else self._command(command)
+        if completion_capture not in {None, "start", "finish"}:
+            raise ValueError("completion_capture must be start, finish, or None")
+        self._capture_completion_images(
+            frame,
+            control_applied=applied,
+            completion_capture=completion_capture,
+        )
         review_artifacts = self._write_review_artifacts(frame)
         record = {
             "frame_index": int(frame.frame_index),
@@ -304,6 +582,7 @@ class FrameDiagnosticsWriter:
             "perception_kind": frame.perception_kind,
             "perception_error": frame.perception_error,
             "control_applied": applied,
+            "completion_capture": completion_capture,
             "annotated_image": None,
             "review_artifacts": review_artifacts,
             "detections": {
@@ -356,11 +635,40 @@ class _ControlDecision:
     controller_state: Mapping[str, Any] | None
     command: Mapping[str, Any] | None
     orientation: Mapping[str, Any] | None
+    completion_capture: str | None
 
 
 @dataclass(frozen=True)
 class _CloseWriter:
     drain: bool
+
+
+def _owned_camera_frame(frame: CameraFrameData) -> CameraFrameData:
+    return replace(
+        frame,
+        rgb=np.asarray(frame.rgb).copy(),
+        target_mask=(
+            None if frame.target_mask is None else np.asarray(frame.target_mask).copy()
+        ),
+        surface_mask=(
+            None
+            if frame.surface_mask is None
+            else np.asarray(frame.surface_mask).copy()
+        ),
+        completed_surface_mask=(
+            None
+            if frame.completed_surface_mask is None
+            else np.asarray(frame.completed_surface_mask).copy()
+        ),
+        table_rgb_edges=(
+            None
+            if frame.table_rgb_edges is None
+            else np.asarray(frame.table_rgb_edges).copy()
+        ),
+        table_geometry=(
+            None if frame.table_geometry is None else dict(frame.table_geometry)
+        ),
+    )
 
 
 def _owned_frame(frame: DetectionFrameData) -> DetectionFrameData:
@@ -391,6 +699,10 @@ def _owned_frame(frame: DetectionFrameData) -> DetectionFrameData:
         ),
         table_geometry=(
             None if frame.table_geometry is None else dict(frame.table_geometry)
+        ),
+        additional_camera_frames=tuple(
+            _owned_camera_frame(camera_frame)
+            for camera_frame in frame.additional_camera_frames
         ),
     )
 
@@ -448,6 +760,7 @@ class AsyncFrameDiagnosticsWriter:
         controller_state: Mapping[str, Any] | None,
         command: Mapping[str, Any] | None,
         orientation: Mapping[str, Any] | None = None,
+        completion_capture: str | None = None,
     ) -> None:
         item = _ControlDecision(
             int(generation),
@@ -456,6 +769,7 @@ class AsyncFrameDiagnosticsWriter:
             None if controller_state is None else dict(controller_state),
             None if command is None else dict(command),
             None if orientation is None else dict(orientation),
+            completion_capture,
         )
         with self._submit_lock:
             if self._closed:
@@ -496,6 +810,7 @@ class AsyncFrameDiagnosticsWriter:
                 controller_state=decision.controller_state,
                 command=decision.command,
                 orientation=decision.orientation,
+                completion_capture=decision.completion_capture,
             )
             return True
         except Exception as exc:
@@ -520,7 +835,7 @@ class AsyncFrameDiagnosticsWriter:
         for key in list(self._frames):
             if key not in self._decisions:
                 self._decisions[key] = _ControlDecision(
-                    key[0], key[1], False, None, None, None
+                    key[0], key[1], False, None, None, None, None
                 )
         generations = sorted({key[0] for key in self._frames})
         for generation in generations:

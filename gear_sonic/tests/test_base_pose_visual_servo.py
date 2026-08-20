@@ -440,7 +440,7 @@ def test_diagnostic_frame_carries_completed_desk_mask_by_value() -> None:
     assert np.count_nonzero(frame.completed_surface_mask) == 20_000
 
 
-def test_chest_approach_mode_never_enters_head_alignment_states() -> None:
+def test_chest_approach_mode_does_not_recenter_at_horizontal_guard() -> None:
     controller = VisualServoController(
         chest_approach_only=True,
         min_linear_speed_m_s=0.4,
@@ -466,19 +466,113 @@ def test_chest_approach_mode_never_enters_head_alignment_states() -> None:
 
     guarded = replace(
         centered,
+        target=replace(
+            centered.target,
+            forward_m=1.2,
+            body_xyz_m=(1.2, 0.0, 0.5),
+            median_depth_m=1.2,
+        ),
         target_bbox_xyxy=(0.0, 120.0, 100.0, 360.0),
     )
-    command = controller.update(guarded, now=2.1)
-    assert controller.phase is ServoPhase.FORWARD_RECENTER
+    command = controller.update(guarded, now=2.1, joint_completion=True)
+    assert controller.phase is ServoPhase.FORWARD_APPROACH
     assert command.vx > 0.4
     assert command.vy == 0.0
-    assert command.wz > 0.0
+    assert command.wz == 0.0
 
     command = controller.update(centered, now=2.7)
     assert controller.phase is ServoPhase.FORWARD_APPROACH
     assert command.vx > 0.4
     assert command.vy == 0.0
     assert command.wz == 0.0
+
+
+def test_position_errors_bypass_ema_while_yaw_remains_filtered() -> None:
+    controller = VisualServoController(
+        target_distance_m=0.8,
+        ema_alpha=0.1,
+    )
+    first = _observation(
+        bbox=(240.0, 120.0, 400.0, 360.0),
+        yaw=0.2,
+    )
+    first = replace(
+        first,
+        target=replace(first.target, forward_m=1.2, right_m=0.1),
+    )
+    second = replace(
+        first,
+        target=replace(first.target, forward_m=2.0, right_m=0.5),
+        table=replace(first.table, yaw_error_rad=0.3),
+    )
+
+    controller._update_filter(first)
+    forward_error, right_error, yaw_error = controller._update_filter(second)
+
+    assert forward_error == pytest.approx(1.2)
+    assert right_error == pytest.approx(0.5)
+    assert yaw_error == pytest.approx(0.21)
+
+
+def test_yaw_filter_bypasses_ema_above_ten_degree_raw_jump() -> None:
+    controller = VisualServoController(ema_alpha=0.1)
+    first = _observation(
+        bbox=(240.0, 120.0, 400.0, 360.0),
+        yaw=math.radians(-40.0),
+    )
+    second = replace(
+        first,
+        table=replace(first.table, yaw_error_rad=math.radians(11.0)),
+    )
+
+    controller._update_filter(first)
+    _, _, yaw_error = controller._update_filter(second)
+
+    assert yaw_error == pytest.approx(math.radians(11.0))
+    assert controller.last_raw_yaw_error_rad == pytest.approx(
+        math.radians(11.0)
+    )
+
+
+def test_yaw_filter_keeps_ema_at_exactly_ten_degree_raw_jump() -> None:
+    controller = VisualServoController(ema_alpha=0.1)
+    first_yaw = math.radians(2.0)
+    second_yaw = first_yaw + math.radians(10.0)
+    first = _observation(
+        bbox=(240.0, 120.0, 400.0, 360.0),
+        yaw=first_yaw,
+    )
+    second = replace(
+        first,
+        table=replace(first.table, yaw_error_rad=second_yaw),
+    )
+
+    controller._update_filter(first)
+    _, _, yaw_error = controller._update_filter(second)
+
+    assert yaw_error == pytest.approx(
+        0.1 * second_yaw + 0.9 * first_yaw
+    )
+
+
+def test_yaw_filter_compares_consecutive_valid_raw_samples_across_gap() -> None:
+    controller = VisualServoController(ema_alpha=0.1)
+    first = _observation(
+        bbox=(240.0, 120.0, 400.0, 360.0),
+        yaw=0.0,
+    )
+    missing = replace(first, table=None)
+    resumed_yaw = math.radians(11.0)
+    resumed = replace(
+        first,
+        table=replace(first.table, yaw_error_rad=resumed_yaw),
+    )
+
+    controller._update_filter(first)
+    controller._update_filter(missing)
+    _, _, yaw_error = controller._update_filter(resumed)
+
+    assert yaw_error == pytest.approx(resumed_yaw)
 
 
 def test_joint_completion_stops_chest_approach_at_chest_standoff() -> None:
@@ -517,6 +611,49 @@ def test_joint_completion_stops_chest_approach_at_chest_standoff() -> None:
 
     assert first.velocity == (0.0, 0.0, 0.0)
     assert second.velocity == (0.0, 0.0, 0.0)
+    assert controller.phase is ServoPhase.DONE
+    assert controller.terminal_reason == "aligned"
+
+
+def test_joint_completion_defaults_to_five_stable_frames() -> None:
+    controller = VisualServoController(
+        target_distance_m=0.7,
+        forward_tolerance_m=0.07,
+        lateral_tolerance_m=0.07,
+        post_stop_sample_s=0.0,
+        chest_approach_only=True,
+    )
+    controller.reset(0.0, initial_phase=ServoPhase.FORWARD_APPROACH)
+    observation = _observation(bbox=(240.0, 120.0, 400.0, 360.0))
+    observation = replace(
+        observation,
+        target=replace(
+            observation.target,
+            forward_m=0.7,
+            right_m=0.02,
+            body_xyz_m=(0.7, -0.02, 0.5),
+            median_depth_m=0.7,
+        ),
+        table_camera_stream="ego_view",
+    )
+
+    for frame_index in range(4):
+        command = controller.update(
+            observation,
+            now=0.1 * (frame_index + 1),
+            joint_completion=True,
+        )
+        assert command.velocity == (0.0, 0.0, 0.0)
+        assert controller.phase is ServoPhase.FORWARD_APPROACH
+        assert controller.stable_frames == frame_index + 1
+
+    command = controller.update(
+        observation,
+        now=0.5,
+        joint_completion=True,
+    )
+
+    assert command.velocity == (0.0, 0.0, 0.0)
     assert controller.phase is ServoPhase.DONE
     assert controller.terminal_reason == "aligned"
 

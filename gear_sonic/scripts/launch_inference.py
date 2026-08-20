@@ -282,6 +282,7 @@ class InferenceLaunchConfig:
     base_pose_raw_reference_update_min_confidence: float = 0.35
     base_pose_raw_reference_update_min_iou: float = 0.50
     base_pose_raw_servo_hz: float = 10.0
+    """Single-camera cadence; dual-camera perception is new-frame-driven."""
     base_pose_raw_head_target_distance_m: float = 1.00
     base_pose_raw_chest_target_distance_m: float = 0.80
     base_pose_raw_forward_tolerance_m: float = 0.10
@@ -292,7 +293,6 @@ class InferenceLaunchConfig:
     base_pose_raw_yaw_tolerance_deg: float = 8.0
     base_pose_raw_yaw_coarse_speed_rad_s: float = 0.30
     base_pose_raw_yaw_trim_speed_rad_s: float = 0.20
-    base_pose_raw_forward_recenter_yaw_speed_rad_s: float = 0.30
     base_pose_raw_horizontal_guard_fraction: float = 0.25
     base_pose_raw_horizontal_recovery_fraction: float = 0.30
     base_pose_raw_camera_stale_s: float = 0.40
@@ -727,8 +727,6 @@ def build_base_pose_agent_command(
         f"--raw-yaw-tolerance-deg {config.base_pose_raw_yaw_tolerance_deg} "
         f"--raw-yaw-coarse-speed-rad-s {config.base_pose_raw_yaw_coarse_speed_rad_s} "
         f"--raw-yaw-trim-speed-rad-s {config.base_pose_raw_yaw_trim_speed_rad_s} "
-        f"--raw-forward-recenter-yaw-speed-rad-s "
-        f"{config.base_pose_raw_forward_recenter_yaw_speed_rad_s} "
         f"--raw-horizontal-guard-fraction "
         f"{config.base_pose_raw_horizontal_guard_fraction} "
         f"--raw-horizontal-recovery-fraction "
@@ -1246,10 +1244,6 @@ def _check_prerequisites(config: InferenceLaunchConfig):
             (config.base_pose_raw_yaw_tolerance_deg, "yaw tolerance"),
             (config.base_pose_raw_yaw_coarse_speed_rad_s, "coarse yaw speed"),
             (config.base_pose_raw_yaw_trim_speed_rad_s, "trim yaw speed"),
-            (
-                config.base_pose_raw_forward_recenter_yaw_speed_rad_s,
-                "forward recenter yaw speed",
-            ),
             (config.base_pose_raw_camera_stale_s, "camera stale timeout"),
             (config.base_pose_raw_max_run_s, "maximum run time"),
         ):

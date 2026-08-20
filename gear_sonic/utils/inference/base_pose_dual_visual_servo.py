@@ -4,10 +4,10 @@ from __future__ import annotations
 
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from dataclasses import dataclass, replace
-from pathlib import Path
 import math
 import multiprocessing
 import os
+from pathlib import Path
 import queue
 import signal
 import threading
@@ -31,29 +31,29 @@ from gear_sonic.utils.inference.base_pose_sensor import (
 )
 from gear_sonic.utils.inference.base_pose_visual_servo import (
     DEFAULT_SURFACE_TEXT_PROMPT,
-    GenerationGate,
     HEAD_MONITOR_HOLD_EVENT,
-    RawServoEvent,
+    GenerationGate,
     RawServoCalibration,
+    RawServoEvent,
     RawServoObservation,
     TableGeometry,
     TrackedInstance,
     YoloePersistentTracker,
     YoloeTargetReferenceEncoder,
-    bbox_iou,
-    normalized_bbox_to_pixels,
     _diagnostic_frame,
     _observation,
     _publish_worker_event,
     _resolve_target,
     _surface_geometry_components,
     _temporary_png,
+    bbox_iou,
     ground_raw_servo_references,
+    normalized_bbox_to_pixels,
 )
 from gear_sonic.utils.inference.base_pose_visual_servo_diagnostics import (
     AsyncFrameDiagnosticsWriter,
+    CameraFrameData,
 )
-
 
 DEFAULT_DUAL_QWEN_FALLBACK_MODEL = "qwen3-vl-8b-instruct"
 QWEN_HOLD_STAGES = frozenset({"head_monitor_qwen"})
@@ -1213,6 +1213,25 @@ def _timed_observe_tracked_snapshot(
     return result, 1000.0 * (time.perf_counter() - started_at)
 
 
+class _HeadYawObservationError(ValueError):
+    """Head-yaw failure that still carries same-camera visualization data."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        target: TrackedInstance | None,
+        surface: TrackedInstance | None,
+        desk_mask: np.ndarray | None = None,
+        table_rgb_edges: np.ndarray | None = None,
+    ):
+        super().__init__(message)
+        self.target = target
+        self.surface = surface
+        self.desk_mask = desk_mask
+        self.table_rgb_edges = table_rgb_edges
+
+
 def _observe_head_yaw_snapshot(
     snapshot: AlignedRGBDSnapshot,
     tracker: Any,
@@ -1225,6 +1244,7 @@ def _observe_head_yaw_snapshot(
     TrackedInstance,
     TableGeometry,
     np.ndarray,
+    np.ndarray | None,
     bool,
     bool,
 ]:
@@ -1246,22 +1266,87 @@ def _observe_head_yaw_snapshot(
             class_index=1,
         )
     if surface is None:
-        raise ValueError("missing tracked desk for live head yaw")
-    table, table_error, desk_mask, _ = _surface_geometry_components(
+        raise _HeadYawObservationError(
+            "missing tracked desk for live head yaw",
+            target=target,
+            surface=None,
+        )
+    table, table_error, desk_mask, table_rgb_edges = _surface_geometry_components(
         snapshot,
         surface,
         calibration,
         target_mask=None if target is None else target.mask,
     )
     if table is None:
-        raise ValueError(table_error or "missing live head desk geometry")
+        raise _HeadYawObservationError(
+            table_error or "missing live head desk geometry",
+            target=target,
+            surface=surface,
+            desk_mask=desk_mask,
+            table_rgb_edges=table_rgb_edges,
+        )
     return (
         target,
         surface,
         table,
         desk_mask,
+        table_rgb_edges,
         target_reacquired,
         surface_reacquired,
+    )
+
+
+def _table_geometry_frame_data(
+    table: TableGeometry | None,
+) -> Mapping[str, Any] | None:
+    if table is None:
+        return None
+    return {
+        "yaw_error_rad": table.yaw_error_rad,
+        "line_length_m": table.line_length_m,
+        "inlier_count": table.inlier_count,
+        "residual_m": table.residual_m,
+        "line_center_xy_m": list(table.line_center_xy_m),
+        "line_endpoints_xy_m": (
+            None
+            if table.line_endpoints_xy_m is None
+            else [list(point) for point in table.line_endpoints_xy_m]
+        ),
+        "line_endpoints_px": (
+            None
+            if table.line_endpoints_px is None
+            else [list(point) for point in table.line_endpoints_px]
+        ),
+    }
+
+
+def _camera_frame_data(
+    snapshot: AlignedRGBDSnapshot,
+    *,
+    target: TrackedInstance | None,
+    surface: TrackedInstance | None,
+    table: TableGeometry | None,
+    completed_surface_mask: np.ndarray | None,
+    table_rgb_edges: np.ndarray | None,
+) -> CameraFrameData:
+    """Own one camera's pixels so later overlays cannot cross camera frames."""
+
+    return CameraFrameData(
+        camera_stream=snapshot.depth_aligned_to,
+        camera_timestamp=snapshot.timestamp,
+        rgb=snapshot.rgb.copy(),
+        target_bbox_xyxy=None if target is None else target.bbox_xyxy,
+        target_mask=None if target is None else target.mask.copy(),
+        surface_mask=None if surface is None else surface.mask.copy(),
+        completed_surface_mask=(
+            None
+            if completed_surface_mask is None
+            else completed_surface_mask.copy()
+        ),
+        table_rgb_edges=(
+            None if table_rgb_edges is None else table_rgb_edges.copy()
+        ),
+        table_geometry=_table_geometry_frame_data(table),
     )
 
 
@@ -1420,6 +1505,21 @@ def _poll_camera_stream(
         return None
 
 
+def _claim_new_stream_snapshot(
+    last_timestamp_by_stream: dict[str, float],
+    stream_name: str,
+    snapshot: AlignedRGBDSnapshot,
+) -> bool:
+    """Claim a strictly newer frame for inference on one camera stream."""
+
+    timestamp = float(snapshot.timestamp)
+    previous = last_timestamp_by_stream.get(stream_name)
+    if previous is not None and timestamp <= previous:
+        return False
+    last_timestamp_by_stream[stream_name] = timestamp
+    return True
+
+
 def _attempt_details(
     attempt: DualCameraAttempt,
     **extra: Any,
@@ -1433,6 +1533,7 @@ def _attempt_details(
         "reference_kind": attempt.reference.kind,
         "prompt_mode": _attempt_prompt_mode(attempt),
         "target_prompt": attempt.reference.target_prompt,
+        "perception_schedule": "new_frame_latest_only",
         **extra,
     }
 
@@ -1691,7 +1792,7 @@ def run_dual_raw_servo_worker(
                         reference_updater = latest_reference_updater_factory()
                 attempt = coordinator.start()
                 frame_index = -1
-                next_frame_at = time.monotonic()
+                last_inference_timestamp_by_stream: dict[str, float] = {}
                 generation_finished = False
                 while gate.is_active(generation) and not stop_event.is_set():
                     try:
@@ -1845,6 +1946,7 @@ def run_dual_raw_servo_worker(
                     joint_chest_missing_frames = 0
                     joint_head_yaw_missing_frames = 0
                     failure_frame = None
+                    last_head_camera_frame: CameraFrameData | None = None
                     preempt_attempt: DualCameraAttempt | None = None
                     switch_details: dict[str, Any] = {}
                     while (
@@ -1852,11 +1954,6 @@ def run_dual_raw_servo_worker(
                         and gate.is_active(generation)
                         and not stop_event.is_set()
                     ):
-                        delay = next_frame_at - time.monotonic()
-                        if delay > 0.0:
-                            stop_event.wait(min(delay, 0.05))
-                            continue
-                        next_frame_at = time.monotonic() + 1.0 / config.raw_servo_hz
                         snapshot: AlignedRGBDSnapshot | None = None
                         target: TrackedInstance | None = None
                         surface: TrackedInstance | None = None
@@ -1873,7 +1970,10 @@ def run_dual_raw_servo_worker(
                         live_head_surface: TrackedInstance | None = None
                         live_head_table: TableGeometry | None = None
                         live_head_desk_mask: np.ndarray | None = None
+                        live_head_table_rgb_edges: np.ndarray | None = None
                         live_head_yaw_error: str | None = None
+                        monitor_result: HeadCameraMonitorResult | None = None
+                        current_head_camera_frame: CameraFrameData | None = None
                         fallback_head_yaw_attempted = False
                         joint_chest_target_missing = False
                         chest_active = attempt.live_stream == stream_names[1]
@@ -1929,6 +2029,12 @@ def run_dual_raw_servo_worker(
                                     int(float(config.raw_camera_stale_s) * 1000.0),
                                 ),
                             )
+                            if not _claim_new_stream_snapshot(
+                                last_inference_timestamp_by_stream,
+                                control_source_stream,
+                                snapshot,
+                            ):
+                                continue
                             frame_index += 1
                             parallel_joint_observation = (
                                 control_source_stream == stream_names[1]
@@ -1958,7 +2064,6 @@ def run_dual_raw_servo_worker(
                             ):
                                 head_branch_started_at = time.perf_counter()
                                 was_holding = head_monitor.hold_active
-                                monitor_result: HeadCameraMonitorResult | None = None
                                 try:
                                     head_snapshot = _poll_camera_stream(
                                         camera,
@@ -2007,7 +2112,7 @@ def run_dual_raw_servo_worker(
                                                 live_head_table,
                                                 live_head_yaw_error,
                                                 live_head_desk_mask,
-                                                _,
+                                                live_head_table_rgb_edges,
                                             ) = _surface_geometry_components(
                                                 head_snapshot,
                                                 monitor_result.surface,
@@ -2021,6 +2126,7 @@ def run_dual_raw_servo_worker(
                                         except Exception as exc:
                                             live_head_table = None
                                             live_head_desk_mask = None
+                                            live_head_table_rgb_edges = None
                                             live_head_yaw_error = str(exc)
                                     effective_hold = (
                                         monitor_result.hold_active
@@ -2159,6 +2265,7 @@ def run_dual_raw_servo_worker(
                                         live_head_surface,
                                         live_head_table,
                                         live_head_desk_mask,
+                                        live_head_table_rgb_edges,
                                         _,
                                         _,
                                     ) = _observe_head_yaw_snapshot(
@@ -2169,6 +2276,13 @@ def run_dual_raw_servo_worker(
                                         surface_id=surface_id,
                                     )
                                 except Exception as exc:
+                                    if isinstance(exc, _HeadYawObservationError):
+                                        live_head_target = exc.target
+                                        live_head_surface = exc.surface
+                                        live_head_desk_mask = exc.desk_mask
+                                        live_head_table_rgb_edges = (
+                                            exc.table_rgb_edges
+                                        )
                                     live_head_yaw_error = str(exc)
                                 head_branch_elapsed_ms = 1000.0 * (
                                     time.perf_counter() - head_branch_started_at
@@ -2447,6 +2561,7 @@ def run_dual_raw_servo_worker(
                                         live_head_surface,
                                         live_head_table,
                                         live_head_desk_mask,
+                                        live_head_table_rgb_edges,
                                         _,
                                         _,
                                     ) = _observe_head_yaw_snapshot(
@@ -2457,6 +2572,13 @@ def run_dual_raw_servo_worker(
                                         surface_id=surface_id,
                                     )
                                 except Exception as exc:
+                                    if isinstance(exc, _HeadYawObservationError):
+                                        live_head_target = exc.target
+                                        live_head_surface = exc.surface
+                                        live_head_desk_mask = exc.desk_mask
+                                        live_head_table_rgb_edges = (
+                                            exc.table_rgb_edges
+                                        )
                                     live_head_yaw_error = str(exc)
                             if (
                                 live_head_yaw_error is not None
@@ -2520,6 +2642,41 @@ def run_dual_raw_servo_worker(
                                 "error": observation.table_geometry_error,
                             }
 
+                        visual_head_snapshot = (
+                            head_snapshot
+                            if head_snapshot is not None
+                            else live_head_snapshot
+                        )
+                        if visual_head_snapshot is not None:
+                            visual_head_target = (
+                                monitor_result.target
+                                if head_snapshot is not None
+                                and monitor_result is not None
+                                else live_head_target
+                            )
+                            visual_head_surface = (
+                                monitor_result.surface
+                                if head_snapshot is not None
+                                and monitor_result is not None
+                                else live_head_surface
+                            )
+                            current_head_camera_frame = _camera_frame_data(
+                                visual_head_snapshot,
+                                target=visual_head_target,
+                                surface=visual_head_surface,
+                                table=live_head_table,
+                                completed_surface_mask=live_head_desk_mask,
+                                table_rgb_edges=live_head_table_rgb_edges,
+                            )
+                            last_head_camera_frame = current_head_camera_frame
+                        additional_camera_frames = (
+                            ()
+                            if last_head_camera_frame is None
+                            or last_head_camera_frame.camera_stream
+                            == control_source_stream
+                            else (last_head_camera_frame,)
+                        )
+
                         head_yaw_loss: dict[str, Any] | None = None
                         if (
                             not perception_error
@@ -2551,6 +2708,9 @@ def run_dual_raw_servo_worker(
                                         observation,
                                         kind="switching",
                                         error=failure_reason,
+                                        additional_camera_frames=(
+                                            additional_camera_frames
+                                        ),
                                         **_attempt_frame_details(
                                             attempt,
                                             camera_stream=control_source_stream,
@@ -2572,6 +2732,9 @@ def run_dual_raw_servo_worker(
                                     None,
                                     kind="invalid",
                                     error=perception_error,
+                                    additional_camera_frames=(
+                                        additional_camera_frames
+                                    ),
                                     **_attempt_frame_details(
                                         attempt,
                                         camera_stream=control_source_stream,
@@ -2909,6 +3072,9 @@ def run_dual_raw_servo_worker(
                                     surface,
                                     observation,
                                     kind=event_kind,
+                                    additional_camera_frames=(
+                                        additional_camera_frames
+                                    ),
                                     **_attempt_frame_details(
                                         attempt,
                                         camera_stream=control_source_stream,

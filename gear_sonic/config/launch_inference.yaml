@@ -233,18 +233,18 @@ launch_inference:
   base_pose_raw_reference_update_interval_frames: 5
   base_pose_raw_reference_update_min_confidence: 0.35
   base_pose_raw_reference_update_min_iou: 0.50
+  # Single-camera cadence; dual-camera perception runs on each newest RGB-D frame.
   base_pose_raw_servo_hz: 10.0
-  base_pose_raw_head_target_distance_m: 0.85
-  base_pose_raw_chest_target_distance_m: 0.65
-  base_pose_raw_forward_tolerance_m: 0.07
-  base_pose_raw_lateral_tolerance_m: 0.07
+  base_pose_raw_head_target_distance_m: 0.9
+  base_pose_raw_chest_target_distance_m: 0.7
+  base_pose_raw_forward_tolerance_m: 0.10
+  base_pose_raw_lateral_tolerance_m: 0.10
   base_pose_raw_min_linear_speed_m_s: 0.35
   base_pose_raw_max_lateral_speed_m_s: 0.40
   base_pose_raw_min_yaw_speed_rad_s: 0.05
-  base_pose_raw_yaw_tolerance_deg: 3.0
-  base_pose_raw_yaw_coarse_speed_rad_s: 0.10
+  base_pose_raw_yaw_tolerance_deg: 3
+  base_pose_raw_yaw_coarse_speed_rad_s: 0.30
   base_pose_raw_yaw_trim_speed_rad_s: 0.10
-  base_pose_raw_forward_recenter_yaw_speed_rad_s: 0.30
   base_pose_raw_horizontal_guard_fraction: 0.25
   base_pose_raw_horizontal_recovery_fraction: 0.30
   base_pose_raw_camera_stale_s: 0.40

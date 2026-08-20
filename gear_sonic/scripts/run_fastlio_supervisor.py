@@ -152,7 +152,10 @@ def _cancel_navigation_and_stop_fastlio(
         f"{reason}; cancelling navigation and commanding zero velocity",
         flush=True,
     )
-    control.send("navigation_key", {"key": " "})
+    control.send(
+        "navigation_key",
+        {"key": " ", "reason": f"slam_recovery:{reason}"},
+    )
     # Let ControlGateway dispatch the typed stop before tearing down SLAM.
     time.sleep(0.1)
     _stop_fastlio(process)

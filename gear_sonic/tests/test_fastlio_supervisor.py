@@ -100,7 +100,11 @@ def test_recovery_sends_typed_stop_before_stopping_fastlio(monkeypatch) -> None:
     )
 
     assert events == [
-        ("send", "navigation_key", {"key": " "}),
+        (
+            "send",
+            "navigation_key",
+            {"key": " ", "reason": "slam_recovery:planar_speed:3.200m/s"},
+        ),
         ("sleep", 0.1),
         ("stop", process),
     ]

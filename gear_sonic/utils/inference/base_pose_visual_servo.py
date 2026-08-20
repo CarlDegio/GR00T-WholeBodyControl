@@ -11,10 +11,10 @@ from __future__ import annotations
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from enum import Enum
-from pathlib import Path
 import json
 import math
 import os
+from pathlib import Path
 import queue
 import re
 import tempfile
@@ -23,12 +23,12 @@ import time
 from typing import Any, Callable, Mapping, Sequence
 
 import cv2
+import numpy as np
+
 from gear_sonic.camera.calibration import (
     CameraCalibrationError,
     load_camera_intrinsics,
 )
-import numpy as np
-
 from gear_sonic.utils.inference.base_pose import (
     AlignedRGBDCamera,
     AlignedRGBDSnapshot,
@@ -40,9 +40,9 @@ from gear_sonic.utils.inference.base_pose import (
 )
 from gear_sonic.utils.inference.base_pose_visual_servo_diagnostics import (
     AsyncFrameDiagnosticsWriter,
+    CameraFrameData,
     DetectionFrameData,
 )
-
 
 RAW_YOLOE_SERVO_MODE = "raw_yoloe_servo"
 HEAD_MONITOR_HOLD_EVENT = "head_monitor_hold"
@@ -197,7 +197,6 @@ class TableGeometry:
 
 class ServoPhase(str, Enum):
     FORWARD_APPROACH = "forward_approach"
-    FORWARD_RECENTER = "forward_recenter"
     VERTICAL_RECENTER = "vertical_recenter"
     YAW_ALIGN = "yaw_align"
     RECENTER = "recenter"
@@ -1302,6 +1301,7 @@ _TABLE_EDGE_DEPTH_SAMPLES = 20
 _TABLE_EDGE_MIN_VALID_DEPTH_SAMPLES = 12
 _TABLE_EDGE_MASK_DILATION_RADIUS_PX = 3
 _TABLE_EDGE_TARGET_EXCLUSION_RADIUS_PX = 20
+_YAW_EMA_BYPASS_DELTA_RAD = math.radians(10.0)
 
 
 @dataclass(frozen=True)
@@ -1680,7 +1680,6 @@ class VisualServoController:
         yaw_tolerance_deg: float = 8.0,
         yaw_coarse_speed_rad_s: float = 0.30,
         yaw_trim_speed_rad_s: float = 0.20,
-        forward_recenter_yaw_speed_rad_s: float = 0.30,
         post_stop_sample_s: float = 0.0,
         allow_missing_table: bool = False,
         chest_approach_only: bool = False,
@@ -1738,14 +1737,6 @@ class VisualServoController:
             or yaw_tolerance > 180.0
         ):
             raise ValueError("yaw tolerance must be in (0, 180] degrees")
-        forward_recenter_yaw_speed = float(forward_recenter_yaw_speed_rad_s)
-        if (
-            not math.isfinite(forward_recenter_yaw_speed)
-            or forward_recenter_yaw_speed <= 0.0
-        ):
-            raise ValueError(
-                "forward recenter yaw speed must be finite and positive"
-            )
         post_stop_duration = float(post_stop_sample_s)
         if not math.isfinite(post_stop_duration) or post_stop_duration < 0.0:
             raise ValueError(
@@ -1765,8 +1756,6 @@ class VisualServoController:
         self.recovery_low_fraction = recovery_fraction
         self.recovery_high_fraction = 1.0 - recovery_fraction
         self.recenter_frames_required = 3
-        self.forward_recenter_interval_s = 0.5
-        self.forward_recenter_yaw_speed_rad_s = forward_recenter_yaw_speed
         self.yaw_lock_frames_required = 3
         self.orientation_stale_s = 0.25
         self.heading_setpoint_gain = 2.0
@@ -1800,12 +1789,12 @@ class VisualServoController:
         self.last_transition_reason: str | None = "reset"
         self.stable_frames = 0
         self.forward_approach_stable_frames = 0
-        self.forward_recenter_next_calibration_at: float | None = None
         self.vertical_recenter_started_at: float | None = None
         self.vertical_recenter_elapsed_s = 0.0
         self.vertical_recenter_stable_frames = 0
         self.yaw_stable_frames = 0
         self.recenter_stable_frames = 0
+        self.last_raw_yaw_error_rad: float | None = None
         self.desired_heading_rad: float | None = None
         self.heading_setpoint_error_rad: float | None = None
         self.last_visual_yaw_error_rad: float | None = None
@@ -1848,7 +1837,6 @@ class VisualServoController:
         """Whether a secondary camera may provide target position this frame."""
         return not self.chest_approach_only and self.phase in {
             ServoPhase.FORWARD_APPROACH,
-            ServoPhase.FORWARD_RECENTER,
             ServoPhase.RECENTER,
             ServoPhase.YAW_ALIGN,
             ServoPhase.YAW_TRIM,
@@ -1863,7 +1851,6 @@ class VisualServoController:
     def _transition(self, phase: ServoPhase, reason: str) -> ServoCommand:
         if self.chest_approach_only and phase not in {
             ServoPhase.FORWARD_APPROACH,
-            ServoPhase.FORWARD_RECENTER,
             ServoPhase.POST_STOP_SAMPLING,
         }:
             raise RuntimeError(
@@ -1877,8 +1864,6 @@ class VisualServoController:
             self.recenter_stable_frames = 0
         if phase is not ServoPhase.FORWARD_APPROACH:
             self.forward_approach_stable_frames = 0
-        if phase is not ServoPhase.FORWARD_RECENTER:
-            self.forward_recenter_next_calibration_at = None
         if phase not in {
             ServoPhase.YAW_TRIM, ServoPhase.GLOBAL_YAW_ALIGN
         }:
@@ -2246,79 +2231,50 @@ class VisualServoController:
         vx, _ = self._enforce_min_linear_speed(desired_vx, 0.0)
         return vx
 
-    def _update_forward_recenter(
-        self,
-        observation: RawServoObservation,
-        *,
-        now: float,
-    ) -> ServoCommand:
-        """Sample-and-hold basket centering used only by chest forward approach."""
-        vx = self._forward_approach_vx(self.last_errors[0])
-        next_calibration = self.forward_recenter_next_calibration_at
-        if next_calibration is not None and float(now) < next_calibration:
-            self.current = ServoCommand(
-                vx, 0.0, self.current.wz, self.command_ttl_s
-            )
-            return self.current
-
-        self.forward_recenter_next_calibration_at = (
-            float(now) + self.forward_recenter_interval_s
-        )
-        if self._target_center_recovered(observation):
-            self.resume_phase = None
-            self._transition(
-                ServoPhase.FORWARD_APPROACH,
-                "basket rotation-recentered during forward approach",
-            )
-            if self.chest_approach_only:
-                self.current = ServoCommand(
-                    self._forward_approach_vx(self.last_errors[0]),
-                    0.0,
-                    0.0,
-                    self.command_ttl_s,
-                )
-            return self.current
-
-        width = float(observation.image_width)
-        if width <= 0.0:
-            self.current = self._zero()
-            return self.current
-        x1, _, x2, _ = observation.target_bbox_xyxy
-        target_center_x = 0.5 * (x1 + x2)
-        image_center_x = 0.5 * width
-        if target_center_x == image_center_x:
-            self.current = self._zero()
-            return self.current
-        # Positive wz turns the camera view toward a target on the image's left.
-        direction = 1.0 if target_center_x < image_center_x else -1.0
-        self.current = ServoCommand(
-            vx,
-            0.0,
-            direction * self.forward_recenter_yaw_speed_rad_s,
-            self.command_ttl_s,
-        )
-        return self.current
-
     def _update_filter(self, observation: RawServoObservation) -> tuple[float, float, float]:
         raw_target = (observation.target.forward_m, observation.target.right_m)
+        raw_yaw_error = (
+            None
+            if observation.table is None
+            else float(observation.table.yaw_error_rad)
+        )
         yaw_sample = (
-            observation.table.yaw_error_rad
-            if observation.table is not None
+            raw_yaw_error
+            if raw_yaw_error is not None
             else (0.0 if self.filtered is None else float(self.filtered[2]))
         )
         sample = np.array([raw_target[0], raw_target[1], yaw_sample], dtype=np.float64)
         if self.filtered is None:
             self.filtered = sample
         else:
-            self.filtered[:2] = (
-                self.ema_alpha * sample[:2]
-                + (1.0 - self.ema_alpha) * self.filtered[:2]
-            )
-            if observation.table is not None:
-                self.filtered[2] = (
-                    self.ema_alpha * sample[2]
-                    + (1.0 - self.ema_alpha) * self.filtered[2]
+            # Position directly drives vx/vy, so use the latest measurement.
+            # Retain EMA only for small changes in the noisier table-derived
+            # yaw. A large inter-frame jump makes the old EMA history stale,
+            # so restart it from the current raw measurement.
+            self.filtered[:2] = sample[:2]
+            if raw_yaw_error is not None:
+                previous_raw_yaw = self.last_raw_yaw_error_rad
+                raw_yaw_delta = (
+                    None
+                    if previous_raw_yaw is None
+                    else abs(
+                        self._wrapped_angle(
+                            raw_yaw_error - previous_raw_yaw
+                        )
+                    )
                 )
+                if (
+                    raw_yaw_delta is None
+                    or raw_yaw_delta > _YAW_EMA_BYPASS_DELTA_RAD
+                ):
+                    self.filtered[2] = raw_yaw_error
+                else:
+                    self.filtered[2] = (
+                        self.ema_alpha * raw_yaw_error
+                        + (1.0 - self.ema_alpha) * self.filtered[2]
+                    )
+        if raw_yaw_error is not None:
+            self.last_raw_yaw_error_rad = raw_yaw_error
         errors = (
             float(self.filtered[0] - self.target_distance_m),
             float(self.filtered[1]),
@@ -2445,14 +2401,6 @@ class VisualServoController:
             return self._yaw_command(speed_limit=self.yaw_trim_speed_rad_s)
 
         if self.phase is ServoPhase.FORWARD_APPROACH:
-            if self._visibility_guarded(observation):
-                self.resume_phase = ServoPhase.FORWARD_APPROACH
-                self.invalid_frames = 0
-                self._transition(
-                    ServoPhase.FORWARD_RECENTER,
-                    "target visibility guard during forward approach",
-                )
-                return self._update_forward_recenter(observation, now=now)
             self.invalid_frames = 0
             if self.chest_approach_only:
                 self.forward_approach_stable_frames = 0
@@ -2485,10 +2433,6 @@ class VisualServoController:
             vx = self._forward_approach_vx(forward_error)
             self.current = ServoCommand(vx, 0.0, 0.0, self.command_ttl_s)
             return self.current
-
-        if self.phase is ServoPhase.FORWARD_RECENTER:
-            self.invalid_frames = 0
-            return self._update_forward_recenter(observation, now=now)
 
         if self.phase in {ServoPhase.YAW_ALIGN, ServoPhase.YAW_TRIM}:
             if self._visibility_guarded(observation):
@@ -2648,7 +2592,6 @@ class VisualServoController:
             return self.current
         self.stable_frames = 0
         self.forward_approach_stable_frames = 0
-        self.forward_recenter_next_calibration_at = None
         self.yaw_stable_frames = 0
         self.current = self._zero()
         if hard:
@@ -2797,6 +2740,7 @@ def _submit_diagnostic_decision(
     controller_state: Mapping[str, Any] | None = None,
     command: Mapping[str, Any] | None = None,
     orientation: Mapping[str, Any] | None = None,
+    completion_capture: str | None = None,
 ) -> None:
     if diagnostics is None or event.frame is None:
         return
@@ -2808,6 +2752,7 @@ def _submit_diagnostic_decision(
             controller_state=controller_state,
             command=command,
             orientation=orientation,
+            completion_capture=completion_capture,
         )
     except Exception as exc:
         diagnostics.logger(f"[RawServo] WARNING diagnostic submit failed: {exc}")
@@ -3046,6 +2991,7 @@ def _diagnostic_frame(
     reference_source_stream: str | None = None,
     reference_kind: str | None = None,
     prompt_mode: str | None = None,
+    additional_camera_frames: Sequence[CameraFrameData] = (),
 ) -> DetectionFrameData:
     target_geometry = None
     table_geometry = None
@@ -3140,6 +3086,7 @@ def _diagnostic_frame(
         table_geometry_error=(
             None if observation is None else observation.table_geometry_error
         ),
+        additional_camera_frames=tuple(additional_camera_frames),
         perception_kind=kind,
         perception_error=error,
     )
@@ -3795,9 +3742,6 @@ class RawServoRuntime:
             yaw_tolerance_deg=config.raw_yaw_tolerance_deg,
             yaw_coarse_speed_rad_s=config.raw_yaw_coarse_speed_rad_s,
             yaw_trim_speed_rad_s=config.raw_yaw_trim_speed_rad_s,
-            forward_recenter_yaw_speed_rad_s=(
-                config.raw_forward_recenter_yaw_speed_rad_s
-            ),
             post_stop_sample_s=config.raw_post_stop_sample_s,
             allow_missing_table=bool(
                 getattr(config, "raw_allow_missing_table", 0)
@@ -4459,6 +4403,8 @@ class RawServoRuntime:
         return "started"
 
     def cancel(self, reason: str, now: float) -> None:
+        if self.phase != "idle":
+            self._record("cancelled", reason=reason)
         self.gate.cancel()
         self.handoff_hold_ready.set()
         self._drain_waiting_observations()
@@ -4570,7 +4516,6 @@ class RawServoRuntime:
             self.controller.invalid_frames = 0
             self.controller.stable_frames = 0
             self.controller.forward_approach_stable_frames = 0
-            self.controller.forward_recenter_next_calibration_at = None
             self.controller.yaw_stable_frames = 0
             self.controller.recenter_stable_frames = 0
             command = self._zero()
@@ -4782,6 +4727,14 @@ class RawServoRuntime:
             and self.controller.phase is not ServoPhase.VERTICAL_RECENTER
         ):
             self.vertical_recenter_armed = False
+        entered_post_stop_sampling = (
+            previous_phase is not ServoPhase.POST_STOP_SAMPLING
+            and self.controller.phase is ServoPhase.POST_STOP_SAMPLING
+        )
+        finished_post_stop_sampling = (
+            previous_phase is ServoPhase.POST_STOP_SAMPLING
+            and self.controller.terminal
+        )
         _submit_diagnostic_decision(
             self._diagnostics,
             event,
@@ -4789,6 +4742,13 @@ class RawServoRuntime:
             controller_state=self._controller_diagnostics(),
             command=self._command_diagnostics(command),
             orientation=orientation,
+            completion_capture=(
+                "start"
+                if entered_post_stop_sampling
+                else "finish"
+                if finished_post_stop_sampling
+                else None
+            ),
         )
         self._record(
             "control_update",
@@ -4830,10 +4790,6 @@ class RawServoRuntime:
             post_stop_invalid_sample_count=self.controller.post_stop_invalid_sample_count,
             post_stop_duration_s=self.controller.post_stop_sample_s,
             event_details=dict(event.details or {}),
-        )
-        entered_post_stop_sampling = (
-            previous_phase is not ServoPhase.POST_STOP_SAMPLING
-            and self.controller.phase is ServoPhase.POST_STOP_SAMPLING
         )
         if entered_post_stop_sampling:
             self._stop_sequence()

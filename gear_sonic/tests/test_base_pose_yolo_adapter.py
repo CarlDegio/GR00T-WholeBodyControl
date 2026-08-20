@@ -81,6 +81,32 @@ def test_yolo_adapter_rebases_internal_worker_to_gateway_generation(tmp_path) ->
     assert intents[-1][1]["velocity"] == [0.0, 0.0, 0.0]
 
 
+def test_yolo_adapter_ignores_stale_and_idle_global_cancels(tmp_path) -> None:
+    logs: list[str] = []
+    adapter = GatewayRawServoAdapter(
+        BasePoseAgentConfig(
+            task="align to the basket",
+            mode="raw_yoloe_servo",
+            output_root=str(tmp_path),
+        ),
+        submit_intent=lambda _name, _values: None,
+        logger=logs.append,
+    )
+
+    assert not adapter.cancel(1, "unrelated_navigation_cancel", now=1.0)
+    assert adapter.runtime.phase == "idle"
+    assert adapter.gateway_generation == 1
+    assert adapter.start(2, now=1.1)
+    assert not adapter.cancel(1, "stale_cancel", now=1.2)
+    assert adapter.runtime.phase == "inference"
+    assert adapter.cancel(3, "base_pose_velocity_timeout", now=1.3)
+    assert adapter.runtime.phase == "idle"
+    assert adapter.gateway_generation == 3
+    assert not any("STOP unrelated_navigation_cancel" in line for line in logs)
+    assert any("ignored stale cancel" in line for line in logs)
+    assert any("STOP base_pose_velocity_timeout" in line for line in logs)
+
+
 def test_yolo_adapter_forwards_viewer_overlay_without_touching_velocity(
     tmp_path,
 ) -> None:

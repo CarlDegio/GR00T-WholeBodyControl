@@ -46,11 +46,17 @@ def build_base_pose_runtime_status(
 ) -> dict[str, object]:
     """Build viewer telemetry without feeding overlays into motion validation."""
 
+    base_pose_action = str(parameters.get("action", "visual_servo"))
+    state = {
+        "hold": "inference",
+        "visual_servo": "motion",
+        "stop": "stopping",
+    }.get(base_pose_action, "motion")
     status: dict[str, object] = {
         "generation": action.generation,
-        "state": "motion",
+        "state": state,
         "velocity": list(action.velocity or (0.0, 0.0, 0.0)),
-        "action": str(parameters.get("action", "visual_servo")),
+        "action": base_pose_action,
         "camera_stream": str(parameters.get("camera_stream", "")),
     }
     viewer_overlay = parameters.get("viewer_overlay")
@@ -267,7 +273,11 @@ def run_control_gateway(settings: ControlGatewaySettings) -> None:
                             key = command.parameters.get("key")
                             if not isinstance(key, str) or len(key) != 1:
                                 raise ValueError("navigation_key requires one string key")
-                            action = navigation.handle_key(key, now=time.monotonic())
+                            action = navigation.handle_key(
+                                key,
+                                now=time.monotonic(),
+                                cancel_reason=str(command.parameters.get("reason", "")),
+                            )
                             command_accepted = publish_navigation_action(
                                 action,
                                 source=command.metadata.source,
@@ -411,7 +421,11 @@ def run_control_gateway(settings: ControlGatewaySettings) -> None:
                             )
                         elif command.name == "select_pose_mode":
                             publish_navigation_action(
-                                navigation.handle_key(" ", now=time.monotonic()),
+                                navigation.handle_key(
+                                    " ",
+                                    now=time.monotonic(),
+                                    cancel_reason="select_pose_mode",
+                                ),
                                 source=command.metadata.source,
                                 input_key="POSE mode",
                             )
