@@ -5,8 +5,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import math
-from typing import Literal
-
 from gear_sonic.camera.calibration import DEFAULT_CAMERA_INTRINSICS_PATH
 
 
@@ -15,16 +13,6 @@ class BasePoseAgentConfig:
     task: str
     target_prompt: str = "bluebasket"
     surface_prompt: str = "desk"
-    mode: Literal[
-        "raw_yoloe_servo",
-        "dual_raw_yoloe_servo",
-    ] = "dual_raw_yoloe_servo"
-    qwenvl_model: str = "qwen3-vl-plus"
-    qwenvl_base_url: str = (
-        "https://dashscope-intl.aliyuncs.com/compatible-mode/v1"
-    )
-    qwenvl_thinking_budget: int = 500
-    qwenvl_timeout_seconds: float = 600.0
     planner_hz: float = 20.0
     final_stop_count: int = 3
 
@@ -35,11 +23,7 @@ class BasePoseAgentConfig:
     control_gateway_endpoint: str = "tcp://127.0.0.1:5565"
     control_gateway_intent_endpoint: str = "tcp://127.0.0.1:5561"
 
-    camera_host: str = "localhost"
-    camera_port: int = 5555
     camera_timeout_ms: int = 15000
-    camera_stream: str = "ego_view"
-    depth_stream: str = "camera/ego_view_depth"
     camera_intrinsics_path: str = str(DEFAULT_CAMERA_INTRINSICS_PATH)
     camera_pitch_deg: float = -38.0
     camera_roll_deg: float = 0.0
@@ -59,8 +43,6 @@ class BasePoseAgentConfig:
     dual_match_tolerance_frames: int = 30
     dual_head_reacquire_frames: int = 1
     dual_head_release_missing_frames: int = 3
-    dual_initialization_grace_s: float = 30.0
-    dual_qwenvl_fallback_model: str = "qwen3-vl-8b-instruct"
     dual_rgbd_buffer_size: int = 8
     dual_rgbd_poll_hz: float = 60.0
 
@@ -69,11 +51,6 @@ class BasePoseAgentConfig:
     raw_yoloe_device: str = "0"
     raw_yoloe_confidence: float = 0.25
     raw_yoloe_imgsz: int = 640
-    raw_reference_update_interval_frames: int = 5
-    raw_reference_update_min_confidence: float = 0.35
-    raw_reference_update_min_iou: float = 0.50
-    # Single-camera cadence. Dual-camera perception is driven by each new frame.
-    raw_servo_hz: float = 10.0
     raw_head_target_distance_m: float = 1.00
     raw_chest_target_distance_m: float = 0.80
     raw_forward_tolerance_m: float = 0.10
@@ -84,14 +61,14 @@ class BasePoseAgentConfig:
     raw_yaw_tolerance_deg: float = 8.0
     raw_yaw_coarse_speed_rad_s: float = 0.30
     raw_yaw_trim_speed_rad_s: float = 0.20
+    raw_forward_recenter_yaw_speed_rad_s: float = 0.30
     raw_horizontal_guard_fraction: float = 0.25
     raw_horizontal_recovery_fraction: float = 0.30
     raw_orientation_telemetry_source: str = "tcp://127.0.0.1:5569"
-    raw_command_ttl_s: float = 0.15
     raw_camera_stale_s: float = 0.4
     raw_max_run_s: float = 180.0
-    raw_post_stop_sample_s: float = 3.0
-    raw_allow_missing_table: Literal[0, 1] = 0
+    raw_post_stop_sample_frames: int = 30
+    raw_post_stop_deviation_frames: int = 10
 
     def __post_init__(self) -> None:
         self.target_prompt = str(self.target_prompt).strip()
@@ -100,6 +77,16 @@ class BasePoseAgentConfig:
         self.surface_prompt = str(self.surface_prompt).strip()
         if not self.surface_prompt:
             raise ValueError("surface_prompt must be non-empty")
+        for value, name in (
+            (self.dual_match_tolerance_frames, "dual_match_tolerance_frames"),
+            (self.dual_head_reacquire_frames, "dual_head_reacquire_frames"),
+            (
+                self.dual_head_release_missing_frames,
+                "dual_head_release_missing_frames",
+            ),
+        ):
+            if value <= 0:
+                raise ValueError(f"{name} must be positive")
         for value, name in (
             (self.raw_head_target_distance_m, "raw_head_target_distance_m"),
             (
@@ -111,6 +98,17 @@ class BasePoseAgentConfig:
         ):
             if not math.isfinite(value) or value <= 0.0:
                 raise ValueError(f"{name} must be finite and positive")
+        if self.raw_post_stop_sample_frames < 0:
+            raise ValueError("raw_post_stop_sample_frames must be non-negative")
+        if not (
+            self.raw_post_stop_sample_frames == 0
+            or 0 < self.raw_post_stop_deviation_frames
+            <= self.raw_post_stop_sample_frames
+        ):
+            raise ValueError(
+                "raw_post_stop_deviation_frames must be in "
+                "[1, raw_post_stop_sample_frames]"
+            )
 
 
 def main(config: BasePoseAgentConfig) -> None:

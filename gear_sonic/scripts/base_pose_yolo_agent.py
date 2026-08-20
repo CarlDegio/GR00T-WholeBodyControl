@@ -3,7 +3,6 @@
 
 from __future__ import annotations
 
-import json
 import math
 import threading
 import time
@@ -19,12 +18,10 @@ from gear_sonic.utils.inference.base_pose_dual_visual_servo import (
     run_dual_raw_servo_worker,
 )
 from gear_sonic.utils.inference.base_pose_sensor import (
-    SensorGatewayBasePoseCamera,
     SensorGatewayDualBasePoseCamera,
 )
 from gear_sonic.utils.inference.base_pose_visual_servo import (
     RawServoRuntime,
-    run_raw_servo_worker,
     validate_raw_servo_dependencies,
 )
 from gear_sonic.utils.teleop.sonic_orientation_telemetry import (
@@ -49,7 +46,6 @@ class GatewayRawServoAdapter:
         self.submit_intent = submit_intent
         self.logger = logger
         self.monotonic = monotonic
-        self.gateway_generation = 0
         self._publish_enabled = False
         self._terminal_reported = True
         self.runtime = RawServoRuntime(
@@ -60,16 +56,13 @@ class GatewayRawServoAdapter:
             orientation_provider=orientation_provider,
         )
 
-    def _publish(self, message: str) -> None:
+    def _publish(self, payload: Mapping[str, Any]) -> None:
         if not self._publish_enabled:
             return
-        payload = json.loads(message)
-        velocity = payload.get("velocity")
-        if not isinstance(velocity, Mapping):
-            raise ValueError("YOLOE servo output has no velocity object")
+        velocity = payload["velocity"]
         command = [float(velocity[name]) for name in ("vx", "vy", "wz")]
         parameters: dict[str, object] = {
-            "generation": self.gateway_generation,
+            "generation": self.runtime.generation,
             "velocity": command,
             "action": str(payload.get("action", "visual_servo")),
             "motion_profile": "yoloe_servo",
@@ -77,8 +70,6 @@ class GatewayRawServoAdapter:
         }
         viewer_overlay = payload.get("viewer_overlay")
         if viewer_overlay is not None:
-            if not isinstance(viewer_overlay, Mapping):
-                raise ValueError("YOLOE servo viewer_overlay must be an object")
             parameters["viewer_overlay"] = dict(viewer_overlay)
         self.submit_intent(
             "base_pose_velocity",
@@ -87,15 +78,19 @@ class GatewayRawServoAdapter:
 
     def start(self, generation: int, *, now: float | None = None) -> bool:
         timestamp = self.monotonic() if now is None else float(now)
-        if self.runtime.phase != "idle" or generation <= self.gateway_generation:
+        requested_generation = int(generation)
+        if (
+            self.runtime.phase != "idle"
+            or requested_generation <= self.runtime.generation
+        ):
             return False
-        self.gateway_generation = int(generation)
-        # RawServoRuntime historically increments an internal keyboard generation.
-        # Rebase it so worker events carry the ControlGateway generation verbatim.
-        self.runtime.generation = self.gateway_generation - 1
         self._publish_enabled = True
         self._terminal_reported = False
-        return self.runtime.handle_key("n", now=timestamp) == "started"
+        started = self.runtime.start(requested_generation, now=timestamp)
+        if not started:
+            self._publish_enabled = False
+            self._terminal_reported = True
+        return started
 
     def cancel(
         self,
@@ -106,24 +101,26 @@ class GatewayRawServoAdapter:
     ) -> bool:
         timestamp = self.monotonic() if now is None else float(now)
         requested_generation = int(generation)
-        if requested_generation < self.gateway_generation:
+        if requested_generation < self.runtime.generation:
             self.logger(
                 "[BasePose/YOLOE] ignored stale cancel "
                 f"generation={requested_generation} "
-                f"active_generation={self.gateway_generation}"
+                f"active_generation={self.runtime.generation}"
             )
             return False
-        self.gateway_generation = requested_generation
         self._publish_enabled = False
         if self.runtime.phase == "idle":
             # Global navigation cancellation is also delivered while BasePose
             # is inactive.  Keep generations aligned without reporting a fake
             # operator stop or perturbing the runtime generation twice.
-            self.runtime.generation = self.gateway_generation
+            self.runtime.generation = requested_generation
             self._terminal_reported = True
             return False
-        self.runtime.cancel(reason, timestamp)
-        self.runtime.generation = self.gateway_generation
+        self.runtime.cancel(
+            reason,
+            timestamp,
+            generation=requested_generation,
+        )
         self._terminal_reported = True
         return True
 
@@ -138,7 +135,7 @@ class GatewayRawServoAdapter:
             self.submit_intent(
                 "base_pose_status",
                 {
-                    "generation": self.gateway_generation,
+                    "generation": self.runtime.generation,
                     "state": state,
                     "reason": reason,
                 },
@@ -151,18 +148,9 @@ class GatewayRawServoAdapter:
         self.runtime.shutdown()
 
 
-def raw_servo_worker_for_mode(mode: str) -> Callable[..., None]:
-    if mode == "raw_yoloe_servo":
-        return run_raw_servo_worker
-    if mode == "dual_raw_yoloe_servo":
-        return run_dual_raw_servo_worker
-    raise ValueError(f"unsupported BasePose YOLOE mode: {mode}")
-
-
 def run_base_pose_yolo_agent(config: Any) -> None:
-    """Run single- or dual-camera YOLOE without owning the SONIC socket."""
+    """Run dual-camera YOLOE without owning the SONIC socket."""
 
-    worker_target = raw_servo_worker_for_mode(config.mode)
     validate_raw_servo_dependencies(config)
     context = zmq.Context.instance()
     intent = ControlGatewayIntentClient(
@@ -214,52 +202,36 @@ def run_base_pose_yolo_agent(config: Any) -> None:
         context=context,
         accepted_names={"start_base_pose", "cancel_navigation"},
     )
-    dual_mode = config.mode == "dual_raw_yoloe_servo"
-    if dual_mode:
-        camera = SensorGatewayDualBasePoseCamera(
-            config.sensor_gateway_endpoint,
-            stream_depths={
-                config.dual_head_camera_stream: config.dual_head_depth_stream,
-                config.dual_chest_camera_stream: config.dual_chest_depth_stream,
-            },
-            timeout_ms=config.camera_timeout_ms,
-            request_timeout_ms=config.sensor_gateway_request_timeout_ms,
-            max_age_ms=config.sensor_gateway_max_age_ms,
-            max_skew_ms=config.sensor_gateway_max_skew_ms,
-            buffer_size=config.dual_rgbd_buffer_size,
-            poll_hz=config.dual_rgbd_poll_hz,
-        )
-        stream_summary = (
-            f"head={config.dual_head_camera_stream}/"
-            f"{config.dual_head_depth_stream} "
-            f"chest={config.dual_chest_camera_stream}/"
-            f"{config.dual_chest_depth_stream}"
-        )
-    else:
-        camera = SensorGatewayBasePoseCamera(
-            config.sensor_gateway_endpoint,
-            camera_stream=config.camera_stream,
-            depth_stream=config.depth_stream,
-            require_depth=True,
-            timeout_ms=config.camera_timeout_ms,
-            request_timeout_ms=config.sensor_gateway_request_timeout_ms,
-            max_age_ms=config.sensor_gateway_max_age_ms,
-            max_skew_ms=config.sensor_gateway_max_skew_ms,
-        )
-        stream_summary = f"stream={config.camera_stream}/{config.depth_stream}"
+    camera = SensorGatewayDualBasePoseCamera(
+        config.sensor_gateway_endpoint,
+        stream_depths={
+            config.dual_head_camera_stream: config.dual_head_depth_stream,
+            config.dual_chest_camera_stream: config.dual_chest_depth_stream,
+        },
+        timeout_ms=config.camera_timeout_ms,
+        request_timeout_ms=config.sensor_gateway_request_timeout_ms,
+        max_age_ms=config.sensor_gateway_max_age_ms,
+        max_skew_ms=config.sensor_gateway_max_skew_ms,
+        buffer_size=config.dual_rgbd_buffer_size,
+        poll_hz=config.dual_rgbd_poll_hz,
+    )
+    stream_summary = (
+        f"head={config.dual_head_camera_stream}/"
+        f"{config.dual_head_depth_stream} "
+        f"chest={config.dual_chest_camera_stream}/"
+        f"{config.dual_chest_depth_stream}"
+    )
     worker_kwargs: dict[str, Any] = {
         "observation_events": adapter.runtime.observation_events,
         "diagnostics": adapter.runtime.diagnostics,
         "camera_factory": lambda: camera,
         "table_required": lambda: adapter.runtime.controller.table_required,
-    }
-    if dual_mode:
-        worker_kwargs["handoff_hold_event"] = adapter.runtime.handoff_hold_ready
-        worker_kwargs["position_fallback_allowed"] = (
+        "position_fallback_allowed": (
             lambda: adapter.runtime.controller.position_fallback_allowed
-        )
+        ),
+    }
     worker = threading.Thread(
-        target=worker_target,
+        target=run_dual_raw_servo_worker,
         args=(
             config,
             adapter.runtime.requests,
@@ -268,13 +240,12 @@ def run_base_pose_yolo_agent(config: Any) -> None:
             adapter.runtime.stop_event,
         ),
         kwargs=worker_kwargs,
-        name="base-pose-dual-yoloe" if dual_mode else "base-pose-yoloe",
+        name="base-pose-dual-yoloe",
         daemon=True,
     )
     worker.start()
     print(
-        f"[BasePose/YOLOE] waiting for B; mode={config.mode} "
-        f"{stream_summary} task={config.task!r}"
+        f"[BasePose/YOLOE] waiting for B; {stream_summary} task={config.task!r}"
     )
     try:
         while True:
@@ -282,9 +253,7 @@ def run_base_pose_yolo_agent(config: Any) -> None:
             if command is not None:
                 generation = int(command.parameters.get("generation", -1))
                 if command.name == "start_base_pose":
-                    begin_generation = getattr(camera, "begin_generation", None)
-                    if callable(begin_generation):
-                        begin_generation(generation)
+                    camera.begin_generation(generation)
                     adapter.start(generation)
                 else:
                     reason = str(

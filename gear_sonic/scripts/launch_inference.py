@@ -237,18 +237,6 @@ class InferenceLaunchConfig:
     base_pose_surface_prompt: str = "desk"
     """YOLOE text prompt for the Base-Pose support surface."""
 
-    base_pose_mode: Literal[
-        "raw_yoloe_servo",
-        "dual_raw_yoloe_servo",
-    ] = "dual_raw_yoloe_servo"
-    """Agent-near raw-depth YOLOE mode."""
-
-    base_pose_qwenvl_model: str = "qwen3-vl-plus"
-    base_pose_qwenvl_base_url: str = "https://dashscope-intl.aliyuncs.com/compatible-mode/v1"
-    base_pose_qwenvl_thinking_budget: int = 500
-    base_pose_qwenvl_timeout_seconds: float = 600.0
-    base_pose_camera_stream: str = "ego_view"
-    base_pose_yoloe_depth_stream: str = "camera/ego_view_depth"
     base_pose_camera_intrinsics_path: str = "gear_sonic/config/camera_intrinsics.json"
     base_pose_camera_pitch_deg: float = -38.0
     base_pose_camera_roll_deg: float = 0.0
@@ -267,8 +255,6 @@ class InferenceLaunchConfig:
     base_pose_dual_match_tolerance_frames: int = 30
     base_pose_dual_head_reacquire_frames: int = 1
     base_pose_dual_head_release_missing_frames: int = 3
-    base_pose_dual_initialization_grace_s: float = 30.0
-    base_pose_dual_qwenvl_fallback_model: str = "qwen3-vl-8b-instruct"
     base_pose_dual_rgbd_buffer_size: int = 8
     base_pose_dual_rgbd_poll_hz: float = 60.0
     base_pose_camera_timeout_ms: int = 15000
@@ -278,11 +264,6 @@ class InferenceLaunchConfig:
     base_pose_yoloe_device: str = "0"
     base_pose_yoloe_confidence: float = 0.25
     base_pose_yoloe_imgsz: int = 640
-    base_pose_raw_reference_update_interval_frames: int = 5
-    base_pose_raw_reference_update_min_confidence: float = 0.35
-    base_pose_raw_reference_update_min_iou: float = 0.50
-    base_pose_raw_servo_hz: float = 10.0
-    """Single-camera cadence; dual-camera perception is new-frame-driven."""
     base_pose_raw_head_target_distance_m: float = 1.00
     base_pose_raw_chest_target_distance_m: float = 0.80
     base_pose_raw_forward_tolerance_m: float = 0.10
@@ -293,12 +274,13 @@ class InferenceLaunchConfig:
     base_pose_raw_yaw_tolerance_deg: float = 8.0
     base_pose_raw_yaw_coarse_speed_rad_s: float = 0.30
     base_pose_raw_yaw_trim_speed_rad_s: float = 0.20
+    base_pose_raw_forward_recenter_yaw_speed_rad_s: float = 0.30
     base_pose_raw_horizontal_guard_fraction: float = 0.25
     base_pose_raw_horizontal_recovery_fraction: float = 0.30
     base_pose_raw_camera_stale_s: float = 0.40
     base_pose_raw_max_run_s: float = 180.0
-    base_pose_raw_post_stop_sample_s: float = 3.0
-    base_pose_raw_allow_missing_table: Literal[0, 1] = 0
+    base_pose_raw_post_stop_sample_frames: int = 30
+    base_pose_raw_post_stop_deviation_frames: int = 10
 
     navdp_root: str = "/home/user/Project/NavDP/baselines/x-navdp"
     navdp_checkpoint: str = (
@@ -499,6 +481,7 @@ def build_deploy_command(config: InferenceLaunchConfig, repo_root: Path) -> str:
     command = (
         f"cd {shlex.quote(str(deploy_dir))} && "
         f"./deploy.sh "
+        f"--yes "
         f"--input-type {shlex.quote(config.deploy_input_type)} "
         f"--zmq-host {shlex.quote(config.deploy_zmq_host)} "
         f"--hand-type dex1 "
@@ -654,47 +637,34 @@ def build_base_pose_agent_command(
     """Build the independent ControlGateway-backed Base-Pose agent."""
 
     quoted_root = shlex.quote(str(repo_root))
-    local_env = "set -a; [ ! -f .env.local ] || . ./.env.local; set +a; "
-    qwen = (
-        f"--qwenvl-model {shlex.quote(config.base_pose_qwenvl_model)} "
-        f"--qwenvl-base-url {shlex.quote(config.base_pose_qwenvl_base_url)} "
-        f"--qwenvl-thinking-budget {config.base_pose_qwenvl_thinking_budget} "
-        f"--qwenvl-timeout-seconds {config.base_pose_qwenvl_timeout_seconds} "
+    dual = (
+        f"--dual-head-camera-stream "
+        f"{shlex.quote(config.base_pose_dual_head_camera_stream)} "
+        f"--dual-head-depth-stream "
+        f"{shlex.quote(config.base_pose_dual_head_depth_stream)} "
+        f"--dual-chest-camera-stream "
+        f"{shlex.quote(config.base_pose_dual_chest_camera_stream)} "
+        f"--dual-chest-depth-stream "
+        f"{shlex.quote(config.base_pose_dual_chest_depth_stream)} "
+        f"--dual-chest-camera-pitch-deg "
+        f"{config.base_pose_dual_chest_camera_pitch_deg} "
+        f"--dual-chest-camera-roll-deg "
+        f"{config.base_pose_dual_chest_camera_roll_deg} "
+        f"--dual-chest-camera-yaw-deg "
+        f"{config.base_pose_dual_chest_camera_yaw_deg} "
+        f"--dual-chest-camera-forward-offset-m "
+        f"{config.base_pose_dual_chest_camera_forward_offset_m} "
+        f"--dual-chest-camera-lateral-offset-m "
+        f"{config.base_pose_dual_chest_camera_lateral_offset_m} "
+        f"--dual-match-tolerance-frames "
+        f"{config.base_pose_dual_match_tolerance_frames} "
+        f"--dual-head-reacquire-frames "
+        f"{config.base_pose_dual_head_reacquire_frames} "
+        f"--dual-head-release-missing-frames "
+        f"{config.base_pose_dual_head_release_missing_frames} "
+        f"--dual-rgbd-buffer-size {config.base_pose_dual_rgbd_buffer_size} "
+        f"--dual-rgbd-poll-hz {config.base_pose_dual_rgbd_poll_hz} "
     )
-    dual = ""
-    if config.base_pose_mode == "dual_raw_yoloe_servo":
-        dual = (
-            f"--dual-head-camera-stream "
-            f"{shlex.quote(config.base_pose_dual_head_camera_stream)} "
-            f"--dual-head-depth-stream "
-            f"{shlex.quote(config.base_pose_dual_head_depth_stream)} "
-            f"--dual-chest-camera-stream "
-            f"{shlex.quote(config.base_pose_dual_chest_camera_stream)} "
-            f"--dual-chest-depth-stream "
-            f"{shlex.quote(config.base_pose_dual_chest_depth_stream)} "
-            f"--dual-chest-camera-pitch-deg "
-            f"{config.base_pose_dual_chest_camera_pitch_deg} "
-            f"--dual-chest-camera-roll-deg "
-            f"{config.base_pose_dual_chest_camera_roll_deg} "
-            f"--dual-chest-camera-yaw-deg "
-            f"{config.base_pose_dual_chest_camera_yaw_deg} "
-            f"--dual-chest-camera-forward-offset-m "
-            f"{config.base_pose_dual_chest_camera_forward_offset_m} "
-            f"--dual-chest-camera-lateral-offset-m "
-            f"{config.base_pose_dual_chest_camera_lateral_offset_m} "
-            f"--dual-match-tolerance-frames "
-            f"{config.base_pose_dual_match_tolerance_frames} "
-            f"--dual-head-reacquire-frames "
-            f"{config.base_pose_dual_head_reacquire_frames} "
-            f"--dual-head-release-missing-frames "
-            f"{config.base_pose_dual_head_release_missing_frames} "
-            f"--dual-initialization-grace-s "
-            f"{config.base_pose_dual_initialization_grace_s} "
-            f"--dual-qwenvl-fallback-model "
-            f"{shlex.quote(config.base_pose_dual_qwenvl_fallback_model)} "
-            f"--dual-rgbd-buffer-size {config.base_pose_dual_rgbd_buffer_size} "
-            f"--dual-rgbd-poll-hz {config.base_pose_dual_rgbd_poll_hz} "
-        )
     yoloe = (
         f"--camera-intrinsics-path {shlex.quote(config.base_pose_camera_intrinsics_path)} "
         f"--camera-pitch-deg {config.base_pose_camera_pitch_deg} "
@@ -709,13 +679,6 @@ def build_base_pose_agent_command(
         f"--raw-yoloe-device {shlex.quote(config.base_pose_yoloe_device)} "
         f"--raw-yoloe-confidence {config.base_pose_yoloe_confidence} "
         f"--raw-yoloe-imgsz {config.base_pose_yoloe_imgsz} "
-        f"--raw-reference-update-interval-frames "
-        f"{config.base_pose_raw_reference_update_interval_frames} "
-        f"--raw-reference-update-min-confidence "
-        f"{config.base_pose_raw_reference_update_min_confidence} "
-        f"--raw-reference-update-min-iou "
-        f"{config.base_pose_raw_reference_update_min_iou} "
-        f"--raw-servo-hz {config.base_pose_raw_servo_hz} "
         f"--raw-head-target-distance-m {config.base_pose_raw_head_target_distance_m} "
         f"--raw-chest-target-distance-m "
         f"{config.base_pose_raw_chest_target_distance_m} "
@@ -727,24 +690,25 @@ def build_base_pose_agent_command(
         f"--raw-yaw-tolerance-deg {config.base_pose_raw_yaw_tolerance_deg} "
         f"--raw-yaw-coarse-speed-rad-s {config.base_pose_raw_yaw_coarse_speed_rad_s} "
         f"--raw-yaw-trim-speed-rad-s {config.base_pose_raw_yaw_trim_speed_rad_s} "
+        f"--raw-forward-recenter-yaw-speed-rad-s "
+        f"{config.base_pose_raw_forward_recenter_yaw_speed_rad_s} "
         f"--raw-horizontal-guard-fraction "
         f"{config.base_pose_raw_horizontal_guard_fraction} "
         f"--raw-horizontal-recovery-fraction "
         f"{config.base_pose_raw_horizontal_recovery_fraction} "
         f"--raw-camera-stale-s {config.base_pose_raw_camera_stale_s} "
         f"--raw-max-run-s {config.base_pose_raw_max_run_s} "
-        f"--raw-post-stop-sample-s {config.base_pose_raw_post_stop_sample_s} "
-        f"--raw-allow-missing-table {config.base_pose_raw_allow_missing_table} "
+        f"--raw-post-stop-sample-frames "
+        f"{config.base_pose_raw_post_stop_sample_frames} "
+        f"--raw-post-stop-deviation-frames "
+        f"{config.base_pose_raw_post_stop_deviation_frames} "
         "--raw-orientation-telemetry-source "
         f"{shlex.quote(_runtime_profile(config).endpoint_uri('orientation_telemetry'))} "
     )
     return (
-        f"cd {quoted_root} && {local_env}"
+        f"cd {quoted_root} && "
         ".venv_inference/bin/python gear_sonic/scripts/base_pose_agent.py "
         f"--task {shlex.quote(config.base_pose_task)} "
-        f"--mode {config.base_pose_mode} {qwen}"
-        f"--camera-stream {shlex.quote(config.base_pose_camera_stream)} "
-        f"--depth-stream {shlex.quote(config.base_pose_yoloe_depth_stream)} "
         f"--camera-timeout-ms {config.base_pose_camera_timeout_ms} "
         f"--sensor-gateway-endpoint tcp://127.0.0.1:{config.sensor_gateway_port} "
         f"--sensor-gateway-request-timeout-ms {config.vla_sensor_gateway_request_timeout_ms} "
@@ -839,8 +803,6 @@ def build_planner_velocity_executor_command(
         "--orientation-output-endpoint "
         f"{shlex.quote(f'tcp://*:{orientation_telemetry.port}')} "
         if config.base_pose_enabled
-        and config.base_pose_mode
-        in {"raw_yoloe_servo", "dual_raw_yoloe_servo"}
         else ""
     )
     return (
@@ -1186,51 +1148,34 @@ def _check_prerequisites(config: InferenceLaunchConfig):
             )
         if config.base_pose_planner_hz <= 0.0:
             errors.append("--base-pose-planner-hz must be positive")
-        if config.base_pose_mode == "raw_yoloe_servo":
-            expected_depth = f"camera/{config.base_pose_camera_stream}_depth"
-            if config.base_pose_yoloe_depth_stream != expected_depth:
-                errors.append(
-                    "raw_yoloe_servo requires the raw depth stream aligned to its RGB: "
-                    f"--base-pose-yoloe-depth-stream {expected_depth}"
-                )
-        elif config.base_pose_mode == "dual_raw_yoloe_servo":
-            head = config.base_pose_dual_head_camera_stream
-            chest = config.base_pose_dual_chest_camera_stream
-            if not head or not chest or head == chest:
-                errors.append("dual Base-Pose camera streams must be distinct")
-            expected_head_depth = f"camera/{head}_depth"
-            expected_chest_depth = f"camera/{chest}_depth"
-            if config.base_pose_dual_head_depth_stream != expected_head_depth:
-                errors.append(
-                    "dual head raw depth must match its RGB: "
-                    f"--base-pose-dual-head-depth-stream {expected_head_depth}"
-                )
-            if config.base_pose_dual_chest_depth_stream != expected_chest_depth:
-                errors.append(
-                    "dual chest raw depth must match its RGB: "
-                    f"--base-pose-dual-chest-depth-stream {expected_chest_depth}"
-                )
-            if config.base_pose_dual_match_tolerance_frames <= 0:
-                errors.append("dual match tolerance must be positive")
-            if config.base_pose_dual_head_reacquire_frames <= 0:
-                errors.append("dual head reacquisition frame count must be positive")
-            if config.base_pose_dual_head_release_missing_frames <= 0:
-                errors.append("dual head release missing frame count must be positive")
-            if config.base_pose_dual_initialization_grace_s <= 0.0:
-                errors.append("dual initialization grace must be positive")
-            if config.base_pose_dual_rgbd_buffer_size <= 0:
-                errors.append("dual RGB-D buffer size must be positive")
-            if config.base_pose_dual_rgbd_poll_hz <= 0.0:
-                errors.append("dual RGB-D poll frequency must be positive")
-            if config.base_pose_raw_reference_update_interval_frames <= 0:
-                errors.append(
-                    "dual Base-Pose reference update interval must be positive"
-                )
-        else:
-            errors.append(f"unsupported Base-Pose mode: {config.base_pose_mode}")
+        head = config.base_pose_dual_head_camera_stream
+        chest = config.base_pose_dual_chest_camera_stream
+        if not head or not chest or head == chest:
+            errors.append("dual Base-Pose camera streams must be distinct")
+        expected_head_depth = f"camera/{head}_depth"
+        expected_chest_depth = f"camera/{chest}_depth"
+        if config.base_pose_dual_head_depth_stream != expected_head_depth:
+            errors.append(
+                "dual head raw depth must match its RGB: "
+                f"--base-pose-dual-head-depth-stream {expected_head_depth}"
+            )
+        if config.base_pose_dual_chest_depth_stream != expected_chest_depth:
+            errors.append(
+                "dual chest raw depth must match its RGB: "
+                f"--base-pose-dual-chest-depth-stream {expected_chest_depth}"
+            )
+        if config.base_pose_dual_match_tolerance_frames <= 0:
+            errors.append("dual match tolerance must be positive")
+        if config.base_pose_dual_head_reacquire_frames <= 0:
+            errors.append("dual head reacquisition frame count must be positive")
+        if config.base_pose_dual_head_release_missing_frames <= 0:
+            errors.append("dual head release missing frame count must be positive")
+        if config.base_pose_dual_rgbd_buffer_size <= 0:
+            errors.append("dual RGB-D buffer size must be positive")
+        if config.base_pose_dual_rgbd_poll_hz <= 0.0:
+            errors.append("dual RGB-D poll frequency must be positive")
         for value, label in (
             (config.base_pose_yoloe_confidence, "YOLOE confidence"),
-            (config.base_pose_raw_servo_hz, "raw servo frequency"),
             (config.base_pose_raw_head_target_distance_m, "head target distance"),
             (
                 config.base_pose_raw_chest_target_distance_m,
@@ -1244,6 +1189,10 @@ def _check_prerequisites(config: InferenceLaunchConfig):
             (config.base_pose_raw_yaw_tolerance_deg, "yaw tolerance"),
             (config.base_pose_raw_yaw_coarse_speed_rad_s, "coarse yaw speed"),
             (config.base_pose_raw_yaw_trim_speed_rad_s, "trim yaw speed"),
+            (
+                config.base_pose_raw_forward_recenter_yaw_speed_rad_s,
+                "forward recenter yaw speed",
+            ),
             (config.base_pose_raw_camera_stale_s, "camera stale timeout"),
             (config.base_pose_raw_max_run_s, "maximum run time"),
         ):
@@ -1253,15 +1202,17 @@ def _check_prerequisites(config: InferenceLaunchConfig):
             errors.append("Base-Pose YOLOE confidence must be in (0, 1]")
         if config.base_pose_yoloe_imgsz <= 0:
             errors.append("Base-Pose YOLOE image size must be positive")
-        if config.base_pose_raw_reference_update_interval_frames < 0:
-            errors.append("Base-Pose reference update interval cannot be negative")
+        if config.base_pose_raw_post_stop_sample_frames < 0:
+            errors.append("Base-Pose post-stop sample frames must be non-negative")
         if not (
-            0.0
-            <= config.base_pose_raw_reference_update_min_confidence
-            <= 1.0
-            and 0.0 <= config.base_pose_raw_reference_update_min_iou <= 1.0
+            config.base_pose_raw_post_stop_sample_frames == 0
+            or 0 < config.base_pose_raw_post_stop_deviation_frames
+            <= config.base_pose_raw_post_stop_sample_frames
         ):
-            errors.append("Base-Pose reference confidence and IoU must be in [0, 1]")
+            errors.append(
+                "Base-Pose post-stop deviation frames must be in "
+                "[1, post-stop sample frames]"
+            )
         if not (
             0.0 < config.base_pose_raw_horizontal_guard_fraction
             < config.base_pose_raw_horizontal_recovery_fraction
@@ -1279,16 +1230,6 @@ def _check_prerequisites(config: InferenceLaunchConfig):
                 path = repo_root / path
             if not path.is_file():
                 errors.append(f"Base-Pose {label} not found: {path}")
-        if (
-            not os.environ.get("DASHSCOPE_API_KEY", "").strip()
-            and not _dotenv_has_nonempty_value(
-                repo_root / ".env.local", "DASHSCOPE_API_KEY"
-            )
-        ):
-            errors.append(
-                "Base-Pose Qwen-VL requires DASHSCOPE_API_KEY in the launcher "
-                "environment or the gitignored .env.local file"
-            )
         inference_python = repo_root / ".venv_inference" / "bin" / "python"
         if inference_python.is_file():
             clip_check = subprocess.run(
@@ -1715,9 +1656,6 @@ def main(config: InferenceLaunchConfig):
         print("    Window 'data_exporter':")
         print("      Data Exporter (.venv_data_collection)")
         print()
-    print()
-    print("  ** deploy.sh (pane 0) is waiting for confirmation --")
-    print("     click on pane 0 and press Enter to proceed **")
     print()
     print("  Planner workflow:")
     print("    1. In pane 1: k (start) -> o (PLANNER mode)")

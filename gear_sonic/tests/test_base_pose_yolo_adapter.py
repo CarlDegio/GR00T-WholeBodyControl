@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from dataclasses import replace
-import json
 import math
 
 import numpy as np
@@ -18,7 +17,6 @@ from gear_sonic.utils.inference.base_pose_visual_servo import (
     TableGeometry,
     TargetGeometry,
     VisualServoController,
-    validate_raw_servo_target,
 )
 from gear_sonic.utils.inference.base_pose_visual_servo_diagnostics import (
     DetectionFrameData,
@@ -34,7 +32,12 @@ def _servo_observation(
     return RawServoObservation(
         target=TargetGeometry(1.2, 0.0, (1.2, 0.0, 0.5), 100, 0.9, 1.2),
         table=(
-            TableGeometry(yaw_rad, 1.0, 100, 0.01, (1.0, 0.0))
+            TableGeometry(
+                yaw_error_rad=yaw_rad,
+                line_length_px=100.0,
+                valid_depth_samples=20,
+                line_center_px=(320.0, 200.0),
+            )
             if include_table
             else None
         ),
@@ -61,12 +64,11 @@ def _orientation(
     }
 
 
-def test_yolo_adapter_rebases_internal_worker_to_gateway_generation(tmp_path) -> None:
+def test_yolo_adapter_uses_gateway_generation_directly(tmp_path) -> None:
     intents: list[tuple[str, dict[str, object]]] = []
     adapter = GatewayRawServoAdapter(
         BasePoseAgentConfig(
             task="align to the basket",
-            mode="raw_yoloe_servo",
             output_root=str(tmp_path),
         ),
         submit_intent=lambda name, values: intents.append((name, dict(values))),
@@ -86,7 +88,6 @@ def test_yolo_adapter_ignores_stale_and_idle_global_cancels(tmp_path) -> None:
     adapter = GatewayRawServoAdapter(
         BasePoseAgentConfig(
             task="align to the basket",
-            mode="raw_yoloe_servo",
             output_root=str(tmp_path),
         ),
         submit_intent=lambda _name, _values: None,
@@ -95,13 +96,13 @@ def test_yolo_adapter_ignores_stale_and_idle_global_cancels(tmp_path) -> None:
 
     assert not adapter.cancel(1, "unrelated_navigation_cancel", now=1.0)
     assert adapter.runtime.phase == "idle"
-    assert adapter.gateway_generation == 1
+    assert adapter.runtime.generation == 1
     assert adapter.start(2, now=1.1)
     assert not adapter.cancel(1, "stale_cancel", now=1.2)
     assert adapter.runtime.phase == "inference"
     assert adapter.cancel(3, "base_pose_velocity_timeout", now=1.3)
     assert adapter.runtime.phase == "idle"
-    assert adapter.gateway_generation == 3
+    assert adapter.runtime.generation == 3
     assert not any("STOP unrelated_navigation_cancel" in line for line in logs)
     assert any("ignored stale cancel" in line for line in logs)
     assert any("STOP base_pose_velocity_timeout" in line for line in logs)
@@ -114,7 +115,6 @@ def test_yolo_adapter_forwards_viewer_overlay_without_touching_velocity(
     adapter = GatewayRawServoAdapter(
         BasePoseAgentConfig(
             task="align to the red tote",
-            mode="raw_yoloe_servo",
             output_root=str(tmp_path),
         ),
         submit_intent=lambda name, values: intents.append((name, dict(values))),
@@ -129,14 +129,12 @@ def test_yolo_adapter_forwards_viewer_overlay_without_touching_velocity(
     }
 
     adapter._publish(
-        json.dumps(
-            {
-                "action": "visual_servo",
-                "camera_stream": "ego_view",
-                "velocity": {"vx": 0.0, "vy": 0.0, "wz": 0.2},
-                "viewer_overlay": overlay,
-            }
-        )
+        {
+            "action": "visual_servo",
+            "camera_stream": "ego_view",
+            "velocity": {"vx": 0.0, "vy": 0.0, "wz": 0.2},
+            "viewer_overlay": overlay,
+        }
     )
 
     assert intents[-1][0] == "base_pose_velocity"
@@ -229,7 +227,6 @@ def test_incomplete_yoloe_frame_keeps_each_available_viewer_overlay(
     adapter = GatewayRawServoAdapter(
         BasePoseAgentConfig(
             task="align to the basket",
-            mode="raw_yoloe_servo",
             output_root=str(tmp_path),
         ),
         submit_intent=lambda _name, _values: None,
@@ -240,7 +237,7 @@ def test_incomplete_yoloe_frame_keeps_each_available_viewer_overlay(
             2,
             "initialized",
             observation=_servo_observation(),
-            details={"camera_stream": "ego_view"},
+            details={"live_stream": "ego_view"},
         ),
         now=1.1,
     )
@@ -278,7 +275,6 @@ def test_yolo_adapter_injects_agent_near_orientation_provider(tmp_path) -> None:
     adapter = GatewayRawServoAdapter(
         BasePoseAgentConfig(
             task="align to the basket",
-            mode="raw_yoloe_servo",
             output_root=str(tmp_path),
         ),
         submit_intent=lambda _name, _values: None,
@@ -293,7 +289,6 @@ def test_yolo_adapter_reports_terminal_worker_failure_once(tmp_path) -> None:
     adapter = GatewayRawServoAdapter(
         BasePoseAgentConfig(
             task="align to the basket",
-            mode="raw_yoloe_servo",
             output_root=str(tmp_path),
         ),
         submit_intent=lambda name, values: intents.append((name, dict(values))),
@@ -328,7 +323,7 @@ def test_dual_worker_failure_stops_before_reporting_failed(tmp_path) -> None:
         RawServoEvent(
             4,
             "error",
-            error="both-camera Qwen failover exhausted",
+            error="both-camera text failover exhausted",
             hard=True,
         )
     )
@@ -347,36 +342,22 @@ def test_dual_worker_failure_stops_before_reporting_failed(tmp_path) -> None:
         {
             "generation": 4,
             "state": "failed",
-            "reason": "both-camera Qwen failover exhausted",
+            "reason": "both-camera text failover exhausted",
         }
     ]
     assert intents[-1][0] == "base_pose_status"
 
 
-def test_yolo_grounding_contract_preserves_model_target_prompt() -> None:
-    target = validate_raw_servo_target(
-        {
-            "status": "READY",
-            "primary_target": {
-                "text_prompt": "red tote returned by codex",
-                "bbox_2d": [250, 200, 750, 800],
-            },
-            "manipulation_anchor": "basket opening",
-            "selection_reason": "stable task destination",
-            "confidence": 0.9,
-            "limitations": "",
-        }
-    )
-
-    assert target.target_prompt == "red tote returned by codex"
-    assert target.target_bbox == (250.0, 200.0, 750.0, 800.0)
-
-
 def test_yolo_servo_outputs_only_bounded_yaw_during_initial_alignment() -> None:
-    controller = VisualServoController(post_stop_sample_s=0.0)
+    controller = VisualServoController()
     observation = RawServoObservation(
         target=TargetGeometry(1.2, 0.0, (1.2, 0.0, 0.5), 100, 0.9, 1.2),
-        table=TableGeometry(0.5, 1.0, 100, 0.01, (1.0, 0.0)),
+        table=TableGeometry(
+            yaw_error_rad=0.5,
+            line_length_px=100.0,
+            valid_depth_samples=20,
+            line_center_px=(320.0, 200.0),
+        ),
         camera_timestamp=1.0,
         target_track_id=1,
         surface_track_id=2,
@@ -389,52 +370,6 @@ def test_yolo_servo_outputs_only_bounded_yaw_during_initial_alignment() -> None:
     assert command.vx == 0.0
     assert command.vy == 0.0
     assert 0.0 < abs(command.wz) <= 0.3
-
-
-@pytest.mark.parametrize("phase", [ServoPhase.YAW_ALIGN, ServoPhase.YAW_TRIM])
-@pytest.mark.parametrize(
-    ("actual_heading_deg", "expected_error_deg", "expected_wz"),
-    [(15.0, 15.0, 0.10), (45.0, -15.0, -0.10)],
-)
-def test_yolo_optional_table_yaw_closes_against_agent_near_actual_heading(
-    phase: ServoPhase,
-    actual_heading_deg: float,
-    expected_error_deg: float,
-    expected_wz: float,
-) -> None:
-    controller = VisualServoController(
-        ema_alpha=1.0,
-        allow_missing_table=True,
-    )
-    controller.reset(1.0)
-    controller.phase = phase
-
-    controller.update(
-        _servo_observation(yaw_rad=math.radians(20.0)),
-        now=1.1,
-        orientation=_orientation(math.radians(10.0)),
-    )
-    target_heading = math.radians(30.0)
-    assert controller.desired_heading_rad == pytest.approx(target_heading)
-
-    # The integrated SONIC setpoint may reach the target before the physical
-    # base; agent-near closes this fallback against measured g1_debug yaw.
-    controller.current = ServoCommand(0.0, 0.0, 0.0, 0.15)
-    command = controller.update(
-        _servo_observation(include_table=False),
-        now=1.2,
-        orientation=_orientation(
-            math.radians(actual_heading_deg),
-            target_heading,
-        ),
-    )
-
-    assert controller.last_errors[2] == pytest.approx(
-        math.radians(expected_error_deg)
-    )
-    assert controller.heading_setpoint_error_rad is None
-    assert controller.yaw_error_source == "propagated_actual_heading"
-    assert command.wz == pytest.approx(expected_wz)
 
 
 def test_yolo_calibration_rejects_non_metric_raw_depth() -> None:

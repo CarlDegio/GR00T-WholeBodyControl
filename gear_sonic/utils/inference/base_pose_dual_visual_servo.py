@@ -2,17 +2,12 @@
 
 from __future__ import annotations
 
-from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, replace
-import math
-import multiprocessing
-import os
 from pathlib import Path
 import queue
-import signal
 import threading
 import time
-from types import SimpleNamespace
 from typing import Any, Callable, Mapping, Sequence
 
 import numpy as np
@@ -26,11 +21,7 @@ from gear_sonic.utils.inference.base_pose import (
     BasePoseCameraError,
     _write_json,
 )
-from gear_sonic.utils.inference.base_pose_sensor import (
-    SensorGatewayDualBasePoseCamera,
-)
 from gear_sonic.utils.inference.base_pose_visual_servo import (
-    DEFAULT_SURFACE_TEXT_PROMPT,
     HEAD_MONITOR_HOLD_EVENT,
     GenerationGate,
     RawServoCalibration,
@@ -39,28 +30,22 @@ from gear_sonic.utils.inference.base_pose_visual_servo import (
     TableGeometry,
     TrackedInstance,
     YoloePersistentTracker,
-    YoloeTargetReferenceEncoder,
     _diagnostic_frame,
     _observation,
     _publish_worker_event,
     _resolve_target,
     _surface_geometry_components,
-    _temporary_png,
-    bbox_iou,
-    ground_raw_servo_references,
-    normalized_bbox_to_pixels,
 )
 from gear_sonic.utils.inference.base_pose_visual_servo_diagnostics import (
     AsyncFrameDiagnosticsWriter,
     CameraFrameData,
 )
 
-DEFAULT_DUAL_QWEN_FALLBACK_MODEL = "qwen3-vl-8b-instruct"
-QWEN_HOLD_STAGES = frozenset({"head_monitor_qwen"})
 JOINT_CHEST_LOSS_GRACE_FRAMES = 5
 JOINT_CHEST_LOSS_ZERO_HOLD_FRAMES = 5
 JOINT_HEAD_YAW_LOSS_GRACE_FRAMES = 10
 JOINT_HEAD_YAW_LOSS_ZERO_HOLD_FRAMES = 10
+TEXT_PROMPT_MODE = "target_text_surface_text"
 
 
 def _joint_head_yaw_loss_details(missing_frames: int) -> dict[str, Any]:
@@ -88,99 +73,36 @@ def _joint_head_yaw_loss_details(missing_frames: int) -> dict[str, Any]:
     }
 
 
-def _reference_bbox(
-    value: Sequence[float],
-    *,
-    field: str,
-) -> tuple[float, float, float, float]:
-    if len(value) != 4:
-        raise ValueError(f"{field} must contain four values")
-    bbox = tuple(float(item) for item in value)
-    if not all(math.isfinite(item) for item in bbox):
-        raise ValueError(f"{field} must be finite")
-    x1, y1, x2, y2 = bbox
-    if not (0.0 <= x1 < x2 <= 1000.0 and 0.0 <= y1 < y2 <= 1000.0):
-        raise ValueError(f"{field} must be an ordered normalized bbox")
-    return bbox
-
-
-@dataclass(frozen=True)
-class DualCameraReference:
-    """Camera-selection evidence; YOLOE detection itself uses fixed text."""
-
-    stream_name: str
-    rgb: np.ndarray
-    target_prompt: str
-    target_bbox: tuple[float, float, float, float]
-    table_bboxes: tuple[tuple[float, float, float, float], ...]
-    camera_timestamp: float
-    kind: str = "initial"
-
-    def __post_init__(self) -> None:
-        stream_name = str(self.stream_name).strip()
-        if not stream_name:
-            raise ValueError("reference stream_name must be non-empty")
-        rgb = np.asarray(self.rgb)
-        if rgb.ndim != 3 or rgb.shape[2] != 3 or rgb.dtype != np.uint8:
-            raise ValueError("reference RGB must be an HxWx3 uint8 image")
-        target_prompt = str(self.target_prompt).strip()
-        if not target_prompt:
-            raise ValueError("reference target_prompt must be non-empty")
-        target_bbox = _reference_bbox(self.target_bbox, field="target_bbox")
-        table_bboxes = tuple(
-            _reference_bbox(value, field="table_bbox")
-            for value in self.table_bboxes
-        )
-        timestamp = float(self.camera_timestamp)
-        if not math.isfinite(timestamp):
-            raise ValueError("reference camera_timestamp must be finite")
-        kind = str(self.kind)
-        if kind not in {"initial", "latest", "qwen", "head_monitor"}:
-            raise ValueError("unsupported dual-camera reference kind")
-        object.__setattr__(self, "stream_name", stream_name)
-        object.__setattr__(self, "rgb", rgb.copy())
-        object.__setattr__(self, "target_prompt", target_prompt)
-        object.__setattr__(self, "target_bbox", target_bbox)
-        object.__setattr__(self, "table_bboxes", table_bboxes)
-        object.__setattr__(self, "camera_timestamp", timestamp)
-        object.__setattr__(self, "kind", kind)
-
-
 @dataclass(frozen=True)
 class DualCameraAttempt:
     attempt_id: int
     live_stream: str
-    reference: DualCameraReference
     stage: str
     origin_stream: str
 
 
 class DualCameraFailoverCoordinator:
-    """Select the active view and bounded reference fallback sequence."""
+    """Select the active view and bounded text-detection failover sequence."""
 
     def __init__(
         self,
         stream_names: Sequence[str],
-        initial_references: Mapping[str, DualCameraReference],
+        initially_eligible_streams: Sequence[str],
     ):
         names = tuple(str(name) for name in stream_names)
         if len(names) != 2 or len(set(names)) != 2 or any(not name for name in names):
             raise ValueError("dual-camera failover requires two distinct streams")
-        initial = dict(initial_references)
-        for stream_name, reference in initial.items():
-            if stream_name not in names or reference.stream_name != stream_name:
-                raise ValueError("initial reference stream does not match its key")
-            if reference.kind != "initial":
-                raise ValueError("initial reference bank only accepts initial references")
+        eligible = frozenset(str(name) for name in initially_eligible_streams)
+        if not eligible.issubset(names):
+            raise ValueError("initial eligibility contains an unknown stream")
         self.stream_names = names
-        self.initial_references = initial
+        self.initially_eligible_streams = eligible
         self._next_attempt_id = 1
         self._active_attempt_id: int | None = None
 
     def _attempt(
         self,
         live_stream: str,
-        reference: DualCameraReference,
         *,
         stage: str,
         origin_stream: str,
@@ -188,7 +110,6 @@ class DualCameraFailoverCoordinator:
         attempt = DualCameraAttempt(
             attempt_id=self._next_attempt_id,
             live_stream=live_stream,
-            reference=reference,
             stage=stage,
             origin_stream=origin_stream,
         )
@@ -198,129 +119,51 @@ class DualCameraFailoverCoordinator:
 
     def start(self) -> DualCameraAttempt:
         for stream_name in self.stream_names:
-            reference = self.initial_references.get(stream_name)
-            if reference is not None:
+            if stream_name in self.initially_eligible_streams:
                 return self._attempt(
                     stream_name,
-                    reference,
                     stage="initial",
                     origin_stream=stream_name,
                 )
-        raise RuntimeError("neither camera has a valid initial reference")
+        raise RuntimeError("neither camera is initially eligible")
 
     def mark_success(self, attempt: DualCameraAttempt) -> None:
         if attempt.live_stream not in self.stream_names:
             raise ValueError("successful attempt belongs to an unknown stream")
         self._active_attempt_id = attempt.attempt_id
 
-    def _other(self, stream_name: str) -> str:
-        if stream_name == self.stream_names[0]:
-            return self.stream_names[1]
-        if stream_name == self.stream_names[1]:
-            return self.stream_names[0]
-        raise ValueError("attempt belongs to an unknown stream")
-
-    def _initial_reference(self, stream_name: str) -> DualCameraReference:
-        other = self._other(stream_name)
-        reference = self.initial_references.get(stream_name)
-        if reference is None:
-            reference = self.initial_references.get(other)
-        if reference is None:
-            raise RuntimeError("neither camera has an initial reference")
-        return reference
-
-    def begin_head_monitor_reacquisition(
-        self,
-        reference: DualCameraReference | None = None,
-        *,
-        use_qwen: bool = False,
-    ) -> DualCameraAttempt:
+    def begin_head_monitor_reacquisition(self) -> DualCameraAttempt:
         """Preempt chest tracking after the background head monitor fires."""
 
         head_stream = self.stream_names[0]
-        if reference is not None:
-            if reference.stream_name != head_stream:
-                raise ValueError(
-                    "head monitor reference must come from the head stream"
-                )
-            if reference.kind != "head_monitor":
-                raise ValueError(
-                    "head monitor reference must use kind=head_monitor"
-                )
-        elif not use_qwen:
-            raise ValueError(
-                "direct head reacquisition requires a monitor reference"
-            )
-        selected = reference or self._initial_reference(head_stream)
         return self._attempt(
             head_stream,
-            selected,
-            stage="head_monitor_qwen" if use_qwen else "head_monitor",
+            stage="head_monitor",
             origin_stream=head_stream,
         )
-
-    def _recovery_sequence(
-        self,
-        origin_stream: str,
-    ) -> tuple[tuple[str, str], ...]:
-        head_stream, chest_stream = self.stream_names
-        if origin_stream == head_stream:
-            return (
-                (head_stream, "origin_text"),
-                (head_stream, "origin_qwen"),
-                (chest_stream, "alternate_text"),
-                (chest_stream, "alternate_qwen"),
-            )
-        if origin_stream == chest_stream:
-            return (
-                (head_stream, "alternate_text"),
-                (head_stream, "alternate_qwen"),
-                (chest_stream, "origin_text"),
-                (chest_stream, "origin_qwen"),
-            )
-        raise ValueError("recovery origin belongs to an unknown stream")
 
     def advance_after_failure(
         self,
         attempt: DualCameraAttempt,
     ) -> DualCameraAttempt | None:
-        if (
-            attempt.stage == "head_monitor_qwen"
-            and self._active_attempt_id != attempt.attempt_id
-        ):
-            chest_stream = self.stream_names[1]
-            return self._attempt(
-                chest_stream,
-                self._initial_reference(chest_stream),
-                stage="origin_text",
-                origin_stream=chest_stream,
-            )
-
         starts_new_cycle = (
             self._active_attempt_id == attempt.attempt_id
-            or attempt.stage in {"initial", "head_monitor", "head_monitor_qwen"}
+            or attempt.stage in {"initial", "head_monitor"}
         )
         origin = attempt.live_stream if starts_new_cycle else attempt.origin_stream
-        sequence = self._recovery_sequence(origin)
         if starts_new_cycle:
-            next_index = 0
+            live_stream = self.stream_names[0]
+        elif attempt.live_stream == self.stream_names[0]:
+            live_stream = self.stream_names[1]
         else:
-            try:
-                current_index = sequence.index(
-                    (attempt.live_stream, attempt.stage)
-                )
-            except ValueError as exc:
-                raise ValueError(
-                    f"unsupported failover stage: {attempt.stage}"
-                ) from exc
-            next_index = current_index + 1
-        if next_index >= len(sequence):
             return None
-        live_stream, stage = sequence[next_index]
         return self._attempt(
             live_stream,
-            self._initial_reference(live_stream),
-            stage=stage,
+            stage=(
+                "origin_text"
+                if live_stream == origin
+                else "alternate_text"
+            ),
             origin_stream=origin,
         )
 
@@ -377,767 +220,77 @@ def dual_calibrations_from_config(
     }
 
 
-def ground_dual_raw_servo_references(
+def detect_dual_camera_eligibility(
     config: Any,
     snapshots: Mapping[str, AlignedRGBDSnapshot],
     calibrations: Mapping[str, RawServoCalibration],
     output_dir: str | Path,
     *,
-    client_factory: Callable[[], Any] | None = None,
-    initialization_grace_s: float = 30.0,
-) -> tuple[dict[str, DualCameraReference], dict[str, str]]:
-    """Ground both views, bounding the second result after one view succeeds."""
+    tracker: Any,
+) -> tuple[set[str], dict[str, str]]:
+    """Select initial cameras using fixed-text YOLOE detections only."""
 
     root = Path(output_dir).resolve()
     root.mkdir(parents=True, exist_ok=True)
-    grace_s = float(initialization_grace_s)
-    if not math.isfinite(grace_s) or grace_s <= 0.0:
-        raise ValueError("dual initialization grace must be finite and positive")
-
-    stream_names = tuple(name for name in calibrations if name in snapshots)
-    if not stream_names:
-        return {}, {}
-
-    if client_factory is None:
-        return _ground_dual_in_processes(
-            config,
-            snapshots,
-            calibrations,
-            root,
-            stream_names=stream_names,
-            initialization_grace_s=grace_s,
-        )
-    return _ground_dual_in_threads(
-        config,
-        snapshots,
-        calibrations,
-        root,
-        stream_names=stream_names,
-        client_factory=client_factory,
-        initialization_grace_s=grace_s,
-    )
-
-
-def _ground_camera_reference(
-    config: Any,
-    stream_name: str,
-    snapshot: AlignedRGBDSnapshot,
-    calibration: RawServoCalibration,
-    root: Path,
-    *,
-    client_factory: Callable[[], Any] | None = None,
-) -> DualCameraReference:
-    calibration.validate_snapshot(snapshot)
-    stream_dir = root / stream_name
-    stream_dir.mkdir(parents=True, exist_ok=False)
-    assert snapshot.depth_raw is not None
-    with _temporary_png(snapshot.rgb, rgb=True) as rgb_path:
-        spec = ground_raw_servo_references(
-            config,
-            rgb_path,
-            stream_dir,
-            client_factory=client_factory,
-            calibration=calibration,
-        )
-    return DualCameraReference(
-        stream_name=stream_name,
-        rgb=snapshot.rgb,
-        target_prompt=spec.target_prompt,
-        target_bbox=spec.target_bbox,
-        table_bboxes=(),
-        camera_timestamp=snapshot.timestamp,
-        kind="initial",
-    )
-
-
-def _timeout_error(grace_s: float, successful_stream: str) -> str:
-    return (
-        "initial grounding exceeded "
-        f"{grace_s:g}s after {successful_stream} became eligible; "
-        "initialization process terminated"
-    )
-
-
-def _ground_dual_in_threads(
-    config: Any,
-    snapshots: Mapping[str, AlignedRGBDSnapshot],
-    calibrations: Mapping[str, RawServoCalibration],
-    root: Path,
-    *,
-    stream_names: Sequence[str],
-    client_factory: Callable[[], Any],
-    initialization_grace_s: float,
-) -> tuple[dict[str, DualCameraReference], dict[str, str]]:
-    """Injected-client path; production uses killable processes below."""
-
-    references: dict[str, DualCameraReference] = {}
-    errors: dict[str, str] = {}
-    pool = ThreadPoolExecutor(
-        max_workers=len(stream_names),
-        thread_name_prefix="dual-raw-servo-grounding",
-    )
-    pending = {
-        pool.submit(
-            _ground_camera_reference,
-            config,
-            stream_name,
-            snapshots[stream_name],
-            calibrations[stream_name],
-            root,
-            client_factory=client_factory,
-        ): stream_name
-        for stream_name in stream_names
-    }
-    successful_stream: str | None = None
-    deadline: float | None = None
-    timed_out = False
-    try:
-        while pending:
-            timeout = (
-                None
-                if deadline is None
-                else max(0.0, deadline - time.monotonic())
-            )
-            done, _ = wait(
-                tuple(pending), timeout=timeout, return_when=FIRST_COMPLETED
-            )
-            if not done:
-                assert successful_stream is not None
-                for future, stream_name in tuple(pending.items()):
-                    future.cancel()
-                    errors[stream_name] = _timeout_error(
-                        initialization_grace_s, successful_stream
-                    )
-                    pending.pop(future)
-                timed_out = True
-                break
-            for future in done:
-                stream_name = pending.pop(future)
-                try:
-                    references[stream_name] = future.result()
-                except Exception as exc:
-                    errors[stream_name] = str(exc)
-                else:
-                    if successful_stream is None:
-                        successful_stream = stream_name
-                        deadline = time.monotonic() + initialization_grace_s
-    finally:
-        pool.shutdown(wait=not timed_out, cancel_futures=True)
-    return references, errors
-
-
-_PROCESS_CONFIG_FIELDS = (
-    "task",
-    "qwenvl_model",
-    "qwenvl_base_url",
-    "qwenvl_thinking_budget",
-    "qwenvl_timeout_seconds",
-    "dual_chest_camera_stream",
-)
-
-
-def _ground_camera_process_entry(
-    config_values: Mapping[str, Any],
-    stream_name: str,
-    snapshot: AlignedRGBDSnapshot,
-    calibration: RawServoCalibration,
-    root: str,
-    results: Any,
-    process_group_ready: Any,
-) -> None:
-    try:
-        os.setsid()
-        process_group_ready.set()
-    except OSError:
-        pass
-    try:
-        reference = _ground_camera_reference(
-            SimpleNamespace(**dict(config_values)),
-            stream_name,
-            snapshot,
-            calibration,
-            Path(root),
-        )
-        payload = {
-            "target_prompt": reference.target_prompt,
-            "target_bbox": reference.target_bbox,
-            "table_bboxes": reference.table_bboxes,
-            "camera_timestamp": reference.camera_timestamp,
-        }
-        results.put((stream_name, payload, None))
-    except BaseException as exc:
-        results.put((stream_name, None, str(exc)))
-
-
-def _terminate_grounding_process(process: Any, process_group_ready: Any) -> None:
-    if not process.is_alive():
-        process.join(timeout=0.2)
-        return
-    if process_group_ready.is_set() and process.pid is not None:
-        try:
-            os.killpg(process.pid, signal.SIGTERM)
-        except ProcessLookupError:
-            pass
-    else:
-        process.terminate()
-    process.join(timeout=1.0)
-    if process.is_alive():
-        if process_group_ready.is_set() and process.pid is not None:
-            try:
-                os.killpg(process.pid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
-        else:
-            process.kill()
-        process.join(timeout=1.0)
-
-
-def _ground_dual_in_processes(
-    config: Any,
-    snapshots: Mapping[str, AlignedRGBDSnapshot],
-    calibrations: Mapping[str, RawServoCalibration],
-    root: Path,
-    *,
-    stream_names: Sequence[str],
-    initialization_grace_s: float,
-) -> tuple[dict[str, DualCameraReference], dict[str, str]]:
-    """Run one killable grounding process per camera."""
-
-    config_values = {
-        name: getattr(config, name) for name in _PROCESS_CONFIG_FIELDS
-    }
-    context = multiprocessing.get_context("spawn")
-    results = context.Queue()
-    processes: dict[str, tuple[Any, Any]] = {}
-    references: dict[str, DualCameraReference] = {}
-    errors: dict[str, str] = {}
-    pending = set(stream_names)
-    successful_stream: str | None = None
-    deadline: float | None = None
-    try:
-        for stream_name in stream_names:
-            process_group_ready = context.Event()
-            process = context.Process(
-                target=_ground_camera_process_entry,
-                args=(
-                    config_values,
-                    stream_name,
-                    snapshots[stream_name],
-                    calibrations[stream_name],
-                    str(root),
-                    results,
-                    process_group_ready,
-                ),
-                name=f"dual-grounding-{stream_name}",
-            )
-            process.start()
-            processes[stream_name] = (process, process_group_ready)
-
-        while pending:
-            if deadline is not None and time.monotonic() >= deadline:
-                assert successful_stream is not None
-                for stream_name in tuple(pending):
-                    process, process_group_ready = processes[stream_name]
-                    _terminate_grounding_process(process, process_group_ready)
-                    errors[stream_name] = _timeout_error(
-                        initialization_grace_s, successful_stream
-                    )
-                    pending.remove(stream_name)
-                break
-            timeout = 0.1
-            if deadline is not None:
-                timeout = min(timeout, max(0.0, deadline - time.monotonic()))
-            try:
-                stream_name, payload, error = results.get(timeout=timeout)
-            except queue.Empty:
-                for stream_name in tuple(pending):
-                    process, _ = processes[stream_name]
-                    if process.exitcode is not None:
-                        errors[stream_name] = (
-                            "initial grounding process exited without a result "
-                            f"(exit code {process.exitcode})"
-                        )
-                        pending.remove(stream_name)
-                continue
-            if stream_name not in pending:
-                continue
-            pending.remove(stream_name)
-            process, _ = processes[stream_name]
-            process.join(timeout=1.0)
-            if error is not None or payload is None:
-                errors[stream_name] = error or "initial grounding failed"
-                continue
-            references[stream_name] = DualCameraReference(
-                stream_name=stream_name,
-                rgb=snapshots[stream_name].rgb,
-                target_prompt=payload["target_prompt"],
-                target_bbox=payload["target_bbox"],
-                table_bboxes=payload["table_bboxes"],
-                camera_timestamp=payload["camera_timestamp"],
-                kind="initial",
-            )
-            if successful_stream is None:
-                successful_stream = stream_name
-                deadline = time.monotonic() + initialization_grace_s
-    finally:
-        for stream_name in tuple(pending):
-            process, process_group_ready = processes[stream_name]
-            _terminate_grounding_process(process, process_group_ready)
-        for process, _ in processes.values():
-            process.join(timeout=0.2)
-        results.close()
-        results.join_thread()
-    return references, errors
-
-
-def ground_qwen_fallback_reference(
-    config: Any,
-    stream_name: str,
-    snapshot: AlignedRGBDSnapshot,
-    calibration: RawServoCalibration,
-    output_dir: str | Path,
-    *,
-    client_factory: Callable[[], Any] | None = None,
-) -> DualCameraReference:
-    """Re-ground one current camera frame with the fixed Qwen fallback model."""
-
-    calibration.validate_snapshot(snapshot)
-    workdir = Path(output_dir).resolve()
-    workdir.mkdir(parents=True, exist_ok=False)
-    qwen_model = str(
-        getattr(
-            config,
-            "dual_qwenvl_fallback_model",
-            DEFAULT_DUAL_QWEN_FALLBACK_MODEL,
-        )
-    ).strip()
-    if not qwen_model:
-        raise ValueError("dual Qwen fallback model must be non-empty")
-    qwen_config = SimpleNamespace(
-        task=config.task,
-        qwenvl_model=qwen_model,
-        qwenvl_base_url=config.qwenvl_base_url,
-        qwenvl_enable_thinking=False,
-        qwenvl_thinking_budget=config.qwenvl_thinking_budget,
-        qwenvl_timeout_seconds=config.qwenvl_timeout_seconds,
-    )
-    with _temporary_png(snapshot.rgb, rgb=True) as rgb_path:
-        spec = ground_raw_servo_references(
-            qwen_config,
-            rgb_path,
-            workdir,
-            client_factory=client_factory,
-            calibration=calibration,
-        )
-    reference = DualCameraReference(
-        stream_name=stream_name,
-        rgb=snapshot.rgb,
-        target_prompt=spec.target_prompt,
-        target_bbox=spec.target_bbox,
-        table_bboxes=(),
-        camera_timestamp=snapshot.timestamp,
-        kind="qwen",
-    )
+    target_prompt = config.target_prompt
+    prompt_artifact = tracker.start_all_text(target_prompt=target_prompt)
     _write_json(
-        workdir / "qwen_reference_summary.json",
+        root / "initial_yoloe_text_prompt.json",
         {
-            "model": qwen_model,
-            "stream_name": stream_name,
-            "camera_timestamp": snapshot.timestamp,
-            "target_prompt": reference.target_prompt,
-            "target_bbox": reference.target_bbox,
-            "table_bboxes": reference.table_bboxes,
+            "target_prompt": target_prompt,
+            "surface_prompt": config.surface_prompt,
+            "tracker": prompt_artifact,
         },
     )
-    return reference
 
-
-def _pixel_bbox_to_normalized(
-    bbox_xyxy: Sequence[float],
-    *,
-    width: int,
-    height: int,
-) -> tuple[float, float, float, float]:
-    if width <= 0 or height <= 0:
-        raise ValueError("reference image dimensions must be positive")
-    if len(bbox_xyxy) != 4:
-        raise ValueError("pixel bbox must contain four values")
-    x1, y1, x2, y2 = (float(item) for item in bbox_xyxy)
-    return _reference_bbox(
-        (
-            1000.0 * x1 / width,
-            1000.0 * y1 / height,
-            1000.0 * x2 / width,
-            1000.0 * y2 / height,
-        ),
-        field="normalized_bbox",
-    )
-
-
-class LatestReferenceGate:
-    """Capture one coherent dual-class reference at a bounded frame cadence."""
-
-    def __init__(
-        self,
-        *,
-        interval_frames: int = 5,
-        min_confidence: float = 0.35,
-    ):
-        if interval_frames <= 0:
-            raise ValueError("latest reference interval must be positive")
-        confidence = float(min_confidence)
-        if not math.isfinite(confidence) or not 0.0 <= confidence <= 1.0:
-            raise ValueError("latest reference confidence must be in [0,1]")
-        self.interval_frames = int(interval_frames)
-        self.min_confidence = confidence
-
-    def consider(
-        self,
-        *,
-        frame_index: int,
-        stream_name: str,
-        rgb: np.ndarray,
-        camera_timestamp: float,
-        target_prompt: str,
-        target_bbox_xyxy: Sequence[float],
-        table_bboxes_xyxy: Sequence[Sequence[float]],
-        target_confidence: float,
-        target_geometry_valid: bool,
-        table_geometry_valid: bool,
-    ) -> tuple[DualCameraReference | None, str]:
-        if int(frame_index) <= 0 or int(frame_index) % self.interval_frames:
-            return None, "interval"
-        if not table_bboxes_xyxy:
-            return None, "missing_table"
-        if not target_geometry_valid:
-            return None, "invalid_target_geometry"
-        if not table_geometry_valid:
-            return None, "invalid_table_geometry"
-        if float(target_confidence) < self.min_confidence:
-            return None, "low_confidence"
-        image = np.asarray(rgb)
-        if image.ndim != 3 or image.shape[2] != 3:
-            return None, "invalid_rgb"
-        height, width = image.shape[:2]
-        reference = DualCameraReference(
-            stream_name=stream_name,
-            rgb=image,
-            target_prompt=target_prompt,
-            target_bbox=_pixel_bbox_to_normalized(
-                target_bbox_xyxy,
-                width=width,
-                height=height,
-            ),
-            table_bboxes=tuple(
-                _pixel_bbox_to_normalized(bbox, width=width, height=height)
-                for bbox in table_bboxes_xyxy
-            ),
-            camera_timestamp=camera_timestamp,
-            kind="latest",
-        )
-        return reference, "accepted"
-
-
-@dataclass(frozen=True)
-class DualReferenceUpdateRequest:
-    generation: int
-    frame_index: int
-    reference: DualCameraReference
-    require_target_embedding: bool = True
-
-
-@dataclass(frozen=True)
-class EncodedDualReference:
-    target_embedding: Any
-    surface_embedding: Any
-    target_confidence: float
-    target_iou: float
-    surface_confidence: float
-    surface_iou: float
-
-
-@dataclass(frozen=True)
-class DualReferenceUpdateResult:
-    generation: int
-    frame_index: int
-    stream_name: str
-    accepted: bool
-    target_validated: bool
-    reference: DualCameraReference
-    target_embedding: Any | None
-    surface_embedding: Any | None
-    target_confidence: float | None
-    target_iou: float | None
-    surface_confidence: float | None
-    surface_iou: float | None
-    reason: str
-
-
-class YoloeDualReferenceEncoder(YoloeTargetReferenceEncoder):
-    """Independent YOLOE model that encodes one coherent target/desk frame."""
-
-    @staticmethod
-    def _best_detection(
-        result: Any,
-        *,
-        class_index: int,
-        expected_boxes: Sequence[tuple[float, float, float, float]],
-    ) -> tuple[float, float]:
-        if result.boxes is None or len(result.boxes) == 0:
-            return 0.0, 0.0
-        boxes = [
-            tuple(float(value) for value in row)
-            for row in result.boxes.xyxy.detach().cpu().numpy()
-        ]
-        classes = result.boxes.cls.detach().cpu().numpy().astype(int)
-        confidences = result.boxes.conf.detach().cpu().numpy()
-        candidates = [
-            index for index, value in enumerate(classes) if value == class_index
-        ]
-        if not candidates:
-            return 0.0, 0.0
-        best_index = max(
-            candidates,
-            key=lambda index: (
-                max(bbox_iou(boxes[index], expected) for expected in expected_boxes),
-                float(confidences[index]),
-            ),
-        )
-        overlap = max(
-            bbox_iou(boxes[best_index], expected) for expected in expected_boxes
-        )
-        return float(confidences[best_index]), float(overlap)
-
-    def extract(
-        self,
-        request: DualReferenceUpdateRequest,
-    ) -> EncodedDualReference:
-        from ultralytics.models.yolo.yoloe import YOLOEVPSegPredictor
-
-        reference = request.reference
-        rgb = reference.rgb
-        height, width = rgb.shape[:2]
-        target_box = normalized_bbox_to_pixels(
-            reference.target_bbox,
-            width,
-            height,
-        )
-        surface_boxes = tuple(
-            normalized_bbox_to_pixels(bbox, width, height)
-            for bbox in reference.table_bboxes
-        )
-        prompt_boxes = np.asarray(
-            (target_box, *surface_boxes),
-            dtype=np.float32,
-        )
-        prompt_classes = np.asarray(
-            (0, *([1] * len(surface_boxes))),
-            dtype=np.int32,
-        )
-        bgr = np.ascontiguousarray(rgb[..., ::-1])
-        self.model.predictor = None
+    eligible_streams: set[str] = set()
+    errors: dict[str, str] = {}
+    for stream_name in calibrations:
+        snapshot = snapshots.get(stream_name)
+        if snapshot is None:
+            continue
+        stream_dir = root / stream_name
+        stream_dir.mkdir(parents=True, exist_ok=True)
         try:
-            results = self.model.predict(
-                source=bgr,
-                refer_image=bgr,
-                visual_prompts={
-                    "bboxes": prompt_boxes,
-                    "cls": prompt_classes,
+            calibrations[stream_name].validate_snapshot(snapshot)
+            # Head and chest are independent views, not consecutive video
+            # frames. Reset BoT-SORT so each camera's one-shot eligibility
+            # check is frame 1 and can activate a new track immediately.
+            tracker.reset_tracking()
+            instances = list(tracker.track(snapshot.rgb))
+            target = _best_instance(instances, 0)
+            if target is None:
+                raise RuntimeError(
+                    f"YOLOE text prompt {target_prompt!r} found no target"
+                )
+            _write_json(
+                stream_dir / "initial_yoloe_detection.json",
+                {
+                    "eligible": True,
+                    "target_prompt": target_prompt,
+                    "target_track_id": target.track_id,
+                    "target_confidence": target.confidence,
+                    "target_bbox_xyxy": target.bbox_xyxy,
+                    "target_candidates": sum(
+                        item.class_index == 0 for item in instances
+                    ),
+                    "surface_candidates": sum(
+                        item.class_index == 1 for item in instances
+                    ),
                 },
-                predictor=YOLOEVPSegPredictor,
-                device=self.device,
-                imgsz=self.imgsz,
-                conf=self.confidence,
-                half=True,
-                quantize=16,
-                verbose=False,
-                save=False,
             )
-        finally:
-            self.model.predictor = None
-        if len(results) != 1:
-            raise RuntimeError(
-                f"YOLOE dual reference returned {len(results)} results"
+            eligible_streams.add(stream_name)
+        except Exception as exc:
+            errors[stream_name] = str(exc)
+            _write_json(
+                stream_dir / "initial_yoloe_detection.json",
+                {
+                    "eligible": False,
+                    "target_prompt": target_prompt,
+                    "error": str(exc),
+                },
             )
-        embeddings = getattr(self.model.model, "pe", None)
-        if embeddings is None:
-            raise RuntimeError("YOLOE did not produce dual visual embeddings")
-        if embeddings.ndim != 3 or embeddings.shape[1] != 2:
-            raise RuntimeError(
-                "YOLOE expected two visual embeddings, got "
-                f"{tuple(embeddings.shape)}"
-            )
-        result = results[0]
-        target_confidence, target_iou = self._best_detection(
-            result,
-            class_index=0,
-            expected_boxes=(target_box,),
-        )
-        surface_confidence, surface_iou = self._best_detection(
-            result,
-            class_index=1,
-            expected_boxes=surface_boxes,
-        )
-        return EncodedDualReference(
-            target_embedding=embeddings[:, :1].detach().clone(),
-            surface_embedding=embeddings[:, 1:2].detach().clone(),
-            target_confidence=target_confidence,
-            target_iou=target_iou,
-            surface_confidence=surface_confidence,
-            surface_iou=surface_iou,
-        )
-
-
-class AsyncDualReferenceUpdater:
-    """Encode the newest coherent target/desk reference off the servo thread."""
-
-    _STOP = object()
-
-    def __init__(
-        self,
-        encoder_factory: Callable[[], Any],
-        *,
-        min_confidence: float,
-        min_iou: float,
-    ) -> None:
-        self._encoder_factory = encoder_factory
-        self._min_confidence = float(min_confidence)
-        self._min_iou = float(min_iou)
-        self._requests: queue.Queue[Any] = queue.Queue(maxsize=1)
-        self._results: queue.Queue[DualReferenceUpdateResult] = queue.Queue(
-            maxsize=1
-        )
-        self._closed = threading.Event()
-        self._thread = threading.Thread(
-            target=self._run,
-            name="yoloe-dual-reference-updater",
-            daemon=True,
-        )
-        self._thread.start()
-
-    @staticmethod
-    def _put_latest(destination: queue.Queue[Any], item: Any) -> None:
-        while True:
-            try:
-                destination.put_nowait(item)
-                return
-            except queue.Full:
-                try:
-                    destination.get_nowait()
-                except queue.Empty:
-                    pass
-
-    def submit(self, request: DualReferenceUpdateRequest) -> None:
-        if not self._closed.is_set():
-            self._put_latest(self._requests, request)
-
-    def poll_latest(self) -> DualReferenceUpdateResult | None:
-        latest = None
-        while True:
-            try:
-                latest = self._results.get_nowait()
-            except queue.Empty:
-                return latest
-
-    def close(self) -> None:
-        if self._closed.is_set():
-            return
-        self._closed.set()
-        self._put_latest(self._requests, self._STOP)
-        self._thread.join(timeout=10.0)
-
-    def _result(
-        self,
-        request: DualReferenceUpdateRequest,
-        *,
-        accepted: bool,
-        reason: str,
-        encoded: EncodedDualReference | None = None,
-    ) -> DualReferenceUpdateResult:
-        return DualReferenceUpdateResult(
-            generation=request.generation,
-            frame_index=request.frame_index,
-            stream_name=request.reference.stream_name,
-            accepted=accepted,
-            target_validated=request.require_target_embedding,
-            reference=request.reference,
-            target_embedding=(
-                None if encoded is None else encoded.target_embedding
-            ),
-            surface_embedding=(
-                None if encoded is None else encoded.surface_embedding
-            ),
-            target_confidence=(
-                None if encoded is None else encoded.target_confidence
-            ),
-            target_iou=None if encoded is None else encoded.target_iou,
-            surface_confidence=(
-                None if encoded is None else encoded.surface_confidence
-            ),
-            surface_iou=None if encoded is None else encoded.surface_iou,
-            reason=reason,
-        )
-
-    def _validate(
-        self,
-        request: DualReferenceUpdateRequest,
-        encoded: EncodedDualReference,
-    ) -> DualReferenceUpdateResult:
-        checks = [
-            ("surface", encoded.surface_confidence, encoded.surface_iou)
-        ]
-        if request.require_target_embedding:
-            checks.insert(
-                0, ("target", encoded.target_confidence, encoded.target_iou)
-            )
-        for role, confidence, overlap in checks:
-            if confidence < self._min_confidence:
-                return self._result(
-                    request,
-                    accepted=False,
-                    reason=f"{role}_confidence_below_threshold",
-                    encoded=encoded,
-                )
-            if overlap < self._min_iou:
-                return self._result(
-                    request,
-                    accepted=False,
-                    reason=f"{role}_iou_below_threshold",
-                    encoded=encoded,
-                )
-        return self._result(
-            request,
-            accepted=True,
-            reason="accepted",
-            encoded=encoded,
-        )
-
-    def _run(self) -> None:
-        encoder = None
-        try:
-            encoder = self._encoder_factory()
-        except Exception:
-            pass
-        while True:
-            item = self._requests.get()
-            if item is self._STOP:
-                return
-            if not isinstance(item, DualReferenceUpdateRequest):
-                continue
-            request = item
-            try:
-                if encoder is None:
-                    encoder = self._encoder_factory()
-                result = self._validate(request, encoder.extract(request))
-            except Exception as exc:
-                result = self._result(
-                    request,
-                    accepted=False,
-                    reason=f"error:{type(exc).__name__}:{exc}",
-                )
-            if self._closed.is_set():
-                return
-            self._put_latest(self._results, result)
+    return eligible_streams, errors
 
 
 def _best_instance(
@@ -1146,6 +299,29 @@ def _best_instance(
 ) -> TrackedInstance | None:
     candidates = [item for item in instances if item.class_index == class_index]
     return max(candidates, key=lambda item: item.confidence, default=None)
+
+
+def _select_tracked_instances(
+    instances: Sequence[TrackedInstance],
+    *,
+    target_id: int | None,
+    surface_id: int | None,
+) -> tuple[TrackedInstance | None, TrackedInstance | None, bool, bool]:
+    if target_id is None:
+        target = _best_instance(instances, 0)
+        target_reacquired = False
+    else:
+        target, target_reacquired, _ = _resolve_target(instances, target_id)
+    if surface_id is None:
+        surface = _best_instance(instances, 1)
+        surface_reacquired = False
+    else:
+        surface, surface_reacquired, _ = _resolve_target(
+            instances,
+            surface_id,
+            class_index=1,
+        )
+    return target, surface, target_reacquired, surface_reacquired
 
 
 def _observe_tracked_snapshot(
@@ -1167,20 +343,13 @@ def _observe_tracked_snapshot(
     """Build one observation while keeping IDs local to one camera stream."""
     calibration.validate_snapshot(snapshot)
     instances = list(tracker.track(snapshot.rgb))
-    target_reacquired = False
-    surface_reacquired = False
-    if target_id is None:
-        target = _best_instance(instances, 0)
-    else:
-        target, target_reacquired, _ = _resolve_target(instances, target_id)
-    if surface_id is None:
-        surface = _best_instance(instances, 1)
-    else:
-        surface, surface_reacquired, _ = _resolve_target(
+    target, surface, target_reacquired, surface_reacquired = (
+        _select_tracked_instances(
             instances,
-            surface_id,
-            class_index=1,
+            target_id=target_id,
+            surface_id=surface_id,
         )
+    )
     if target is None:
         raise ValueError("missing tracked target")
     if surface is None and require_table:
@@ -1213,25 +382,6 @@ def _timed_observe_tracked_snapshot(
     return result, 1000.0 * (time.perf_counter() - started_at)
 
 
-class _HeadYawObservationError(ValueError):
-    """Head-yaw failure that still carries same-camera visualization data."""
-
-    def __init__(
-        self,
-        message: str,
-        *,
-        target: TrackedInstance | None,
-        surface: TrackedInstance | None,
-        desk_mask: np.ndarray | None = None,
-        table_rgb_edges: np.ndarray | None = None,
-    ):
-        super().__init__(message)
-        self.target = target
-        self.surface = surface
-        self.desk_mask = desk_mask
-        self.table_rgb_edges = table_rgb_edges
-
-
 def _observe_head_yaw_snapshot(
     snapshot: AlignedRGBDSnapshot,
     tracker: Any,
@@ -1241,35 +391,30 @@ def _observe_head_yaw_snapshot(
     surface_id: int | None,
 ) -> tuple[
     TrackedInstance | None,
-    TrackedInstance,
-    TableGeometry,
-    np.ndarray,
+    TrackedInstance | None,
+    TableGeometry | None,
     np.ndarray | None,
-    bool,
-    bool,
+    np.ndarray | None,
+    str | None,
 ]:
     """Measure live head-camera desk yaw without requiring a head basket."""
     calibration.validate_snapshot(snapshot)
     instances = list(tracker.track(snapshot.rgb))
-    target_reacquired = False
-    surface_reacquired = False
-    if target_id is None:
-        target = _best_instance(instances, 0)
-    else:
-        target, target_reacquired, _ = _resolve_target(instances, target_id)
-    if surface_id is None:
-        surface = _best_instance(instances, 1)
-    else:
-        surface, surface_reacquired, _ = _resolve_target(
+    target, surface, _, _ = (
+        _select_tracked_instances(
             instances,
-            surface_id,
-            class_index=1,
+            target_id=target_id,
+            surface_id=surface_id,
         )
+    )
     if surface is None:
-        raise _HeadYawObservationError(
+        return (
+            target,
+            None,
+            None,
+            None,
+            None,
             "missing tracked desk for live head yaw",
-            target=target,
-            surface=None,
         )
     table, table_error, desk_mask, table_rgb_edges = _surface_geometry_components(
         snapshot,
@@ -1277,22 +422,13 @@ def _observe_head_yaw_snapshot(
         calibration,
         target_mask=None if target is None else target.mask,
     )
-    if table is None:
-        raise _HeadYawObservationError(
-            table_error or "missing live head desk geometry",
-            target=target,
-            surface=surface,
-            desk_mask=desk_mask,
-            table_rgb_edges=table_rgb_edges,
-        )
     return (
         target,
         surface,
         table,
         desk_mask,
         table_rgb_edges,
-        target_reacquired,
-        surface_reacquired,
+        None if table is not None else table_error or "missing live head desk geometry",
     )
 
 
@@ -1303,15 +439,9 @@ def _table_geometry_frame_data(
         return None
     return {
         "yaw_error_rad": table.yaw_error_rad,
-        "line_length_m": table.line_length_m,
-        "inlier_count": table.inlier_count,
-        "residual_m": table.residual_m,
-        "line_center_xy_m": list(table.line_center_xy_m),
-        "line_endpoints_xy_m": (
-            None
-            if table.line_endpoints_xy_m is None
-            else [list(point) for point in table.line_endpoints_xy_m]
-        ),
+        "line_length_px": table.line_length_px,
+        "valid_depth_samples": table.valid_depth_samples,
+        "line_center_px": list(table.line_center_px),
         "line_endpoints_px": (
             None
             if table.line_endpoints_px is None
@@ -1354,11 +484,7 @@ def _camera_frame_data(
 class HeadCameraMonitorResult:
     """One result from the text-only head-camera monitor."""
 
-    target_streak: int
-    missing_streak: int
-    hold_active: bool
     triggered: bool
-    reference: DualCameraReference | None
     target: TrackedInstance | None
     surface: TrackedInstance | None
 
@@ -1417,92 +543,54 @@ class HeadCameraTextMonitor:
         surface = _best_instance(instances, 1)
         if target is None:
             self.note_missing_frame()
-            return HeadCameraMonitorResult(
-                target_streak=self.target_streak,
-                missing_streak=self.missing_streak,
-                hold_active=self.hold_active,
-                triggered=False,
-                reference=None,
-                target=None,
-                surface=surface,
-            )
-        self.missing_streak = 0
-        self.hold_active = True
-        self.target_streak += 1
-        streak = self.target_streak
-        if streak < self.required_target_frames:
-            return HeadCameraMonitorResult(
-                target_streak=streak,
-                missing_streak=0,
-                hold_active=True,
-                triggered=False,
-                reference=None,
-                target=target,
-                surface=surface,
-            )
-
-        self.target_streak = 0
-        height, width = snapshot.rgb.shape[:2]
-        reference = DualCameraReference(
-            stream_name=snapshot.depth_aligned_to,
-            rgb=snapshot.rgb,
-            target_prompt=self.target_prompt,
-            target_bbox=_pixel_bbox_to_normalized(
-                target.bbox_xyxy, width=width, height=height
-            ),
-            table_bboxes=(),
-            camera_timestamp=snapshot.timestamp,
-            kind="head_monitor",
-        )
+        else:
+            self.missing_streak = 0
+            self.hold_active = True
+            self.target_streak += 1
         return HeadCameraMonitorResult(
-            target_streak=streak,
-            missing_streak=0,
-            hold_active=True,
-            triggered=True,
-            reference=reference,
+            triggered=(
+                target is not None
+                and self.target_streak >= self.required_target_frames
+            ),
             target=target,
             surface=surface,
         )
 
 
-def _attempt_prompt_mode(_attempt: DualCameraAttempt) -> str:
-    return "target_text_surface_text"
-
-
-def _attempt_uses_target_text(_attempt: DualCameraAttempt) -> bool:
-    """All online BasePose target detections use the configured text prompt."""
-
-    return True
-
-
-def _attempt_uses_surface_text(_attempt: DualCameraAttempt) -> bool:
-    """The BasePose surface class is always the fixed ``desk`` text prompt."""
-    return True
-
-
-def _capture_camera_stream(
+def _capture_head_yaw(
     camera: Any,
     stream_name: str,
     *,
     timeout_ms: int,
-) -> AlignedRGBDSnapshot:
-    capture_stream = getattr(camera, "capture_stream", None)
-    if callable(capture_stream):
-        return capture_stream(stream_name, timeout_ms=timeout_ms)
-    return camera.capture().require(stream_name)
-
-
-def _poll_camera_stream(
-    camera: Any,
-    stream_name: str,
-) -> AlignedRGBDSnapshot | None:
-    poll_stream = getattr(camera, "poll_stream", None)
-    if callable(poll_stream):
-        return poll_stream(stream_name)
+    tracker: Any,
+    calibration: RawServoCalibration,
+    target_id: int | None,
+    surface_id: int | None,
+) -> tuple[
+    AlignedRGBDSnapshot | None,
+    TrackedInstance | None,
+    TrackedInstance | None,
+    TableGeometry | None,
+    np.ndarray | None,
+    np.ndarray | None,
+    str | None,
+]:
+    snapshot: AlignedRGBDSnapshot | None = None
     try:
-        return camera.capture().require(stream_name)
-    except BasePoseCameraError:
-        return None
+        snapshot = camera.capture_stream(stream_name, timeout_ms=timeout_ms)
+        target, surface, table, desk_mask, edges, error = (
+            _observe_head_yaw_snapshot(
+                snapshot,
+                tracker,
+                calibration,
+                target_id=target_id,
+                surface_id=surface_id,
+            )
+        )
+    except Exception as exc:
+        target = surface = table = desk_mask = edges = None
+        error = str(exc)
+    return snapshot, target, surface, table, desk_mask, edges, error
 
 
 def _claim_new_stream_snapshot(
@@ -1522,6 +610,8 @@ def _claim_new_stream_snapshot(
 
 def _attempt_details(
     attempt: DualCameraAttempt,
+    *,
+    target_prompt: str,
     **extra: Any,
 ) -> dict[str, Any]:
     return {
@@ -1529,10 +619,8 @@ def _attempt_details(
         "live_stream": attempt.live_stream,
         "failover_stage": attempt.stage,
         "origin_stream": attempt.origin_stream,
-        "reference_source_stream": attempt.reference.stream_name,
-        "reference_kind": attempt.reference.kind,
-        "prompt_mode": _attempt_prompt_mode(attempt),
-        "target_prompt": attempt.reference.target_prompt,
+        "prompt_mode": TEXT_PROMPT_MODE,
+        "target_prompt": target_prompt,
         "perception_schedule": "new_frame_latest_only",
         **extra,
     }
@@ -1547,43 +635,25 @@ def _attempt_frame_details(
         "camera_stream": camera_stream or attempt.live_stream,
         "attempt_id": attempt.attempt_id,
         "failover_stage": attempt.stage,
-        "reference_source_stream": attempt.reference.stream_name,
-        "reference_kind": attempt.reference.kind,
-        "prompt_mode": _attempt_prompt_mode(attempt),
+        "prompt_mode": TEXT_PROMPT_MODE,
     }
 
 
-def _write_initial_reference_summary(
+def _write_initial_eligibility_summary(
     output_dir: Path,
     stream_names: Sequence[str],
-    references: Mapping[str, DualCameraReference],
+    eligible_streams: set[str],
     errors: Mapping[str, str],
     selected_stream: str | None,
 ) -> None:
     _write_json(
-        output_dir / "initial_reference_summary.json",
+        output_dir / "initial_eligibility_summary.json",
         {
             "selected_initial_stream": selected_stream,
             "streams": {
                 stream_name: {
-                    "eligible": stream_name in references,
+                    "eligible": stream_name in eligible_streams,
                     "error": errors.get(stream_name),
-                    "reference": (
-                        None
-                        if stream_name not in references
-                        else {
-                            "camera_timestamp": references[
-                                stream_name
-                            ].camera_timestamp,
-                            "target_prompt": references[
-                                stream_name
-                            ].target_prompt,
-                            "target_bbox": references[stream_name].target_bbox,
-                            "table_bboxes": references[
-                                stream_name
-                            ].table_bboxes,
-                        }
-                    ),
                 }
                 for stream_name in stream_names
             },
@@ -1600,25 +670,21 @@ def run_dual_raw_servo_worker(
     *,
     observation_events: queue.Queue[RawServoEvent] | None = None,
     diagnostics: AsyncFrameDiagnosticsWriter | None = None,
-    camera_factory: Callable[[], Any] | None = None,
-    client_factory: Callable[[], Any] | None = None,
+    camera_factory: Callable[[], Any],
+    table_required: Callable[[], bool],
+    position_fallback_allowed: Callable[[], bool],
     tracker_factory: Callable[[], Any] | None = None,
     head_monitor_tracker_factory: Callable[[], Any] | None = None,
-    latest_reference_updater_factory: Callable[[], Any] | None = None,
-    qwen_reference_factory: Callable[..., DualCameraReference] | None = None,
-    handoff_hold_event: threading.Event | None = None,
     calibration_factory: (
         Callable[[Any], Mapping[str, RawServoCalibration]] | None
     ) = None,
-    reference_factory: (
+    eligibility_factory: (
         Callable[
             ...,
-            tuple[dict[str, DualCameraReference], dict[str, str]],
+            tuple[set[str], dict[str, str]],
         ]
         | None
     ) = None,
-    table_required: Callable[[], bool] | None = None,
-    position_fallback_allowed: Callable[[], bool] | None = None,
 ) -> None:
     """Run one bounded dual-camera failover session per operator generation."""
 
@@ -1627,25 +693,11 @@ def run_dual_raw_servo_worker(
         str(config.dual_head_camera_stream),
         str(config.dual_chest_camera_stream),
     )
-    surface_prompt = str(
-        getattr(config, "surface_prompt", DEFAULT_SURFACE_TEXT_PROMPT)
-    ).strip()
-    if not surface_prompt:
-        raise ValueError("surface_prompt must be non-empty")
-    target_prompt = str(getattr(config, "target_prompt", "")).strip()
-    if not target_prompt:
-        raise ValueError("target_prompt must be non-empty")
-    tolerance = int(config.dual_match_tolerance_frames)
-    if tolerance <= 0:
-        raise ValueError("dual match tolerance must be positive")
-    head_reacquire_frames = int(getattr(config, "dual_head_reacquire_frames", 1))
-    if head_reacquire_frames <= 0:
-        raise ValueError("dual head reacquisition frame count must be positive")
-    head_release_missing_frames = int(
-        getattr(config, "dual_head_release_missing_frames", 3)
-    )
-    if head_release_missing_frames <= 0:
-        raise ValueError("dual head release missing frame count must be positive")
+    surface_prompt = config.surface_prompt
+    target_prompt = config.target_prompt
+    tolerance = config.dual_match_tolerance_frames
+    head_reacquire_frames = config.dual_head_reacquire_frames
+    head_release_missing_frames = config.dual_head_release_missing_frames
     camera: Any | None = None
     tracker: Any = (
         tracker_factory()
@@ -1662,7 +714,6 @@ def run_dual_raw_servo_worker(
         max_workers=2,
         thread_name_prefix="dual-raw-servo-perception",
     )
-    reference_updater: Any | None = None
     head_monitor_tracker: Any | None = None
     try:
         while not stop_event.is_set():
@@ -1681,23 +732,7 @@ def run_dual_raw_servo_worker(
                         else dual_calibrations_from_config(config)
                     )
                 if camera is None:
-                    camera = (
-                        camera_factory()
-                        if camera_factory is not None
-                        else SensorGatewayDualBasePoseCamera(
-                            config.sensor_gateway_endpoint,
-                            stream_depths={
-                                stream_names[0]: config.dual_head_depth_stream,
-                                stream_names[1]: config.dual_chest_depth_stream,
-                            },
-                            timeout_ms=config.camera_timeout_ms,
-                            request_timeout_ms=(
-                                config.sensor_gateway_request_timeout_ms
-                            ),
-                            max_age_ms=config.sensor_gateway_max_age_ms,
-                            max_skew_ms=config.sensor_gateway_max_skew_ms,
-                        )
-                    )
+                    camera = camera_factory()
                 initial_capture = camera.capture()
                 stamp = time.strftime("%Y%m%d_%H%M%S")
                 output_dir = (
@@ -1705,57 +740,39 @@ def run_dual_raw_servo_worker(
                     / f"dual_raw_yoloe_{stamp}_g{generation}"
                 )
                 output_dir.mkdir(parents=True, exist_ok=False)
-                if reference_factory is not None:
-                    initial_references, grounding_errors = reference_factory(
+                if eligibility_factory is not None:
+                    eligible_streams, grounding_errors = eligibility_factory(
                         config,
                         initial_capture.snapshots,
                         calibrations,
                         output_dir,
-                        client_factory=client_factory,
                     )
                 else:
-                    initial_references, grounding_errors = (
-                        ground_dual_raw_servo_references(
+                    eligible_streams, grounding_errors = (
+                        detect_dual_camera_eligibility(
                             config,
                             initial_capture.snapshots,
                             calibrations,
                             output_dir,
-                            client_factory=client_factory,
-                            initialization_grace_s=float(
-                                getattr(
-                                    config,
-                                    "dual_initialization_grace_s",
-                                    30.0,
-                                )
-                            ),
+                            tracker=tracker,
                         )
                     )
                 initial_errors = {
                     **dict(initial_capture.errors),
                     **grounding_errors,
                 }
-                # Qwen decides whether a camera contains the requested object,
-                # but its reference bbox and generated label are not used by
-                # YOLOE. Both YOLOE classes are fixed text embeddings.
-                initial_references = {
-                    stream_name: replace(
-                        reference,
-                        target_prompt=target_prompt,
-                    )
-                    for stream_name, reference in initial_references.items()
-                }
                 selected_initial_stream = next(
                     (
                         stream_name
                         for stream_name in stream_names
-                        if stream_name in initial_references
+                        if stream_name in eligible_streams
                     ),
                     None,
                 )
-                _write_initial_reference_summary(
+                _write_initial_eligibility_summary(
                     output_dir,
                     stream_names,
-                    initial_references,
+                    eligible_streams,
                     initial_errors,
                     selected_initial_stream,
                 )
@@ -1763,114 +780,42 @@ def run_dual_raw_servo_worker(
                     message = "; ".join(
                         f"{name}: {error}"
                         for name, error in sorted(initial_errors.items())
-                    ) or "neither camera produced an initial reference"
+                    ) or "neither camera passed initial text detection"
                     raise RuntimeError(message)
                 coordinator = DualCameraFailoverCoordinator(
                     stream_names,
-                    initial_references,
+                    eligible_streams,
                 )
-                monitor_reference = initial_references.get(stream_names[0])
-                if monitor_reference is None:
-                    monitor_reference = initial_references[selected_initial_stream]
-                head_monitor_target_prompt = monitor_reference.target_prompt
                 head_monitor: HeadCameraTextMonitor | None = None
-                pending_head_qwen: dict[int, AlignedRGBDSnapshot] = {}
 
-                latest_gates = {
-                    stream_name: LatestReferenceGate(
-                        interval_frames=(
-                            config.raw_reference_update_interval_frames
-                        ),
-                        min_confidence=(
-                            config.raw_reference_update_min_confidence
-                        ),
-                    )
-                    for stream_name in stream_names
-                }
-                if reference_updater is None:
-                    if latest_reference_updater_factory is not None:
-                        reference_updater = latest_reference_updater_factory()
                 attempt = coordinator.start()
                 frame_index = -1
                 last_inference_timestamp_by_stream: dict[str, float] = {}
-                generation_finished = False
                 while gate.is_active(generation) and not stop_event.is_set():
                     try:
-                        if attempt.stage in {
-                            "origin_qwen",
-                            "alternate_qwen",
-                            "head_monitor_qwen",
-                        }:
-                            qwen_snapshot = pending_head_qwen.pop(
-                                attempt.attempt_id, None
-                            )
-                            if qwen_snapshot is None:
-                                qwen_snapshot = _capture_camera_stream(
-                                    camera,
-                                    attempt.live_stream,
-                                    timeout_ms=int(config.camera_timeout_ms),
-                                )
-                            qwen_calibration = calibrations[attempt.live_stream]
-                            qwen_output_dir = (
-                                output_dir
-                                / f"{attempt.stage}_{attempt.attempt_id:02d}"
-                            )
-                            qwen_reference = (
-                                qwen_reference_factory(
-                                    config,
-                                    attempt.live_stream,
-                                    qwen_snapshot,
-                                    qwen_calibration,
-                                    qwen_output_dir,
-                                )
-                                if qwen_reference_factory is not None
-                                else ground_qwen_fallback_reference(
-                                    config,
-                                    attempt.live_stream,
-                                    qwen_snapshot,
-                                    qwen_calibration,
-                                    qwen_output_dir,
-                                )
-                            )
-                            if (
-                                qwen_reference.stream_name != attempt.live_stream
-                                or qwen_reference.kind != "qwen"
-                            ):
-                                raise ValueError(
-                                    "Qwen fallback reference must use the active "
-                                    "camera and kind=qwen"
-                                )
-                            qwen_reference = replace(
-                                qwen_reference,
-                                target_prompt=target_prompt,
-                            )
-                            attempt = replace(
-                                attempt,
-                                reference=qwen_reference,
-                            )
                         tracker.start_all_text(
-                            target_prompt=attempt.reference.target_prompt,
+                            target_prompt=target_prompt,
                         )
                         chest_fallback_ready = False
                         chest_fallback_init_error: str | None = None
+                        if head_monitor_tracker is None:
+                            if head_monitor_tracker_factory is not None:
+                                head_monitor_tracker = (
+                                    head_monitor_tracker_factory()
+                                )
+                            elif tracker_factory is None:
+                                head_monitor_tracker = YoloePersistentTracker(
+                                    config.raw_yoloe_model_path,
+                                    confidence=config.raw_yoloe_confidence,
+                                    imgsz=config.raw_yoloe_imgsz,
+                                    device=config.raw_yoloe_device,
+                                    surface_prompt=surface_prompt,
+                                )
                         if attempt.live_stream == stream_names[1]:
-                            if head_monitor_tracker is None:
-                                if head_monitor_tracker_factory is not None:
-                                    head_monitor_tracker = (
-                                        head_monitor_tracker_factory()
-                                    )
-                                elif tracker_factory is None:
-                                    head_monitor_tracker = YoloePersistentTracker(
-                                        config.raw_yoloe_model_path,
-                                        confidence=config.raw_yoloe_confidence,
-                                        imgsz=config.raw_yoloe_imgsz,
-                                        device=config.raw_yoloe_device,
-                                        surface_prompt=surface_prompt,
-                                    )
                             if head_monitor_tracker is not None:
                                 head_monitor = HeadCameraTextMonitor(
                                     head_monitor_tracker,
-                                    head_monitor_target_prompt,
+                                    target_prompt,
                                     required_target_frames=head_reacquire_frames,
                                     release_missing_frames=(
                                         head_release_missing_frames
@@ -1879,30 +824,10 @@ def run_dual_raw_servo_worker(
                                 head_monitor.start()
                         else:
                             head_monitor = None
-                            if head_monitor_tracker is None:
-                                if head_monitor_tracker_factory is not None:
-                                    head_monitor_tracker = (
-                                        head_monitor_tracker_factory()
-                                    )
-                                elif tracker_factory is None:
-                                    head_monitor_tracker = YoloePersistentTracker(
-                                        config.raw_yoloe_model_path,
-                                        confidence=config.raw_yoloe_confidence,
-                                        imgsz=config.raw_yoloe_imgsz,
-                                        device=config.raw_yoloe_device,
-                                        surface_prompt=surface_prompt,
-                                    )
                             if head_monitor_tracker is not None:
                                 try:
-                                    chest_reference = initial_references.get(
-                                        stream_names[1]
-                                    )
                                     head_monitor_tracker.start_all_text(
-                                        target_prompt=(
-                                            attempt.reference.target_prompt
-                                            if chest_reference is None
-                                            else chest_reference.target_prompt
-                                        )
+                                        target_prompt=target_prompt
                                     )
                                     chest_fallback_ready = True
                                 except Exception as exc:
@@ -1926,6 +851,7 @@ def run_dual_raw_servo_worker(
                                 output_dir=str(output_dir),
                                 details=_attempt_details(
                                     attempt,
+                                    target_prompt=target_prompt,
                                     chest_position_fallback_available=(
                                         chest_fallback_ready
                                     ),
@@ -1980,16 +906,12 @@ def run_dual_raw_servo_worker(
                         require_table = (
                             False
                             if chest_active
-                            else table_required is None
-                            or bool(table_required())
+                            else bool(table_required())
                         )
                         fallback_allowed = (
                             attempt.live_stream == stream_names[0]
                             and chest_fallback_ready
-                            and (
-                                position_fallback_allowed is None
-                                or bool(position_fallback_allowed())
-                            )
+                            and bool(position_fallback_allowed())
                         )
                         control_source_stream = (
                             position_source_stream
@@ -2021,8 +943,7 @@ def run_dual_raw_servo_worker(
                         head_branch_started_at: float | None = None
                         head_branch_elapsed_ms: float | None = None
                         try:
-                            snapshot = _capture_camera_stream(
-                                camera,
+                            snapshot = camera.capture_stream(
                                 control_source_stream,
                                 timeout_ms=max(
                                     1,
@@ -2065,9 +986,8 @@ def run_dual_raw_servo_worker(
                                 head_branch_started_at = time.perf_counter()
                                 was_holding = head_monitor.hold_active
                                 try:
-                                    head_snapshot = _poll_camera_stream(
-                                        camera,
-                                        stream_names[0],
+                                    head_snapshot = camera.poll_stream(
+                                        stream_names[0]
                                     )
                                     if head_snapshot is None:
                                         raise BasePoseCameraError(
@@ -2129,7 +1049,7 @@ def run_dual_raw_servo_worker(
                                             live_head_table_rgb_edges = None
                                             live_head_yaw_error = str(exc)
                                     effective_hold = (
-                                        monitor_result.hold_active
+                                        head_monitor.hold_active
                                         and live_head_table is None
                                         and not joint_chest_tracking_active
                                     )
@@ -2142,13 +1062,13 @@ def run_dual_raw_servo_worker(
                                             else "tracking"
                                         ),
                                         "target_streak": (
-                                            monitor_result.target_streak
+                                            head_monitor.target_streak
                                         ),
                                         "required_target_frames": (
                                             head_reacquire_frames
                                         ),
                                         "missing_streak": (
-                                            monitor_result.missing_streak
+                                            head_monitor.missing_streak
                                         ),
                                         "release_missing_frames": (
                                             head_release_missing_frames
@@ -2183,6 +1103,7 @@ def run_dual_raw_servo_worker(
                                             output_dir=str(output_dir),
                                             details=_attempt_details(
                                                 attempt,
+                                                target_prompt=target_prompt,
                                                 head_monitor=monitor_state,
                                             ),
                                         ),
@@ -2193,33 +1114,15 @@ def run_dual_raw_servo_worker(
                                         and live_head_table is None
                                         and not joint_chest_tracking_active
                                     ):
-                                        if monitor_result.reference is not None:
-                                            preempt_attempt = (
-                                                coordinator
-                                                .begin_head_monitor_reacquisition(
-                                                    monitor_result.reference
-                                                )
-                                            )
-                                            failure_reason = (
-                                                "head target reacquired for "
-                                                f"{head_reacquire_frames} consecutive "
-                                                "frames with desk"
-                                            )
-                                        else:
-                                            preempt_attempt = (
-                                                coordinator
-                                                .begin_head_monitor_reacquisition(
-                                                    use_qwen=True
-                                                )
-                                            )
-                                            pending_head_qwen[
-                                                preempt_attempt.attempt_id
-                                            ] = head_snapshot
-                                            failure_reason = (
-                                                "head target reacquired for "
-                                                f"{head_reacquire_frames} consecutive "
-                                                "frames without desk; requesting Qwen"
-                                            )
+                                        preempt_attempt = (
+                                            coordinator
+                                            .begin_head_monitor_reacquisition()
+                                        )
+                                        failure_reason = (
+                                            "head target reacquired for "
+                                            f"{head_reacquire_frames} consecutive "
+                                            "frames using text detection"
+                                        )
                                         switch_details = monitor_details
                                         failure_frame = _diagnostic_frame(
                                             frame_index,
@@ -2248,42 +1151,26 @@ def run_dual_raw_servo_worker(
                             ):
                                 fallback_head_yaw_attempted = True
                                 head_branch_started_at = time.perf_counter()
-                                try:
-                                    live_head_snapshot = _capture_camera_stream(
-                                        camera,
-                                        stream_names[0],
-                                        timeout_ms=max(
-                                            1,
-                                            int(
-                                                float(config.raw_camera_stale_s)
-                                                * 1000.0
-                                            ),
-                                        ),
-                                    )
-                                    (
-                                        live_head_target,
-                                        live_head_surface,
-                                        live_head_table,
-                                        live_head_desk_mask,
-                                        live_head_table_rgb_edges,
-                                        _,
-                                        _,
-                                    ) = _observe_head_yaw_snapshot(
-                                        live_head_snapshot,
-                                        tracker,
-                                        calibrations[stream_names[0]],
-                                        target_id=target_id,
-                                        surface_id=surface_id,
-                                    )
-                                except Exception as exc:
-                                    if isinstance(exc, _HeadYawObservationError):
-                                        live_head_target = exc.target
-                                        live_head_surface = exc.surface
-                                        live_head_desk_mask = exc.desk_mask
-                                        live_head_table_rgb_edges = (
-                                            exc.table_rgb_edges
-                                        )
-                                    live_head_yaw_error = str(exc)
+                                (
+                                    live_head_snapshot,
+                                    live_head_target,
+                                    live_head_surface,
+                                    live_head_table,
+                                    live_head_desk_mask,
+                                    live_head_table_rgb_edges,
+                                    live_head_yaw_error,
+                                ) = _capture_head_yaw(
+                                    camera,
+                                    stream_names[0],
+                                    timeout_ms=max(
+                                        1,
+                                        int(config.raw_camera_stale_s * 1000.0),
+                                    ),
+                                    tracker=tracker,
+                                    calibration=calibrations[stream_names[0]],
+                                    target_id=target_id,
+                                    surface_id=surface_id,
+                                )
                                 head_branch_elapsed_ms = 1000.0 * (
                                     time.perf_counter() - head_branch_started_at
                                 )
@@ -2387,8 +1274,7 @@ def run_dual_raw_servo_worker(
                                     else fallback_surface_id
                                 )
                                 try:
-                                    fallback_snapshot = _capture_camera_stream(
-                                        camera,
+                                    fallback_snapshot = camera.capture_stream(
                                         alternate_stream,
                                         timeout_ms=max(
                                             1,
@@ -2544,42 +1430,26 @@ def run_dual_raw_servo_worker(
                             and control_source_stream == stream_names[1]
                         ):
                             if not fallback_head_yaw_attempted:
-                                try:
-                                    live_head_snapshot = _capture_camera_stream(
-                                        camera,
-                                        stream_names[0],
-                                        timeout_ms=max(
-                                            1,
-                                            int(
-                                                float(config.raw_camera_stale_s)
-                                                * 1000.0
-                                            ),
-                                        ),
-                                    )
-                                    (
-                                        live_head_target,
-                                        live_head_surface,
-                                        live_head_table,
-                                        live_head_desk_mask,
-                                        live_head_table_rgb_edges,
-                                        _,
-                                        _,
-                                    ) = _observe_head_yaw_snapshot(
-                                        live_head_snapshot,
-                                        tracker,
-                                        calibrations[stream_names[0]],
-                                        target_id=target_id,
-                                        surface_id=surface_id,
-                                    )
-                                except Exception as exc:
-                                    if isinstance(exc, _HeadYawObservationError):
-                                        live_head_target = exc.target
-                                        live_head_surface = exc.surface
-                                        live_head_desk_mask = exc.desk_mask
-                                        live_head_table_rgb_edges = (
-                                            exc.table_rgb_edges
-                                        )
-                                    live_head_yaw_error = str(exc)
+                                (
+                                    live_head_snapshot,
+                                    live_head_target,
+                                    live_head_surface,
+                                    live_head_table,
+                                    live_head_desk_mask,
+                                    live_head_table_rgb_edges,
+                                    live_head_yaw_error,
+                                ) = _capture_head_yaw(
+                                    camera,
+                                    stream_names[0],
+                                    timeout_ms=max(
+                                        1,
+                                        int(config.raw_camera_stale_s * 1000.0),
+                                    ),
+                                    tracker=tracker,
+                                    calibration=calibrations[stream_names[0]],
+                                    target_id=target_id,
+                                    surface_id=surface_id,
+                                )
                             if (
                                 live_head_yaw_error is not None
                                 or live_head_snapshot is None
@@ -2801,6 +1671,7 @@ def run_dual_raw_servo_worker(
                                         hard=False,
                                         details=_attempt_details(
                                             attempt,
+                                            target_prompt=target_prompt,
                                             match_invalid_frames=invalid_frames,
                                             control_source_stream=(
                                                 control_source_stream
@@ -2840,173 +1711,9 @@ def run_dual_raw_servo_worker(
                             fallback_surface_id = (
                                 None if surface is None else surface.track_id
                             )
-                        refresh_details: dict[str, Any] = {}
-                        if (
-                            reference_updater is not None
-                            and control_source_stream == attempt.live_stream
-                        ):
-                            update_result = reference_updater.poll_latest()
-                            if update_result is not None:
-                                if update_result.generation != generation:
-                                    refresh_details[
-                                        "latest_reference_refresh"
-                                    ] = {
-                                        "status": "discarded",
-                                        "reason": "generation",
-                                        "source_generation": (
-                                            update_result.generation
-                                        ),
-                                        "source_frame": update_result.frame_index,
-                                    }
-                                elif (
-                                    update_result.stream_name
-                                    != attempt.live_stream
-                                ):
-                                    refresh_details[
-                                        "latest_reference_refresh"
-                                    ] = {
-                                        "status": "discarded",
-                                        "reason": "stream",
-                                        "source_stream": (
-                                            update_result.stream_name
-                                        ),
-                                        "source_frame": update_result.frame_index,
-                                    }
-                                elif frame_index - update_result.frame_index > max(
-                                    5,
-                                    2
-                                    * config.raw_reference_update_interval_frames,
-                                ):
-                                    refresh_details[
-                                        "latest_reference_refresh"
-                                    ] = {
-                                        "status": "discarded",
-                                        "reason": "stale",
-                                        "source_frame": update_result.frame_index,
-                                        "age_frames": (
-                                            frame_index
-                                            - update_result.frame_index
-                                        ),
-                                    }
-                                elif _attempt_uses_surface_text(attempt):
-                                    refresh_details[
-                                        "latest_reference_refresh"
-                                    ] = {
-                                        "status": "discarded",
-                                        "reason": "surface_text_prompt",
-                                        "source_frame": update_result.frame_index,
-                                    }
-                                elif (
-                                    not _attempt_uses_target_text(attempt)
-                                    and not update_result.target_validated
-                                ):
-                                    refresh_details[
-                                        "latest_reference_refresh"
-                                    ] = {
-                                        "status": "discarded",
-                                        "reason": "prompt_mode",
-                                        "source_frame": update_result.frame_index,
-                                        "source_mode": "target_text",
-                                    }
-                                elif not update_result.accepted:
-                                    refresh_details[
-                                        "latest_reference_refresh"
-                                    ] = {
-                                        "status": "rejected",
-                                        "reason": update_result.reason,
-                                        "source_frame": update_result.frame_index,
-                                        "target_confidence": (
-                                            update_result.target_confidence
-                                        ),
-                                        "target_iou": update_result.target_iou,
-                                        "surface_confidence": (
-                                            update_result.surface_confidence
-                                        ),
-                                        "surface_iou": update_result.surface_iou,
-                                    }
-                                else:
-                                    try:
-                                        if update_result.surface_embedding is None:
-                                            raise RuntimeError(
-                                                "accepted refresh has no desk PE"
-                                            )
-                                        if _attempt_uses_target_text(attempt):
-                                            tracker.install_surface_embedding(
-                                                update_result.surface_embedding
-                                            )
-                                        else:
-                                            if update_result.target_embedding is None:
-                                                raise RuntimeError(
-                                                    "accepted refresh has no target PE"
-                                                )
-                                            tracker.install_reference_embeddings(
-                                                target_embedding=(
-                                                    update_result.target_embedding
-                                                ),
-                                                surface_embedding=(
-                                                    update_result.surface_embedding
-                                                ),
-                                            )
-                                    except Exception as exc:
-                                        refresh_details[
-                                            "latest_reference_refresh"
-                                        ] = {
-                                            "status": "error",
-                                            "source_frame": (
-                                                update_result.frame_index
-                                            ),
-                                            "error": str(exc),
-                                        }
-                                    else:
-                                        attempt = replace(
-                                            attempt,
-                                            reference=update_result.reference,
-                                        )
-                                        refresh_details[
-                                            "latest_reference_refresh"
-                                        ] = {
-                                            "status": "applied",
-                                            "source_frame": (
-                                                update_result.frame_index
-                                            ),
-                                            "source_stream": (
-                                                update_result.stream_name
-                                            ),
-                                            "target_confidence": (
-                                                update_result.target_confidence
-                                            ),
-                                            "target_iou": update_result.target_iou,
-                                            "surface_confidence": (
-                                                update_result.surface_confidence
-                                            ),
-                                            "surface_iou": update_result.surface_iou,
-                                        }
-                        if control_source_stream == attempt.live_stream:
-                            latest, latest_reason = latest_gates[
-                                attempt.live_stream
-                            ].consider(
-                                frame_index=frame_index,
-                                stream_name=attempt.live_stream,
-                                rgb=snapshot.rgb,
-                                camera_timestamp=snapshot.timestamp,
-                                target_prompt=attempt.reference.target_prompt,
-                                target_bbox_xyxy=target.bbox_xyxy,
-                                table_bboxes_xyxy=(
-                                    ()
-                                    if surface is None
-                                    else (surface.bbox_xyxy,)
-                                ),
-                                target_confidence=target.confidence,
-                                target_geometry_valid=True,
-                                table_geometry_valid=(
-                                    observation.table is not None
-                                ),
-                            )
-                        else:
-                            latest = None
-                            latest_reason = "chest_position_fallback"
                         details = _attempt_details(
                             attempt,
+                            target_prompt=target_prompt,
                             match_invalid_frames=0,
                             control_source_stream=control_source_stream,
                             basket_source=basket_source_details,
@@ -3016,31 +1723,8 @@ def run_dual_raw_servo_worker(
                             surface_track_id=(
                                 None if surface is None else surface.track_id
                             ),
-                            latest_reference_update=latest_reason,
-                            **refresh_details,
                             **monitor_details,
                         )
-                        if latest is not None:
-                            if (
-                                reference_updater is not None
-                                and not _attempt_uses_surface_text(attempt)
-                            ):
-                                reference_updater.submit(
-                                    DualReferenceUpdateRequest(
-                                        generation=generation,
-                                        frame_index=frame_index,
-                                        reference=latest,
-                                        require_target_embedding=(
-                                            not _attempt_uses_target_text(attempt)
-                                        ),
-                                    )
-                                )
-                                details[
-                                    "latest_reference_refresh_scheduled"
-                                ] = {
-                                    "source_frame": frame_index,
-                                    "source_stream": attempt.live_stream,
-                                }
                         if target_reacquired:
                             details.update(
                                 {
@@ -3090,7 +1774,7 @@ def run_dual_raw_servo_worker(
                     )
                     if next_attempt is None:
                         terminal_error = (
-                            "both-camera Qwen failover exhausted: "
+                            "both-camera text failover exhausted: "
                             f"{failure_reason or 'perception failed'}"
                         )
                         _publish_worker_event(
@@ -3105,6 +1789,7 @@ def run_dual_raw_servo_worker(
                                 hard=True,
                                 details=_attempt_details(
                                     attempt,
+                                    target_prompt=target_prompt,
                                     terminal_cause=(
                                         failure_reason or "perception failed"
                                     ),
@@ -3113,17 +1798,8 @@ def run_dual_raw_servo_worker(
                             ),
                         )
                         gate.cancel(generation)
-                        generation_finished = True
                         break
                     attempt = next_attempt
-                    qwen_handoff_requires_hold = (
-                        attempt.stage in QWEN_HOLD_STAGES
-                    )
-                    if (
-                        qwen_handoff_requires_hold
-                        and handoff_hold_event is not None
-                    ):
-                        handoff_hold_event.clear()
                     _publish_worker_event(
                         events,
                         observation_events,
@@ -3134,22 +1810,14 @@ def run_dual_raw_servo_worker(
                             output_dir=str(output_dir),
                             error=failure_reason or "perception failed",
                             hard=False,
-                            details=_attempt_details(attempt, **switch_details),
+                            details=_attempt_details(
+                                attempt,
+                                target_prompt=target_prompt,
+                                **switch_details,
+                            ),
                             frame=failure_frame,
                         ),
                     )
-                    if (
-                        qwen_handoff_requires_hold
-                        and handoff_hold_event is not None
-                    ):
-                        while (
-                            gate.is_active(generation)
-                            and not stop_event.is_set()
-                            and not handoff_hold_event.wait(timeout=0.05)
-                        ):
-                            pass
-                if generation_finished:
-                    continue
             except Exception as exc:
                 _publish_worker_event(
                     events,
@@ -3166,7 +1834,5 @@ def run_dual_raw_servo_worker(
                 gate.cancel(generation)
     finally:
         perception_pool.shutdown(wait=True, cancel_futures=True)
-        if reference_updater is not None:
-            reference_updater.close()
         if camera is not None:
             camera.close()

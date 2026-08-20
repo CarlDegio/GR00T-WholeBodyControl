@@ -43,8 +43,6 @@ class DetectionFrameData:
     camera_stream: str | None = None
     attempt_id: int | None = None
     failover_stage: str | None = None
-    reference_source_stream: str | None = None
-    reference_kind: str | None = None
     prompt_mode: str | None = None
     target_bbox_xyxy: tuple[float, float, float, float] | None = None
     target_mask: np.ndarray | None = field(default=None, repr=False)
@@ -522,11 +520,20 @@ class FrameDiagnosticsWriter:
             "heading_setpoint_error_rad": value.get("heading_setpoint_error_rad"),
             "yaw_error_source": value.get("yaw_error_source"),
             "yaw_error_trusted": value.get("yaw_error_trusted"),
-            "post_stop_duration_s": value.get("post_stop_duration_s"),
-            "post_stop_elapsed_s": value.get("post_stop_elapsed_s"),
+            "post_stop_sample_frames": value.get("post_stop_sample_frames"),
+            "post_stop_deviation_frames": value.get(
+                "post_stop_deviation_frames"
+            ),
             "post_stop_sample_count": value.get("post_stop_sample_count"),
             "post_stop_valid_sample_count": value.get("post_stop_valid_sample_count"),
             "post_stop_invalid_sample_count": value.get("post_stop_invalid_sample_count"),
+            "post_stop_out_of_tolerance_streak": value.get(
+                "post_stop_out_of_tolerance_streak"
+            ),
+            "post_stop_max_out_of_tolerance_streak": value.get(
+                "post_stop_max_out_of_tolerance_streak"
+            ),
+            "post_stop_realign_count": value.get("post_stop_realign_count"),
             "invalid_frames": value.get("invalid_frames"),
             "vertical_recenter_armed": value.get("vertical_recenter_armed"),
             "vertical_recenter_elapsed_s": value.get("vertical_recenter_elapsed_s"),
@@ -542,7 +549,6 @@ class FrameDiagnosticsWriter:
             "vx": float(value.get("vx", 0.0)),
             "vy": float(value.get("vy", 0.0)),
             "wz": float(value.get("wz", 0.0)),
-            "duration_s": float(value.get("duration_s", 0.0)),
         }
 
     def write(
@@ -576,8 +582,6 @@ class FrameDiagnosticsWriter:
                 None if frame.attempt_id is None else int(frame.attempt_id)
             ),
             "failover_stage": frame.failover_stage,
-            "reference_source_stream": frame.reference_source_stream,
-            "reference_kind": frame.reference_kind,
             "prompt_mode": frame.prompt_mode,
             "perception_kind": frame.perception_kind,
             "perception_error": frame.perception_error,

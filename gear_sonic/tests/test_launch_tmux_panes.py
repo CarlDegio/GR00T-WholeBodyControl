@@ -213,6 +213,7 @@ def test_build_deploy_command_uses_resolved_v1_1_policy(tmp_path: Path) -> None:
     )
 
     assert f"cd {deploy_dir}" in command
+    assert "./deploy.sh --yes " in command
     assert "--cp policy/sonic_v1_1/model" in command
     assert "--obs-config policy/sonic_v1_1/observation_config.yaml" in command
     assert command.endswith("sim")
@@ -280,11 +281,12 @@ def test_yaml_contains_every_launch_parameter() -> None:
     assert loaded.base_pose_dual_chest_depth_stream == "camera/chest_view_depth"
     assert loaded.base_pose_raw_min_linear_speed_m_s == pytest.approx(0.35)
     assert loaded.base_pose_raw_max_lateral_speed_m_s == pytest.approx(0.4)
-    assert loaded.base_pose_mode == "dual_raw_yoloe_servo"
+    assert not hasattr(loaded, "base_pose_mode")
     assert not hasattr(loaded, "base_pose_vision_backend")
     assert not hasattr(loaded, "base_pose_model")
     assert not hasattr(loaded, "base_pose_codex_fast")
-    assert loaded.base_pose_qwenvl_model == "qwen3-vl-plus"
+    assert not hasattr(loaded, "base_pose_qwenvl_model")
+    assert not hasattr(loaded, "base_pose_dual_qwenvl_fallback_model")
     assert loaded.slam_debug is False
 
 
@@ -503,7 +505,7 @@ def test_base_pose_agent_uses_gateway_arbitration_and_fixed_task() -> None:
     assert "--task 'align with the medicine bottle and basket'" in command
     assert "--target-prompt bluebasket" in command
     assert "--surface-prompt 'work bench'" in command
-    assert "--mode dual_raw_yoloe_servo" in command
+    assert "--mode" not in command
     assert "--dual-head-camera-stream ego_view" in command
     assert "--dual-head-depth-stream camera/ego_view_depth" in command
     assert "--dual-chest-camera-stream chest_view" in command
@@ -511,9 +513,9 @@ def test_base_pose_agent_uses_gateway_arbitration_and_fixed_task() -> None:
     assert "--sensor-gateway-endpoint tcp://127.0.0.1:5560" in command
     assert "--control-gateway-endpoint tcp://127.0.0.1:5565" in command
     assert "--control-gateway-intent-endpoint tcp://127.0.0.1:5561" in command
-    assert ". ./.env.local" in command
-    assert "--qwenvl-model qwen3-vl-plus" in command
-    assert "--qwenvl-timeout-seconds 600.0" in command
+    assert ". ./.env.local" not in command
+    assert "--qwenvl" not in command
+    assert "dual-qwenvl" not in command
     assert "--dual-rgbd-buffer-size 8" in command
     assert "--dual-rgbd-poll-hz 60.0" in command
     assert "--dual-head-reacquire-frames 1" in command
@@ -523,12 +525,15 @@ def test_base_pose_agent_uses_gateway_arbitration_and_fixed_task() -> None:
     assert "--raw-chest-fallback-lateral-tolerance-m" not in command
     assert "--raw-head-target-distance-m 1.0" in command
     assert "--raw-chest-target-distance-m 0.8" in command
+    assert "--raw-forward-recenter-yaw-speed-rad-s 0.3" in command
+    assert "--raw-post-stop-sample-frames 30" in command
+    assert "--raw-post-stop-deviation-frames 10" in command
     assert "--vision-backend" not in command
     assert "codex" not in command.lower()
     assert "--port 5558" not in command
 
 
-def test_base_pose_qwenvl_command_loads_local_key_without_persisting_by_default() -> None:
+def test_base_pose_command_has_no_remote_vision_model_arguments() -> None:
     command = build_base_pose_agent_command(
         InferenceLaunchConfig(
             base_pose_enabled=True,
@@ -537,18 +542,17 @@ def test_base_pose_qwenvl_command_loads_local_key_without_persisting_by_default(
         Path("/workspace/sonic"),
     )
 
-    assert ". ./.env.local" in command
+    assert ". ./.env.local" not in command
     assert "--vision-backend" not in command
     assert "codex" not in command.lower()
-    assert "--qwenvl-thinking-budget 500" in command
+    assert "qwen" not in command.lower()
     assert "--persist-diagnostics" not in command
 
 
-def test_base_pose_yoloe_command_uses_aligned_raw_depth_and_local_model() -> None:
+def test_base_pose_yoloe_command_uses_dual_raw_depth_and_local_model() -> None:
     config = InferenceLaunchConfig(
         base_pose_enabled=True,
         base_pose_task="align",
-        base_pose_mode="raw_yoloe_servo",
     )
     command = build_base_pose_agent_command(config, Path("/workspace/sonic"))
     executor = build_planner_velocity_executor_command(
@@ -556,8 +560,9 @@ def test_base_pose_yoloe_command_uses_aligned_raw_depth_and_local_model() -> Non
         Path("/workspace/sonic"),
     )
 
-    assert "--mode raw_yoloe_servo" in command
-    assert "--depth-stream camera/ego_view_depth" in command
+    assert "--mode" not in command
+    assert "--dual-head-depth-stream camera/ego_view_depth" in command
+    assert "--dual-chest-depth-stream camera/chest_view_depth" in command
     assert "--raw-yoloe-model-path tools/yoloe26m/weights/yoloe-26m-seg.pt" in command
     assert "--raw-head-target-distance-m 1.0" in command
     assert "--raw-chest-target-distance-m 0.8" in command
@@ -565,11 +570,10 @@ def test_base_pose_yoloe_command_uses_aligned_raw_depth_and_local_model() -> Non
     assert "--orientation-output-endpoint 'tcp://*:5569'" in executor
 
 
-def test_orientation_telemetry_is_enabled_for_dual_raw_yoloe_mode() -> None:
+def test_orientation_telemetry_is_enabled_for_base_pose() -> None:
     executor = build_planner_velocity_executor_command(
         InferenceLaunchConfig(
             base_pose_enabled=True,
-            base_pose_mode="dual_raw_yoloe_servo",
         ),
         Path("/workspace/sonic"),
     )

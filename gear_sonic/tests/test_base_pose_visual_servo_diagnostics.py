@@ -39,7 +39,6 @@ def test_writer_serializes_nonfinite_controller_values_as_null(tmp_path) -> None
             "vx": float("inf"),
             "vy": 0.0,
             "wz": 0.0,
-            "duration_s": 0.15,
         },
     )
 
@@ -220,7 +219,7 @@ def test_completion_capture_saves_three_context_frames_and_all_post_stop_views(
         )
 
     controller = {"phase": "post_stop_sampling"}
-    command = {"vx": 0.0, "vy": 0.0, "wz": 0.0, "duration_s": 0.15}
+    command = {"vx": 0.0, "vy": 0.0, "wz": 0.0}
     for index in range(6):
         writer.write(
             paired_frame(index),

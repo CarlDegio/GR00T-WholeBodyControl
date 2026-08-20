@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 import math
 from dataclasses import replace
 
@@ -50,13 +49,11 @@ def test_velocity_message_publishes_each_viewer_overlay_independently(
     overlay_kwargs: dict[str, object],
     expected_key: str,
 ) -> None:
-    payload = json.loads(
-        raw_servo.build_servo_velocity_message(
-            raw_servo.ServoCommand(0.0, 0.0, 0.0),
-            action="hold",
-            camera_stream="camera/ego_view",
-            **overlay_kwargs,
-        )
+    payload = raw_servo.build_servo_velocity_payload(
+        raw_servo.ServoCommand(0.0, 0.0, 0.0),
+        action="hold",
+        camera_stream="camera/ego_view",
+        **overlay_kwargs,
     )
 
     assert expected_key in payload["viewer_overlay"]
@@ -99,6 +96,7 @@ def test_yoloe_tracker_uses_configured_surface_text() -> None:
     tracker.class_names = None
     tracker._initial_surface_embedding = None
     tracker.surface_prompt = "workbench"
+    tracker._model_updated = lambda: None
 
     artifact = tracker.start_all_text(target_prompt="blue basket")
 
@@ -123,7 +121,12 @@ def _observation(
             1.2,
             lateral_anchor_px=(320.0, 200.0),
         ),
-        table=TableGeometry(yaw, 1.0, 100, 0.01, (1.0, 0.0)),
+        table=TableGeometry(
+            yaw_error_rad=yaw,
+            line_length_px=100.0,
+            valid_depth_samples=20,
+            line_center_px=(320.0, 200.0),
+        ),
         camera_timestamp=1.0,
         target_track_id=1,
         surface_track_id=2,
@@ -336,28 +339,41 @@ def test_hough_candidates_are_strictly_longer_than_45_pixels() -> None:
     )
 
 
-def test_table_geometry_uses_camera_plane_without_body_transform(
+def test_table_geometry_uses_signed_pixel_angle_without_deprojection(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    def fail_camera_to_body(_self, _points):
-        raise AssertionError("table edge must remain in the camera frame")
-
-    monkeypatch.setattr(
-        RawServoCalibration,
-        "camera_to_body",
-        fail_camera_to_body,
+    segment = raw_servo._PixelLineSegment(
+        # Deliberately reverse the endpoints: yaw must not depend on the
+        # arbitrary direction returned by HoughLinesP.
+        endpoint_a=np.array([220.0, 80.0]),
+        endpoint_b=np.array([20.0, 120.0]),
+        length=math.hypot(200.0, 40.0),
     )
-    mask = np.zeros((200, 240), dtype=np.uint8)
-    mask[60:160, 20:220] = 1
+    monkeypatch.setattr(
+        raw_servo,
+        "_rgb_mask_line_segments",
+        lambda *_args, **_kwargs: [segment],
+    )
+    monkeypatch.setattr(
+        raw_servo,
+        "_deproject",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("table yaw must not deproject pixels")
+        ),
+    )
+    mask = np.ones((200, 240), dtype=np.uint8)
 
     geometry = estimate_table_geometry(
-        _snapshot(rgb=_rgb_with_mask_contrast(mask)),
+        _snapshot(),
         mask,
         _calibration(),
     )
 
-    assert geometry.line_endpoints_px is not None
-    assert geometry.line_length_m > 0.0
+    assert geometry.yaw_error_rad == pytest.approx(math.atan2(40.0, 200.0))
+    assert geometry.line_endpoints_px == ((20.0, 120.0), (220.0, 80.0))
+    assert geometry.line_length_px == pytest.approx(math.hypot(200.0, 40.0))
+    assert geometry.valid_depth_samples == 20
+    assert geometry.line_center_px == pytest.approx((120.0, 100.0))
 
 
 def test_table_geometry_rejects_rgb_lines_not_longer_than_45_pixels(
@@ -440,7 +456,7 @@ def test_diagnostic_frame_carries_completed_desk_mask_by_value() -> None:
     assert np.count_nonzero(frame.completed_surface_mask) == 20_000
 
 
-def test_chest_approach_mode_does_not_recenter_at_horizontal_guard() -> None:
+def test_chest_approach_mode_recenters_at_horizontal_guard() -> None:
     controller = VisualServoController(
         chest_approach_only=True,
         min_linear_speed_m_s=0.4,
@@ -466,25 +482,33 @@ def test_chest_approach_mode_does_not_recenter_at_horizontal_guard() -> None:
 
     guarded = replace(
         centered,
-        target=replace(
-            centered.target,
-            forward_m=1.2,
-            body_xyz_m=(1.2, 0.0, 0.5),
-            median_depth_m=1.2,
-        ),
         target_bbox_xyxy=(0.0, 120.0, 100.0, 360.0),
     )
-    command = controller.update(guarded, now=2.1, joint_completion=True)
-    assert controller.phase is ServoPhase.FORWARD_APPROACH
+    command = controller.update(guarded, now=2.1)
+    assert controller.phase is ServoPhase.FORWARD_RECENTER
     assert command.vx > 0.4
     assert command.vy == 0.0
-    assert command.wz == 0.0
+    assert command.wz > 0.0
 
     command = controller.update(centered, now=2.7)
     assert controller.phase is ServoPhase.FORWARD_APPROACH
     assert command.vx > 0.4
     assert command.vy == 0.0
     assert command.wz == 0.0
+
+
+def test_forward_recenter_can_only_be_entered_from_forward_approach() -> None:
+    controller = VisualServoController()
+    controller.phase = ServoPhase.YAW_ALIGN
+
+    with pytest.raises(
+        RuntimeError,
+        match="forward recenter can only be entered from forward_approach",
+    ):
+        controller._transition(
+            ServoPhase.FORWARD_RECENTER,
+            "invalid non-approach transition",
+        )
 
 
 def test_position_errors_bypass_ema_while_yaw_remains_filtered() -> None:
@@ -581,7 +605,6 @@ def test_joint_completion_stops_chest_approach_at_chest_standoff() -> None:
         forward_tolerance_m=0.07,
         lateral_tolerance_m=0.07,
         stable_frames=2,
-        post_stop_sample_s=0.0,
         chest_approach_only=True,
     )
     controller.reset(0.0, initial_phase=ServoPhase.FORWARD_APPROACH)
@@ -615,12 +638,11 @@ def test_joint_completion_stops_chest_approach_at_chest_standoff() -> None:
     assert controller.terminal_reason == "aligned"
 
 
-def test_joint_completion_defaults_to_five_stable_frames() -> None:
+def test_joint_completion_defaults_to_three_stable_frames() -> None:
     controller = VisualServoController(
         target_distance_m=0.7,
         forward_tolerance_m=0.07,
         lateral_tolerance_m=0.07,
-        post_stop_sample_s=0.0,
         chest_approach_only=True,
     )
     controller.reset(0.0, initial_phase=ServoPhase.FORWARD_APPROACH)
@@ -637,7 +659,7 @@ def test_joint_completion_defaults_to_five_stable_frames() -> None:
         table_camera_stream="ego_view",
     )
 
-    for frame_index in range(4):
+    for frame_index in range(2):
         command = controller.update(
             observation,
             now=0.1 * (frame_index + 1),
@@ -649,13 +671,79 @@ def test_joint_completion_defaults_to_five_stable_frames() -> None:
 
     command = controller.update(
         observation,
-        now=0.5,
+        now=0.3,
         joint_completion=True,
     )
 
     assert command.velocity == (0.0, 0.0, 0.0)
     assert controller.phase is ServoPhase.DONE
     assert controller.terminal_reason == "aligned"
+
+
+def test_post_stop_sampling_finishes_only_after_thirty_frames() -> None:
+    controller = VisualServoController(
+        target_distance_m=1.2,
+        post_stop_sample_frames=30,
+        post_stop_deviation_frames=10,
+    )
+    controller.phase = ServoPhase.POST_STOP_SAMPLING
+    aligned = _observation(bbox=(240.0, 120.0, 400.0, 360.0))
+
+    for frame_index in range(29):
+        controller.update(aligned, now=10.0 + frame_index)
+        assert controller.phase is ServoPhase.POST_STOP_SAMPLING
+        assert not controller.terminal
+
+    controller.update(aligned, now=39.0)
+
+    assert controller.post_stop_sample_count == 30
+    assert controller.phase is ServoPhase.DONE
+    assert controller.terminal_reason == "aligned"
+
+
+def test_post_stop_sampling_requires_ten_consecutive_deviation_frames() -> None:
+    controller = VisualServoController(
+        target_distance_m=1.2,
+        forward_tolerance_m=0.1,
+        ema_alpha=1.0,
+        post_stop_sample_frames=30,
+        post_stop_deviation_frames=10,
+    )
+    controller.phase = ServoPhase.POST_STOP_SAMPLING
+    aligned = _observation(bbox=(240.0, 120.0, 400.0, 360.0))
+    deviated = replace(
+        aligned,
+        target=replace(
+            aligned.target,
+            forward_m=1.5,
+            body_xyz_m=(1.5, 0.0, 0.5),
+            median_depth_m=1.5,
+        ),
+    )
+
+    for frame_index in range(9):
+        controller.update(deviated, now=0.1 * (frame_index + 1))
+    assert controller.post_stop_out_of_tolerance_streak == 9
+
+    controller.update(aligned, now=1.0)
+    assert controller.post_stop_out_of_tolerance_streak == 0
+
+    for frame_index in range(9):
+        controller.update(deviated, now=1.1 + 0.1 * frame_index)
+        assert controller.phase is ServoPhase.POST_STOP_SAMPLING
+
+    command = controller.update(deviated, now=2.0)
+
+    assert controller.post_stop_sample_count == 20
+    assert controller.post_stop_out_of_tolerance_streak == 10
+    assert controller.post_stop_max_out_of_tolerance_streak == 10
+    assert controller.post_stop_realign_count == 1
+    assert controller.phase is ServoPhase.TRANSLATE_TARGET
+    assert not controller.terminal
+    assert command.vx > 0.0
+    assert "existing YOLOE navigation" in (
+        controller.last_transition_reason or ""
+    )
 
 
 def test_position_fallback_remains_allowed_during_head_yaw_phases() -> None:

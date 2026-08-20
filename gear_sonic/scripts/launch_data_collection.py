@@ -593,6 +593,7 @@ def main(config: DataCollectionLaunchConfig):
     deploy_cmd = (
         f"cd {repo_root / 'gear_sonic_deploy'} && "
         f"./deploy.sh "
+        f"--yes "
         f"--input-type {config.deploy_input_type} "
         f"--zmq-host {config.deploy_zmq_host} "
         f"--hand-type dex1 "
@@ -686,9 +687,6 @@ def main(config: DataCollectionLaunchConfig):
     if config.pico_video:
         gateway_summary += " | PICO Video (USBOnly, supervised)"
     print(f"  Window 'gateways': {gateway_summary}")
-    print()
-    print("  ** deploy.sh (pane 0) is waiting for confirmation —")
-    print("     click on pane 0 and press Enter to proceed **")
     print()
     print("  Controls:")
     print("    Ctrl+b, arrow keys  - Switch between panes")

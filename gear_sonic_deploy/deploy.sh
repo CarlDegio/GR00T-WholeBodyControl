@@ -204,6 +204,7 @@ show_usage() {
     echo ""
     echo "Options:"
     echo "  -h, --help              Show this help message"
+    echo "  -y, --yes               Proceed without the interactive confirmation"
     echo "  --cp, --checkpoint PATH Set the checkpoint path (default: policy/checkpoints/example/model_step_000000)"
     echo "  --obs-config PATH       Set the observation config file (default: policy/configs/example.yaml)"
     echo "  --planner PATH          Set the planner model path (default: planner/example.onnx)"
@@ -257,6 +258,7 @@ INPUT_TYPE="$INPUT_TYPE_DEFAULT"
 OUTPUT_TYPE="$OUTPUT_TYPE_DEFAULT"
 ZMQ_HOST="$ZMQ_HOST_DEFAULT"
 EXTRA_PASSTHROUGH_ARGS=()
+AUTO_CONFIRM=false
 
 # Parse arguments
 while [[ $# -gt 0 ]]; do
@@ -264,6 +266,10 @@ while [[ $# -gt 0 ]]; do
         -h|--help)
             show_usage
             exit 0
+            ;;
+        -y|--yes)
+            AUTO_CONFIRM=true
+            shift
             ;;
         --cp|--checkpoint)
             if [[ -z "$2" ]]; then
@@ -564,7 +570,12 @@ else
     echo -e "${YELLOW}📋 This will start the simulation control system.${NC}"
 fi
 echo ""
-read -p "$(echo -e ${GREEN}Proceed with deployment? [Y/n]: ${NC})" confirm
+if [[ "$AUTO_CONFIRM" == true ]]; then
+    confirm="Y"
+    echo -e "${GREEN}Proceeding automatically (--yes).${NC}"
+else
+    read -p "$(echo -e ${GREEN}Proceed with deployment? [Y/n]: ${NC})" confirm
+fi
 
 if [[ "$confirm" =~ ^[Yy]$ ]] || [[ -z "$confirm" ]]; then
     echo ""

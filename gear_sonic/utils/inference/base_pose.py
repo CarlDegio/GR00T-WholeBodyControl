@@ -1,14 +1,12 @@
-"""Head-camera multimodal base-pose adjustment policy for Unitree G1."""
+"""RGB-D camera utilities for Unitree G1 base-pose adjustment."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-import base64
 import json
 import math
 import os
-import sys
 import tempfile
 import time
 from typing import Any, Callable, Mapping, Sequence
@@ -24,17 +22,8 @@ from gear_sonic.camera.calibration import (
 )
 from gear_sonic.camera.sensor_server import ImageMessageSchema
 
-
-DEFAULT_QWENVL_PLUS_MODEL = "qwen3-vl-plus"
-DEFAULT_QWENVL_BASE_URL = (
-    "https://dashscope-intl.aliyuncs.com/compatible-mode/v1"
-)
 class BasePoseCameraError(RuntimeError):
     """Raised when a head-camera observation is unavailable or malformed."""
-
-
-class BasePoseValidationError(ValueError):
-    """Raised when structured YOLOE grounding output is invalid."""
 
 
 @dataclass(frozen=True)
@@ -355,164 +344,3 @@ class DualAlignedRGBDCamera:
     def close(self) -> None:
         self._socket.close()
         self._context.term()
-
-
-def _dashscope_api_key(env_file: str | Path | None = None) -> str:
-    key = os.environ.get("DASHSCOPE_API_KEY", "").strip()
-    if key:
-        return key
-    path = Path(env_file) if env_file is not None else Path(sys.prefix) / ".env"
-    if path.is_file():
-        for raw_line in path.read_text(encoding="utf-8").splitlines():
-            line = raw_line.strip()
-            if not line or line.startswith("#") or "=" not in line:
-                continue
-            name, value = line.split("=", 1)
-            if name.strip() == "DASHSCOPE_API_KEY" and value.strip():
-                return value.strip().strip("\"'")
-    raise RuntimeError(
-        "Qwen-VL requires DASHSCOPE_API_KEY in the environment or "
-        f"{path}"
-    )
-
-
-class QwenVLStructuredVisionClient:
-    """Call Qwen-VL Plus through DashScope's OpenAI-compatible API."""
-
-    def __init__(
-        self,
-        *,
-        model: str = DEFAULT_QWENVL_PLUS_MODEL,
-        base_url: str = DEFAULT_QWENVL_BASE_URL,
-        timeout_seconds: float = 600.0,
-        thinking_budget: int = 500,
-        enable_thinking: bool = True,
-        api_key: str | None = None,
-        env_file: str | Path | None = None,
-        client: Any | None = None,
-    ):
-        self.model = model
-        self.base_url = base_url
-        self.timeout_seconds = float(timeout_seconds)
-        self.thinking_budget = int(thinking_budget)
-        self.enable_thinking = bool(enable_thinking)
-        self.last_reasoning_content = ""
-        self.last_answer_content = ""
-        if self.enable_thinking and self.thinking_budget <= 0:
-            raise ValueError("Qwen-VL thinking_budget must be positive")
-        if client is not None:
-            self.client = client
-            return
-        key = api_key or _dashscope_api_key(env_file)
-        try:
-            from openai import OpenAI
-        except ImportError as exc:
-            raise RuntimeError(
-                "Qwen-VL requires the openai package in .venv_inference"
-            ) from exc
-        import httpx
-
-        proxy = (
-            os.environ.get("HTTPS_PROXY")
-            or os.environ.get("https_proxy")
-            or os.environ.get("HTTP_PROXY")
-            or os.environ.get("http_proxy")
-        )
-        http_client = (
-            httpx.Client(proxy=proxy) if proxy else httpx.Client(trust_env=False)
-        )
-        self.client = OpenAI(
-            api_key=key,
-            base_url=base_url,
-            http_client=http_client,
-        )
-
-    @staticmethod
-    def _parse_json_content(content: str) -> dict[str, Any]:
-        text = content.strip()
-        if not text:
-            raise BasePoseValidationError("Qwen-VL base-pose output is empty")
-        if text.startswith("```") and text.endswith("```"):
-            lines = text.splitlines()
-            if len(lines) >= 3:
-                text = "\n".join(lines[1:-1]).strip()
-        try:
-            value = json.loads(text)
-        except json.JSONDecodeError as exc:
-            raise BasePoseValidationError(
-                "Qwen-VL base-pose output is not valid JSON"
-            ) from exc
-        if not isinstance(value, dict):
-            raise BasePoseValidationError(
-                "Qwen-VL base-pose output must be a JSON object"
-            )
-        return value
-
-    def run(
-        self,
-        *,
-        prompt: str,
-        image_paths: Sequence[str | Path],
-        schema: Mapping[str, Any],
-        schema_filename: str,
-        cwd: str | Path,
-    ) -> dict[str, Any]:
-        resolved_images = [Path(path).resolve() for path in image_paths]
-        for path in resolved_images:
-            if not path.is_file():
-                raise FileNotFoundError(f"model image input not found: {path}")
-        workdir = Path(cwd).resolve()
-        _write_json(workdir / schema_filename, schema)
-        content: list[dict[str, Any]] = []
-        for path in resolved_images:
-            encoded = base64.b64encode(path.read_bytes()).decode("ascii")
-            mime_type = "image/png" if path.suffix.lower() == ".png" else "image/jpeg"
-            content.append(
-                {
-                    "type": "image_url",
-                    "image_url": {"url": f"data:{mime_type};base64,{encoded}"},
-                }
-            )
-        schema_text = json.dumps(schema, ensure_ascii=False, separators=(",", ":"))
-        image_manifest = "\n".join(
-            f"ATTACHED_IMAGE_{index} is image_url item {index} above."
-            for index in range(1, len(resolved_images) + 1)
-        )
-        content.append(
-            {
-                "type": "text",
-                "text": (
-                    f"{image_manifest}\n\n{prompt}\n\n"
-                    "Return only one JSON object matching this schema:\n"
-                    f"{schema_text}"
-                ),
-            }
-        )
-        extra_body: dict[str, bool | int] = {
-            "enable_thinking": self.enable_thinking,
-        }
-        if self.enable_thinking:
-            extra_body["thinking_budget"] = self.thinking_budget
-        completion = self.client.chat.completions.create(
-            model=self.model,
-            messages=[{"role": "user", "content": content}],
-            stream=True,
-            timeout=self.timeout_seconds,
-            extra_body=extra_body,
-        )
-        reasoning_parts: list[str] = []
-        answer_parts: list[str] = []
-        for chunk in completion:
-            choices = getattr(chunk, "choices", None)
-            if not choices:
-                continue
-            delta = choices[0].delta
-            reasoning = getattr(delta, "reasoning_content", None)
-            if reasoning:
-                reasoning_parts.append(reasoning)
-            answer = getattr(delta, "content", None)
-            if answer:
-                answer_parts.append(answer)
-        self.last_reasoning_content = "".join(reasoning_parts)
-        self.last_answer_content = "".join(answer_parts)
-        return self._parse_json_content(self.last_answer_content)
