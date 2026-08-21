@@ -19,7 +19,7 @@ Press **`O`** at any time to immediately stop control and exit — this works re
 ```bash
 # Terminal 1 — MuJoCo simulator (from repo root)
 source .venv_sim/bin/activate
-python gear_sonic/scripts/run_sim_loop.py
+python -m gear_sonic.utils.mujoco_sim.service
 
 # Terminal 2 — C++ deployment (from gear_sonic_deploy/)
 bash deploy.sh --input-type manager sim
@@ -116,4 +116,3 @@ The only exceptions are:
 - **`O`** is always intercepted by the manager for emergency stop (not passed to the active interface).
 - **`G/H/B/V/X/C`** are always intercepted for compliance control.
 - **`!/@ /#/$`** are always intercepted for interface switching.
-

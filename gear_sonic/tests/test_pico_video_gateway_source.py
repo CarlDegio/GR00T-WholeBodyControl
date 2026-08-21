@@ -7,15 +7,19 @@ from typing import Any
 import numpy as np
 import pytest
 
-from gear_sonic.pico_video.gateway_source import GatewayFrame, SensorGatewayVideoSource
-from gear_sonic.runtime.client import (
+from gear_sonic.utils.pico_video.gateway_source import GatewayFrame, SensorGatewayVideoSource
+from gear_sonic.runtime.gateway.sensor_client import (
     MaterializedSnapshot,
     SensorGatewayClientError,
     SensorGatewayTimeoutError,
     SnapshotUnavailableError,
 )
-from gear_sonic.runtime.contracts import MessageMetadata, SharedMemoryFrame
-from gear_sonic.runtime.snapshot import SensorSnapshot, SnapshotRequest, TimestampBasis
+from gear_sonic.runtime.protocol import MessageMetadata, SharedMemoryFrame
+from gear_sonic.runtime.gateway.snapshot import (
+    SensorSnapshot,
+    SnapshotRequest,
+    TimestampBasis,
+)
 
 
 class SequenceClient:

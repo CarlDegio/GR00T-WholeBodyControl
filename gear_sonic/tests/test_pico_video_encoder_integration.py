@@ -9,8 +9,8 @@ import threading
 import numpy as np
 import pytest
 
-from gear_sonic.pico_video.encoder import EncoderSettings, FfmpegH264Encoder
-from gear_sonic.pico_video.frames import compose_mono_sbs, render_test_card
+from gear_sonic.utils.pico_video.encoder import EncoderSettings, FfmpegH264Encoder
+from gear_sonic.utils.pico_video.frames import compose_mono_sbs, render_test_card
 
 
 @pytest.mark.skipif(

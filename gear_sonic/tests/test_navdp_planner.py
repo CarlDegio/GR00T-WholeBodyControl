@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import queue
 import json
 import struct
 import sys
@@ -11,37 +10,59 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 
-from gear_sonic.scripts.navdp_planner import (
+from gear_sonic.utils.inference.navdp.control import (
+    XNAVDP_G1_MPC_DEFAULTS,
+    AsyncMpcSolver,
+    InternNavMpcController,
+    LatestMessageWorker,
+    MpcSolveRequest,
+    fastlio_heading_target_from_mpc,
+    fresh_mpc_control,
+    prepare_internnav_world_reference,
+    should_abort_nav_for_zero_action,
+    xnavdp_adaptive_speed,
+    xnavdp_control_to_body_velocity,
+)
+from gear_sonic.utils.inference.navdp.gateway import (
+    NavDPPlannerConfig,
+    load_navdp_planner_config,
+    _SharedSensors,
+    _control_freshness_snapshot,
+    _encode_navdp_frames,
+    _navdp_request,
+    _reset_navdp,
+    point_plane_distances,
+)
+from gear_sonic.utils.inference.navdp.navigation import (
     NavigationCommand,
     Pose2D,
     base_goal_to_world,
     build_navigation_message,
+    closest_timestamped_pose,
     decode_navigation_message,
-    filter_livox_points,
-    format_navigation_diagnostics,
-    integrate_velocity_path,
     local_goal_from_world,
-    compose_reasan_navigation_view,
-    render_actor_ray_panel,
-    render_slam_world_panel,
     local_trajectory_to_world,
     update_slam_map,
-    should_abort_nav_for_zero_action,
 )
-from gear_sonic.planner_control import SonicPlannerState, depth_requires_stop
-from gear_sonic.scripts import navdp_planner
-
-
-def test_runtime_queue_dependency_is_imported_at_module_scope() -> None:
-    assert navdp_planner.queue is queue
+from gear_sonic.utils.inference.navdp.visualization import (
+    _VIZ_CENTER,
+    actor_ray_from_points,
+    actor_ray_velocity_arrow,
+    filter_livox_points,
+    format_actor_ray_control_text,
+    install_shutdown_signal_handlers,
+    render_actor_ray_panel,
+    render_slam_world_panel,
+)
+from gear_sonic.utils.planner_control import SonicPlannerState, depth_requires_stop
 
 
 def test_navdp_goal_tolerance_matches_production_profile() -> None:
-    assert navdp_planner.NavDPPlannerConfig().goal_tolerance_m == pytest.approx(0.5)
+    assert load_navdp_planner_config().goal_tolerance_m == pytest.approx(0.5)
 
 
 def test_navdp_runs_unthrottled_inference_with_ten_hz_mpc() -> None:
-    config = navdp_planner.NavDPPlannerConfig()
+    config = load_navdp_planner_config()
     assert config.control_hz == pytest.approx(20.0)
     assert config.mpc_hz == pytest.approx(10.0)
     assert config.mpc_result_timeout_s == pytest.approx(0.3)
@@ -52,7 +73,7 @@ def test_navdp_runs_unthrottled_inference_with_ten_hz_mpc() -> None:
 
 
 def test_xnavdp_g1_mpc_defaults_keep_three_second_horizon() -> None:
-    defaults = navdp_planner.XNAVDP_G1_MPC_DEFAULTS
+    defaults = XNAVDP_G1_MPC_DEFAULTS
 
     assert defaults == {
         "horizon_steps": 30,
@@ -72,16 +93,16 @@ def test_xnavdp_g1_mpc_defaults_keep_three_second_horizon() -> None:
 
 
 def test_xnavdp_speed_mapping_is_unicycle_without_lateral_velocity() -> None:
-    assert navdp_planner.xnavdp_control_to_body_velocity(0.3, 0.5) == pytest.approx(
+    assert xnavdp_control_to_body_velocity(0.3, 0.5) == pytest.approx(
         (0.3, 0.0, 0.5)
     )
-    assert navdp_planner.xnavdp_control_to_body_velocity(-0.2, -0.4) == pytest.approx(
+    assert xnavdp_control_to_body_velocity(-0.2, -0.4) == pytest.approx(
         (-0.2, 0.0, -0.4)
     )
 
 
 def test_fastlio_heading_target_integrates_the_original_mpc_yaw_rate() -> None:
-    heading = navdp_planner.fastlio_heading_target_from_mpc(
+    heading = fastlio_heading_target_from_mpc(
         fastlio_yaw=0.4,
         mpc_angular_velocity=0.5,
         heading_preview_s=0.6,
@@ -106,7 +127,7 @@ def test_xnavdp_request_keeps_lateral_trajectory_axis_unchanged(monkeypatch) -> 
         SimpleNamespace(post=lambda *args, **kwargs: Response()),
     )
 
-    trajectory = navdp_planner._navdp_request(
+    trajectory = _navdp_request(
         "http://127.0.0.1:19999",
         np.zeros((8, 8, 3), dtype=np.uint8),
         np.ones((8, 8), dtype=np.float32),
@@ -118,33 +139,29 @@ def test_xnavdp_request_keeps_lateral_trajectory_axis_unchanged(monkeypatch) -> 
 
 def test_xnavdp_adaptive_speed_matches_length_and_curvature_limits() -> None:
     kwargs = {"max_angular_velocity": 0.8, "curvature_speed_gain": 0.15}
-    assert navdp_planner.xnavdp_adaptive_speed(2.0, 0.0, **kwargs) == pytest.approx(0.3)
-    assert navdp_planner.xnavdp_adaptive_speed(1.0, 0.0, **kwargs) == pytest.approx(0.15)
-    assert navdp_planner.xnavdp_adaptive_speed(0.01, 0.0, **kwargs) == pytest.approx(0.0015)
-    assert navdp_planner.xnavdp_adaptive_speed(2.0, 10.0, **kwargs) == pytest.approx(0.012)
+    assert xnavdp_adaptive_speed(2.0, 0.0, **kwargs) == pytest.approx(0.3)
+    assert xnavdp_adaptive_speed(1.0, 0.0, **kwargs) == pytest.approx(0.15)
+    assert xnavdp_adaptive_speed(0.01, 0.0, **kwargs) == pytest.approx(0.0015)
+    assert xnavdp_adaptive_speed(2.0, 10.0, **kwargs) == pytest.approx(0.012)
 
 
 def test_navdp_sensor_state_starts_empty() -> None:
-    sensors = navdp_planner._SharedSensors()
+    sensors = _SharedSensors()
     assert sensors.slam_map_xy.shape == (0, 2)
     assert sensors.robot_history.shape == (0, 2)
 
 
 def test_control_freshness_snapshot_reads_latest_ros_callback_values() -> None:
-    sensors = navdp_planner._SharedSensors()
+    sensors = _SharedSensors()
     sensors.pose = Pose2D(1.0, 2.0, 0.3)
     sensors.pose_time = 12.0
     sensors.points = np.array([[0.5, 0.1, 0.2]], dtype=np.float32)
-    sensors.points_time = 13.0
 
-    pose, pose_time, points, points_time = navdp_planner._control_freshness_snapshot(
-        sensors
-    )
+    pose, pose_time, points = _control_freshness_snapshot(sensors)
 
     assert pose == Pose2D(1.0, 2.0, 0.3)
     assert pose_time == pytest.approx(12.0)
     np.testing.assert_allclose(points, [[0.5, 0.1, 0.2]])
-    assert points_time == pytest.approx(13.0)
 
 
 def test_navdp_reset_uses_configured_permissive_pointgoal_stop_threshold(monkeypatch) -> None:
@@ -161,7 +178,7 @@ def test_navdp_reset_uses_configured_permissive_pointgoal_stop_threshold(monkeyp
 
     monkeypatch.setitem(sys.modules, "requests", SimpleNamespace(post=post))
 
-    navdp_planner._reset_navdp(
+    _reset_navdp(
         "http://127.0.0.1:19999",
         {"fx": 500.0, "fy": 501.0, "cx": 320.0, "cy": 240.0},
         stop_threshold=-4.0,
@@ -170,61 +187,8 @@ def test_navdp_reset_uses_configured_permissive_pointgoal_stop_threshold(monkeyp
     assert captured["json"]["stop_threshold"] == [-4.0]
 
 
-def test_navdp_camera_extraction_uses_aligned_ego_view_rgbd() -> None:
-    rgb = np.array([[[250, 20, 5]]], dtype=np.uint8)
-    depth = np.array([[1000]], dtype=np.uint16)
-
-    extracted_rgb, extracted_depth, _ = navdp_planner._extract_camera_frame(
-        {
-            "images": {
-                "chest_view": np.zeros_like(rgb),
-                "chest_view_depth": np.full_like(depth, 2000),
-                "ego_view": rgb,
-                "ego_view_depth": depth,
-            },
-            "camera_info": {"ego_view": {"depth_scale_m": 0.001}},
-        }
-    )
-
-    np.testing.assert_array_equal(extracted_rgb, rgb)
-    np.testing.assert_allclose(extracted_depth, [[1.0]])
-
-
-def test_head_depth_panel_uses_fixed_zero_to_five_meter_scale() -> None:
-    near = navdp_planner.render_head_depth_panel(
-        np.array([[1.0, 5.0, np.nan]], dtype=np.float32)
-    )
-    repeated = navdp_planner.render_head_depth_panel(
-        np.array([[1.0, 3.0, np.nan]], dtype=np.float32)
-    )
-
-    assert near.shape == (1, 3, 3)
-    np.testing.assert_array_equal(near[0, 0], repeated[0, 0])
-    np.testing.assert_array_equal(near[0, 2], [0, 0, 0])
-
-
-def test_head_rgbd_view_uses_black_panels_when_sources_are_missing() -> None:
-    missing = navdp_planner.compose_head_rgbd_view(None, None, panel_size=(4, 3))
-    rgb_only = navdp_planner.compose_head_rgbd_view(
-        np.full((2, 2, 3), 127, dtype=np.uint8), None, panel_size=(4, 3)
-    )
-
-    assert missing.shape == (3, 8, 3)
-    assert not np.any(missing)
-    assert np.any(rgb_only[:, :4])
-    assert not np.any(rgb_only[:, 4:])
-
-
-def test_head_rgb_is_converted_to_bgr_for_opencv_only() -> None:
-    view = navdp_planner.compose_head_rgbd_view(
-        np.array([[[255, 0, 0]]], dtype=np.uint8), None, panel_size=(1, 1)
-    )
-
-    np.testing.assert_array_equal(view[0, 0], [0, 0, 255])
-
-
 def test_navdp_rgb_uses_official_jpeg_and_depth_uses_png() -> None:
-    rgb_bytes, depth_bytes = navdp_planner._encode_navdp_frames(
+    rgb_bytes, depth_bytes = _encode_navdp_frames(
         np.zeros((8, 8, 3), dtype=np.uint8),
         np.ones((8, 8), dtype=np.float32),
     )
@@ -251,7 +215,7 @@ def test_xnavdp_request_sends_fastlio_pose_for_real_trajectory_guidance(monkeypa
 
     monkeypatch.setitem(sys.modules, "requests", SimpleNamespace(post=post))
 
-    trajectory = navdp_planner._navdp_request(
+    trajectory = _navdp_request(
         "http://127.0.0.1:19999",
         np.zeros((8, 8, 3), dtype=np.uint8),
         np.ones((8, 8), dtype=np.float32),
@@ -285,7 +249,7 @@ def test_xnavdp_request_timeout_defaults_to_ten_seconds(monkeypatch) -> None:
 
     monkeypatch.setitem(sys.modules, "requests", SimpleNamespace(post=post))
 
-    navdp_planner._navdp_request(
+    _navdp_request(
         "http://127.0.0.1:19999",
         np.zeros((8, 8, 3), dtype=np.uint8),
         np.ones((8, 8), dtype=np.float32),
@@ -293,49 +257,6 @@ def test_xnavdp_request_timeout_defaults_to_ten_seconds(monkeypatch) -> None:
     )
 
     assert captured["timeout"] == pytest.approx(10.0)
-
-
-def test_reasan_actor_ray_and_world_map_are_present_beside_physical_view() -> None:
-    rays = np.full(180, 3.0, dtype=np.float32)
-    rays[90] = 0.5
-    trajectory = np.array([[0.0, 0.0], [0.25, 0.05], [0.5, 0.1]], dtype=np.float32)
-    actor = render_actor_ray_panel(rays, trajectory=trajectory)
-    frame = compose_reasan_navigation_view(
-        np.array([[1.0, 0.0, 0.0]], dtype=np.float32),
-        rays,
-        trajectory,
-        slam_map_xy=np.array([[10.0, 20.0]], dtype=np.float32),
-        pose=Pose2D(10.0, 20.0, 0.0),
-        world_goal=(11.0, 20.0),
-        robot_history=np.array([[9.5, 20.0], [10.0, 20.0]], dtype=np.float32),
-    )
-
-    assert actor.shape == (500, 500, 3)
-    assert frame.shape == (500, 1500, 3)
-    assert np.any(actor != 20)
-    assert np.array_equal(frame[:, 500:1000], actor)
-    assert np.any(frame[:, 1000:] != 20)
-
-
-def test_navdp_prediction_changes_only_actor_ray_panel() -> None:
-    rays = np.full(180, 3.0, dtype=np.float32)
-    common = dict(
-        points_base=np.array([[1.0, 0.0, 0.0]], dtype=np.float32),
-        ranges_m=rays,
-        slam_map_xy=np.array([[0.5, 0.5]], dtype=np.float32),
-        pose=Pose2D(0.0, 0.0, 0.0),
-        world_goal=(2.0, 0.0),
-        robot_history=np.array([[-0.2, 0.0], [0.0, 0.0]], dtype=np.float32),
-    )
-    empty = compose_reasan_navigation_view(trajectory=np.empty((0, 2)), **common)
-    predicted = compose_reasan_navigation_view(
-        trajectory=np.array([[0.0, 0.0], [0.25, 0.1], [0.5, 0.2]], dtype=np.float32),
-        **common,
-    )
-
-    assert np.array_equal(predicted[:, :500], empty[:, :500])
-    assert np.any(predicted[:, 500:1000] != empty[:, 500:1000])
-    assert np.array_equal(predicted[:, 1000:], empty[:, 1000:])
 
 
 def test_actor_ray_draws_raw_navdp_positions_as_yellow_points_not_segments() -> None:
@@ -362,34 +283,11 @@ def test_actor_ray_draws_only_the_first_24_navdp_positions() -> None:
     assert not np.array_equal(panel[excluded_row, 250], [0, 255, 255])
 
 
-def test_tmp_client_velocity_integrator_remains_30_steps_for_diagnostics() -> None:
-    path = integrate_velocity_path((0.3, 0.0, 0.0))
-    assert path.shape == (31, 2)
-    assert path[-1] == pytest.approx([0.45, 0.0], abs=1e-5)
-
-
 def test_sonic_planner_packet_preserves_positive_left_lateral_direction() -> None:
     packet = SonicPlannerState().message((0.0, 0.15, 0.0), dt=0.05)
     values = struct.unpack("<i3f3f2f", packet[len(b"planner") + 1280 :])
     assert values[1:4] == pytest.approx((0.0, 1.0, 0.0))
     assert values[7] == pytest.approx(0.15)
-
-
-def test_navigation_diagnostics_include_confidence_goals_and_both_paths() -> None:
-    text = format_navigation_diagnostics(
-        generation=4,
-        confidence=0.95,
-        local_goal=(1.2, -0.3),
-        world_goal=(4.0, 5.0),
-        trajectory=np.array([[0.0, 0.0], [0.4, -0.1]], dtype=np.float32),
-        velocity=(0.3, -0.05, 0.1),
-    )
-
-    assert "generation=4 lavira_confidence=0.950" in text
-    assert "local_goal=(1.200, -0.300) world_goal=(4.000, 5.000)" in text
-    assert "navdp_local_trajectory=" in text
-    assert "sent_velocity=(0.300, -0.050, 0.100)" in text
-    assert "sent_velocity_path_30x0.05s=" in text
 
 
 def test_local_navdp_trajectory_rotates_and_translates_into_world_frame() -> None:
@@ -482,18 +380,22 @@ def test_livox_filter_uses_translation_without_legacy_yaw_rotation() -> None:
 def test_actor_ray_uses_3d_range_and_full_vertical_field() -> None:
     points = np.array([[1.0, 0.0, 2.0]], dtype=np.float32)
 
-    rays = navdp_planner.actor_ray_from_points(points)
+    rays = actor_ray_from_points(points)
 
     assert rays[90] == pytest.approx(np.sqrt(5.0))
 
 
 def test_runtime_has_no_actor_ray_temporal_filter_state() -> None:
-    sensors = navdp_planner._SharedSensors()
+    sensors = _SharedSensors()
     assert not hasattr(sensors, "ray_history")
 
 
-def test_sonic_arc_packet_uses_same_world_direction_for_motion_and_facing() -> None:
-    packet = SonicPlannerState().arc_message(speed=0.2, heading=np.pi / 4)
+def test_sonic_directional_packet_can_share_motion_and_facing_heading() -> None:
+    packet = SonicPlannerState().directional_message(
+        speed=0.2,
+        movement_heading=np.pi / 4,
+        facing_heading=np.pi / 4,
+    )
     values = struct.unpack("<i3f3f2f", packet[len(b"planner") + 1280 :])
 
     expected = np.sqrt(0.5)
@@ -521,7 +423,7 @@ def test_internnav_reference_skips_first_three_points_and_uses_odom_world_frame(
         dtype=np.float32,
     )
 
-    world = navdp_planner.prepare_internnav_world_reference(
+    world = prepare_internnav_world_reference(
         local,
         Pose2D(10.0, 20.0, np.pi / 2),
         interpolation_ratio=1,
@@ -537,50 +439,15 @@ def test_camera_trajectory_uses_closest_timestamped_fastlio_pose() -> None:
         (10.4, Pose2D(3.0, 0.0, 0.2)),
     ]
 
-    pose = navdp_planner.closest_timestamped_pose(history, 10.26)
+    pose = closest_timestamped_pose(history, 10.26)
 
     assert pose == Pose2D(2.0, 0.0, 0.1)
 
 
 def test_navdp_runtime_has_no_heading_step_cap() -> None:
-    config = navdp_planner.NavDPPlannerConfig()
+    config = load_navdp_planner_config()
 
     assert not hasattr(config, "max_heading_step_deg")
-    assert not hasattr(navdp_planner, "mpc_twist_to_sonic_target")
-
-
-def test_actor_ray_recorder_publishes_mp4_only_after_it_is_finalized(tmp_path) -> None:
-    rays = np.full(180, 3.0, dtype=np.float32)
-    trajectory = np.array([[0.0, 0.0], [0.4, 0.1], [0.8, 0.2]], dtype=np.float32)
-    panel = render_actor_ray_panel(rays, trajectory=trajectory)
-    recorder = navdp_planner.ActorRayVideoRecorder(tmp_path, fps=20.0)
-
-    recorder.write(panel)
-    output_path = recorder.output_path
-    working_path = recorder.working_path
-
-    assert output_path is not None
-    assert output_path.suffix == ".mp4"
-    assert not output_path.exists()
-    assert working_path is not None and working_path.name.endswith(".recording.mp4")
-
-    recorder.close()
-
-    assert output_path.parent == tmp_path
-    assert output_path.name.startswith("actorray_")
-    assert output_path.stat().st_size > 0
-    assert not working_path.exists()
-
-    import cv2
-
-    capture = cv2.VideoCapture(str(output_path))
-    fourcc_value = int(capture.get(cv2.CAP_PROP_FOURCC))
-    fourcc = "".join(chr((fourcc_value >> (8 * index)) & 0xFF) for index in range(4))
-    ok, decoded = capture.read()
-    capture.release()
-    assert ok
-    assert fourcc.lower() in {"avc1", "h264"}
-    assert decoded.shape[:2] == panel.shape[:2]
 
 
 def test_shutdown_signal_handlers_turn_tmux_termination_into_cleanup(monkeypatch) -> None:
@@ -588,70 +455,28 @@ def test_shutdown_signal_handlers_turn_tmux_termination_into_cleanup(monkeypatch
 
     monkeypatch.setattr(signal, "signal", lambda signum, handler: installed.setdefault(signum, handler))
 
-    navdp_planner.install_shutdown_signal_handlers()
+    install_shutdown_signal_handlers()
 
     assert {signal.SIGHUP, signal.SIGINT, signal.SIGTERM} <= installed.keys()
     with pytest.raises(KeyboardInterrupt):
         installed[signal.SIGTERM](signal.SIGTERM, None)
 
 
-def test_actor_ray_recording_session_creates_one_video_per_navigation(tmp_path) -> None:
-    panel = np.zeros((64, 64, 3), dtype=np.uint8)
-    session = navdp_planner.ActorRayRecordingSession(tmp_path, fps=20.0)
-
-    session.write(panel)
-    assert session.output_path is None
-
-    session.start(generation=7)
-    session.write(panel)
-    first_path = session.output_path
-    assert first_path is not None and not first_path.exists()
-    session.stop()
-    assert first_path.exists()
-
-    session.start(generation=8)
-    session.write(panel)
-    second_path = session.output_path
-    session.stop()
-
-    assert first_path is not None and first_path.exists()
-    assert second_path is not None and second_path.exists()
-    assert first_path != second_path
-    assert first_path.name.startswith("actorray_g000007_")
-    assert second_path.name.startswith("actorray_g000008_")
-
-
-def test_direction_chain_diagnostics_exposes_every_yaw_sign() -> None:
-    text = navdp_planner.format_direction_chain_diagnostics(
-        trajectory=np.array([[0.0, 0.0], [0.2, 0.1]], dtype=np.float32),
-        mpc_angular_velocity=0.25,
-        fastlio_yaw=0.4,
-        fastlio_yaw_delta=-0.03,
-        fastlio_target_heading=0.62,
-    )
-
-    assert "path_dy=+0.100" in text
-    assert "mpc_wz=+0.250" in text
-    assert "fastlio_yaw=+0.400" in text
-    assert "fastlio_dyaw=-0.030" in text
-    assert "fastlio_target_heading=+0.620" in text
-
-
 def test_actor_ray_control_text_reports_sent_speed_and_yaw_rate() -> None:
-    text = navdp_planner.format_actor_ray_control_text((0.18, 0.0, -0.32))
+    text = format_actor_ray_control_text((0.18, 0.0, -0.32))
 
     assert text == "sent speed=0.180 m/s   wz=-0.320 rad/s"
 
 
 def test_actor_ray_velocity_arrow_uses_vx_length_and_wz_deflection() -> None:
-    start, end = navdp_planner.actor_ray_velocity_arrow(
+    start, end = actor_ray_velocity_arrow(
         (0.15, 99.0, 0.30),
         max_speed_mps=0.30,
         max_length_px=100,
         preview_s=1.0,
     )
 
-    assert start == navdp_planner._VIZ_CENTER
+    assert start == _VIZ_CENTER
     assert end[0] < start[0]
     assert end[1] < start[1]
     assert np.linalg.norm(np.subtract(end, start)) == pytest.approx(50.0, abs=1.0)
@@ -662,7 +487,7 @@ def test_actor_ray_velocity_arrow_uses_vx_length_and_wz_deflection() -> None:
 
 
 def test_mpc_defaults_match_xnavdp_g1_with_sonic_timing() -> None:
-    controller = navdp_planner.InternNavMpcController(
+    controller = InternNavMpcController(
         np.array([[0.0, 0.0], [1.0, 0.0]], dtype=np.float64)
     )
 
@@ -690,8 +515,8 @@ def test_async_mpc_solver_does_not_block_the_control_thread() -> None:
             assert release.wait(1.0)
             return 0.2, 0.4
 
-    solver = navdp_planner.AsyncMpcSolver(controller_factory=Controller)
-    request = navdp_planner.MpcSolveRequest(
+    solver = AsyncMpcSolver(controller_factory=Controller)
+    request = MpcSolveRequest(
         generation=3,
         reference_version=5,
         world_reference=np.array([[0.0, 0.0], [1.0, 0.0]]),
@@ -720,10 +545,10 @@ def test_async_mpc_solver_does_not_block_the_control_thread() -> None:
 
 
 def test_mpc_control_expires_without_a_recent_success() -> None:
-    assert navdp_planner.fresh_mpc_control(
+    assert fresh_mpc_control(
         (0.2, 0.4), result_time=10.0, now=10.25, timeout_s=0.3
     ) == pytest.approx((0.2, 0.4))
-    assert navdp_planner.fresh_mpc_control(
+    assert fresh_mpc_control(
         (0.2, 0.4), result_time=10.0, now=10.31, timeout_s=0.3
     ) == (0.0, 0.0)
 
@@ -738,7 +563,7 @@ def test_latest_message_worker_keeps_ros_callback_non_blocking() -> None:
         assert release.wait(1.0)
         processed.append(value)
 
-    worker = navdp_planner.LatestMessageWorker(process)
+    worker = LatestMessageWorker(process)
     before = time.perf_counter()
     worker.submit(1)
     assert time.perf_counter() - before < 0.02
@@ -761,7 +586,7 @@ def test_point_plane_distances_match_plane_equation_without_matrix_multiply() ->
     normal = np.array([0.2, -0.3, 0.5], dtype=np.float32)
     offset = 0.7
 
-    distances = navdp_planner.point_plane_distances(points, normal, offset)
+    distances = point_plane_distances(points, normal, offset)
 
     assert distances == pytest.approx(np.abs(points @ normal - offset))
 

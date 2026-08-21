@@ -2,9 +2,9 @@ from types import SimpleNamespace
 
 import pytest
 
-from gear_sonic.scripts.run_data_exporter import GrootDataCollector
-from gear_sonic.utils.data_collection.episode_state import EpisodeState
-from gear_sonic.utils.data_collection.recording_controls import select_recording_key
+from gear_sonic.utils.data_collection.episode import EpisodeState
+from gear_sonic.utils.data_collection.recording import select_recording_key
+from gear_sonic.utils.data_collection.service import GrootDataCollector
 
 
 YELLOW = "\033[93m"

@@ -33,7 +33,7 @@ From the **repo root**:
 # bash install_scripts/install_pico.sh
 
 source .venv_teleop/bin/activate
-python gear_sonic/scripts/run_sim_loop.py
+python -m gear_sonic.utils.mujoco_sim.service
 ```
 
 ### Terminal 2 — C++ Deployment
@@ -59,11 +59,11 @@ From the **repo root**:
 source .venv_teleop/bin/activate
 
 # With full visualization (recommended for first run):
-python gear_sonic/scripts/pico_manager_thread_server.py --manager \
+python -m gear_sonic.utils.teleop.pico_manager --manager \
     --vis_vr3pt --vis_smpl
 
 # Without visualization (for headless / onboard practice):
-# python gear_sonic/scripts/pico_manager_thread_server.py --manager
+# python -m gear_sonic.utils.teleop.pico_manager --manager
 ```
 
 When you turn on the visualization, wait for a window to pop up showing a Unitree G1 mesh with all joints at the default angles. If no window shows up, double-check the PICO's XRoboToolKit IP configuration in the [VR Teleop Setup](../getting_started/vr_teleop_setup.md).
@@ -259,7 +259,7 @@ Active in **PLANNER**, **PLANNER_FROZEN_UPPER**, and **VR_3PT**:
 
 ```{admonition} Safety Warning
 :class: danger
-Only proceed once you can smoothly control the robot in simulation and are comfortable with emergency stops. **Terminate any running `run_sim_loop.py` process first** — simultaneous sim and real instances will conflict.
+Only proceed once you can smoothly control the robot in simulation and are comfortable with emergency stops. **Terminate any running MuJoCo service first** — simultaneous sim and real instances will conflict.
 ```
 
 The real-robot workflow uses **two terminals** (no MuJoCo simulator).
@@ -290,7 +290,7 @@ From the **repo root**:
 
 ```bash
 source .venv_teleop/bin/activate
-python gear_sonic/scripts/pico_manager_thread_server.py --manager
+python -m gear_sonic.utils.teleop.pico_manager --manager
 
 # If running offboard with a display, add visualization:
 #   --vis_vr3pt --vis_smpl

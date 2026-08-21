@@ -7,9 +7,9 @@ import math
 import numpy as np
 import pytest
 
-from gear_sonic.utils.inference.object_nav_geometry import (
+from gear_sonic.utils.inference.lavira.geometry import (
     ObjectNavGeometryError,
-    build_object_nav_commands_from_frames,
+    build_object_nav_geometry_from_frames,
     measure_object_nav_target,
 )
 
@@ -49,22 +49,7 @@ def test_measures_target_direction_on_each_side_of_image(
     assert math.copysign(1, measurement["goal_y"]) == expected_goal_y_sign
 
 
-def test_suppresses_rotation_below_two_degrees() -> None:
-    frames = [(depth_frame(), 1000.0, 50.0)] * 5
-    commands, geometry = build_object_nav_commands_from_frames(
-        navigate_policy([480, 450, 500, 550]), frames
-    )
-
-    assert abs(geometry["angle_deg"]) < 2.0
-    assert commands["commands"][0] == {
-        "vx": 0.0,
-        "vy": 0.0,
-        "wz": 0.0,
-        "duration": 0.0,
-    }
-
-
-def test_builds_commands_from_three_valid_measurements() -> None:
+def test_builds_goal_from_three_valid_measurements() -> None:
     frames = [
         (depth_frame(1000.0), 100.0, 50.0),
         (depth_frame(2000.0), 100.0, 50.0),
@@ -73,7 +58,7 @@ def test_builds_commands_from_three_valid_measurements() -> None:
         (np.zeros((101, 101), dtype=np.float32), 100.0, 50.0),
     ]
 
-    commands, geometry = build_object_nav_commands_from_frames(
+    geometry = build_object_nav_geometry_from_frames(
         navigate_policy([450, 450, 550, 550]), frames
     )
 
@@ -104,30 +89,22 @@ def test_rejects_invalid_bbox_depth_or_intrinsics(
         measure_object_nav_target(policy, depth_mm, fx, cx)
 
 
-def test_zero_target_standoff_preserves_full_direct_travel() -> None:
+def test_goal_preserves_full_measured_range() -> None:
     frames = [(np.full((5, 5), 2000, dtype=np.float32), 100.0, 2.0)] * 5
 
-    commands, geometry = build_object_nav_commands_from_frames(
+    geometry = build_object_nav_geometry_from_frames(
         navigate_policy([450, 450, 550, 550]), frames
     )
 
-    assert commands["commands"][0] == {
-        "vx": 0.0,
-        "vy": 0.0,
-        "wz": 0.0,
-        "duration": 0.0,
-    }
-    assert commands["commands"][1]["vx"] == 0.3
-    assert commands["commands"][1]["duration"] == pytest.approx(
-        geometry["travel"] / 0.3, abs=1e-3
-    )
-    assert geometry["travel"] == 2.0
+    assert geometry["goal_x"] == pytest.approx(2.0)
+    assert geometry["goal_y"] == pytest.approx(0.0)
+    assert geometry["mean_range"] == 2.0
 
 
 def test_rejects_direct_travel_above_eight_metres() -> None:
     frames = [(depth_frame(8100.0), 100.0, 50.0)] * 5
 
     with pytest.raises(ObjectNavGeometryError, match="exceeds"):
-        build_object_nav_commands_from_frames(
+        build_object_nav_geometry_from_frames(
             navigate_policy([450, 450, 550, 550]), frames
         )

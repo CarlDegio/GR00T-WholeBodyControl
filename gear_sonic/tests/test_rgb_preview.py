@@ -7,7 +7,7 @@ import time
 import cv2
 import numpy as np
 
-from gear_sonic.runtime.rgb_preview import RgbPreviewWorker, build_preview_frame
+from gear_sonic.runtime.gateway.rgb_preview import RgbPreviewWorker, build_preview_frame
 
 
 class _FakeGui:

@@ -11,11 +11,11 @@ from typing import Any
 import pytest
 import zmq
 
-from gear_sonic.scripts.navdp_planner import (
+from gear_sonic.runtime.protocol import (
     build_navigation_message,
     decode_navigation_message,
 )
-from gear_sonic.planner_control import (
+from gear_sonic.utils.planner_control import (
     build_navigation_runtime_status_message,
     build_planner_velocity_message,
     decode_navigation_runtime_status_message,

@@ -1,7 +1,7 @@
 import msgpack
 import pytest
 
-from gear_sonic.scripts.benchmark_camera_stream import CameraStreamStats
+from gear_sonic.runtime.tools.benchmark_camera_stream import CameraStreamStats
 
 
 def _packed_message(timestamp: float, padding_length: int) -> bytes:

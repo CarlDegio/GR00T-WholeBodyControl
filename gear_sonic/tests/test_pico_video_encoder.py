@@ -8,7 +8,7 @@ import time
 import numpy as np
 import pytest
 
-from gear_sonic.pico_video.encoder import (
+from gear_sonic.utils.pico_video.encoder import (
     AnnexBAccessUnitParser,
     EncoderError,
     EncoderSettings,

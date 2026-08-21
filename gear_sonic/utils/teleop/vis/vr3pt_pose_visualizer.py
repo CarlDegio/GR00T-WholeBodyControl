@@ -849,7 +849,7 @@ class VR3PtPoseVisualizer:
     # Axis colors (RGB for XYZ)
     AXIS_COLORS = ["red", "green", "blue"]
 
-    # Head kinematic chain constants (must match pico_manager_thread_server.py)
+    # Head kinematic chain constants (must match utils.teleop.pico_manager)
     TORSO_LINK_OFFSET_Z = 0.05  # meters from root to torso_link
     HEAD_LINK_LENGTH = 0.35  # meters from torso_link to head along head's local Z
     TORSO_LINK_COLOR = "purple"

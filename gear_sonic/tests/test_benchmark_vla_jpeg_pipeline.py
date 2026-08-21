@@ -6,8 +6,8 @@ from types import SimpleNamespace
 
 import pytest
 
-from gear_sonic.runtime.client import SnapshotUnavailableError
-from gear_sonic.scripts import benchmark_vla_jpeg_pipeline as benchmark
+from gear_sonic.runtime.gateway.sensor_client import SnapshotUnavailableError
+from gear_sonic.utils.inference.vla import benchmark
 
 OPENPI_REPO = Path("/home/user/Project/openpi_sonic")
 
@@ -204,7 +204,8 @@ def test_benchmark_script_runs_directly_from_worktree():
     completed = subprocess.run(
         [
             sys.executable,
-            "gear_sonic/scripts/benchmark_vla_jpeg_pipeline.py",
+            "-m",
+            "gear_sonic.utils.inference.vla.benchmark",
             "--help",
         ],
         cwd=repository,

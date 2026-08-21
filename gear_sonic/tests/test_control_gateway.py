@@ -1,24 +1,21 @@
 from __future__ import annotations
 
-import argparse
 import json
 import time
 
 import pytest
 import zmq
 
-from gear_sonic.runtime.contracts import OperatorCommand
-from gear_sonic.runtime.control_client import ControlGatewayIntentClient
-from gear_sonic.runtime.control_gateway import (
+from gear_sonic.runtime.protocol import OperatorCommand
+from gear_sonic.runtime.gateway.control_client import ControlGatewayIntentClient
+from gear_sonic.runtime.gateway.control import (
     ControlGatewayCore,
     ControlGatewayRouter,
     NavigationControlState,
     OperatorConsoleRouter,
-    normalize_console_line,
 )
-from gear_sonic.scripts.run_control_gateway import (
+from gear_sonic.runtime.gateway.services.control import (
     build_base_pose_runtime_status,
-    resolve_control_gateway_settings,
 )
 
 
@@ -50,14 +47,6 @@ def test_latest_only_intent_client_conflates_pending_commands() -> None:
         context.term()
 
 
-def test_console_translation_normalizes_prompt_and_single_key_input() -> None:
-    assert normalize_console_line("i") == "i"
-    assert normalize_console_line("t pick up the cup") == (
-        "prompt:pick up the cup"
-    )
-    assert normalize_console_line("") == ""
-
-
 def test_core_adds_identity_lifetime_and_typed_semantics() -> None:
     timestamps = iter((100, 200, 300))
     core = ControlGatewayCore(
@@ -82,7 +71,7 @@ def test_core_adds_identity_lifetime_and_typed_semantics() -> None:
 
     assert unknown.command.name == "unsupported_console_input"
     assert unknown.command.parameters == {}
-    assert core.next_sequence == 3
+    assert unknown.command.metadata.sequence == 2
 
 
 def test_navigation_key_is_a_structured_typed_command() -> None:
@@ -118,30 +107,6 @@ def test_console_routes_planner_keys_and_pose_recording_without_e_collision() ->
     assert planner.command.name == "select_planner_mode"
     assert stop.command.name == "navigation_key"
     assert stop.command.parameters["key"] == " "
-
-
-def test_gateway_settings_use_reserved_profile_endpoints() -> None:
-    args = argparse.Namespace(
-        profile="",
-        overlay=[],
-        intent_bind_host="",
-        intent_port=0,
-        dispatch_bind_host="",
-        dispatch_port=0,
-        status_bind_host="",
-        status_port=0,
-        command_ttl_ms=0,
-    )
-
-    settings = resolve_control_gateway_settings(args)
-
-    assert settings.intent_bind_endpoint == "tcp://127.0.0.1:5561"
-    assert settings.dispatch_bind_endpoint == "tcp://127.0.0.1:5565"
-    assert settings.status_bind_endpoint == "tcp://127.0.0.1:5562"
-    assert settings.navigation_bind_endpoint == "tcp://127.0.0.1:5558"
-    assert settings.navigation_status_endpoint == "tcp://127.0.0.1:5559"
-    assert settings.command_ttl_ms == 1000
-    assert settings.heartbeat_hz == 2.0
 
 
 def test_navigation_state_preserves_existing_listen_wasd_mapping() -> None:

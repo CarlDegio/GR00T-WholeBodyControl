@@ -6,7 +6,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from gear_sonic.scripts import run_fastlio_supervisor
+from gear_sonic.utils.inference.navdp import slam_supervisor as run_fastlio_supervisor
 
 
 class _ExitedLaunchProcess:

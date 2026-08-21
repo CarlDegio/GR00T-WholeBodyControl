@@ -10,15 +10,15 @@ endpoints:
   navigation_status: {host: 127.0.0.1, port: 5559}
   sensor_gateway_metadata: {host: 127.0.0.1, port: 5560}
   control_gateway_intent: {host: 127.0.0.1, port: 5561}
-  control_gateway_status: {host: 127.0.0.1, port: 5562}
   planner_relay: {host: 127.0.0.1, port: 5563}
   depth_anything: {host: 127.0.0.1, port: 5564}
   control_gateway_dispatch: {host: 127.0.0.1, port: 5565}
   sensor_gateway_visualization_ingress: {host: 127.0.0.1, port: 5566}
-  vla_timing_ingress: {host: 127.0.0.1, port: 5567}
+  runtime_metrics_ingress: {host: 127.0.0.1, port: 5567}
   navdp_velocity: {host: 127.0.0.1, port: 5568}
   orientation_telemetry: {host: 127.0.0.1, port: 5569}
   navigation_runtime_status: {host: 127.0.0.1, port: 5570}
+  runtime_event_ingress: {host: 127.0.0.1, port: 5571}
   xnavdp_http: {host: 127.0.0.1, port: 19999}
 ros_topics:
   lidar: /livox/lidar
@@ -28,12 +28,23 @@ ros_topics:
 components:
   launcher:
     sim: false
+    opencv_viewer: true
     keyboard_planner: true
     planner_input: lavira
+    depth_anything_ready_timeout_s: 180.0
+    base_pose_enabled: true
+    slam_debug: false
     data_exporter: false
-    opencv_viewer: true
     lidar_ready_timeout_s: 30.0
     navigation_ready_timeout_s: 60.0
+  deploy:
+    input_type: zmq_manager
+    policy_variant: sonic_v1_1  # default | low_latency | sonic_v1_1
+    checkpoint: ''
+    obs_config: ''
+    planner: ''
+    motion_data: ''
+    output_type: ''
   vla:
     embodiment_tag: unitree_g1_sonic
     #prompt: &vla_task_prompt >-
@@ -44,19 +55,79 @@ components:
     prompt: &vla_task_prompt >-
       Move in front of the table, grasp the medicine bottle, and place it into the blue basket.
     inference_hz: 2.0
-    action_publish_hz: 50
+    action_publish_rate: 50
     action_horizon: 50
     sensor_gateway_poll_hz: 50.0
     sensor_gateway_request_timeout_ms: 100
     sensor_gateway_max_age_ms: 1000.0
     sensor_gateway_max_skew_ms: 5.0
-  keyboard_planner:
-    publish_hz: 20.0
   lavira:
+    mission: blue basket
+    global_target: blue basket
+    qwenvl_model: qwen3-vl-32b-instruct
+    qwenvl_base_url: https://dashscope-intl.aliyuncs.com/compatible-mode/v1
     camera_timeout_ms: 15000
-    policy_timeout_s: 180.0
+    sensor_gateway_request_timeout_ms: 100
+    sensor_gateway_max_age_ms: 1000.0
+    sensor_gateway_max_skew_ms: 5.0
+    qwenvl_timeout_seconds: 180.0
     min_confidence: 0.6
+  base_pose:
+    task: >-
+      align to the blue basket
+    target_prompt: bluebasket
+    surface_prompt: desk
+    planner_hz: 20.0
+    final_stop_count: 3
+    sensor_gateway_request_timeout_ms: 100
+    sensor_gateway_max_age_ms: 1000.0
+    sensor_gateway_max_skew_ms: 5.0
+    camera_timeout_ms: 15000
+    camera_intrinsics_path: gear_sonic/config/camera_intrinsics.json
+    camera_pitch_deg: -38.0
+    camera_roll_deg: 0.0
+    camera_yaw_deg: 0.0
+    camera_forward_offset_m: 0.0
+    camera_lateral_offset_m: 0.0
+    dual_head_camera_stream: ego_view
+    dual_head_depth_stream: camera/ego_view_depth
+    dual_chest_camera_stream: chest_view
+    dual_chest_depth_stream: camera/chest_view_depth
+    dual_chest_camera_pitch_deg: -3.0
+    dual_chest_camera_roll_deg: 0.0
+    dual_chest_camera_yaw_deg: 0.0
+    dual_chest_camera_forward_offset_m: 0.0
+    dual_chest_camera_lateral_offset_m: 0.0
+    dual_match_tolerance_frames: 30
+    dual_head_reacquire_frames: 1
+    dual_head_release_missing_frames: 3
+    dual_rgbd_buffer_size: 8
+    dual_rgbd_poll_hz: 60.0
+    output_root: outputs/base_pose_adjustment
+    raw_yoloe_model_path: tools/yoloe26m/weights/yoloe-26m-seg.pt
+    raw_yoloe_device: '0'
+    raw_yoloe_confidence: 0.25
+    raw_yoloe_imgsz: 640
+    raw_head_target_distance_m: 0.9
+    raw_chest_target_distance_m: 0.7
+    raw_forward_tolerance_m: 0.10
+    raw_lateral_tolerance_m: 0.10
+    raw_min_linear_speed_m_s: 0.35
+    raw_max_lateral_speed_m_s: 0.40
+    raw_min_yaw_speed_rad_s: 0.10
+    raw_yaw_tolerance_deg: 3
+    raw_yaw_coarse_speed_rad_s: 0.30
+    raw_yaw_trim_speed_rad_s: 0.10
+    raw_forward_recenter_yaw_speed_rad_s: 0.30
+    raw_horizontal_guard_fraction: 0.25
+    raw_horizontal_recovery_fraction: 0.30
+    raw_camera_stale_s: 0.40
+    raw_max_run_s: 180.0
+    raw_post_stop_sample_frames: 30
+    raw_post_stop_deviation_frames: 10
   navdp:
+    root: /home/user/Project/NavDP/baselines/x-navdp
+    checkpoint: /home/user/Project/NavDP/baselines/x-navdp/checkpoints/x-navdp_posttrain.ckpt
     control_hz: 20.0
     mpc_hz: 10.0
     mpc_result_timeout_s: 0.3
@@ -70,10 +141,10 @@ components:
     sensor_gateway_max_skew_ms: 5.0
     odometry_timeout_s: 0.3
     trajectory_timeout_s: 2.5
-    visualize: true
-    record_actorray: false
-    actorray_output_dir: outputs/navdp
-    actorray_record_fps: 20.0
+  fastlio:
+    workspace: /home/user/Project/fastlio_humanoid_ws
+    livox_sdk_lib: /home/user/Project/livox_sdk2_install/lib
+    config: mid360.yaml
   planner_executor:
     control_hz: 20.0
     manual_velocity_timeout_s: 0.70
@@ -99,27 +170,31 @@ components:
   depth_anything:
     root: /home/user/Project/Depth-Anything-V2/metric_depth
     checkpoint: /home/user/Project/Depth-Anything-V2/metric_depth/checkpoints/depth_anything_v2_metric_hypersim_vitb.pth
+    camera_intrinsics_path: gear_sonic/config/camera_intrinsics.json
     encoder: vitb
     device: cuda
     inference_hz: 10.5
+    idle_heartbeat_hz: 2.0
+    sensor_gateway_request_timeout_ms: 100
+    sensor_gateway_max_age_ms: 1000.0
     input_size: 644
     model_max_depth_m: 20.0
     publish_max_depth_m: 20.0
     use_amp: true
-    ready_timeout_s: 180.0
   data_exporter:
     frequency_hz: 50
     sensor_gateway_poll_hz: 50.0
     sensor_gateway_request_timeout_ms: 100
     sensor_gateway_max_age_ms: 1000.0
     sensor_gateway_max_skew_ms: 5.0
+    record_chest_camera: false
+    task_prompt: ''
+    dataset_name: ''
   sensor_gateway:
     snapshot_history_size: 64
     shared_memory_slots: 8
     frame_ttl_ms: 1000
     retired_ring_ttl_s: 2.0
-    default_max_age_ms: 250.0
-    default_max_skew_ms: 50.0
     timestamp_basis: receive
     loop_hz: 200.0
     camera_expected_hz: 30.0
@@ -129,11 +204,9 @@ components:
     odometry_expected_hz: 10.0
     registered_cloud_expected_hz: 10.0
     visualization_expected_hz: 20.0
-    vla_timing_expected_hz: 2.0
-    vla_timing_window_size: 100
+    runtime_metrics_window_size: 100
   control_gateway:
     command_ttl_ms: 1000
-    heartbeat_hz: 2.0
   slam_recovery:
     # Normal NavDP motion is capped at 0.3 m/s and 0.8 rad/s. These limits only
     # catch estimator motion that is clearly outside the commanded envelope.
@@ -142,112 +215,3 @@ components:
     max_position_step_m: 1.0
     max_yaw_rate_rad_s: 2.5
     consecutive_samples: 3
-launch_inference:
-  sim: false
-  deploy_input_type: zmq_manager
-  deploy_zmq_host: localhost
-  deploy_policy_variant: sonic_v1_1  # default | low_latency | sonic_v1_1
-  deploy_checkpoint: ''
-  deploy_obs_config: ''
-  deploy_planner: ''
-  deploy_motion_data: ''
-  deploy_output_type: ''
-  policy_host: 127.0.0.1
-  policy_port: 29999
-  embodiment_tag: unitree_g1_sonic
-  prompt: *vla_task_prompt
-  action_publish_rate: 50
-  action_horizon: 50
-  camera_host: 192.168.123.164
-  camera_port: 5555
-  opencv_viewer: true
-  sensor_gateway_port: 5560
-  sensor_gateway_visualization_port: 5566
-  vla_timing_port: 5567
-  control_gateway_intent_port: 5561
-  control_gateway_status_port: 5562
-  control_gateway_dispatch_port: 5565
-  vla_sensor_gateway_poll_hz: 50.0
-  vla_sensor_gateway_request_timeout_ms: 100
-  vla_sensor_gateway_max_age_ms: 1000.0
-  vla_sensor_gateway_max_skew_ms: 5.0
-  keyboard_planner: true
-  keyboard_planner_port: 5558
-  keyboard_planner_publish_rate: 20
-  keyboard_planner_host: localhost
-  planner_input: lavira
-  lavira_mission: blue basket
-  lavira_global_target: blue basket
-  lavira_qwenvl_model: qwen3-vl-32b-instruct
-  lavira_qwenvl_base_url: https://dashscope-intl.aliyuncs.com/compatible-mode/v1
-  lavira_debug: false
-  lavira_host: '*'
-  lavira_control_input: gateway
-  lavira_camera_timeout_ms: 15000
-  depth_anything_port: 5564
-  depth_anything_ready_timeout: 180.0
-  lavira_qwenvl_timeout_seconds: 180.0
-  lavira_min_confidence: 0.6
-  lavira_output_root: outputs/object_nav
-  base_pose_enabled: true
-  base_pose_task: >-
-    align to the blue basket
-  base_pose_target_prompt: bluebasket
-  base_pose_surface_prompt: desk
-  base_pose_camera_intrinsics_path: gear_sonic/config/camera_intrinsics.json
-  base_pose_camera_pitch_deg: -38.0
-  base_pose_camera_roll_deg: 0.0
-  base_pose_camera_yaw_deg: 0.0
-  base_pose_camera_forward_offset_m: 0.0
-  base_pose_camera_lateral_offset_m: 0.0
-  base_pose_dual_head_camera_stream: ego_view
-  base_pose_dual_head_depth_stream: camera/ego_view_depth
-  base_pose_dual_chest_camera_stream: chest_view
-  base_pose_dual_chest_depth_stream: camera/chest_view_depth
-  base_pose_dual_chest_camera_pitch_deg: -3.0
-  base_pose_dual_chest_camera_roll_deg: 0.0
-  base_pose_dual_chest_camera_yaw_deg: 0.0
-  base_pose_dual_chest_camera_forward_offset_m: 0.0
-  base_pose_dual_chest_camera_lateral_offset_m: 0.0
-  base_pose_dual_match_tolerance_frames: 30
-  base_pose_dual_head_reacquire_frames: 1
-  base_pose_dual_head_release_missing_frames: 3
-  base_pose_dual_rgbd_buffer_size: 8
-  base_pose_dual_rgbd_poll_hz: 60.0
-  base_pose_camera_timeout_ms: 15000
-  base_pose_planner_hz: 20.0
-  base_pose_output_root: outputs/base_pose_adjustment
-  base_pose_yoloe_model_path: tools/yoloe26m/weights/yoloe-26m-seg.pt
-  base_pose_yoloe_device: '0'
-  base_pose_yoloe_confidence: 0.25
-  base_pose_yoloe_imgsz: 640
-  base_pose_raw_head_target_distance_m: 0.9
-  base_pose_raw_chest_target_distance_m: 0.7
-  base_pose_raw_forward_tolerance_m: 0.10
-  base_pose_raw_lateral_tolerance_m: 0.10
-  base_pose_raw_min_linear_speed_m_s: 0.35
-  base_pose_raw_max_lateral_speed_m_s: 0.40
-  base_pose_raw_min_yaw_speed_rad_s: 0.10
-  base_pose_raw_yaw_tolerance_deg: 3
-  base_pose_raw_yaw_coarse_speed_rad_s: 0.30
-  base_pose_raw_yaw_trim_speed_rad_s: 0.10
-  base_pose_raw_forward_recenter_yaw_speed_rad_s: 0.30
-  base_pose_raw_horizontal_guard_fraction: 0.25
-  base_pose_raw_horizontal_recovery_fraction: 0.30
-  base_pose_raw_camera_stale_s: 0.40
-  base_pose_raw_max_run_s: 180.0
-  base_pose_raw_post_stop_sample_frames: 30
-  base_pose_raw_post_stop_deviation_frames: 10
-  navdp_root: /home/user/Project/NavDP/baselines/x-navdp
-  navdp_checkpoint: /home/user/Project/NavDP/baselines/x-navdp/checkpoints/x-navdp_posttrain.ckpt
-  fastlio_workspace: /home/user/Project/fastlio_humanoid_ws
-  livox_sdk_lib: /home/user/Project/livox_sdk2_install/lib
-  fastlio_config: mid360.yaml
-  # Preserve raw LiDAR/IMU plus FAST-LIO odometry/cloud in outputs/slam_debug/.
-  slam_debug: false
-  lidar_ready_timeout: 30.0
-  navigation_ready_timeout: 60.0
-  data_exporter: false
-  record_chest_camera: false
-  task_prompt: ''
-  dataset_name: ''

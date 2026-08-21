@@ -11,9 +11,9 @@ import numpy as np
 import zmq
 
 from gear_sonic.camera.sensor_server import ImageMessageSchema
-from gear_sonic.runtime.fakes import FakeCameraServer, FakeCppService
-from gear_sonic.runtime.client import SensorGatewayClient
-from gear_sonic.runtime.sensor_gateway import (
+from gear_sonic.runtime.gateway.fakes import FakeCameraServer, FakeCppService
+from gear_sonic.runtime.gateway.sensor_client import SensorGatewayClient
+from gear_sonic.runtime.gateway.sensor import (
     CameraZmqIngress,
     CppStateZmqIngress,
     DepthAnythingZmqIngress,
@@ -28,8 +28,8 @@ from gear_sonic.runtime.sensor_gateway import (
     pointcloud2_xyz_array,
     ros_stamp_ns,
 )
-from gear_sonic.runtime.shared_memory import read_shared_memory_frame
-from gear_sonic.runtime.snapshot import SnapshotRequest
+from gear_sonic.runtime.gateway.shared_memory import read_shared_memory_frame
+from gear_sonic.runtime.gateway.snapshot import SnapshotRequest
 
 
 def _publish_until_ingested(publish, poll, *, timeout_s: float = 1.0) -> int:

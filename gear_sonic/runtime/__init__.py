@@ -1,30 +1,35 @@
-"""Runtime contracts shared by future SONIC gateways and clients."""
+"""Stable SONIC runtime contracts, configuration, and Gateway APIs.
 
-from gear_sonic.runtime.client import (
+``profile`` owns YAML configuration and endpoint topology, ``protocol`` owns
+transport-neutral messages and wire codecs, and ``gateway`` owns the reusable
+data plane.  Only ``gateway.services`` may compose those primitives with
+application domains under :mod:`gear_sonic.utils`.
+"""
+
+from gear_sonic.runtime.gateway.sensor_client import (
     MaterializedSnapshot,
     SensorGatewayClient,
     SensorGatewayClientError,
     SensorGatewayTimeoutError,
     SnapshotUnavailableError,
 )
-from gear_sonic.runtime.config import (
+from gear_sonic.runtime.profile import (
+    ENDPOINT_SCHEMES,
     EndpointAddress,
     RuntimeProfile,
     default_runtime_profile_path,
     load_runtime_profile,
 )
-from gear_sonic.runtime.contracts import (
-    CommandAck,
-    ControlGatewayHealth,
+from gear_sonic.runtime.protocol import (
     MessageMetadata,
     OperatorCommand,
     SharedMemoryFrame,
 )
-from gear_sonic.runtime.control_client import (
+from gear_sonic.runtime.gateway.control_client import (
     ControlGatewayIntentClient,
     ControlGatewaySubscriber,
 )
-from gear_sonic.runtime.control_gateway import (
+from gear_sonic.runtime.gateway.control import (
     ControlGatewayCore,
     ControlGatewayRouter,
     ControlIngressEvent,
@@ -32,25 +37,17 @@ from gear_sonic.runtime.control_gateway import (
     NavigationControlState,
     RoutedControlCommand,
 )
-from gear_sonic.runtime.diagnostics import (
+from gear_sonic.runtime.gateway.diagnostics import (
     EndpointHealth,
     EndpointHealthMonitor,
     EndpointState,
 )
-from gear_sonic.runtime.endpoints import (
-    ENDPOINTS,
-    ROS_TOPICS,
-    EndpointSpec,
-    RosTopicSpec,
-    Transport,
-    get_endpoint,
-)
-from gear_sonic.runtime.shared_memory import (
+from gear_sonic.runtime.gateway.shared_memory import (
     FrameOverwrittenError,
     SharedMemoryRing,
     read_shared_memory_frame,
 )
-from gear_sonic.runtime.snapshot import (
+from gear_sonic.runtime.gateway.snapshot import (
     SensorSnapshot,
     SensorSnapshotStore,
     SnapshotRequest,
@@ -58,18 +55,15 @@ from gear_sonic.runtime.snapshot import (
 )
 
 __all__ = [
-    "CommandAck",
     "ControlGatewayCore",
-    "ControlGatewayHealth",
     "ControlGatewayIntentClient",
     "ControlGatewayRouter",
     "ControlGatewaySubscriber",
     "ControlIngressEvent",
-    "ENDPOINTS",
+    "ENDPOINT_SCHEMES",
     "EndpointAddress",
     "EndpointHealth",
     "EndpointHealthMonitor",
-    "EndpointSpec",
     "EndpointState",
     "FrameOverwrittenError",
     "MessageMetadata",
@@ -77,8 +71,6 @@ __all__ = [
     "OperatorCommand",
     "NavigationControlAction",
     "NavigationControlState",
-    "ROS_TOPICS",
-    "RosTopicSpec",
     "RoutedControlCommand",
     "RuntimeProfile",
     "SensorSnapshot",
@@ -91,9 +83,7 @@ __all__ = [
     "SnapshotRequest",
     "SnapshotUnavailableError",
     "TimestampBasis",
-    "Transport",
     "default_runtime_profile_path",
-    "get_endpoint",
     "load_runtime_profile",
     "read_shared_memory_frame",
 ]

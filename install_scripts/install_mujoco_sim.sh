@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # install_mujoco_sim.sh
-# Minimal venv setup for running the MuJoCo simulator (run_sim_loop.py).
+# Minimal venv setup for running the MuJoCo simulator service.
 # Skips XRoboToolkit SDK and teleop dependencies that are NOT needed for sim.
 # Based on install_pico.sh — see that script for the full teleop setup.
 #
@@ -72,5 +72,5 @@ echo ""
 echo "  You should see (gear_sonic_sim) in your prompt."
 echo ""
 echo "  Then run the MuJoCo simulator with:"
-echo "    python gear_sonic/scripts/run_sim_loop.py"
+echo "    python -m gear_sonic.utils.mujoco_sim.service"
 echo "══════════════════════════════════════════════════════════════"

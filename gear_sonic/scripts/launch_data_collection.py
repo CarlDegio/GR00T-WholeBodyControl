@@ -14,7 +14,7 @@ Starts the full data collection stack in a single tmux session:
 
     Window 1 — sim  (only when --sim is passed):
     ┌─────────────────────────────────────────────────┐
-    │ MuJoCo Simulator (run_sim_loop.py)              │
+    │ MuJoCo Simulator service                        │
     │ (.venv_sim)                                     │
     └─────────────────────────────────────────────────┘
 
@@ -420,7 +420,7 @@ def build_camera_viewer_command(
     return (
         f"cd {shlex.quote(str(repo_root))} && "
         "source .venv_data_collection/bin/activate && "
-        "python gear_sonic/scripts/run_camera_viewer.py "
+        "python -m gear_sonic.utils.operator.camera_viewer "
         f"--profile {shlex.quote(config.runtime_profile)}"
     )
 
@@ -433,7 +433,7 @@ def build_sensor_gateway_command(
     return (
         f"cd {shlex.quote(str(repo_root))} && "
         "source .venv_teleop/bin/activate && "
-        "python gear_sonic/scripts/run_sensor_gateway.py "
+        "python -m gear_sonic.runtime.gateway.services.sensor "
         f"--profile {shlex.quote(config.runtime_profile)} "
         f"--camera-host {shlex.quote(config.camera_host)} "
         f"--camera-port {config.camera_port} "
@@ -451,7 +451,7 @@ def build_pico_video_command(
     return (
         f"cd {shlex.quote(str(repo_root))} && "
         "source .venv_teleop/bin/activate && "
-        "python -m gear_sonic.scripts.run_pico_video_bridge "
+        "python -m gear_sonic.utils.pico_video.service "
         f"--profile {shlex.quote(config.runtime_profile)} "
         "--encoder h264_nvenc --stay-alive"
     )
@@ -514,7 +514,7 @@ def main(config: DataCollectionLaunchConfig):
     control_gateway_cmd = (
         f"cd {shlex.quote(str(repo_root))} && "
         "source .venv_teleop/bin/activate && "
-        "python gear_sonic/scripts/run_control_gateway.py "
+        "python -m gear_sonic.runtime.gateway.services.control "
         f"--profile {profile_arg}"
     )
     pico_video_cmd = (
@@ -572,7 +572,7 @@ def main(config: DataCollectionLaunchConfig):
         sim_cmd = (
             f"cd {repo_root} && "
             f"source .venv_sim/bin/activate && "
-            f"python gear_sonic/scripts/run_sim_loop.py "
+            f"python -m gear_sonic.utils.mujoco_sim.service "
             f"--enable-image-publish --enable-offscreen "
             f"--camera-port {config.camera_port}"
         )
@@ -622,7 +622,7 @@ def main(config: DataCollectionLaunchConfig):
     pico_cmd = (
         f"cd {repo_root} && "
         f"source .venv_teleop/bin/activate && "
-        f"python gear_sonic/scripts/pico_manager_thread_server.py"
+        f"python -m gear_sonic.utils.teleop.pico_manager"
     )
     if config.pico_manager:
         pico_cmd += " --manager"
@@ -646,7 +646,7 @@ def main(config: DataCollectionLaunchConfig):
     exporter_cmd = (
         f"cd {shlex.quote(str(repo_root))} && "
         "source .venv_data_collection/bin/activate && "
-        "python gear_sonic/scripts/run_data_exporter.py "
+        "python -m gear_sonic.utils.data_collection.service "
         f"--profile {profile_arg} "
         f"--task-prompt {shlex.quote(config.task_prompt)}"
     )

@@ -7,7 +7,7 @@ import msgpack
 import numpy as np
 import pytest
 
-from gear_sonic.planner_control import (
+from gear_sonic.utils.planner_control import (
     NavigationCommand,
     PlannerVelocityCommand,
     PlannerVelocityExecutorCore,
@@ -17,7 +17,7 @@ from gear_sonic.planner_control import (
     decode_navigation_runtime_status_message,
     decode_planner_velocity_message,
 )
-from gear_sonic.scripts.planner_velocity_executor import PlannerSafetySensorMonitor
+from gear_sonic.utils.planner_control.executor_service import PlannerSafetySensorMonitor
 from gear_sonic.utils.teleop.sonic_orientation_telemetry import OrientationTracker
 
 

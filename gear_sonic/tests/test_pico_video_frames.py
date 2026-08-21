@@ -6,7 +6,7 @@ import cv2
 import numpy as np
 import pytest
 
-from gear_sonic.pico_video.frames import (
+from gear_sonic.utils.pico_video.frames import (
     FrameError,
     compose_ego_with_wrist_views,
     compose_mono_sbs,

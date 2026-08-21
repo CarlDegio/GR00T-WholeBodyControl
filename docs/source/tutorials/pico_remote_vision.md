@@ -37,7 +37,7 @@ each terminal.
 ### Terminal 1: animated camera server
 
 ```bash
-python gear_sonic/scripts/run_mock_camera_server.py --port 5555
+python -m gear_sonic.utils.pico_video.mock_service --port 5555
 ```
 
 The source publishes a changing 640x480 RGB card under `ego_view` using the
@@ -47,10 +47,17 @@ visible.
 
 ### Terminal 2: SensorGateway with camera ingress only
 
+Create a local-test overlay so the mock camera address still comes from a
+profile rather than a production CLI port override:
+
 ```bash
-python gear_sonic/scripts/run_sensor_gateway.py \
-  --camera-host 127.0.0.1 --camera-port 5555 \
-  --rpc-bind-host 127.0.0.1 \
+printf 'endpoints:\n  camera_server: {host: 127.0.0.1, port: 5555}\n' \
+  > /tmp/sonic-pico-local.yaml
+```
+
+```bash
+python -m gear_sonic.runtime.gateway.services.sensor \
+  --overlay /tmp/sonic-pico-local.yaml \
   --no-enable-depth-anything --no-enable-cpp-state --no-enable-ros \
   --no-enable-visualization --no-enable-vla-timing
 ```
@@ -63,7 +70,7 @@ port 5555.
 For the first CPU-only workstation check:
 
 ```bash
-python gear_sonic/scripts/run_pico_video_bridge.py \
+python -m gear_sonic.utils.pico_video.service \
   --gateway-endpoint tcp://127.0.0.1:5560 \
   --network-mode local-test --encoder libx264 --verbose
 ```
@@ -71,7 +78,7 @@ python gear_sonic/scripts/run_pico_video_bridge.py \
 For normal use on the RTX workstation:
 
 ```bash
-python gear_sonic/scripts/run_pico_video_bridge.py \
+python -m gear_sonic.utils.pico_video.service \
   --gateway-endpoint tcp://127.0.0.1:5560 \
   --network-mode local-test --encoder h264_nvenc
 ```
@@ -173,8 +180,8 @@ With SensorGateway running, start the production bridge without a network
 override:
 
 ```bash
-python gear_sonic/scripts/run_pico_video_bridge.py \
-  --gateway-endpoint tcp://127.0.0.1:5560 \
+python -m gear_sonic.utils.pico_video.service \
+  --profile gear_sonic/config/launch_inference.yaml \
   --encoder h264_nvenc
 ```
 
@@ -184,8 +191,8 @@ seconds, and fully recreates the listener, SensorGateway client, and video
 session after a disconnect or DHCP address change:
 
 ```bash
-python gear_sonic/scripts/run_pico_video_bridge.py \
-  --gateway-endpoint tcp://127.0.0.1:5560 \
+python -m gear_sonic.utils.pico_video.service \
+  --profile gear_sonic/config/launch_inference.yaml \
   --encoder h264_nvenc --stay-alive
 ```
 
@@ -193,8 +200,8 @@ If multiple PICO headsets are attached, select the intended native interface
 explicitly:
 
 ```bash
-python gear_sonic/scripts/run_pico_video_bridge.py \
-  --gateway-endpoint tcp://127.0.0.1:5560 \
+python -m gear_sonic.utils.pico_video.service \
+  --profile gear_sonic/config/launch_inference.yaml \
   --pico-usb-interface enx0123456789ab
 ```
 
@@ -242,19 +249,21 @@ Do not begin this section until the operator has been notified and confirms
 that the robot camera and PICO are ready. No motion/control process is needed
 for this video check.
 
-1. Stop `run_mock_camera_server.py`.
+1. Stop `gear_sonic.utils.pico_video.mock_service`.
 2. Start the normal composed camera server on the robot.
 3. Start SensorGateway with the deployed runtime profile. If a temporary
-   override is needed, use the camera endpoint only:
+   camera change is needed, put it in an overlay:
 
    ```bash
-   python gear_sonic/scripts/run_sensor_gateway.py \
-     --camera-host 192.168.123.164 --camera-port 5555 \
+   printf 'endpoints:\n  camera_server: {host: 192.168.123.164, port: 5555}\n' \
+     > /tmp/sonic-pico-camera.yaml
+   python -m gear_sonic.runtime.gateway.services.sensor \
+     --overlay /tmp/sonic-pico-camera.yaml \
      --no-enable-depth-anything --no-enable-cpp-state --no-enable-ros \
      --no-enable-visualization --no-enable-vla-timing
    ```
 
-4. Keep `run_pico_video_bridge.py` unchanged. Its input remains
+4. Keep `gear_sonic.utils.pico_video.service` unchanged. Its input remains
    `camera_encoded/ego_view` from SensorGateway.
 5. Confirm disconnect, stale-card, and automatic recovery behavior before
    combining the video path with robot teleoperation.
@@ -263,7 +272,7 @@ for this video check.
 
 | Symptom | Check |
 |---|---|
-| `SENSORGATEWAY OFFLINE` | SensorGateway RPC is listening at the bridge's `--gateway-endpoint`; default local port is 5560. |
+| `SENSORGATEWAY OFFLINE` | SensorGateway RPC is listening at the endpoint selected by `--profile`/`--overlay`; `--gateway-endpoint` is reserved for `local-test`. |
 | `SENSOR FRAME STALE` | The camera publisher stopped, the stream name is missing, or the newest Gateway frame is older than `--max-age-ms` (default 250 ms). |
 | `INVALID CAMERA FRAME` | `camera_encoded/ego_view` must be a 1-D uint8 shared-memory array with `encoding=jpeg_bytes` and `image_shape=[H,W,3]`. |
 | FFmpeg exits immediately | Run the encoder listing command above; use `--encoder libx264` to distinguish NVENC/driver problems from pipeline problems. |

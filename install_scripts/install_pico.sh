@@ -101,7 +101,7 @@ uv pip install --no-build-isolation -e external_dependencies/XRoboToolkit-PC-Ser
 if [ "$ARCH" = "aarch64" ] && [ "$(whoami)" = "unitree" ]; then
     echo "[SKIP] Skipping sim extra & unitree_sdk2_python (onboard Jetson Orin)"
 else
-    # ── 6. Install sim extra (for run_sim_loop.py / sim2sim testing)
+    # ── 6. Install sim extra (for the MuJoCo service / sim2sim testing)
     echo "[INFO] Installing sim extra …"
     uv pip install -e "gear_sonic[sim]"
 

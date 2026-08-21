@@ -19,7 +19,7 @@ Press **`O`** at any time to immediately stop control and exit. Always keep a ha
 ```bash
 # Terminal 1 — MuJoCo simulator (from repo root)
 source .venv_sim/bin/activate
-python gear_sonic/scripts/run_sim_loop.py
+python -m gear_sonic.utils.mujoco_sim.service
 
 # Terminal 2 — C++ deployment (from gear_sonic_deploy/)
 bash deploy.sh --input-type zmq \
@@ -65,7 +65,7 @@ You can replay a recorded Sonic VLA dataset back into the deploy-side `--input-t
 interface with:
 
 ```bash
-python gear_sonic/scripts/replay_sonic_zmq.py \
+python -m gear_sonic.utils.inference.vla.replay \
   --dataset-path outputs/my_dataset \
   --protocol v1
 ```
@@ -73,7 +73,7 @@ python gear_sonic/scripts/replay_sonic_zmq.py \
 Or replay motion tokens directly:
 
 ```bash
-python gear_sonic/scripts/replay_sonic_zmq.py \
+python -m gear_sonic.utils.inference.vla.replay \
   --dataset-path outputs/my_dataset \
   --protocol v4
 ```
@@ -104,7 +104,7 @@ Run three terminals:
 
 ```bash
 source .venv_sim/bin/activate
-python gear_sonic/scripts/run_sim_loop.py
+python -m gear_sonic.utils.mujoco_sim.service
 ```
 
 **Terminal 2 — C++ deployment** (from `gear_sonic_deploy/`):
@@ -123,11 +123,11 @@ bash deploy.sh --input-type zmq \
 source .venv_teleop/bin/activate
 
 # With visualization (recommended for first run):
-python gear_sonic/scripts/pico_manager_thread_server.py \
+python -m gear_sonic.utils.teleop.pico_manager \
     --manager --vis_smpl --vis_vr3pt
 
 # Without visualization (headless):
-# python gear_sonic/scripts/pico_manager_thread_server.py --manager
+# python -m gear_sonic.utils.teleop.pico_manager --manager
 ```
 
 ### Launch (Real Robot)
@@ -150,7 +150,7 @@ Replace `<teleop-machine-ip>` with `localhost` if the PICO streamer runs on the 
 
 ```bash
 source .venv_teleop/bin/activate
-python gear_sonic/scripts/pico_manager_thread_server.py --manager
+python -m gear_sonic.utils.teleop.pico_manager --manager
 ```
 
 ### Step-by-Step

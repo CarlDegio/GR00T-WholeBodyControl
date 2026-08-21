@@ -7,9 +7,9 @@ import cv2
 import numpy as np
 import pytest
 
-from gear_sonic.utils.inference import base_pose_visual_servo as raw_servo
-from gear_sonic.utils.inference.base_pose import AlignedRGBDSnapshot
-from gear_sonic.utils.inference.base_pose_visual_servo import (
+from gear_sonic.utils.inference.base_pose import servo as raw_servo
+from gear_sonic.utils.inference.base_pose.sensor import AlignedRGBDSnapshot
+from gear_sonic.utils.inference.base_pose.servo import (
     RawServoCalibration,
     RawServoObservation,
     ServoPhase,

@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 from dataclasses import FrozenInstanceError, replace
+import base64
 import json
+import logging
 from pathlib import Path
 import sys
 from types import SimpleNamespace
@@ -11,15 +13,14 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 
-from gear_sonic.camera.sensor_server import ImageMessageSchema
-from gear_sonic.utils.inference.object_nav import (
-    ComposedRGBDCamera,
+from gear_sonic.utils.inference.lavira.object_nav import (
     ObjectNavCameraError,
     ObjectNavConfig,
     ObjectNavResult,
     ObjectNavRunner,
     QwenVLBBoxClient,
     RGBDSnapshot,
+    SensorGatewayRGBDCamera,
     get_qwenvl_policy_prompt,
     validate_object_nav_policy,
 )
@@ -29,35 +30,20 @@ def snapshot(index: int = 1, depth_mm: int = 2000) -> RGBDSnapshot:
     depth = np.full((5, 5), depth_mm, dtype=np.uint16)
     return RGBDSnapshot(
         rgb_bgr=np.full((5, 5, 3), index, dtype=np.uint8),
-        depth_raw=depth,
         depth_mm=depth.astype(np.float32),
         fx=100.0,
-        fy=100.0,
         cx=2.0,
-        cy=2.0,
-        depth_scale_m=0.001,
-        depth_aligned_to="chest_view",
-        timestamp=float(index),
     )
 
 
 def policy(*, action: str = "NAVIGATE", confidence: float = 0.9) -> dict[str, object]:
     boxable = action == "NAVIGATE"
     return {
-        "visual_check": "chair visible",
         "action": action,
         "bbox_2d": [450, 450, 550, 550] if boxable else None,
         "target": "red chair",
         "target_type": "global_target",
-        "estimated_distance_m": 2.5 if boxable else None,
-        "target_center_normalized": [500.0, 500.0] if boxable else None,
-        "target_center_pixel": [2.0, 2.0] if boxable else None,
-        "horizontal_offset_pixel": 0.0 if boxable else None,
-        "camera_bearing_deg": 0.0 if boxable else None,
-        "rotation_direction": "CENTERED" if boxable else None,
-        "rotation_angle_deg": 0.0 if boxable else None,
         "confidence": confidence,
-        "distance_confidence": 0.7,
         "stop_reasoning": "target reached" if action == "STOP" else "",
     }
 
@@ -108,8 +94,6 @@ class FakePolicyClient:
 def run_with_fakes(
     tmp_path: Path,
     policy_value: dict[str, object],
-    *,
-    target_standoff_distance: float = 0.0,
 ) -> tuple[ObjectNavResult, FakeCamera, FakePolicyClient]:
     camera = FakeCamera([snapshot(index) for index in range(1, 6)])
     policy_client = FakePolicyClient(policy_value)
@@ -117,8 +101,6 @@ def run_with_fakes(
         ObjectNavConfig(
             mission="find the chair",
             global_target="chair",
-            target_standoff_distance=target_standoff_distance,
-            output_root=str(tmp_path),
         ),
         camera=camera,
         policy_client=policy_client,
@@ -129,11 +111,10 @@ def run_with_fakes(
 def test_config_preserves_agentnav_automatic_defaults() -> None:
     config = ObjectNavConfig(mission="find chair", global_target="chair")
 
-    assert config.camera_timeout_ms == 3000
     assert config.qwenvl_timeout_seconds == 180.0
     assert config.qwenvl_model == "qwen3-vl-32b-instruct"
     assert config.min_confidence == 0.6
-    assert config.target_standoff_distance == 0.0
+    assert config.max_direct_travel == 8.0
     assert not hasattr(config, "vision_backend")
     assert not hasattr(config, "model")
 
@@ -150,7 +131,7 @@ def test_default_runner_constructs_only_qwenvl_client(
         return marker
 
     monkeypatch.setattr(
-        "gear_sonic.utils.inference.object_nav.QwenVLBBoxClient",
+        "gear_sonic.utils.inference.lavira.object_nav.QwenVLBBoxClient",
         build_qwenvl,
     )
     runner = ObjectNavRunner(
@@ -160,7 +141,6 @@ def test_default_runner_constructs_only_qwenvl_client(
             qwenvl_model="qwen-test",
             qwenvl_base_url="https://qwen.invalid/v1",
             qwenvl_timeout_seconds=42.0,
-            output_root=str(tmp_path),
         ),
         camera=FakeCamera([snapshot(index) for index in range(1, 6)]),
     )
@@ -174,7 +154,7 @@ def test_default_runner_constructs_only_qwenvl_client(
 
 
 def test_object_nav_result_is_immutable() -> None:
-    result = ObjectNavResult("FAILED", {}, {"commands": []}, {}, "/tmp/output")
+    result = ObjectNavResult("FAILED", {}, {})
 
     with pytest.raises(FrozenInstanceError):
         result.outcome = "NAVIGATE"  # type: ignore[misc]
@@ -210,13 +190,12 @@ def test_policy_rejects_extra_keys() -> None:
         validate_object_nav_policy(value)
 
 
-@pytest.mark.parametrize("key", ["confidence", "distance_confidence"])
 @pytest.mark.parametrize("invalid", [float("nan"), float("inf"), True])
-def test_policy_rejects_non_finite_or_boolean_confidence(key: str, invalid: object) -> None:
+def test_policy_rejects_non_finite_or_boolean_confidence(invalid: object) -> None:
     value = policy()
-    value[key] = invalid
+    value["confidence"] = invalid
 
-    with pytest.raises(ValueError, match=key):
+    with pytest.raises(ValueError, match="confidence"):
         validate_object_nav_policy(value)
 
 
@@ -253,34 +232,25 @@ def test_policy_rejects_unknown_target_type_and_non_global_stop() -> None:
         validate_object_nav_policy(value)
 
 
-@pytest.mark.parametrize("direction", ["LEFT", "RIGHT", "CENTERED"])
-def test_policy_accepts_each_supported_rotation_direction(direction: str) -> None:
-    value = policy()
-    value["rotation_direction"] = direction
+def test_gateway_camera_rejects_mismatched_rgbd_shapes() -> None:
+    rgb_stream = SensorGatewayRGBDCamera.RGB_STREAM
+    depth_stream = SensorGatewayRGBDCamera.DEPTH_STREAM
+    frame = SimpleNamespace(attributes={}, source_timestamp_ns=1)
+    malformed = SimpleNamespace(
+        snapshot=SimpleNamespace(
+            frames={rgb_stream: frame, depth_stream: frame},
+        ),
+        arrays={
+            rgb_stream: np.zeros((2, 2, 3), dtype=np.uint8),
+            depth_stream: np.zeros((3, 2), dtype=np.uint16),
+        },
+    )
 
-    assert validate_object_nav_policy(value) == value
-
-
-def test_policy_rejects_unknown_rotation_direction() -> None:
-    value = policy()
-    value["rotation_direction"] = "FORWARD"
-
-    with pytest.raises(ValueError, match="rotation_direction"):
-        validate_object_nav_policy(value)
-
-
-def test_composed_camera_rejects_malformed_rgbd_payload() -> None:
-    malformed = ImageMessageSchema(
-        timestamps={"chest_view": 1.0},
-        images={"chest_view": np.zeros((2, 2, 3), dtype=np.uint8)},
-        camera_info={"chest_view": {}},
-    ).serialize()
-
-    with pytest.raises(ObjectNavCameraError, match="RGB and depth"):
-        ComposedRGBDCamera.decode_payload(malformed)
+    with pytest.raises(ObjectNavCameraError, match="shapes do not match"):
+        SensorGatewayRGBDCamera._decode(malformed)
 
 
-def test_qwenvl_client_sends_local_image_and_validates_policy(tmp_path: Path) -> None:
+def test_qwenvl_client_sends_in_memory_image_and_validates_policy() -> None:
     calls: list[dict[str, object]] = []
 
     class FakeCompletions:
@@ -295,28 +265,17 @@ def test_qwenvl_client_sends_local_image_and_validates_policy(tmp_path: Path) ->
             )
 
     client = SimpleNamespace(chat=SimpleNamespace(completions=FakeCompletions()))
-    image_path = tmp_path / "input.png"
-    image_path.write_bytes(b"png bytes")
-    ticks = iter([4.0, 5.25])
+    ticks = iter([3.0, 3.25, 4.0, 5.25])
     qwen = QwenVLBBoxClient(client=client, monotonic=lambda: next(ticks))
 
     result = qwen.locate(
-        image_path=image_path,
         mission="find chair",
         global_target="chair",
         snapshot=snapshot(),
-        cwd=tmp_path,
     )
 
     assert result["action"] == "NAVIGATE"
     assert result["bbox_2d"] == [450, 450, 550, 550]
-    assert result["estimated_distance_m"] is None
-    assert result["target_center_normalized"] == [500.0, 500.0]
-    assert result["target_center_pixel"] == [2.0, 2.0]
-    assert result["horizontal_offset_pixel"] == 0.0
-    assert result["camera_bearing_deg"] == 0.0
-    assert result["rotation_direction"] == "CENTERED"
-    assert result["rotation_angle_deg"] == 0.0
     assert calls[0]["model"] == "qwen3-vl-32b-instruct"
     assert calls[0]["timeout"] == 180.0
     assert calls[0]["response_format"] == {"type": "json_object"}
@@ -325,40 +284,12 @@ def test_qwenvl_client_sends_local_image_and_validates_policy(tmp_path: Path) ->
     assert isinstance(messages, list)
     image_url = messages[0]["content"][0]["image_url"]["url"]
     assert image_url.startswith("data:image/png;base64,")
+    assert base64.b64decode(image_url.partition(",")[2]).startswith(b"\x89PNG")
     prompt = messages[0]["content"][1]["text"]
     assert '"bbox_2d": [x1, y1, x2, y2] or null' in prompt
     assert "Do not output target_center" in prompt
-    assert qwen.last_auth_check_seconds == 0.0
+    assert qwen.last_image_encode_seconds == pytest.approx(0.25)
     assert qwen.last_api_inference_seconds == pytest.approx(1.25)
-
-
-def test_qwenvl_derives_right_turn_from_bbox_and_camera_intrinsics(tmp_path: Path) -> None:
-    value = qwen_policy()
-    value["bbox_2d"] = [700, 400, 800, 600]
-
-    class FakeCompletions:
-        def create(self, **_kwargs: object) -> object:
-            return SimpleNamespace(
-                choices=[SimpleNamespace(message=SimpleNamespace(content=json.dumps(value)))]
-            )
-
-    image_path = tmp_path / "input.png"
-    image_path.write_bytes(b"png bytes")
-    client = SimpleNamespace(chat=SimpleNamespace(completions=FakeCompletions()))
-
-    result = QwenVLBBoxClient(client=client).locate(
-        image_path=image_path,
-        mission="find chair",
-        global_target="chair",
-        snapshot=replace(snapshot(), fx=2.0),
-        cwd=tmp_path,
-    )
-
-    assert result["target_center_pixel"] == [3.0, 2.0]
-    assert result["horizontal_offset_pixel"] == 1.0
-    assert result["camera_bearing_deg"] == pytest.approx(26.565, abs=0.001)
-    assert result["rotation_direction"] == "RIGHT"
-    assert result["rotation_angle_deg"] == pytest.approx(26.565, abs=0.001)
 
 
 def test_qwenvl_client_requires_api_key(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -397,44 +328,30 @@ def test_qwenvl_client_uses_isolated_http_proxy_and_ignores_environment(
     assert captured["openai"]["http_client"].__class__ is FakeHttpClient
 
 
-def test_successful_cycle_captures_five_frames_and_writes_diagnostics(
-    tmp_path: Path,
+def test_successful_cycle_logs_diagnostics_without_writing_artifacts(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture,
 ) -> None:
-    result, camera, policy_client = run_with_fakes(
-        tmp_path, policy(), target_standoff_distance=0.5
-    )
+    with caplog.at_level(logging.INFO, logger="sonic.lavira"):
+        result, camera, policy_client = run_with_fakes(tmp_path, policy())
 
     assert result.outcome == "NAVIGATE"
-    assert len(result.commands["commands"]) == 2
-    assert result.geometry["travel"] == 1.5
+    assert result.geometry["mean_range"] == 2.0
     assert camera.capture_count == 5
     assert len(policy_client.calls) == 1
-    assert policy_client.calls[0]["snapshot"].timestamp == 3.0
-    assert "qwen_prediction" in result.geometry
-    output_dir = Path(result.output_dir)
-    assert sorted(path.name for path in output_dir.glob("depth_raw_*.png")) == [
-        "depth_raw_01.png",
-        "depth_raw_02.png",
-        "depth_raw_03.png",
-        "depth_raw_04.png",
-        "depth_raw_05.png",
-    ]
+    assert np.all(policy_client.calls[0]["snapshot"].rgb_bgr == 3)
+    assert list(tmp_path.iterdir()) == []
+    assert "object_nav outcome=NAVIGATE" in caplog.text
+    assert "policy=" in caplog.text
+    assert "geometry=" in caplog.text
     timing = result.geometry["timing_s"]
     assert set(timing) == {
         "camera_rgbd",
-        "image_io",
-        "auth_check",
+        "image_encode",
         "api_inference",
         "postprocess",
         "total",
     }
     assert all(float(value) >= 0.0 for value in timing.values())
-    saved_geometry = json.loads(
-        (output_dir / "object_nav_geometry.json").read_text(encoding="utf-8")
-    )
-    assert saved_geometry["timing_s"] == timing
-    assert json.loads((output_dir / "camera_info.json").read_text())["frame_count"] == 5
-    assert json.loads((output_dir / "object_nav_commands.json").read_text()) == result.commands
 
 
 def test_da_release_callback_runs_after_rgbd_capture_before_qwen_policy(
@@ -448,7 +365,7 @@ def test_da_release_callback_runs_after_rgbd_capture_before_qwen_policy(
             return super().locate(**kwargs)
 
     runner = ObjectNavRunner(
-        ObjectNavConfig("find chair", "chair", output_root=str(tmp_path)),
+        ObjectNavConfig("find chair", "chair"),
         camera=FakeCamera([snapshot(index) for index in range(1, 6)]),
         policy_client=OrderedPolicyClient(policy()),
     )
@@ -456,22 +373,6 @@ def test_da_release_callback_runs_after_rgbd_capture_before_qwen_policy(
     runner.run_once(rgbd_capture_complete=lambda: events.append("depth_released"))
 
     assert events == ["depth_released", "policy"]
-
-
-def test_object_nav_warmup_runs_iteration_zero_without_returning_motion(
-    tmp_path: Path,
-) -> None:
-    camera = FakeCamera([snapshot(index) for index in range(1, 6)])
-    runner = ObjectNavRunner(
-        ObjectNavConfig("find chair", "chair", output_root=str(tmp_path)),
-        camera=camera,
-        policy_client=FakePolicyClient(policy()),
-    )
-
-    warmup = runner.warmup()
-
-    assert warmup.outcome == "NAVIGATE"
-    assert Path(warmup.output_dir).name == "iteration_0000"
 
 
 @pytest.mark.parametrize(
@@ -484,17 +385,16 @@ def test_stop_and_low_confidence_fail_closed(
     result, _, _ = run_with_fakes(tmp_path, policy_value)
 
     assert result.outcome == expected
-    assert result.commands == {"commands": []}
     assert result.error is None
 
 
-def test_qwenvl_failure_returns_failed_result_and_empty_commands(
+def test_qwenvl_failure_returns_failed_result(
     tmp_path: Path,
 ) -> None:
     camera = FakeCamera([snapshot(index) for index in range(1, 6)])
     policy_client = FakePolicyClient(error=RuntimeError("Qwen-VL unavailable"))
     runner = ObjectNavRunner(
-        ObjectNavConfig("find chair", "chair", output_root=str(tmp_path)),
+        ObjectNavConfig("find chair", "chair"),
         camera=camera,
         policy_client=policy_client,
     )
@@ -502,14 +402,12 @@ def test_qwenvl_failure_returns_failed_result_and_empty_commands(
     result = runner.run_once()
 
     assert result.outcome == "FAILED"
-    assert result.commands == {"commands": []}
     assert result.error == "Qwen-VL unavailable"
     assert result.geometry["status"] == "failed"
     assert result.geometry["error"] == "Qwen-VL unavailable"
     assert set(result.geometry["timing_s"]) == {
         "camera_rgbd",
-        "image_io",
-        "auth_check",
+        "image_encode",
         "api_inference",
         "postprocess",
         "total",
@@ -519,7 +417,7 @@ def test_qwenvl_failure_returns_failed_result_and_empty_commands(
 def test_injected_camera_lifecycle_remains_with_caller(tmp_path: Path) -> None:
     camera = FakeCamera([snapshot(index) for index in range(1, 6)])
     runner = ObjectNavRunner(
-        ObjectNavConfig("find chair", "chair", output_root=str(tmp_path)),
+        ObjectNavConfig("find chair", "chair"),
         camera=camera,
         policy_client=FakePolicyClient(policy()),
     )

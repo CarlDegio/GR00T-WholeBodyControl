@@ -48,7 +48,7 @@ We highly recommend running through this process and getting familiar with the c
 
 ```sh
 source .venv_sim/bin/activate
-python gear_sonic/scripts/run_sim_loop.py
+python -m gear_sonic.utils.mujoco_sim.service
 ```
 
 **Terminal 2 — Deployment** (host or Docker, from `gear_sonic_deploy/`):

@@ -10,17 +10,20 @@ import numpy as np
 import pytest
 import zmq
 
-from gear_sonic.runtime.client import MaterializedSnapshot, SensorGatewayClient
-from gear_sonic.runtime.contracts import MessageMetadata, SharedMemoryFrame
-from gear_sonic.runtime.data_exporter_sensor_gateway import (
+from gear_sonic.runtime.gateway.sensor_client import (
+    MaterializedSnapshot,
+    SensorGatewayClient,
+)
+from gear_sonic.runtime.protocol import MessageMetadata, SharedMemoryFrame
+from gear_sonic.utils.data_collection.ingress import (
     DATA_EXPORTER_ROBOT_CONFIG_STREAM,
     DATA_EXPORTER_STATE_STREAM,
     DataExporterSensorGatewayIngress,
     data_exporter_camera_message_from_snapshot,
     decode_robot_config_array,
 )
-from gear_sonic.runtime.sensor_gateway import SensorGatewayCore, SensorGatewayRpc
-from gear_sonic.runtime.snapshot import SensorSnapshot, TimestampBasis
+from gear_sonic.runtime.gateway.sensor import SensorGatewayCore, SensorGatewayRpc
+from gear_sonic.runtime.gateway.snapshot import SensorSnapshot, TimestampBasis
 
 
 def _materialized_encoded_camera(

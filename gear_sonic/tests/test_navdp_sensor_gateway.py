@@ -8,15 +8,17 @@ import numpy as np
 import pytest
 import zmq
 
-from gear_sonic.navdp import gateway as navdp_gateway
-from gear_sonic.runtime.client import MaterializedSnapshot, SensorGatewayClient
-from gear_sonic.runtime.contracts import MessageMetadata, SharedMemoryFrame
-from gear_sonic.runtime.sensor_gateway import SensorGatewayCore, SensorGatewayRpc
-from gear_sonic.runtime.snapshot import SensorSnapshot, TimestampBasis
-from gear_sonic.scripts.navdp_planner import (
+from gear_sonic.utils.inference.navdp import gateway as navdp_gateway
+from gear_sonic.runtime.gateway.sensor_client import (
+    MaterializedSnapshot,
+    SensorGatewayClient,
+)
+from gear_sonic.runtime.protocol import MessageMetadata, SharedMemoryFrame
+from gear_sonic.runtime.gateway.sensor import SensorGatewayCore, SensorGatewayRpc
+from gear_sonic.runtime.gateway.snapshot import SensorSnapshot, TimestampBasis
+from gear_sonic.utils.inference.navdp.gateway import (
     NavDPSensorGatewayIngress,
     _SharedSensors,
-    _extract_camera_frame,
     _gateway_camera_frame,
     _update_slam_cloud_state,
     _update_odometry_state,
@@ -104,18 +106,11 @@ def test_gateway_camera_builds_the_same_navdp_rgb_depth_and_intrinsics() -> None
         source_ns=source_ns,
         attributes={"camera/ego_view": {"camera_info": info}},
     )
-    legacy_rgb, legacy_depth, legacy_info = _extract_camera_frame(
-        {
-            "images": {"ego_view": rgb, "ego_view_depth": depth},
-            "camera_info": {"ego_view": info},
-        }
-    )
-
     gateway = _gateway_camera_frame(materialized)
 
-    np.testing.assert_array_equal(gateway.rgb, legacy_rgb)
-    np.testing.assert_array_equal(gateway.depth_m, legacy_depth)
-    assert gateway.camera_info == legacy_info
+    np.testing.assert_array_equal(gateway.rgb, rgb)
+    np.testing.assert_allclose(gateway.depth_m, depth.astype(np.float32) * 0.001)
+    assert gateway.camera_info == info
     assert gateway.source_timestamp_s == pytest.approx(123.0)
 
 

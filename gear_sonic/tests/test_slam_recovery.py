@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import math
 
-from gear_sonic.runtime.slam_recovery import (
+from gear_sonic.utils.inference.navdp.recovery import (
     MaliciousDriftDetector,
     OdometrySample,
     SlamRecoveryLimits,

@@ -2,8 +2,8 @@ from __future__ import annotations
 
 import pytest
 
-from gear_sonic.runtime.contracts import MessageMetadata, SharedMemoryFrame
-from gear_sonic.runtime.snapshot import (
+from gear_sonic.runtime.protocol import MessageMetadata, SharedMemoryFrame
+from gear_sonic.runtime.gateway.snapshot import (
     SensorSnapshot,
     SensorSnapshotStore,
     SnapshotRequest,

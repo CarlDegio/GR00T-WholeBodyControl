@@ -4,23 +4,26 @@ import threading
 
 import pytest
 
-from gear_sonic.scripts.lavira_planner import (
+from gear_sonic.utils.inference.lavira.service import (
     LaviraPlannerConfig,
     LaviraPlannerRuntime,
     WorkerResult,
     run_inference_worker,
     result_to_goal,
 )
-from gear_sonic.utils.inference.object_nav import ObjectNavResult
+from gear_sonic.utils.inference.lavira.object_nav import ObjectNavResult
 
 
-def nav_result(*, distance: float = 2.0, angle_deg: float = -30.0) -> ObjectNavResult:
+def nav_result(
+    *,
+    distance: float = 2.0,
+    angle_deg: float = -30.0,
+) -> ObjectNavResult:
+    geometry = {"mean_range": distance, "angle_deg": angle_deg}
     return ObjectNavResult(
         outcome="NAVIGATE",
         policy={"target": "chair", "target_type": "global_target", "confidence": 0.9},
-        commands={},
-        geometry={"mean_range": distance, "angle_deg": angle_deg},
-        output_dir="/tmp",
+        geometry=geometry,
     )
 
 
@@ -40,6 +43,8 @@ def test_lavira_config_exposes_only_qwenvl_policy_settings() -> None:
     assert config.qwenvl_timeout_seconds == 180.0
     assert not hasattr(config, "vision_backend")
     assert not hasattr(config, "model")
+    assert not hasattr(config, "debug")
+    assert not hasattr(config, "output_root")
 
 
 def test_result_goal_maps_camera_right_to_negative_base_y() -> None:
@@ -57,7 +62,7 @@ def test_worker_result_publishes_goal_not_timed_velocity_sequence() -> None:
     runtime, intents = runtime_with_intents()
     runtime.start_navigation(1)
     runtime.results.put(WorkerResult(1, nav_result(), None))
-    runtime.tick(2.0)
+    runtime.tick()
     name, parameters = intents[-1]
     assert name == "navigation_goal"
     assert parameters["goal_base"] == pytest.approx((1.73205, -1.0))
@@ -65,12 +70,27 @@ def test_worker_result_publishes_goal_not_timed_velocity_sequence() -> None:
     assert "duration_s" not in parameters
 
 
+def test_current_worker_result_returns_timing_for_main_thread_publish() -> None:
+    runtime, _ = runtime_with_intents()
+    runtime.start_navigation(1)
+    timing = {"camera_rgbd": 0.1, "api_inference": 1.5, "total": 1.7}
+    result = nav_result()
+    result.geometry["timing_s"] = timing
+    runtime.results.put(WorkerResult(1, result, None))
+
+    assert runtime.tick() == {
+        "camera_rgbd": 100.0,
+        "api_inference": 1500.0,
+        "total": 1700.0,
+    }
+
+
 def test_space_invalidates_generation_and_late_worker_result() -> None:
     runtime, intents = runtime_with_intents()
     runtime.start_navigation(1)
     runtime.cancel(2, "operator_stop")
     runtime.results.put(WorkerResult(1, nav_result(), None))
-    runtime.tick(2.0)
+    assert runtime.tick() is None
     assert runtime.phase == "listen_wasd"
     assert intents == []
 
@@ -105,23 +125,14 @@ def test_current_generation_status_returns_to_listen_but_stale_status_is_ignored
     assert runtime.phase == "listen_wasd"
 
 
-def test_worker_does_not_warm_up_and_releases_da_after_rgbd_capture() -> None:
+def test_worker_releases_da_after_rgbd_capture() -> None:
     intents: list[tuple[str, dict]] = []
-    logs: list[str] = []
     runtime = LaviraPlannerRuntime(
         LaviraPlannerConfig("find chair", "chair"),
         submit_intent=lambda name, parameters: intents.append((name, dict(parameters))),
-        logger=logs.append,
     )
 
     class Runner:
-        def __init__(self) -> None:
-            self.warmup_called = False
-
-        def warmup(self) -> None:
-            self.warmup_called = True
-            raise AssertionError("demand-scheduled LaViRA must not warm up")
-
         def run_once(self, *, rgbd_capture_complete) -> ObjectNavResult:
             rgbd_capture_complete()
             return nav_result()
@@ -143,5 +154,4 @@ def test_worker_does_not_warm_up_and_releases_da_after_rgbd_capture() -> None:
 
     assert result.result is not None
     assert result.error is None
-    assert not runner.warmup_called
     assert ("lavira_rgbd_captured", {"generation": 1}) in intents

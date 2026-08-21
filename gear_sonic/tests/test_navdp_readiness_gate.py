@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import subprocess
 
-from gear_sonic.scripts import navdp_readiness_gate
+from gear_sonic.utils.inference.navdp import readiness as navdp_readiness_gate
 
 
 def test_topic_gate_requires_a_real_message(monkeypatch) -> None:

@@ -1,15 +1,9 @@
 import math
 import struct
-import sys
-from pathlib import Path
 
 import pytest
 
-
-SCRIPTS = Path(__file__).resolve().parents[1] / "scripts"
-sys.path.insert(0, str(SCRIPTS))
-
-from filter_velocity_relay import (  # noqa: E402
+from gear_sonic.utils.planner_control.velocity_relay import (
     LatestVelocity,
     PlannerState,
     ReadySignal,

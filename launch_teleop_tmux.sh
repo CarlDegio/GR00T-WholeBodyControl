@@ -99,8 +99,8 @@ command -v tmux >/dev/null 2>&1 || {
 
 require_path "$ROOT_DIR/.venv_sim/bin/activate"
 require_path "$ROOT_DIR/.venv_teleop/bin/activate"
-require_path "$ROOT_DIR/gear_sonic/scripts/run_sim_loop.py"
-require_path "$ROOT_DIR/gear_sonic/scripts/pico_manager_thread_server.py"
+require_path "$ROOT_DIR/gear_sonic/utils/mujoco_sim/service.py"
+require_path "$ROOT_DIR/gear_sonic/utils/teleop/pico_manager.py"
 require_path "$ROOT_DIR/gear_sonic_deploy/deploy.sh"
 require_path "$ROOT_DIR/gear_sonic_deploy/scripts/setup_env.sh"
 
@@ -120,13 +120,13 @@ tmux new-window -d -t "=$SESSION_NAME" -n pico \
     "$BASH_BIN" --noprofile --norc
 
 tmux send-keys -t "=$SESSION_NAME:mujoco" \
-    "export PATH='$BASE_PATH'; cd '$ROOT_DIR'; source .venv_sim/bin/activate; python gear_sonic/scripts/run_sim_loop.py --show-smpl-tracking; rc=\$?; echo '[mujoco] exited with code' \$rc; exec '$BASH_BIN' --noprofile --norc" C-m
+    "export PATH='$BASE_PATH'; cd '$ROOT_DIR'; source .venv_sim/bin/activate; python -m gear_sonic.utils.mujoco_sim.service --show-smpl-tracking; rc=\$?; echo '[mujoco] exited with code' \$rc; exec '$BASH_BIN' --noprofile --norc" C-m
 
 tmux send-keys -t "=$SESSION_NAME:deploy" \
     "export PATH='$BASE_PATH'; export TensorRT_ROOT=/usr; export CUDAToolkit_ROOT=/usr/local/cuda-13.0; export onnxruntime_ROOT=/home/user/.local/onnxruntime; export LD_LIBRARY_PATH=/home/user/.local/onnxruntime/lib:/usr/local/cuda-13.0/lib64:\${LD_LIBRARY_PATH:-}; cd '$ROOT_DIR/gear_sonic_deploy'; source scripts/setup_env.sh; just run g1_deploy_onnx_ref lo policy/release/model_decoder.onnx reference/example/ --obs-config policy/release/observation_config.yaml --encoder-file policy/release/model_encoder.onnx --planner-file planner/target_vel/V2/planner_sonic.onnx --input-type zmq_manager --output-type all --zmq-host localhost --disable-crc-check $DEPLOY_RECORD_ARGS; rc=\$?; echo '[deploy] exited with code' \$rc; exec '$BASH_BIN' --noprofile --norc" C-m
 
 tmux send-keys -t "=$SESSION_NAME:pico" \
-    "export PATH='$BASE_PATH'; cd '$ROOT_DIR'; source .venv_teleop/bin/activate; python gear_sonic/scripts/pico_manager_thread_server.py --manager --vis_vr3pt --vis_smpl $PICO_RECORD_ARGS; rc=\$?; echo '[pico] exited with code' \$rc; exec '$BASH_BIN' --noprofile --norc" C-m
+    "export PATH='$BASE_PATH'; cd '$ROOT_DIR'; source .venv_teleop/bin/activate; python -m gear_sonic.utils.teleop.pico_manager --manager --vis_vr3pt --vis_smpl $PICO_RECORD_ARGS; rc=\$?; echo '[pico] exited with code' \$rc; exec '$BASH_BIN' --noprofile --norc" C-m
 
 tmux select-window -t "=$SESSION_NAME:deploy"
 

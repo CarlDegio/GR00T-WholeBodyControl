@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-from gear_sonic.runtime.contracts import MessageMetadata, OperatorCommand
-from gear_sonic.runtime.control_client import ControlGatewaySubscriber
+from gear_sonic.runtime.protocol import MessageMetadata, OperatorCommand
+from gear_sonic.runtime.gateway.control_client import ControlGatewaySubscriber
 
 
 def _command(sequence: int, timestamp_ns: int, name: str) -> OperatorCommand:

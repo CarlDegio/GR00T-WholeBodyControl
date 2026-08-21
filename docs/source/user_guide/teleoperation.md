@@ -29,7 +29,7 @@ A typical whole-body teleoperation session follows this workflow:
 **Terminal 1 — MuJoCo Simulator** (or skip for real robot):
 ```bash
 source .venv_teleop/bin/activate
-python gear_sonic/scripts/run_sim_loop.py
+python -m gear_sonic.utils.mujoco_sim.service
 ```
 
 **Terminal 2 — C++ Deployment**:
@@ -44,7 +44,7 @@ bash deploy.sh --input-type zmq_manager sim
 **Terminal 3 — PICO Teleop Streamer**:
 ```bash
 source .venv_teleop/bin/activate
-python gear_sonic/scripts/pico_manager_thread_server.py --manager 
+python -m gear_sonic.utils.teleop.pico_manager --manager
 ```
 
 **Operator Actions**:
@@ -242,4 +242,4 @@ Both methods immediately halt the policy and exit control mode.
 
 - **Understand input interfaces** — See tutorials for [Keyboard](../tutorials/keyboard.md), [Gamepad](../tutorials/gamepad.md), [ZMQ](../tutorials/zmq.md), [Manager](../tutorials/manager.md)
 - **Learn about deployment** — See [Deployment Code & Program Flow](../references/deployment_code)
-- **General troubleshooting** — See [Troubleshooting Guide](troubleshooting) 
+- **General troubleshooting** — See [Troubleshooting Guide](troubleshooting)

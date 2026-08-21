@@ -183,14 +183,12 @@ uv run python gr00t/eval/run_gr00t_server.py \
 
 ### Run Inference
 
-On the inference machine (from the GR00T-WholeBodyControl repository):
+On the inference machine, set `policy_server` and `camera_server` under
+`endpoints`, and set the task under `components.vla.prompt` in
+`gear_sonic/config/launch_inference.yaml`, then run:
 
 ```bash
-python gear_sonic/scripts/launch_inference.py \
-    --policy-host <gpu_machine_ip> \
-    --policy-port 5550 \
-    --camera-host 192.168.123.164 \
-    --prompt "pick up the soda can and place it in the bin"
+python gear_sonic/scripts/launch_inference.py
 ```
 
 ## Summary

@@ -13,9 +13,9 @@ import numpy as np
 sys.modules.setdefault("tyro", types.ModuleType("tyro"))
 
 from gear_sonic.camera.sensor_server import ImageMessageSchema
-from gear_sonic.runtime.client import SensorGatewayClientError
+from gear_sonic.runtime.gateway.sensor_client import SensorGatewayClientError
 import gear_sonic.scripts.launch_data_collection as data_collection_launcher
-from gear_sonic.scripts.run_camera_viewer import (
+from gear_sonic.utils.operator.camera_viewer import (
     GatewayCameraClient,
     _gateway_rgb_streams,
     _rgb_camera_names,
@@ -27,7 +27,7 @@ from gear_sonic.scripts.launch_data_collection import (
     build_pico_video_command,
     build_sensor_gateway_command,
 )
-from gear_sonic.scripts.run_depth_camera_viewer import colorize_depth
+from gear_sonic.utils.operator.depth_viewer import colorize_depth
 
 
 def _gateway_health(*streams: str) -> dict:
@@ -182,7 +182,7 @@ def test_data_collection_launcher_viewer_uses_profile_without_direct_camera() ->
     assert command == (
         "cd /workspace/sonic && "
         "source .venv_data_collection/bin/activate && "
-        "python gear_sonic/scripts/run_camera_viewer.py "
+        "python -m gear_sonic.utils.operator.camera_viewer "
         "--profile '/tmp/runtime profile.yaml'"
     )
 
@@ -200,7 +200,7 @@ def test_data_collection_launcher_enables_sensor_gateway_rgb_preview() -> None:
     assert command == (
         "cd /workspace/sonic && "
         "source .venv_teleop/bin/activate && "
-        "python gear_sonic/scripts/run_sensor_gateway.py "
+        "python -m gear_sonic.runtime.gateway.services.sensor "
         "--profile '/tmp/runtime profile.yaml' "
         "--camera-host 192.168.123.164 --camera-port 5555 "
         "--enable-rgb-preview "
@@ -218,7 +218,7 @@ def test_data_collection_launcher_keeps_pico_video_running_by_default() -> None:
     assert command == (
         "cd /workspace/sonic && "
         "source .venv_teleop/bin/activate && "
-        "python -m gear_sonic.scripts.run_pico_video_bridge "
+        "python -m gear_sonic.utils.pico_video.service "
         "--profile '/tmp/runtime profile.yaml' "
         "--encoder h264_nvenc --stay-alive"
     )

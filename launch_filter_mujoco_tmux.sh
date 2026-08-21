@@ -11,8 +11,8 @@ command -v tmux >/dev/null
 for path in \
     "$ROOT_DIR/.venv_sim/bin/activate" \
     "$ROOT_DIR/.venv_teleop/bin/activate" \
-    "$ROOT_DIR/gear_sonic/scripts/run_sim_loop.py" \
-    "$ROOT_DIR/gear_sonic/scripts/filter_velocity_relay.py" \
+    "$ROOT_DIR/gear_sonic/utils/mujoco_sim/service.py" \
+    "$ROOT_DIR/gear_sonic/utils/planner_control/velocity_relay.py" \
     "$ROOT_DIR/gear_sonic_deploy/scripts/setup_env.sh"; do
     [[ -e "$path" ]] || { echo "Missing required path: $path" >&2; exit 1; }
 done
@@ -28,10 +28,10 @@ tmux new-window -d -t "=$SESSION_NAME" -n mujoco "$BASH_BIN" --noprofile --norc
 tmux new-window -d -t "=$SESSION_NAME" -n deploy "$BASH_BIN" --noprofile --norc
 
 tmux send-keys -t "=$SESSION_NAME:relay" \
-    "export PATH='$BASE_PATH'; cd '$ROOT_DIR'; source .venv_teleop/bin/activate; python gear_sonic/scripts/filter_velocity_relay.py --source tcp://127.0.0.1:5558 --output 'tcp://*:5556' --hz 10 --timeout 1.0 --ready-file '$READY_FILE'; rc=\$?; echo '[relay] exited with code' \$rc; exec '$BASH_BIN' --noprofile --norc" C-m
+    "export PATH='$BASE_PATH'; cd '$ROOT_DIR'; source .venv_teleop/bin/activate; python -m gear_sonic.utils.planner_control.velocity_relay --source tcp://127.0.0.1:5558 --output 'tcp://*:5556' --hz 10 --timeout 1.0 --ready-file '$READY_FILE'; rc=\$?; echo '[relay] exited with code' \$rc; exec '$BASH_BIN' --noprofile --norc" C-m
 
 tmux send-keys -t "=$SESSION_NAME:mujoco" \
-    "export PATH='$BASE_PATH'; cd '$ROOT_DIR'; source .venv_sim/bin/activate; echo '[mujoco] waiting for first Filter velocity'; while [[ ! -e '$READY_FILE' ]]; do sleep 0.1; done; python gear_sonic/scripts/run_sim_loop.py; rc=\$?; echo '[mujoco] exited with code' \$rc; exec '$BASH_BIN' --noprofile --norc" C-m
+    "export PATH='$BASE_PATH'; cd '$ROOT_DIR'; source .venv_sim/bin/activate; echo '[mujoco] waiting for first Filter velocity'; while [[ ! -e '$READY_FILE' ]]; do sleep 0.1; done; python -m gear_sonic.utils.mujoco_sim.service; rc=\$?; echo '[mujoco] exited with code' \$rc; exec '$BASH_BIN' --noprofile --norc" C-m
 
 tmux send-keys -t "=$SESSION_NAME:deploy" \
     "export PATH='$BASE_PATH'; export TensorRT_ROOT=/usr; export CUDAToolkit_ROOT=/usr/local/cuda-13.0; export onnxruntime_ROOT=/home/user/.local/onnxruntime; export LD_LIBRARY_PATH=/home/user/.local/onnxruntime/lib:/usr/local/cuda-13.0/lib64:\${LD_LIBRARY_PATH:-}; cd '$ROOT_DIR/gear_sonic_deploy'; source scripts/setup_env.sh; just run g1_deploy_onnx_ref lo policy/release/model_decoder.onnx reference/example/ --obs-config policy/release/observation_config.yaml --encoder-file policy/release/model_encoder.onnx --planner-file planner/target_vel/V2/planner_sonic.onnx --input-type zmq_manager --output-type all --zmq-host localhost --zmq-port 5556 --disable-crc-check; rc=\$?; echo '[deploy] exited with code' \$rc; exec '$BASH_BIN' --noprofile --norc" C-m

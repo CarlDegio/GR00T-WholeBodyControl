@@ -31,7 +31,7 @@ Press **`O`** at any time to immediately stop control and exit. Always keep a ha
 ```bash
 # Terminal 1 — MuJoCo simulator (from repo root)
 source .venv_sim/bin/activate
-python gear_sonic/scripts/run_sim_loop.py
+python -m gear_sonic.utils.mujoco_sim.service
 
 # Terminal 2 — C++ deployment (from gear_sonic_deploy/)
 bash deploy.sh --input-type keyboard sim

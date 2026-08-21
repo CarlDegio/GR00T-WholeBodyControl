@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from dataclasses import replace
-import json
 from pathlib import Path
 import queue
 import threading
@@ -10,15 +9,14 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 
-from gear_sonic.runtime.client import SensorGatewayClientError
-from gear_sonic.runtime.snapshot import TimestampBasis
-from gear_sonic.scripts.base_pose_agent import BasePoseAgentConfig
-from gear_sonic.scripts.base_pose_yolo_agent import (
+from gear_sonic.runtime.gateway.sensor_client import SensorGatewayClientError
+from gear_sonic.runtime.gateway.snapshot import TimestampBasis
+from gear_sonic.utils.inference.base_pose.agent import (
+    BasePoseAgentConfig,
     GatewayRawServoAdapter,
 )
-from gear_sonic.utils.inference.base_pose import BasePoseCameraError
-import gear_sonic.utils.inference.base_pose_dual_visual_servo as dual_servo
-from gear_sonic.utils.inference.base_pose_dual_visual_servo import (
+import gear_sonic.utils.inference.base_pose.dual_servo as dual_servo
+from gear_sonic.utils.inference.base_pose.dual_servo import (
     DualCameraFailoverCoordinator,
     HeadCameraTextMonitor,
     _claim_new_stream_snapshot,
@@ -26,12 +24,13 @@ from gear_sonic.utils.inference.base_pose_dual_visual_servo import (
     dual_calibrations_from_config,
     run_dual_raw_servo_worker,
 )
-from gear_sonic.utils.inference.base_pose_sensor import (
+from gear_sonic.utils.inference.base_pose.sensor import (
+    BasePoseCameraError,
     DualBasePoseCapture,
     SensorGatewayDualBasePoseCamera,
 )
-import gear_sonic.utils.inference.base_pose_visual_servo as visual_servo
-from gear_sonic.utils.inference.base_pose_visual_servo import (
+import gear_sonic.utils.inference.base_pose.servo as visual_servo
+from gear_sonic.utils.inference.base_pose.servo import (
     HEAD_MONITOR_HOLD_EVENT,
     GenerationGate,
     RawServoCalibration,
@@ -43,7 +42,7 @@ from gear_sonic.utils.inference.base_pose_visual_servo import (
     TargetGeometry,
     TrackedInstance,
 )
-from gear_sonic.utils.inference.base_pose_visual_servo_diagnostics import (
+from gear_sonic.utils.inference.base_pose.diagnostics import (
     DetectionFrameData,
 )
 
@@ -148,9 +147,7 @@ def test_normal_chest_failure_can_try_head_then_return_to_chest() -> None:
     assert coordinator.advance_after_failure(chest_text) is None
 
 
-def test_initial_reference_resets_tracker_for_each_camera(
-    tmp_path: Path,
-) -> None:
+def test_initial_reference_resets_tracker_for_each_camera() -> None:
     target = TrackedInstance(
         11,
         0,
@@ -201,6 +198,7 @@ def test_initial_reference_resets_tracker_for_each_camera(
         1.5,
         camera_pitch_deg=-3.0,
     )
+    logs: list[str] = []
     eligible_streams, errors = detect_dual_camera_eligibility(
         config,
         {
@@ -208,8 +206,8 @@ def test_initial_reference_resets_tracker_for_each_camera(
             CHEST: _worker_snapshot(CHEST, 2),
         },
         {HEAD: calibration, CHEST: calibration},
-        tmp_path,
         tracker=tracker,
+        logger=logs.append,
     )
 
     assert tracker.prompts == ["bluebasket"]
@@ -217,12 +215,9 @@ def test_initial_reference_resets_tracker_for_each_camera(
     assert tracker.reset_count == 2
     assert eligible_streams == {HEAD, CHEST}
     assert errors == {}
-    assert json.loads(
-        (tmp_path / HEAD / "initial_yoloe_detection.json").read_text()
-    )["eligible"]
-    assert json.loads(
-        (tmp_path / CHEST / "initial_yoloe_detection.json").read_text()
-    )["eligible"]
+    assert "YOLOE prompt" in logs[0]
+    assert any(f"stream={HEAD} eligible=true" in line for line in logs)
+    assert any(f"stream={CHEST} eligible=true" in line for line in logs)
 
 
 def test_head_monitor_reacquires_head_stream_directly() -> None:
@@ -439,7 +434,7 @@ def test_dual_gateway_does_not_let_one_camera_block_the_other() -> None:
     head_only = camera.capture()
     assert set(head_only.snapshots) == {HEAD}
     assert "chest_view unavailable" in head_only.errors[CHEST]
-    assert head_only.require(HEAD).depth_aligned_to == HEAD
+    assert head_only.snapshots[HEAD].depth_aligned_to == HEAD
 
     # A ready chest frame must remain available after an unrelated head read.
     clients[CHEST].publish(2_000_000_000)
@@ -631,7 +626,7 @@ def test_runtime_preserves_vertical_recenter_across_head_retries_and_resets_ches
 
 
 def _worker_snapshot(stream_name: str, marker: int) -> object:
-    from gear_sonic.utils.inference.base_pose import AlignedRGBDSnapshot
+    from gear_sonic.utils.inference.base_pose.sensor import AlignedRGBDSnapshot
 
     return AlignedRGBDSnapshot(
         rgb=np.full((4, 6, 3), marker, dtype=np.uint8),
@@ -666,7 +661,10 @@ class _FakeWorkerCamera:
         self.closed = True
 
 
-def test_dual_worker_exhausts_the_agent_near_failover_sequence(tmp_path: Path) -> None:
+def test_dual_worker_exhausts_the_agent_near_failover_sequence(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
     started_text_prompts: list[str] = []
 
     class MissingTracker:
@@ -736,10 +734,9 @@ def test_dual_worker_exhausts_the_agent_near_failover_sequence(tmp_path: Path) -
     ]
     assert len(terminal) == 1
     assert "both-camera text failover exhausted" in (terminal[0].error or "")
-    summary_path = next(tmp_path.glob("dual_raw_yoloe_*")) / (
-        "initial_eligibility_summary.json"
-    )
-    assert json.loads(summary_path.read_text())["selected_initial_stream"] == HEAD
+    output_dir = next(tmp_path.glob("dual_raw_yoloe_*"))
+    assert not list(output_dir.rglob("*.json"))
+    assert "YOLOE initial selection selected=ego_view" in capsys.readouterr().out
     assert camera.closed
 
 
@@ -828,76 +825,6 @@ def test_runtime_allows_joint_completion_regardless_of_live_stream(
     assert runtime.controller.current.velocity == (0.0, 0.0, 0.0)
     assert runtime.controller.target_distance_m == pytest.approx(0.7)
     assert runtime.phase == "idle"
-
-
-def test_runtime_marks_completion_capture_start_and_finish(tmp_path: Path) -> None:
-    markers: list[str | None] = []
-
-    class Diagnostics:
-        logger = staticmethod(lambda _message: None)
-
-        def submit_decision(self, *_args, completion_capture=None, **_kwargs):
-            markers.append(completion_capture)
-
-    runtime = RawServoRuntime(
-        BasePoseAgentConfig(
-            task="align",
-            output_root=str(tmp_path),
-            raw_chest_target_distance_m=0.7,
-        ),
-        publish=lambda _message: None,
-        logger=lambda _message: None,
-        diagnostics=Diagnostics(),
-    )
-    assert runtime.start(1, now=0.0)
-    details = {
-        "attempt_id": 1,
-        "live_stream": HEAD,
-        "failover_stage": "initial",
-        "control_source_stream": CHEST,
-        "yaw_source": {"stream": HEAD, "valid": True, "realtime": True},
-    }
-    assert runtime.accept_event(
-        RawServoEvent(1, "detecting", details=details),
-        now=0.01,
-    )
-
-    def frame(index: int) -> DetectionFrameData:
-        return DetectionFrameData(
-            frame_index=index,
-            camera_timestamp=float(index),
-            camera_stream=CHEST,
-            rgb=np.zeros((4, 6, 3), dtype=np.uint8),
-        )
-
-    for index in range(5):
-        assert runtime.accept_event(
-            RawServoEvent(
-                1,
-                "initialized" if index == 0 else "observation",
-                observation=_joint_observation(0.7),
-                details=details,
-                frame=frame(index),
-            ),
-            now=0.02 + index * 0.01,
-        )
-    assert runtime.controller.phase is ServoPhase.POST_STOP_SAMPLING
-    assert markers[-1] == "start"
-
-    for index in range(5, 35):
-        assert runtime.accept_event(
-            RawServoEvent(
-                1,
-                "observation",
-                observation=_joint_observation(0.7),
-                details=details,
-                frame=frame(index),
-            ),
-            now=0.07 + 0.1 * (index - 4),
-        )
-    assert markers[-1] == "finish"
-    assert runtime.controller.post_stop_sample_count == 30
-    assert runtime.controller.terminal_reason == "aligned"
 
 
 def test_runtime_reuses_yoloe_after_ten_post_stop_deviation_frames(
@@ -1257,7 +1184,7 @@ def test_runtime_stops_on_first_head_hit_and_resumes_after_three_misses(
 def test_close_chest_distance_does_not_trigger_head_handoff(
     tmp_path: Path,
 ) -> None:
-    from gear_sonic.utils.inference.base_pose import AlignedRGBDSnapshot
+    from gear_sonic.utils.inference.base_pose.sensor import AlignedRGBDSnapshot
 
     height, width = 120, 160
 
@@ -1424,7 +1351,7 @@ def test_head_monitor_keeps_chest_position_when_live_head_yaw_is_valid(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from gear_sonic.utils.inference.base_pose import AlignedRGBDSnapshot
+    from gear_sonic.utils.inference.base_pose.sensor import AlignedRGBDSnapshot
 
     height, width = 120, 160
 
@@ -1594,25 +1521,6 @@ def test_head_monitor_keeps_chest_position_when_live_head_yaw_is_valid(
     )
     assert all(event.details["yaw_source"]["valid"] for event in observations)
     assert all(event.frame is not None for event in observations)
-    assert all(
-        len(event.frame.additional_camera_frames) == 1
-        for event in observations
-        if event.frame is not None
-    )
-    head_frames = [
-        event.frame.additional_camera_frames[0]
-        for event in observations
-        if event.frame is not None
-    ]
-    assert all(frame.camera_stream == HEAD for frame in head_frames)
-    assert all(frame.target_bbox_xyxy == target.bbox_xyxy for frame in head_frames)
-    assert all(frame.surface_mask is not None for frame in head_frames)
-    assert all(frame.table_geometry is not None for frame in head_frames)
-    assert all(
-        frame.table_geometry["line_endpoints_px"] is not None
-        for frame in head_frames
-        if frame.table_geometry is not None
-    )
     assert all(
         event.details["parallel_perception"]["enabled"]
         for event in observations
@@ -1817,7 +1725,7 @@ def test_worker_switches_state_after_twenty_joint_head_yaw_misses(
 def test_head_stage_keeps_chest_basket_until_it_becomes_invalid(
     tmp_path: Path,
 ) -> None:
-    from gear_sonic.utils.inference.base_pose import AlignedRGBDSnapshot
+    from gear_sonic.utils.inference.base_pose.sensor import AlignedRGBDSnapshot
 
     height, width = 120, 160
 

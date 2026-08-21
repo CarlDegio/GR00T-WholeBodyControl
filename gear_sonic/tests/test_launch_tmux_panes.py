@@ -7,30 +7,30 @@ import types
 from pathlib import Path
 
 import pytest
+import yaml
 
 
 sys.modules.setdefault("tyro", types.ModuleType("tyro"))
 
-from gear_sonic.runtime.config import load_runtime_profile
-from gear_sonic.runtime.endpoints import get_endpoint
+from gear_sonic.runtime.profile import load_runtime_profile
+from gear_sonic.utils.inference.base_pose.agent import load_base_pose_config
+from gear_sonic.utils.inference.lavira.service import load_lavira_config
+from gear_sonic.utils.inference.vla.service import load_inference_config
 from gear_sonic.scripts.launch_inference import (
     InferenceLaunchConfig,
     _check_prerequisites,
     _clear_stale_fastlio_processes,
     _clear_stale_navdp_processes,
+    _create_tmux_session,
     _dotenv_has_nonempty_value,
-    _inference_pane_count,
-    _parse_pane_ids,
+    _worker_pane_names,
     build_base_pose_agent_command,
-    build_fastlio_command,
     build_fastlio_supervisor_command,
     build_slam_debug_command,
     build_control_gateway_command,
     build_data_exporter_command,
     build_deploy_command,
     build_operator_console_command,
-    build_operator_interface_command,
-    build_livox_command,
     build_depth_anything_command,
     build_planner_input_command,
     build_planner_velocity_executor_command,
@@ -83,7 +83,8 @@ def test_startup_clears_only_stale_navdp_processes(monkeypatch) -> None:
         ["pkill", "-KILL", "-f"],
     ]
     assert all(
-        "navdp_planner" in command[-1] or "eval\\.src\\.policy_server" in command[-1]
+        "gear_sonic\\.utils\\.inference\\.navdp\\.service" in command[-1]
+        or "eval\\.src\\.policy_server" in command[-1]
         for command in commands
     )
 
@@ -100,6 +101,19 @@ def _write_deploy_policy_files(
     config_path = deploy_dir / obs_config
     config_path.parent.mkdir(parents=True, exist_ok=True)
     config_path.write_text("observations: []\n", encoding="utf-8")
+
+
+def _profile_config(
+    tmp_path: Path,
+    *,
+    components: dict[str, dict] | None = None,
+) -> InferenceLaunchConfig:
+    payload = yaml.safe_load(default_launch_config_path().read_text(encoding="utf-8"))
+    for name, values in (components or {}).items():
+        payload["components"][name].update(values)
+    profile_path = tmp_path / "runtime.yaml"
+    profile_path.write_text(yaml.safe_dump(payload, sort_keys=False), encoding="utf-8")
+    return load_inference_launch_config(profile_path)
 
 
 @pytest.mark.parametrize(
@@ -127,7 +141,11 @@ def test_deploy_policy_presets_keep_checkpoint_and_observation_config_paired(
     _write_deploy_policy_files(tmp_path, checkpoint, obs_config)
 
     resolved = resolve_deploy_policy(
-        InferenceLaunchConfig(deploy_policy_variant=variant),
+        {
+            "policy_variant": variant,
+            "checkpoint": "",
+            "obs_config": "",
+        },
         tmp_path,
     )
 
@@ -140,11 +158,11 @@ def test_deploy_policy_allows_paired_custom_override(tmp_path: Path) -> None:
     _write_deploy_policy_files(tmp_path, checkpoint, obs_config)
 
     resolved = resolve_deploy_policy(
-        InferenceLaunchConfig(
-            deploy_policy_variant="sonic_v1_1",
-            deploy_checkpoint=checkpoint,
-            deploy_obs_config=obs_config,
-        ),
+        {
+            "policy_variant": "sonic_v1_1",
+            "checkpoint": checkpoint,
+            "obs_config": obs_config,
+        },
         tmp_path,
     )
 
@@ -165,13 +183,16 @@ def test_deploy_policy_expands_custom_tilde_paths_for_the_launch_command(
         str(obs_config),
     )
 
-    command = build_deploy_command(
-        InferenceLaunchConfig(
-            deploy_checkpoint="~/policy/custom/controller",
-            deploy_obs_config="~/policy/custom/observations.yaml",
-        ),
+    config = _profile_config(
         tmp_path,
+        components={
+            "deploy": {
+                "checkpoint": "~/policy/custom/controller",
+                "obs_config": "~/policy/custom/observations.yaml",
+            }
+        },
     )
+    command = build_deploy_command(config, tmp_path)
 
     assert f"--cp {shlex.quote(str(checkpoint))}" in command
     assert f"--obs-config {shlex.quote(str(obs_config))}" in command
@@ -180,7 +201,11 @@ def test_deploy_policy_expands_custom_tilde_paths_for_the_launch_command(
 def test_deploy_policy_rejects_partial_custom_override(tmp_path: Path) -> None:
     with pytest.raises(ValueError, match="must be set together"):
         resolve_deploy_policy(
-            InferenceLaunchConfig(deploy_checkpoint="policy/custom/model"),
+            {
+                "policy_variant": "default",
+                "checkpoint": "policy/custom/model",
+                "obs_config": "",
+            },
             tmp_path,
         )
 
@@ -190,7 +215,11 @@ def test_deploy_policy_reports_missing_v1_1_files_and_download_command(
 ) -> None:
     with pytest.raises(FileNotFoundError) as exc_info:
         resolve_deploy_policy(
-            InferenceLaunchConfig(deploy_policy_variant="sonic_v1_1"),
+            {
+                "policy_variant": "sonic_v1_1",
+                "checkpoint": "",
+                "obs_config": "",
+            },
             tmp_path,
         )
 
@@ -207,10 +236,14 @@ def test_build_deploy_command_uses_resolved_v1_1_policy(tmp_path: Path) -> None:
     obs_config = "policy/sonic_v1_1/observation_config.yaml"
     _write_deploy_policy_files(deploy_dir, checkpoint, obs_config)
 
-    command = build_deploy_command(
-        InferenceLaunchConfig(deploy_policy_variant="sonic_v1_1", sim=True),
+    config = _profile_config(
         tmp_path,
+        components={
+            "launcher": {"sim": True},
+            "deploy": {"policy_variant": "sonic_v1_1"},
+        },
     )
+    command = build_deploy_command(config, tmp_path)
 
     assert f"cd {deploy_dir}" in command
     assert "./deploy.sh --yes " in command
@@ -231,29 +264,91 @@ def test_dotenv_key_check_does_not_require_loading_secret(tmp_path: Path) -> Non
     assert not _dotenv_has_nonempty_value(env_file, "MISSING")
 
 
-def test_parse_pane_ids_returns_stable_ids_in_visual_index_order() -> None:
-    output = "2 %8\n0 %3\n1 %5\n4 %11\n3 %9\n"
-
-    assert _parse_pane_ids(output) == ["%3", "%5", "%8", "%9", "%11"]
-
-
-def test_parse_pane_ids_rejects_incomplete_layout() -> None:
-    with pytest.raises(RuntimeError, match="expected 5 tmux panes, found 4"):
-        _parse_pane_ids("0 %1\n1 %2\n2 %3\n3 %4\n")
+def test_worker_layout_omits_disabled_navigation_components() -> None:
+    assert _worker_pane_names(InferenceLaunchConfig(keyboard_planner=False)) == (
+        "deploy",
+        "vla",
+    )
 
 
-def test_parse_pane_ids_supports_gateways_in_the_inference_window() -> None:
-    output = "\n".join(f"{index} %{index + 1}" for index in range(8))
+def test_worker_layout_omits_only_base_pose_when_disabled() -> None:
+    assert _worker_pane_names(
+        InferenceLaunchConfig(keyboard_planner=True, base_pose_enabled=False)
+    ) == (
+        "deploy",
+        "vla",
+        "planner_input",
+        "navdp",
+        "planner_executor",
+    )
 
-    assert _parse_pane_ids(output, 8) == [f"%{index + 1}" for index in range(8)]
 
+def test_tmux_session_builds_stacked_overview_and_tiled_workers(monkeypatch) -> None:
+    tmux_commands: list[tuple[str, ...]] = []
+    split_calls: list[tuple[str, tuple[str, ...]]] = []
+    pane_ids = iter(("%performance", "%deploy"))
+    split_ids = iter(
+        (
+            "%events",
+            "%control",
+            "%vla",
+            "%planner_input",
+            "%navdp",
+            "%planner_executor",
+            "%base_pose",
+        )
+    )
 
-def test_configured_inference_layout_uses_nine_panes() -> None:
-    assert _inference_pane_count(load_inference_launch_config()) == 9
+    def fake_tmux(*args: str, output: bool = False) -> str:
+        del output
+        tmux_commands.append(args)
+        return ""
+
+    def fake_split(
+        target: str,
+        _shell: tuple[str, ...],
+        *split_args: str,
+    ) -> str:
+        split_calls.append((target, split_args))
+        return next(split_ids)
+
+    monkeypatch.setattr("gear_sonic.scripts.launch_inference._tmux", fake_tmux)
+    monkeypatch.setattr(
+        "gear_sonic.scripts.launch_inference._pane_id",
+        lambda _target: next(pane_ids),
+    )
+    monkeypatch.setattr("gear_sonic.scripts.launch_inference._split_pane", fake_split)
+    monkeypatch.setattr("gear_sonic.scripts.launch_inference.time.sleep", lambda _s: None)
+
+    panes = _create_tmux_session(load_inference_launch_config())
+
+    assert panes == {
+        "performance": "%performance",
+        "control": "%control",
+        "events": "%events",
+        "deploy": "%deploy",
+        "vla": "%vla",
+        "planner_input": "%planner_input",
+        "navdp": "%navdp",
+        "planner_executor": "%planner_executor",
+        "base_pose": "%base_pose",
+    }
+    assert split_calls[:2] == [
+        ("%performance", ("-h", "-p", "58")),
+        ("%performance", ("-v", "-p", "42")),
+    ]
+    assert split_calls[2:] == [
+        ("sonic_inference:workers", ("-h",)),
+    ] * 5
+    assert ("select-layout", "-t", "sonic_inference:workers", "tiled") in tmux_commands
+    assert tmux_commands[-2:] == [
+        ("select-window", "-t", "sonic_inference:overview"),
+        ("select-pane", "-t", "%control"),
+    ]
 
 
 def test_vla_action_horizon_defaults_to_fifty() -> None:
-    assert InferenceLaunchConfig().action_horizon == 50
+    assert load_inference_config().action_horizon == 50
 
 
 def test_gateways_are_mandatory_launcher_components() -> None:
@@ -268,19 +363,23 @@ def test_gateways_are_mandatory_launcher_components() -> None:
 
 def test_yaml_contains_every_launch_parameter() -> None:
     loaded = load_inference_launch_config()
+    vla = load_inference_config()
+    lavira = load_lavira_config()
+    base_pose = load_base_pose_config()
+    profile = load_runtime_profile()
 
-    assert loaded.deploy_policy_variant == "sonic_v1_1"
-    assert loaded.prompt.startswith("Move in front of the table")
-    assert loaded.lavira_mission == "blue basket"
-    assert loaded.lavira_global_target == "blue basket"
-    assert loaded.lavira_qwenvl_model == "qwen3-vl-32b-instruct"
+    assert profile.component("deploy")["policy_variant"] == "sonic_v1_1"
+    assert vla.prompt.startswith("Move in front of the table")
+    assert lavira.mission == "blue basket"
+    assert lavira.global_target == "blue basket"
+    assert lavira.qwenvl_model == "qwen3-vl-32b-instruct"
     assert loaded.base_pose_enabled is True
-    assert loaded.base_pose_task == "align to the blue basket"
-    assert loaded.base_pose_target_prompt == "bluebasket"
-    assert loaded.base_pose_surface_prompt == "desk"
-    assert loaded.base_pose_dual_chest_depth_stream == "camera/chest_view_depth"
-    assert loaded.base_pose_raw_min_linear_speed_m_s == pytest.approx(0.35)
-    assert loaded.base_pose_raw_max_lateral_speed_m_s == pytest.approx(0.4)
+    assert base_pose.task == "align to the blue basket"
+    assert base_pose.target_prompt == "bluebasket"
+    assert base_pose.surface_prompt == "desk"
+    assert base_pose.dual_chest_depth_stream == "camera/chest_view_depth"
+    assert base_pose.raw_min_linear_speed_m_s == pytest.approx(0.35)
+    assert base_pose.raw_max_lateral_speed_m_s == pytest.approx(0.4)
     assert not hasattr(loaded, "base_pose_mode")
     assert not hasattr(loaded, "base_pose_vision_backend")
     assert not hasattr(loaded, "base_pose_model")
@@ -290,38 +389,66 @@ def test_yaml_contains_every_launch_parameter() -> None:
     assert loaded.slam_debug is False
 
 
-def test_schema_v1_yaml_without_policy_variant_uses_default(
-    tmp_path: Path,
-) -> None:
-    current_text = default_launch_config_path().read_text(encoding="utf-8")
-    legacy_text = "\n".join(
-        line
-        for line in current_text.splitlines()
-        if not line.lstrip().startswith("deploy_policy_variant:")
-    )
-    legacy_path = tmp_path / "legacy_launch_inference.yaml"
-    legacy_path.write_text(legacy_text + "\n", encoding="utf-8")
+def test_runtime_profile_has_no_duplicate_launch_inference_section() -> None:
+    payload = yaml.safe_load(default_launch_config_path().read_text(encoding="utf-8"))
 
-    loaded = load_inference_launch_config(legacy_path)
-
-    assert loaded.deploy_policy_variant == "default"
+    assert "launch_inference" not in payload
 
 
-def test_launcher_defaults_match_current_endpoint_inventory() -> None:
+def test_launcher_keeps_endpoint_addresses_out_of_cli_config() -> None:
     config = InferenceLaunchConfig()
 
-    assert config.policy_port == get_endpoint("policy_server").port
-    assert config.camera_port == get_endpoint("camera_server").port
-    assert config.keyboard_planner_port == get_endpoint("navigation_command").port
-    assert config.depth_anything_port == get_endpoint("depth_anything").port
-    assert config.sensor_gateway_port == get_endpoint("sensor_gateway_metadata").port
-    assert config.vla_timing_port == get_endpoint("vla_timing_ingress").port
-    assert config.control_gateway_intent_port == get_endpoint("control_gateway_intent").port
-    assert config.control_gateway_status_port == get_endpoint("control_gateway_status").port
-    assert config.control_gateway_dispatch_port == get_endpoint("control_gateway_dispatch").port
-    assert config.sensor_gateway_visualization_port == get_endpoint(
-        "sensor_gateway_visualization_ingress"
-    ).port
+    for field in (
+        "deploy_zmq_host",
+        "policy_host",
+        "policy_port",
+        "camera_host",
+        "camera_port",
+        "sensor_gateway_port",
+        "sensor_gateway_visualization_port",
+        "vla_timing_port",
+        "control_gateway_intent_port",
+        "control_gateway_status_port",
+        "control_gateway_dispatch_port",
+        "keyboard_planner_host",
+        "keyboard_planner_port",
+        "depth_anything_port",
+    ):
+        assert not hasattr(config, field)
+
+
+def test_launcher_forwards_selected_runtime_profile_without_copying_endpoints(
+    tmp_path: Path,
+) -> None:
+    payload = yaml.safe_load(default_launch_config_path().read_text(encoding="utf-8"))
+    payload["endpoints"]["policy_server"] = {"host": "10.20.30.40", "port": 31001}
+    payload["endpoints"]["sensor_gateway_metadata"] = {
+        "host": "127.0.0.1",
+        "port": 31002,
+    }
+    payload["endpoints"]["control_gateway_dispatch"] = {
+        "host": "127.0.0.1",
+        "port": 31003,
+    }
+    payload["endpoints"]["planner_relay"] = {
+        "host": "127.0.0.1",
+        "port": 31004,
+    }
+    profile_path = tmp_path / "runtime.yaml"
+    profile_path.write_text(yaml.safe_dump(payload, sort_keys=False), encoding="utf-8")
+    config = load_inference_launch_config(profile_path)
+
+    vla = build_vla_inference_command(config, Path("/workspace/sonic"))
+    gateway = build_sensor_gateway_command(config, Path("/workspace/sonic"))
+    control = build_control_gateway_command(config, Path("/workspace/sonic"))
+
+    assert f"--profile {profile_path}" in vla
+    assert "--host" not in vla
+    assert "--sensor-gateway-endpoint" not in vla
+    assert "--control-gateway-endpoint" not in vla
+    assert "--planner-relay-zmq-port" not in vla
+    assert f"--profile {profile_path}" in gateway
+    assert f"--profile {profile_path}" in control
 
 
 def test_control_gateway_uses_only_typed_gateway_ports() -> None:
@@ -330,39 +457,40 @@ def test_control_gateway_uses_only_typed_gateway_ports() -> None:
         Path("/workspace/sonic"),
     )
 
-    assert "run_control_gateway.py" in command
+    assert "python -m gear_sonic.runtime.gateway.services.control" in command
     assert "5580" not in command
-    assert "--intent-port 5561" in command
-    assert "--dispatch-port 5565" in command
-    assert "--status-port 5562" in command
-    assert "--navigation-port 5558" in command
-    assert "--navigation-status-port 5559" in command
+    assert "--profile" in command
+    assert "--intent-port" not in command
+    assert "--dispatch-port" not in command
+    assert "--status-port" not in command
+    assert "5562" not in command
 
     console = build_operator_console_command(
         InferenceLaunchConfig(),
         Path("/workspace/sonic"),
     )
-    assert "run_operator_console.py" in console
-    assert "--port 5561" in console
-    operator = build_operator_interface_command(
-        InferenceLaunchConfig(),
-        Path("/workspace/sonic"),
+    assert "python -m gear_sonic.utils.operator.console" in console
+    assert "--profile" in console
+    assert "--port" not in console
+
+
+def test_data_exporter_uses_runtime_profile_gateways_only(tmp_path: Path) -> None:
+    config = _profile_config(
+        tmp_path,
+        components={
+            "data_exporter": {
+                "task_prompt": "collect a demo",
+                "dataset_name": "session one",
+                "record_chest_camera": True,
+            }
+        },
     )
-    assert "run_operator_console.py" in operator
-    assert "run_operator_cv_viewer.py" not in operator
-
-
-def test_data_exporter_uses_runtime_profile_gateways_only() -> None:
     command = build_data_exporter_command(
-        InferenceLaunchConfig(
-            task_prompt="collect a demo",
-            dataset_name="session one",
-            record_chest_camera=True,
-        ),
+        config,
         Path("/workspace/sonic"),
     )
 
-    assert "run_data_exporter.py" in command
+    assert "-m gear_sonic.utils.data_collection.service" in command
     assert "--profile" in command
     assert "--task-prompt 'collect a demo'" in command
     assert "--dataset-name 'session one'" in command
@@ -384,13 +512,22 @@ def test_launcher_defaults_match_unified_runtime_profile() -> None:
     assert launcher["planner_input"] == config.planner_input
     assert launcher["data_exporter"] is config.data_exporter
     assert launcher["opencv_viewer"] is config.opencv_viewer
-    assert launcher["lidar_ready_timeout_s"] == config.lidar_ready_timeout
-    assert launcher["navigation_ready_timeout_s"] == config.navigation_ready_timeout
-    assert vla["embodiment_tag"] == config.embodiment_tag
-    assert vla["prompt"] == config.prompt
-    assert vla["action_publish_hz"] == config.action_publish_rate
-    assert vla["action_horizon"] == config.action_horizon
-    assert vla["sensor_gateway_poll_hz"] == config.vla_sensor_gateway_poll_hz
+    assert launcher["lidar_ready_timeout_s"] == config.lidar_ready_timeout_s
+    assert launcher["navigation_ready_timeout_s"] == config.navigation_ready_timeout_s
+    assert set(config.__dict__) == {
+        "sim",
+        "opencv_viewer",
+        "keyboard_planner",
+        "planner_input",
+        "depth_anything_ready_timeout_s",
+        "base_pose_enabled",
+        "slam_debug",
+        "lidar_ready_timeout_s",
+        "navigation_ready_timeout_s",
+        "data_exporter",
+        "config",
+    }
+    assert vla["action_horizon"] == load_inference_config().action_horizon
     assert profile.component("navdp")["sensor_gateway_poll_hz"] == 20.0
 
 
@@ -402,25 +539,23 @@ def test_navdp_stack_commands_use_ros_topics_and_official_xnavdp_server() -> Non
     )
     server = build_navdp_server_command(config)
     background_server = build_navdp_server_background_command(config)
-    livox = build_livox_command(config)
-    fastlio = build_fastlio_command(config)
     fastlio_supervisor = build_fastlio_supervisor_command(config)
 
-    assert "navdp_planner.py" in planner
+    assert "-m gear_sonic.utils.inference.navdp.service" in planner
     assert "--sensor-input" not in planner
-    assert "--sensor-gateway-endpoint tcp://127.0.0.1:5560" in planner
-    assert "--no-visualize" in planner
-    assert "--visualization-gateway-endpoint tcp://127.0.0.1:5566" in planner
-    assert "--sensor-gateway-endpoint tcp://127.0.0.1:5560" in planner
-    assert "--navdp-request-timeout-s 10.0" in planner
-    assert "--control-hz 20.0" in planner
-    assert "--mpc-hz 10.0" in planner
-    assert "--goal-tolerance-m 0.5" in planner
+    assert f"--profile {default_launch_config_path()}" in planner
+    assert "--visualization-gateway-endpoint" not in planner
+    assert "--sensor-gateway-endpoint" not in planner
+    assert "--navdp-request-timeout-s" not in planner
+    assert "--control-hz" not in planner
+    assert "--mpc-hz" not in planner
+    assert "--goal-tolerance-m" not in planner
     assert "--radar-timeout-s" not in planner
-    assert "--output-endpoint 'tcp://*:5568'" in planner
+    assert "--output-endpoint" not in planner
     assert "source /opt/ros/humble/setup.bash" in planner
-    assert config.navdp_root == "/home/user/Project/NavDP/baselines/x-navdp"
-    assert config.navdp_checkpoint.endswith("/x-navdp_posttrain.ckpt")
+    navdp = load_runtime_profile().component("navdp")
+    assert navdp["root"] == "/home/user/Project/NavDP/baselines/x-navdp"
+    assert str(navdp["checkpoint"]).endswith("/x-navdp_posttrain.ckpt")
     assert "python -m eval.src.policy_server" in server
     assert "--embodiment humanoid" in server
     assert "--real" in server
@@ -430,7 +565,7 @@ def test_navdp_stack_commands_use_ros_topics_and_official_xnavdp_server() -> Non
     assert "[NavDP server:stderr]" in background_server
     assert "logs are routed to this pane" in background_server
     assert "trap _stop_navdp_server EXIT HUP" in background_server
-    assert "navdp_planner.py" in planner_pane
+    assert "-m gear_sonic.utils.inference.navdp.service" in planner_pane
     assert "_stop_navdp_server" in planner_pane
     assert 'exit "${NAVDP_PLANNER_STATUS}"' in planner_pane
     subprocess.run(
@@ -439,14 +574,12 @@ def test_navdp_stack_commands_use_ros_topics_and_official_xnavdp_server() -> Non
         text=True,
         check=True,
     )
-    assert f"--checkpoint {config.navdp_checkpoint}" in server
-    assert "msg_MID360_launch.py" in livox
-    assert "mapping.launch.py" in fastlio
-    assert "rviz:=false" in fastlio
-    assert "run_fastlio_supervisor.py" in fastlio_supervisor
+    assert f"--checkpoint {navdp['checkpoint']}" in server
+    assert "-m gear_sonic.utils.inference.navdp.slam_supervisor" in fastlio_supervisor
     assert "--config-file mid360.yaml" in fastlio_supervisor
-    assert "--control-gateway-endpoint tcp://127.0.0.1:5561" in fastlio_supervisor
-    assert "mid360_reasan_open3d.py" not in " ".join((planner, server, livox, fastlio))
+    assert f"--profile {default_launch_config_path()}" in fastlio_supervisor
+    assert "--control-gateway-endpoint" not in fastlio_supervisor
+    assert "mid360_reasan_open3d.py" not in " ".join((planner, server))
 
 
 def test_depth_anything_is_an_independent_rgb_only_shared_service() -> None:
@@ -460,16 +593,17 @@ def test_depth_anything_is_an_independent_rgb_only_shared_service() -> None:
         Path("/workspace/sonic"),
     )
 
-    assert "run_depth_anything.py" in command
-    assert "run_depth_anything.py" not in planner_command
+    assert "-m gear_sonic.utils.inference.lavira.depth_service" in command
+    assert "-m gear_sonic.utils.inference.lavira.depth_service" not in planner_command
     assert "sonic_depth_anything_ready" in planner_command
     assert "--ready-file /tmp/sonic_depth_anything_ready" in command
     assert "$ready_file" not in command
-    assert "--sensor-gateway-endpoint tcp://127.0.0.1:5560" in command
-    assert "--control-gateway-endpoint tcp://127.0.0.1:5565" in command
-    assert "--encoder vitb" in command
-    assert "--input-size 644" in command
-    assert "--inference-hz 10.5" in command
+    assert f"--profile {default_launch_config_path()}" in command
+    assert "--sensor-gateway-endpoint" not in command
+    assert "--control-gateway-endpoint" not in command
+    assert "--encoder" not in command
+    assert "--input-size" not in command
+    assert "--inference-hz" not in command
 
 
 def test_lavira_uses_only_control_and_sensor_gateways() -> None:
@@ -478,11 +612,14 @@ def test_lavira_uses_only_control_and_sensor_gateways() -> None:
         Path("/workspace/sonic"),
     )
 
-    assert "--sensor-gateway-endpoint tcp://127.0.0.1:5560" in command
-    assert "--control-gateway-endpoint tcp://127.0.0.1:5565" in command
-    assert "--control-gateway-intent-endpoint tcp://127.0.0.1:5561" in command
-    assert "--qwenvl-model qwen3-vl-32b-instruct" in command
-    assert "--qwenvl-timeout-seconds 180.0" in command
+    assert f"--profile {default_launch_config_path()}" in command
+    assert "--sensor-gateway-endpoint" not in command
+    assert "--control-gateway-endpoint" not in command
+    assert "--control-gateway-intent-endpoint" not in command
+    assert "--qwenvl-model" not in command
+    assert "--qwenvl-timeout-seconds" not in command
+    assert load_lavira_config().qwenvl_model == "qwen3-vl-32b-instruct"
+    assert load_lavira_config().qwenvl_timeout_seconds == 180.0
     assert "--vision-backend" not in command
     assert "--model gpt-" not in command
     assert "codex" not in command.lower()
@@ -493,41 +630,35 @@ def test_lavira_uses_only_control_and_sensor_gateways() -> None:
 
 
 def test_base_pose_agent_uses_gateway_arbitration_and_fixed_task() -> None:
-    config = InferenceLaunchConfig(
-        base_pose_enabled=True,
-        base_pose_task="align with the medicine bottle and basket",
-        base_pose_target_prompt="bluebasket",
-        base_pose_surface_prompt="work bench",
-    )
+    config = InferenceLaunchConfig(base_pose_enabled=True)
     command = build_base_pose_agent_command(config, Path("/workspace/sonic"))
+    worker = load_base_pose_config()
 
-    assert "gear_sonic/scripts/base_pose_agent.py" in command
-    assert "--task 'align with the medicine bottle and basket'" in command
-    assert "--target-prompt bluebasket" in command
-    assert "--surface-prompt 'work bench'" in command
+    assert "-m gear_sonic.utils.inference.base_pose.agent" in command
+    assert "--task" not in command
+    assert "--target-prompt" not in command
+    assert "--surface-prompt" not in command
     assert "--mode" not in command
-    assert "--dual-head-camera-stream ego_view" in command
-    assert "--dual-head-depth-stream camera/ego_view_depth" in command
-    assert "--dual-chest-camera-stream chest_view" in command
-    assert "--dual-chest-depth-stream camera/chest_view_depth" in command
-    assert "--sensor-gateway-endpoint tcp://127.0.0.1:5560" in command
-    assert "--control-gateway-endpoint tcp://127.0.0.1:5565" in command
-    assert "--control-gateway-intent-endpoint tcp://127.0.0.1:5561" in command
+    assert "--dual-head-camera-stream" not in command
+    assert worker.dual_head_depth_stream == "camera/ego_view_depth"
+    assert worker.dual_chest_depth_stream == "camera/chest_view_depth"
+    assert f"--profile {default_launch_config_path()}" in command
+    assert "--sensor-gateway-endpoint" not in command
+    assert "--control-gateway-endpoint" not in command
+    assert "--control-gateway-intent-endpoint" not in command
     assert ". ./.env.local" not in command
     assert "--qwenvl" not in command
     assert "dual-qwenvl" not in command
-    assert "--dual-rgbd-buffer-size 8" in command
-    assert "--dual-rgbd-poll-hz 60.0" in command
-    assert "--dual-head-reacquire-frames 1" in command
-    assert "--dual-head-release-missing-frames 3" in command
+    assert "--dual-rgbd-buffer-size" not in command
+    assert worker.dual_rgbd_buffer_size == 8
+    assert worker.dual_rgbd_poll_hz == 60.0
     assert "--raw-chest-handoff-distance-m" not in command
     assert "--raw-chest-fallback-forward-tolerance-m" not in command
     assert "--raw-chest-fallback-lateral-tolerance-m" not in command
-    assert "--raw-head-target-distance-m 1.0" in command
-    assert "--raw-chest-target-distance-m 0.8" in command
-    assert "--raw-forward-recenter-yaw-speed-rad-s 0.3" in command
-    assert "--raw-post-stop-sample-frames 30" in command
-    assert "--raw-post-stop-deviation-frames 10" in command
+    assert "--raw-head-target-distance-m" not in command
+    assert worker.raw_head_target_distance_m == pytest.approx(0.9)
+    assert worker.raw_chest_target_distance_m == pytest.approx(0.7)
+    assert worker.raw_post_stop_sample_frames == 30
     assert "--vision-backend" not in command
     assert "codex" not in command.lower()
     assert "--port 5558" not in command
@@ -535,10 +666,7 @@ def test_base_pose_agent_uses_gateway_arbitration_and_fixed_task() -> None:
 
 def test_base_pose_command_has_no_remote_vision_model_arguments() -> None:
     command = build_base_pose_agent_command(
-        InferenceLaunchConfig(
-            base_pose_enabled=True,
-            base_pose_task="align",
-        ),
+        InferenceLaunchConfig(base_pose_enabled=True),
         Path("/workspace/sonic"),
     )
 
@@ -550,10 +678,7 @@ def test_base_pose_command_has_no_remote_vision_model_arguments() -> None:
 
 
 def test_base_pose_yoloe_command_uses_dual_raw_depth_and_local_model() -> None:
-    config = InferenceLaunchConfig(
-        base_pose_enabled=True,
-        base_pose_task="align",
-    )
+    config = InferenceLaunchConfig(base_pose_enabled=True)
     command = build_base_pose_agent_command(config, Path("/workspace/sonic"))
     executor = build_planner_velocity_executor_command(
         config,
@@ -561,13 +686,12 @@ def test_base_pose_yoloe_command_uses_dual_raw_depth_and_local_model() -> None:
     )
 
     assert "--mode" not in command
-    assert "--dual-head-depth-stream camera/ego_view_depth" in command
-    assert "--dual-chest-depth-stream camera/chest_view_depth" in command
-    assert "--raw-yoloe-model-path tools/yoloe26m/weights/yoloe-26m-seg.pt" in command
-    assert "--raw-head-target-distance-m 1.0" in command
-    assert "--raw-chest-target-distance-m 0.8" in command
-    assert "--raw-orientation-telemetry-source tcp://127.0.0.1:5569" in command
-    assert "--orientation-output-endpoint 'tcp://*:5569'" in executor
+    assert "--dual-head-depth-stream" not in command
+    assert "--dual-chest-depth-stream" not in command
+    assert "--raw-yoloe-model-path" not in command
+    assert "--raw-orientation-telemetry-source" not in command
+    assert "--publish-orientation" in executor
+    assert "--orientation-output-endpoint" not in executor
 
 
 def test_orientation_telemetry_is_enabled_for_base_pose() -> None:
@@ -578,42 +702,46 @@ def test_orientation_telemetry_is_enabled_for_base_pose() -> None:
         Path("/workspace/sonic"),
     )
 
-    assert "--orientation-output-endpoint 'tcp://*:5569'" in executor
+    assert "--publish-orientation" in executor
+    assert "--orientation-output-endpoint" not in executor
 
 
 def test_runtime_sidecars_are_read_only_and_navdp_uses_gateway_by_default() -> None:
-    config = InferenceLaunchConfig(camera_host="192.168.123.164")
+    config = InferenceLaunchConfig()
     root = Path("/workspace/sonic")
     gateway = build_sensor_gateway_command(config, root)
     planner = build_navdp_planner_command(config, root)
     executor = build_planner_velocity_executor_command(config, root)
 
-    assert "run_sensor_gateway.py" in gateway
-    assert "run_operator_cv_viewer.py" in gateway
-    assert "--control-gateway-endpoint tcp://127.0.0.1:5565" in gateway
-    assert "--navigation-runtime-status-endpoint tcp://127.0.0.1:5570" in gateway
+    assert "python -m gear_sonic.runtime.gateway.services.sensor" in gateway
+    assert "python -m gear_sonic.utils.operator.cv_viewer" in gateway
+    assert "--control-gateway-endpoint" not in gateway
+    assert "--navigation-runtime-status-endpoint" not in gateway
     assert "/tmp/sonic_opencv_viewer.log" in gateway
-    assert "run_depth_anything.py" in gateway
-    assert "/tmp/sonic_depth_anything.log" in gateway
+    assert "-m gear_sonic.utils.inference.lavira.depth_service" in gateway
+    assert "/tmp/sonic_depth_anything.log" not in gateway
     assert "msg_MID360_launch.py" in gateway
-    assert "run_fastlio_supervisor.py" in gateway
-    assert "--control-gateway-endpoint tcp://127.0.0.1:5561" in gateway
+    assert "-m gear_sonic.utils.inference.navdp.slam_supervisor" in gateway
+    assert "--control-gateway-endpoint" not in gateway
     assert "/tmp/sonic_livox_driver.log" in gateway
     assert "/tmp/sonic_fastlio.log" in gateway
     assert "ros2 bag record" not in gateway
-    assert "--camera-host 192.168.123.164" in gateway
-    assert "--rpc-port 5560" in gateway
+    assert f"--profile {default_launch_config_path()}" in gateway
+    assert "--camera-host" not in gateway
+    assert "--rpc-port" not in gateway
     assert "PYTHONPATH=/workspace/sonic:$PYTHONPATH" in gateway
     assert "cpp_command" not in gateway
     assert "5556" not in gateway
     assert "--sensor-input" not in planner
-    assert "--sensor-gateway-endpoint tcp://127.0.0.1:5560" in planner
-    assert "run_sensor_gateway" not in planner
-    assert "--output-endpoint 'tcp://*:5568'" in planner
-    assert "planner_velocity_executor.py" in executor
-    assert "--navdp-velocity-endpoint tcp://127.0.0.1:5568" in executor
-    assert "--output-endpoint 'tcp://*:5563'" in executor
-    assert "--runtime-status-endpoint 'tcp://*:5570'" in executor
+    assert f"--profile {default_launch_config_path()}" in planner
+    assert "--sensor-gateway-endpoint" not in planner
+    assert "runtime_gateway.sensor_service" not in planner
+    assert "--output-endpoint" not in planner
+    assert "python -m gear_sonic.utils.planner_control.executor_service" in executor
+    assert f"--profile {default_launch_config_path()}" in executor
+    assert "--navdp-velocity-endpoint" not in executor
+    assert "--output-endpoint" not in executor
+    assert "--runtime-status-endpoint" not in executor
 
 
 def test_base_pose_uses_raw_chest_depth_without_starting_depth_anything() -> None:
@@ -621,12 +749,11 @@ def test_base_pose_uses_raw_chest_depth_without_starting_depth_anything() -> Non
         InferenceLaunchConfig(
             planner_input="keyboard",
             base_pose_enabled=True,
-            base_pose_task="align",
         ),
         Path("/workspace/sonic"),
     )
 
-    assert "run_depth_anything.py" not in command
+    assert "-m gear_sonic.utils.inference.lavira.depth_service" not in command
     assert "/tmp/sonic_depth_anything.log" not in command
     assert "--no-enable-depth-anything" in command
 
@@ -660,10 +787,10 @@ def test_vla_uses_only_gateway_inputs_and_preserves_control_endpoints() -> None:
     assert "--control-input" not in gateway
     assert "--camera-host" not in gateway
     assert "--camera-port" not in gateway
-    assert "--control-gateway-endpoint tcp://127.0.0.1:5565" in gateway
-    assert "--sensor-gateway-endpoint tcp://127.0.0.1:5560" in gateway
-    assert "--sensor-gateway-poll-hz 50.0" in gateway
-    assert "--planner-relay-zmq-port 5563" in gateway
+    assert "--control-gateway-endpoint" not in gateway
+    assert "--sensor-gateway-endpoint" not in gateway
+    assert "--sensor-gateway-poll-hz" not in gateway
+    assert "--planner-relay-zmq-port" not in gateway
     assert "--action-zmq-port" not in gateway
 
 
@@ -675,9 +802,10 @@ def test_navdp_is_a_pure_velocity_producer_for_the_shared_executor() -> None:
     assert "--sensor-input" not in planner
     assert "--camera-host" not in planner
     assert "--camera-port" not in planner
-    assert "--sensor-gateway-endpoint tcp://127.0.0.1:5560" in planner
-    assert "--navdp-server http://127.0.0.1:19999" in planner
-    assert "--output-endpoint 'tcp://*:5568'" in planner
+    assert f"--profile {default_launch_config_path()}" in planner
+    assert "--sensor-gateway-endpoint" not in planner
+    assert "--navdp-server" not in planner
+    assert "--output-endpoint" not in planner
     assert "--radar-timeout-s" not in planner
 
 
@@ -692,11 +820,11 @@ def test_launcher_runs_readiness_gate_synchronously(monkeypatch) -> None:
         return Result()
 
     monkeypatch.setattr("gear_sonic.scripts.launch_inference.subprocess.run", run)
-    config = InferenceLaunchConfig(lidar_ready_timeout=45.0)
+    config = InferenceLaunchConfig(lidar_ready_timeout_s=45.0)
 
     assert run_readiness_gate(config, Path("/workspace/sonic"), "lidar")
     shell = commands[0][-1]
-    assert "navdp_readiness_gate.py --stage lidar" in shell
+    assert "-m gear_sonic.utils.inference.navdp.readiness --stage lidar" in shell
     assert "--timeout 45.0" in shell
 
 
@@ -716,4 +844,5 @@ def test_gateway_navdp_readiness_requires_the_gateway_rpc(monkeypatch) -> None:
     assert run_readiness_gate(config, Path("/workspace/sonic"), "navigation")
     shell = commands[0][-1]
     assert "--require-sensor-gateway" in shell
-    assert "--sensor-gateway-port 5560" in shell
+    assert f"--profile {default_launch_config_path()}" in shell
+    assert "--sensor-gateway-port" not in shell

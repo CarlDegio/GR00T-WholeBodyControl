@@ -4,7 +4,7 @@ import json
 
 import pytest
 
-from gear_sonic.pico_video.usb_network import (
+from gear_sonic.utils.pico_video.usb_network import (
     PicoUsbNetwork,
     PicoUsbNetworkError,
     discover_pico_usb_network,

@@ -8,7 +8,7 @@ import pytest
 import zmq
 
 from gear_sonic.camera.sensor_server import ImageMessageSchema
-from gear_sonic.runtime.fakes import (
+from gear_sonic.runtime.gateway.fakes import (
     FakeCameraServer,
     FakeCppService,
     FakePolicyServer,

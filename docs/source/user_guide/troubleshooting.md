@@ -219,7 +219,7 @@ rebuild the C++ deployment binary.
 
 ## 10. `ChannelFactory create domain error` in MuJoCo sim
 
-**Symptom:** `run_sim_loop.py` crashes with:
+**Symptom:** the MuJoCo simulation service crashes with:
 ```
 [ChannelFactory] create domain error. msg: Occurred upon initialisation
 of a cyclonedds.domain.Domain

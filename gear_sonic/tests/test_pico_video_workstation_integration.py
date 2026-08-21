@@ -13,11 +13,11 @@ import numpy as np
 import pytest
 import zmq
 
-from gear_sonic.pico_video.bridge import BridgeSettings, PicoVideoBridge
-from gear_sonic.pico_video.gateway_source import SensorGatewayVideoSource
-from gear_sonic.pico_video.mock_camera import MockCameraPublisher, MockCameraSettings
-from gear_sonic.runtime.client import SensorGatewayClient
-from gear_sonic.runtime.sensor_gateway import (
+from gear_sonic.utils.pico_video.bridge import BridgeSettings, PicoVideoBridge
+from gear_sonic.utils.pico_video.gateway_source import SensorGatewayVideoSource
+from gear_sonic.utils.pico_video.mock_camera import MockCameraPublisher, MockCameraSettings
+from gear_sonic.runtime.gateway.sensor_client import SensorGatewayClient
+from gear_sonic.runtime.gateway.sensor import (
     CameraZmqIngress,
     SensorGatewayCore,
     SensorGatewayRpcServer,

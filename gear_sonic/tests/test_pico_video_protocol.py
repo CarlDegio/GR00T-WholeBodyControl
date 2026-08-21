@@ -4,7 +4,7 @@ import struct
 
 import pytest
 
-from gear_sonic.pico_video.protocol import (
+from gear_sonic.utils.pico_video.protocol import (
     CameraRequest,
     ControlFrameDecoder,
     ProtocolError,

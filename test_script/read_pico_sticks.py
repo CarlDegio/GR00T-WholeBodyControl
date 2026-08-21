@@ -1,7 +1,7 @@
 """Print PICO controller stick values once per second.
 
 This is a lightweight diagnostic script that mirrors the controller-axis read
-path used by ``pico_manager_thread_server.py`` without starting any robot
+path used by ``gear_sonic.utils.teleop.pico_manager`` without starting any robot
 control or ZMQ publishing.
 
 Usage:
@@ -22,7 +22,7 @@ except ImportError:
 
 
 def get_controller_axes() -> tuple[float, float, float, float]:
-    """Fetch joystick axes in the same format as pico_manager_thread_server.py."""
+    """Fetch joystick axes in the same format as the PICO teleop manager."""
     if xrt is None:
         return 0.0, 0.0, 0.0, 0.0
     try:

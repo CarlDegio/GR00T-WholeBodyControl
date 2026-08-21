@@ -7,7 +7,7 @@ import sys
 import numpy as np
 import pytest
 
-from gear_sonic.runtime.shared_memory import (
+from gear_sonic.runtime.gateway.shared_memory import (
     FrameOverwrittenError,
     SharedMemoryRing,
     read_shared_memory_frame,
@@ -73,8 +73,8 @@ def test_external_reader_does_not_unlink_producer_owned_memory() -> None:
         frame = ring.write(values, received_ns=1)
         child_code = (
             "import json,sys; "
-            "from gear_sonic.runtime.contracts import SharedMemoryFrame; "
-            "from gear_sonic.runtime.shared_memory import read_shared_memory_frame; "
+            "from gear_sonic.runtime.protocol import SharedMemoryFrame; "
+            "from gear_sonic.runtime.gateway.shared_memory import read_shared_memory_frame; "
             "frame=SharedMemoryFrame.from_dict(json.loads(sys.argv[1])); "
             "print(float(read_shared_memory_frame(frame).sum()))"
         )

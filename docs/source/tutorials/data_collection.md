@@ -143,13 +143,13 @@ On your workstation, SensorGateway connects to the robot's camera server over th
 ```sh
 # Start SensorGateway before running the standalone viewer
 source .venv_teleop/bin/activate
-python gear_sonic/scripts/run_sensor_gateway.py \
-    --camera-host 192.168.123.164 --camera-port 5555 \
+python -m gear_sonic.runtime.gateway.services.sensor \
+    --profile gear_sonic/config/launch_inference.yaml \
     --no-enable-depth-anything --no-enable-ros \
     --no-enable-visualization --no-enable-vla-timing
 
 source .venv_data_collection/bin/activate
-python gear_sonic/scripts/run_camera_viewer.py \
+python -m gear_sonic.utils.operator.camera_viewer \
     --profile gear_sonic/config/launch_inference.yaml
 ```
 
@@ -188,7 +188,7 @@ SensorGateway is the only DataExporter boundary for camera, `g1_debug`, and `rob
 ```text
  C++ g1_debug/config ───> SensorGateway ──┐
  Camera server (robot) ─> SensorGateway ──┤
- PICO pose/planner/manager ───────────────┼─> run_data_exporter.py
+ PICO pose/planner/manager ───────────────┼─> gear_sonic.utils.data_collection.service
  Operator console ──────> ControlGateway ─┘             │
                                                         ▼
                                             LeRobot parquet + MP4
@@ -247,7 +247,7 @@ The collection YAML owns launcher settings only. Its `runtime_profile` field
 continues to reference `gear_sonic/config/launch_inference.yaml`, which remains
 the single source of truth for Gateway endpoints and component timing.
 
-**For simulation** (the launcher starts `run_sim_loop.py` in a separate tmux window automatically):
+**For simulation** (the launcher starts the MuJoCo service in a separate tmux window automatically):
 
 ```bash
 python gear_sonic/scripts/launch_data_collection.py --sim
@@ -321,7 +321,7 @@ If you prefer individual control over each process, run them in separate termina
 
 ```bash
 source .venv_sim/bin/activate
-python gear_sonic/scripts/run_sim_loop.py \
+python -m gear_sonic.utils.mujoco_sim.service \
     --enable-image-publish --enable-offscreen --camera-port 5555
 ```
 
@@ -345,40 +345,40 @@ source scripts/setup_env.sh
 
 ```bash
 source .venv_teleop/bin/activate
-python gear_sonic/scripts/pico_manager_thread_server.py --manager
+python -m gear_sonic.utils.teleop.pico_manager --manager
 ```
 
 **Terminal 4 — SensorGateway:**
 
 ```bash
 source .venv_teleop/bin/activate
-python gear_sonic/scripts/run_sensor_gateway.py \
+python -m gear_sonic.runtime.gateway.services.sensor \
     --no-enable-depth-anything --no-enable-ros \
     --no-enable-visualization --no-enable-vla-timing
 ```
 
-For simulation, add `--camera-host localhost`; for the real-robot default profile,
-the configured camera host is used.
+For simulation, select a profile or overlay whose `camera_server.host` is
+`localhost`; the real-robot default profile already contains the deployed host.
 
 **Terminal 5 — ControlGateway:**
 
 ```bash
 source .venv_teleop/bin/activate
-python gear_sonic/scripts/run_control_gateway.py
+python -m gear_sonic.runtime.gateway.services.control
 ```
 
 **Terminal 6 — Data Exporter:**
 
 ```bash
 source .venv_data_collection/bin/activate
-python gear_sonic/scripts/run_data_exporter.py --task-prompt "pick up the cup"
+python -m gear_sonic.utils.data_collection.service --task-prompt "pick up the cup"
 ```
 
 **Terminal 7 (optional) — Camera Viewer:**
 
 ```bash
 source .venv_data_collection/bin/activate
-python gear_sonic/scripts/run_camera_viewer.py
+python -m gear_sonic.utils.operator.camera_viewer
 ```
 
 All options are provided via CLI flags — no interactive prompts.  Key flags:
@@ -428,7 +428,7 @@ A standalone camera viewer is available for monitoring camera feeds and recordin
 
 ```bash
 source .venv_data_collection/bin/activate
-python gear_sonic/scripts/run_camera_viewer.py \
+python -m gear_sonic.utils.operator.camera_viewer \
     --profile gear_sonic/config/launch_inference.yaml
 ```
 
@@ -446,7 +446,7 @@ Recordings are saved to `camera_recordings/rec_<timestamp>/` with one MP4 per ca
 - Recording reference videos alongside the LeRobot dataset
 - Debugging camera server connectivity
 
-Run `python gear_sonic/scripts/run_camera_viewer.py --help` for all options.
+Run `python -m gear_sonic.utils.operator.camera_viewer --help` for all options.
 
 ---
 
@@ -455,7 +455,7 @@ Run `python gear_sonic/scripts/run_camera_viewer.py --help` for all options.
 All options can be viewed with `--help`:
 
 ```bash
-python gear_sonic/scripts/run_data_exporter.py --help
+python -m gear_sonic.utils.data_collection.service --help
 ```
 
 Key options:
@@ -539,11 +539,11 @@ frozen (identical) lead-in frames that precede them:
 
 ```bash
 # Clean a single dataset in-place
-python gear_sonic/scripts/process_dataset.py \
+python -m gear_sonic.utils.data_collection.tools.process_dataset \
     --dataset-path outputs/my_dataset
 
 # Clean and write to a new directory (non-destructive)
-python gear_sonic/scripts/process_dataset.py \
+python -m gear_sonic.utils.data_collection.tools.process_dataset \
     --dataset-path outputs/my_dataset \
     --output-path outputs/my_dataset_cleaned
 ```
@@ -556,12 +556,12 @@ configuration) before merging:
 
 ```bash
 # Merge by listing datasets on the command line
-python gear_sonic/scripts/process_dataset.py \
+python -m gear_sonic.utils.data_collection.tools.process_dataset \
     --dataset-path outputs/session1 outputs/session2 outputs/session3 \
     --output-path outputs/merged_dataset
 
 # Or use a text file (one dataset path per line, # for comments)
-python gear_sonic/scripts/process_dataset.py \
+python -m gear_sonic.utils.data_collection.tools.process_dataset \
     --dataset-list datasets.txt \
     --output-path outputs/merged_dataset
 ```

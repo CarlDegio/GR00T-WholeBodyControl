@@ -1,24 +1,54 @@
 import queue
 import threading
-import time
 import unittest
 from unittest.mock import patch
 
-import gear_sonic.scripts.run_vla_inference as run_vla_inference
-from gear_sonic.scripts.run_vla_inference import (
+import gear_sonic.utils.inference.vla.service as run_vla_inference
+from gear_sonic.utils.inference.vla.service import (
     JPEG_VIDEO_MARKER,
-    SIMULATED_INFERENCE_DELAY_SECONDS,
     _drain_queue,
     _inference_worker_loop,
     _pose_policy_is_active,
     _should_schedule_vla_inference,
-    _vla_inference_is_due,
     prepare_observation_from_sensors,
 )
-from gear_sonic.utils.inference.vla_utils import calculate_latency_compensated_index
 
 
-class InferenceWorkerDelayTest(unittest.TestCase):
+class InferenceWorkerTest(unittest.TestCase):
+    def test_policy_safety_warning_is_promoted_to_runtime_event(self):
+        class UnsafePolicy:
+            last_timing_ms = {}
+
+            def get_action(self, _observation):
+                return {"motion_token": [2.0]}, {}
+
+        events = []
+
+        def report(*args, **kwargs):
+            events.append((args, kwargs))
+            return False
+
+        result = run_vla_inference.run_policy_inference_and_process(
+            UnsafePolicy(), {}, report
+        )
+
+        self.assertIsNone(result)
+        self.assertEqual(events[0][0][1], "ACTION_REJECTED")
+
+    def test_policy_exception_is_promoted_to_runtime_event(self):
+        class BrokenPolicy:
+            def get_action(self, _observation):
+                raise RuntimeError("policy unavailable")
+
+        events = []
+        result = run_vla_inference.run_policy_inference_and_process(
+            BrokenPolicy(), {},
+            lambda *args, **kwargs: events.append((args, kwargs)) or False,
+        )
+
+        self.assertIsNone(result)
+        self.assertEqual(events[0][0][1], "INFERENCE_FAILED")
+
     def test_camera_jpeg_wrapper_keeps_bytes_and_uses_existing_protocol(self):
         payload = b"already-encoded-camera-jpeg"
 
@@ -70,7 +100,7 @@ class InferenceWorkerDelayTest(unittest.TestCase):
             "prepare_observation_for_eval",
             side_effect=lambda _robot_model, observation: observation,
         ):
-            observation = prepare_observation_from_sensors(
+            observation, timing = prepare_observation_from_sensors(
                 FakeGateway(), FakeRobotModel(), "test prompt"
             )
 
@@ -85,15 +115,14 @@ class InferenceWorkerDelayTest(unittest.TestCase):
                     "data": payloads[name],
                 },
             )
-        self.assertIn("jpeg_prepare", observation.timing_ms)
-        self.assertNotIn("jpeg_encode", observation.timing_ms)
+        self.assertIn("jpeg_prepare", timing)
+        self.assertNotIn("jpeg_encode", timing)
 
-    def test_worker_emits_best_effort_timing_without_changing_result_contract(self):
+    def test_worker_returns_timing_with_its_result(self):
         inference_queue = queue.Queue(maxsize=1)
         result_queue = queue.Queue(maxsize=1)
         stop_event = threading.Event()
         busy_event = threading.Event()
-        samples = []
         inference_queue.put_nowait(7)
 
         worker = threading.Thread(
@@ -103,30 +132,26 @@ class InferenceWorkerDelayTest(unittest.TestCase):
                 result_queue,
                 stop_event,
                 busy_event,
-                lambda: {"observation": True},
-                lambda _observation: {"action": True},
+                lambda: ({"observation": True}, {}),
+                lambda _observation: ({"action": True}, {}),
                 0.0,
             ),
-            kwargs={"timing_callback": samples.append},
             daemon=True,
         )
         worker.start()
-        generation, action, _started = result_queue.get(timeout=1.0)
+        generation, action, _started, timing = result_queue.get(timeout=1.0)
         stop_event.set()
         worker.join(timeout=1.0)
 
         self.assertEqual(generation, 7)
         self.assertEqual(action, {"action": True})
-        self.assertEqual(len(samples), 1)
-        self.assertGreaterEqual(samples[0]["worker_total"], 0.0)
+        self.assertGreaterEqual(timing["worker_total"], 0.0)
 
     def setUp(self):
         self.inference_queue = queue.Queue(maxsize=1)
         self.result_queue = queue.Queue(maxsize=1)
         self.stop_event = threading.Event()
         self.busy_event = threading.Event()
-        self.inference_finished = threading.Event()
-        self.inference_returned_at = None
         self.worker_errors = []
 
     def tearDown(self):
@@ -134,71 +159,9 @@ class InferenceWorkerDelayTest(unittest.TestCase):
         if hasattr(self, "thread"):
             self.thread.join(timeout=1.0)
 
-    def start_worker(self, delay):
-        def inference_fn(_observation):
-            self.inference_returned_at = time.monotonic()
-            self.inference_finished.set()
-            return {"motion_token": "action"}
-
-        def run_worker():
-            try:
-                _inference_worker_loop(
-                    self.inference_queue,
-                    self.result_queue,
-                    self.stop_event,
-                    self.busy_event,
-                    lambda: {"observation": True},
-                    inference_fn,
-                    simulated_inference_delay_seconds=delay,
-                )
-            except BaseException as error:
-                self.worker_errors.append(error)
-
-        self.thread = threading.Thread(target=run_worker)
-        self.thread.start()
-        self.inference_queue.put_nowait(None)
-
-    def test_successful_result_is_held_while_worker_remains_busy(self):
-        delay = 0.08
-        self.start_worker(delay)
-        self.assertTrue(self.inference_finished.wait(timeout=0.5))
-        self.assertTrue(self.busy_event.is_set())
-        with self.assertRaises(queue.Empty):
-            self.result_queue.get_nowait()
-
-        generation, action, inference_start_time = self.result_queue.get(timeout=0.5)
-
-        self.assertEqual(generation, 0)
-        self.assertGreaterEqual(time.monotonic() - self.inference_returned_at, delay)
-        self.assertEqual(action, {"motion_token": "action"})
-        self.assertLessEqual(inference_start_time, self.inference_returned_at)
-        self.assertEqual(self.worker_errors, [])
-
-    def test_shutdown_interrupts_hold_and_drops_pending_result(self):
-        self.start_worker(delay=2.0)
-        self.assertTrue(self.inference_finished.wait(timeout=0.5))
-        self.assertTrue(self.busy_event.is_set())
-
-        self.stop_event.set()
-        self.thread.join(timeout=0.5)
-
-        self.assertFalse(self.thread.is_alive())
-        self.assertFalse(self.busy_event.is_set())
-        with self.assertRaises(queue.Empty):
-            self.result_queue.get_nowait()
-        self.assertEqual(self.worker_errors, [])
-
-    def test_production_has_no_simulated_inference_delay(self):
-        self.assertEqual(SIMULATED_INFERENCE_DELAY_SECONDS, 0.0)
-        without_delay = calculate_latency_compensated_index(0.1, 50, 70)
-        with_delay = calculate_latency_compensated_index(
-            0.1 + SIMULATED_INFERENCE_DELAY_SECONDS, 50, 70
-        )
-        self.assertEqual(with_delay, without_delay)
-
     def test_worker_preserves_request_generation(self):
         def inference_fn(_observation):
-            return {"motion_token": "action"}
+            return {"motion_token": "action"}, {}
 
         self.thread = threading.Thread(
             target=_inference_worker_loop,
@@ -207,7 +170,7 @@ class InferenceWorkerDelayTest(unittest.TestCase):
                 self.result_queue,
                 self.stop_event,
                 self.busy_event,
-                lambda: {"observation": True},
+                lambda: ({"observation": True}, {}),
                 inference_fn,
                 0.0,
             ),
@@ -215,7 +178,7 @@ class InferenceWorkerDelayTest(unittest.TestCase):
         self.thread.start()
         self.inference_queue.put_nowait(7)
 
-        generation, action, _inference_start_time = self.result_queue.get(timeout=0.5)
+        generation, action, _inference_start_time, _timing = self.result_queue.get(timeout=0.5)
         self.assertEqual(generation, 7)
         self.assertEqual(action, {"motion_token": "action"})
 
@@ -224,24 +187,6 @@ class InferenceWorkerDelayTest(unittest.TestCase):
         self.assertFalse(_pose_policy_is_active(True, "POSE", True))
         self.assertFalse(_pose_policy_is_active(True, "PLANNER", False))
         self.assertFalse(_pose_policy_is_active(False, "POSE", False))
-
-    def test_vla_inference_timing_predicate(self):
-        self.assertTrue(
-            _vla_inference_is_due(
-                worker_is_busy=False,
-                request_queue_is_empty=True,
-                time_since_request=0.5,
-                inference_interval=0.5,
-            )
-        )
-        self.assertFalse(
-            _vla_inference_is_due(
-                worker_is_busy=True,
-                request_queue_is_empty=True,
-                time_since_request=10.0,
-                inference_interval=0.5,
-            )
-        )
 
     def test_vla_observation_is_not_scheduled_outside_active_pose(self):
         common = dict(
@@ -276,7 +221,8 @@ class InferenceWorkerDelayTest(unittest.TestCase):
             )
         )
         self.assertFalse(
-            _vla_inference_is_due(
+            _should_schedule_vla_inference(
+                cpp_mode="POSE",
                 worker_is_busy=False,
                 request_queue_is_empty=False,
                 time_since_request=10.0,

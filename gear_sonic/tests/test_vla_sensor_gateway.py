@@ -10,11 +10,14 @@ import numpy as np
 import pytest
 import zmq
 
-from gear_sonic.runtime.client import MaterializedSnapshot, SensorGatewayClient
-from gear_sonic.runtime.contracts import MessageMetadata, SharedMemoryFrame
-from gear_sonic.runtime.sensor_gateway import SensorGatewayCore, SensorGatewayRpc
-from gear_sonic.runtime.snapshot import SensorSnapshot, TimestampBasis
-from gear_sonic.runtime.vla_sensor_gateway import (
+from gear_sonic.runtime.gateway.sensor_client import (
+    MaterializedSnapshot,
+    SensorGatewayClient,
+)
+from gear_sonic.runtime.protocol import MessageMetadata, SharedMemoryFrame
+from gear_sonic.runtime.gateway.sensor import SensorGatewayCore, SensorGatewayRpc
+from gear_sonic.runtime.gateway.snapshot import SensorSnapshot, TimestampBasis
+from gear_sonic.utils.inference.vla.ingress import (
     VLA_CAMERA_NAMES,
     VLA_CAMERA_STREAMS,
     VLA_STATE_STREAM,

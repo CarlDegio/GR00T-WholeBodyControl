@@ -8,8 +8,8 @@ import numpy as np
 import zmq
 
 from gear_sonic.camera.sensor_server import ImageMessageSchema
-from gear_sonic.pico_video.mock_camera import MockCameraPublisher, MockCameraSettings
-from gear_sonic.scripts.run_mock_camera_server import build_argument_parser
+from gear_sonic.utils.pico_video.mock_camera import MockCameraPublisher, MockCameraSettings
+from gear_sonic.utils.pico_video.mock_service import build_argument_parser
 
 
 def _free_tcp_port() -> int:

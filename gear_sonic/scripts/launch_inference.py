@@ -1,9 +1,10 @@
 """All-in-one tmux launcher for SONIC VLA inference.
 
-The inference window contains the core deploy, operator, VLA, navigation, and
-gateway panes, plus an optional Base-Pose agent pane. The NavDP policy server
-runs in the background of the NavDP planner pane and shares its log output.
-Simulation and data collection use optional additional windows.
+The overview window contains performance, keyboard control, and event panes.
+The workers window keeps deploy, VLA, navigation, and Base-Pose processes in
+independent panes with their original TTYs and scrollback. The NavDP policy
+server runs in the background of the NavDP planner pane and shares its log
+output. Simulation and data collection use optional additional windows.
 
 Prerequisites:
     - tmux installed (sudo apt install tmux)
@@ -20,18 +21,16 @@ Usage (from repo root — no venv activation needed):
 """
 
 import argparse
-from dataclasses import dataclass, fields
+from dataclasses import dataclass
 from pathlib import Path
-import math
 import os
 import shlex
 import shutil
 import signal
-import socket
 import subprocess
 import sys
 import time
-from typing import Any, Literal, get_args, get_origin, get_type_hints
+from typing import Any, Literal
 
 
 def _bootstrap_venv():
@@ -58,25 +57,14 @@ def _bootstrap_venv():
 _bootstrap_venv()
 
 import tyro
-import yaml
-
-from gear_sonic.runtime.config import load_runtime_profile  # noqa: E402
+from gear_sonic.runtime.profile import (  # noqa: E402
+    load_component_config,
+    load_runtime_profile,
+)
 
 
 def default_launch_config_path() -> Path:
     return Path(__file__).resolve().parents[1] / "config" / "launch_inference.yaml"
-
-
-def _get_local_ip() -> str:
-    """Best-effort detection of the PC's LAN IP address."""
-    try:
-        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        s.connect(("8.8.8.8", 80))
-        ip = s.getsockname()[0]
-        s.close()
-        return ip
-    except Exception:
-        return "unknown"
 
 
 @dataclass
@@ -87,296 +75,40 @@ class InferenceLaunchConfig:
     sim: bool = False
     """Run against MuJoCo sim instead of real robot."""
 
-    # C++ deploy options
-    deploy_input_type: str = "zmq_manager"
-    """Input type for the C++ deploy."""
-
-    deploy_zmq_host: str = "localhost"
-    """ZMQ host for the C++ deploy to listen on."""
-
-    deploy_policy_variant: Literal["default", "low_latency", "sonic_v1_1"] = "default"
-    """Bundled deploy checkpoint and observation-config preset."""
-
-    deploy_checkpoint: str = ""
-    """Checkpoint path for deploy.sh. Leave empty for default."""
-
-    deploy_obs_config: str = ""
-    """Observation config file for deploy.sh. Leave empty for default."""
-
-    deploy_planner: str = ""
-    """Planner model path for deploy.sh. Leave empty for default."""
-
-    deploy_motion_data: str = ""
-    """Motion data path for deploy.sh. Leave empty for default."""
-
-    deploy_output_type: str = ""
-    """Output type for deploy.sh. Leave empty for default."""
-
-    # VLA inference options
-    policy_host: str = "localhost"
-    """OpenPI policy server host."""
-
-    policy_port: int = 29999
-    """OpenPI policy server port."""
-
-    embodiment_tag: str = "unitree_g1_sonic"
-    """Embodiment tag for policy inference."""
-
-    prompt: str = "demo"
-    """Language prompt for inference."""
-
-    action_publish_rate: int = 50
-    """Rate at which individual actions are published to the C++ control loop (Hz)."""
-
-    action_horizon: int = 50
-    """Action horizon of the VLA policy."""
-
-    # Camera
-    camera_host: str = "localhost"
-    """Camera server host."""
-
-    camera_port: int = 5555
-    """Camera server port."""
-
     opencv_viewer: bool = True
     """Start the standalone OpenCV visualization process under the SensorGateway pane."""
-
-    sensor_gateway_port: int = 5560
-    """Local SensorGateway Snapshot and health REP port."""
-
-    sensor_gateway_visualization_port: int = 5566
-    """Rendered-panel ingress owned by SensorGateway."""
-
-    vla_timing_port: int = 5567
-    """Best-effort VLA timing ingress owned by SensorGateway."""
-
-    control_gateway_intent_port: int = 5561
-    """Structured operator-intent mirror published by ControlGateway."""
-
-    control_gateway_status_port: int = 5562
-    """ControlGateway acknowledgement/status stream."""
-
-    control_gateway_dispatch_port: int = 5565
-    """Validated structured commands published to migrated consumers."""
-
-    vla_sensor_gateway_poll_hz: float = 50.0
-    """Background Gateway cache update rate used by VLA."""
-
-    vla_sensor_gateway_request_timeout_ms: int = 100
-    """VLA local SensorGateway metadata request deadline."""
-
-    vla_sensor_gateway_max_age_ms: float = 1000.0
-    """Maximum accepted age for VLA Gateway frames and caches."""
-
-    vla_sensor_gateway_max_skew_ms: float = 5.0
-    """Maximum receive-time skew among VLA's four RGB streams."""
 
     keyboard_planner: bool = True
     """Start planner input, rule-based safety, and MID-360 sidecars."""
 
-    keyboard_planner_port: int = 5558
-    """Keyboard planner sidecar port."""
-
-    keyboard_planner_publish_rate: int = 20
-    """Keyboard planner publish rate (Hz)."""
-
-    keyboard_planner_host: str = "localhost"
-    """Keyboard planner sidecar host."""
-
     planner_input: Literal["keyboard", "lavira"] = "lavira"
-    """Navigation keyboard and semantic target source used in pane 3."""
+    """Navigation keyboard and semantic target source used in the worker window."""
 
-    lavira_mission: str = ""
-    """Mission sent to LaViRA when --planner-input lavira is selected."""
-
-    lavira_global_target: str = ""
-    """Global target used by LaViRA when --planner-input lavira is selected."""
-
-    lavira_qwenvl_model: str = "qwen3-vl-32b-instruct"
-    """DashScope Qwen-VL model used by LaViRA."""
-
-    lavira_qwenvl_base_url: str = "https://dashscope-intl.aliyuncs.com/compatible-mode/v1"
-    """DashScope OpenAI-compatible endpoint; key comes from DASHSCOPE_API_KEY."""
-
-    lavira_debug: bool = False
-    """Enable LaViRA debug logging."""
-
-    lavira_host: str = "*"
-    """LaViRA REASAN publisher bind host."""
-
-    lavira_control_input: Literal["tty", "gateway"] = "gateway"
-    """LaViRA navigation keys come from its own pane or ControlGateway."""
-
-    lavira_camera_timeout_ms: int = 15000
-    """LaViRA metric RGB-D receive timeout (ms)."""
-
-    depth_anything_port: int = 5564
-    """Local Depth Anything metric-depth publisher port."""
-
-    depth_anything_ready_timeout: float = 180.0
+    depth_anything_ready_timeout_s: float = 180.0
     """Maximum time to wait for the metric model to become ready."""
-
-    lavira_qwenvl_timeout_seconds: float = 180.0
-    """LaViRA Qwen-VL policy timeout (s)."""
-
-    lavira_min_confidence: float = 0.6
-    """Minimum Qwen-VL target confidence accepted by LaViRA."""
-
-    lavira_output_root: str = "outputs/object_nav"
-    """Directory where LaViRA stores ObjectNav diagnostics."""
 
     base_pose_enabled: bool = False
     """Start the independently triggered Base-Pose navigation agent."""
 
-    base_pose_task: str = ""
-    """Fixed manipulation task used whenever B starts Base-Pose alignment."""
-
-    base_pose_target_prompt: str = "bluebasket"
-    """Exact YOLOE text prompt for the Base-Pose target."""
-
-    base_pose_surface_prompt: str = "desk"
-    """YOLOE text prompt for the Base-Pose support surface."""
-
-    base_pose_camera_intrinsics_path: str = "gear_sonic/config/camera_intrinsics.json"
-    base_pose_camera_pitch_deg: float = -38.0
-    base_pose_camera_roll_deg: float = 0.0
-    base_pose_camera_yaw_deg: float = 0.0
-    base_pose_camera_forward_offset_m: float = 0.0
-    base_pose_camera_lateral_offset_m: float = 0.0
-    base_pose_dual_head_camera_stream: str = "ego_view"
-    base_pose_dual_head_depth_stream: str = "camera/ego_view_depth"
-    base_pose_dual_chest_camera_stream: str = "chest_view"
-    base_pose_dual_chest_depth_stream: str = "camera/chest_view_depth"
-    base_pose_dual_chest_camera_pitch_deg: float = -3.0
-    base_pose_dual_chest_camera_roll_deg: float = 0.0
-    base_pose_dual_chest_camera_yaw_deg: float = 0.0
-    base_pose_dual_chest_camera_forward_offset_m: float = 0.0
-    base_pose_dual_chest_camera_lateral_offset_m: float = 0.0
-    base_pose_dual_match_tolerance_frames: int = 30
-    base_pose_dual_head_reacquire_frames: int = 1
-    base_pose_dual_head_release_missing_frames: int = 3
-    base_pose_dual_rgbd_buffer_size: int = 8
-    base_pose_dual_rgbd_poll_hz: float = 60.0
-    base_pose_camera_timeout_ms: int = 15000
-    base_pose_planner_hz: float = 20.0
-    base_pose_output_root: str = "outputs/base_pose_adjustment"
-    base_pose_yoloe_model_path: str = "tools/yoloe26m/weights/yoloe-26m-seg.pt"
-    base_pose_yoloe_device: str = "0"
-    base_pose_yoloe_confidence: float = 0.25
-    base_pose_yoloe_imgsz: int = 640
-    base_pose_raw_head_target_distance_m: float = 1.00
-    base_pose_raw_chest_target_distance_m: float = 0.80
-    base_pose_raw_forward_tolerance_m: float = 0.10
-    base_pose_raw_lateral_tolerance_m: float = 0.10
-    base_pose_raw_min_linear_speed_m_s: float = 0.40
-    base_pose_raw_max_lateral_speed_m_s: float = 0.40
-    base_pose_raw_min_yaw_speed_rad_s: float = 0.10
-    base_pose_raw_yaw_tolerance_deg: float = 8.0
-    base_pose_raw_yaw_coarse_speed_rad_s: float = 0.30
-    base_pose_raw_yaw_trim_speed_rad_s: float = 0.20
-    base_pose_raw_forward_recenter_yaw_speed_rad_s: float = 0.30
-    base_pose_raw_horizontal_guard_fraction: float = 0.25
-    base_pose_raw_horizontal_recovery_fraction: float = 0.30
-    base_pose_raw_camera_stale_s: float = 0.40
-    base_pose_raw_max_run_s: float = 180.0
-    base_pose_raw_post_stop_sample_frames: int = 30
-    base_pose_raw_post_stop_deviation_frames: int = 10
-
-    navdp_root: str = "/home/user/Project/NavDP/baselines/x-navdp"
-    navdp_checkpoint: str = (
-        "/home/user/Project/NavDP/baselines/x-navdp/checkpoints/x-navdp_posttrain.ckpt"
-    )
-    fastlio_workspace: str = "/home/user/Project/fastlio_humanoid_ws"
-    livox_sdk_lib: str = "/home/user/Project/livox_sdk2_install/lib"
-    fastlio_config: str = "mid360.yaml"
     slam_debug: bool = False
     """Record raw LiDAR/IMU and FAST-LIO outputs for each real-robot run."""
 
-    lidar_ready_timeout: float = 30.0
-    navigation_ready_timeout: float = 60.0
+    lidar_ready_timeout_s: float = 30.0
+    navigation_ready_timeout_s: float = 60.0
     # Data exporter (optional recording during inference)
     data_exporter: bool = True
     """Start the data exporter pane for recording during inference."""
-
-    record_chest_camera: bool = False
-    """Record chest camera stream (chest_view) in the dataset."""
-
-    task_prompt: str = ""
-    """Task prompt for the data exporter. Defaults to the inference prompt if empty."""
-
-    dataset_name: str = ""
-    """Dataset name for the data exporter. Leave empty to auto-generate."""
 
     config: str = str(default_launch_config_path())
     """YAML file containing the complete launch_inference configuration."""
 
 
-def _validated_launch_values(raw_values: dict[str, Any]) -> dict[str, Any]:
-    config_fields = {
-        item.name: item for item in fields(InferenceLaunchConfig) if item.name != "config"
-    }
-    unknown = set(raw_values) - set(config_fields)
-    missing = set(config_fields) - set(raw_values)
-    if unknown:
-        raise ValueError(
-            "unknown launch_inference YAML fields: " + ", ".join(sorted(unknown))
-        )
-    if missing:
-        raise ValueError(
-            "missing launch_inference YAML fields: " + ", ".join(sorted(missing))
-        )
-
-    annotations = get_type_hints(InferenceLaunchConfig)
-    values: dict[str, Any] = {}
-    for name, value in raw_values.items():
-        annotation = annotations[name]
-        origin = get_origin(annotation)
-        if origin is Literal:
-            allowed = get_args(annotation)
-            if value not in allowed:
-                raise ValueError(
-                    f"launch_inference.{name} must be one of {allowed}, got {value!r}"
-                )
-            values[name] = value
-        elif annotation is bool:
-            if not isinstance(value, bool):
-                raise ValueError(f"launch_inference.{name} must be a boolean")
-            values[name] = value
-        elif annotation is int:
-            if isinstance(value, bool) or not isinstance(value, int):
-                raise ValueError(f"launch_inference.{name} must be an integer")
-            values[name] = value
-        elif annotation is float:
-            if isinstance(value, bool) or not isinstance(value, (int, float)):
-                raise ValueError(f"launch_inference.{name} must be a number")
-            values[name] = float(value)
-        elif annotation is str:
-            if not isinstance(value, str):
-                raise ValueError(f"launch_inference.{name} must be a string")
-            values[name] = value
-        else:
-            raise TypeError(f"unsupported launch configuration type for {name}: {annotation}")
-    return values
-
-
 def load_inference_launch_config(path: str | Path | None = None) -> InferenceLaunchConfig:
-    config_path = default_launch_config_path() if path is None else Path(path).expanduser()
-    try:
-        with config_path.open("r", encoding="utf-8") as stream:
-            payload = yaml.safe_load(stream)
-    except yaml.YAMLError as exc:
-        raise ValueError(f"invalid launch YAML {config_path}: {exc}") from exc
-    if not isinstance(payload, dict):
-        raise ValueError(f"launch YAML must contain an object: {config_path}")
-    if payload.get("schema") != "sonic.runtime_profile" or payload.get("version") != 1:
-        raise ValueError("launch YAML must use sonic.runtime_profile version 1")
-    raw_values = payload.get("launch_inference")
-    if not isinstance(raw_values, dict):
-        raise ValueError("launch YAML must contain a launch_inference object")
-    migrated_values = dict(raw_values)
-    migrated_values.setdefault("deploy_policy_variant", "default")
-    values = _validated_launch_values(migrated_values)
-    return InferenceLaunchConfig(config=str(config_path), **values)
+    return load_component_config(
+        InferenceLaunchConfig,
+        "launcher",
+        default_launch_config_path() if path is None else path,
+    )
 
 
 def parse_inference_launch_config(
@@ -395,11 +127,25 @@ def parse_inference_launch_config(
 
 SESSION_NAME = "sonic_inference"
 DEPTH_ANYTHING_READY_FILE = Path("/tmp/sonic_depth_anything_ready")
-INFERENCE_CORE_PANE_COUNT = 5
+PANE_TITLES = {
+    "performance": "PERFORMANCE · SensorGateway",
+    "control": "CONTROL · Operator CLI",
+    "events": "EVENTS · ControlGateway",
+    "deploy": "WORKER · C++ Deploy",
+    "vla": "WORKER · VLA Inference",
+    "planner_input": "WORKER · LaViRA / Planner Input",
+    "navdp": "WORKER · NavDP + Server",
+    "planner_executor": "WORKER · Planner Executor",
+    "base_pose": "WORKER · Base-Pose",
+}
 
 
 def _runtime_profile(config: InferenceLaunchConfig):
     return load_runtime_profile(config.config)
+
+
+def _component(config: InferenceLaunchConfig, name: str):
+    return _runtime_profile(config).component(name)
 
 
 def _depth_anything_required(config: InferenceLaunchConfig) -> bool:
@@ -437,24 +183,24 @@ def _normalized_deploy_argument(value: str) -> str:
 
 
 def resolve_deploy_policy(
-    config: InferenceLaunchConfig,
+    settings: Any,
     deploy_dir: Path,
 ) -> tuple[str, str]:
     """Resolve and validate a paired deploy checkpoint and observation config."""
-    has_checkpoint = bool(config.deploy_checkpoint.strip())
-    has_obs_config = bool(config.deploy_obs_config.strip())
+    has_checkpoint = bool(str(settings["checkpoint"]).strip())
+    has_obs_config = bool(str(settings["obs_config"]).strip())
     if has_checkpoint != has_obs_config:
         raise ValueError(
             "deploy_checkpoint and deploy_obs_config must be set together"
         )
 
     if has_checkpoint:
-        checkpoint = _normalized_deploy_argument(config.deploy_checkpoint.strip())
-        obs_config = _normalized_deploy_argument(config.deploy_obs_config.strip())
+        checkpoint = _normalized_deploy_argument(str(settings["checkpoint"]).strip())
+        obs_config = _normalized_deploy_argument(str(settings["obs_config"]).strip())
         download_hint = "provide the matching custom deployment files"
     else:
         checkpoint, obs_config, download_hint = DEPLOY_POLICY_PRESETS[
-            config.deploy_policy_variant
+            str(settings["policy_variant"])
         ]
 
     required = (
@@ -476,26 +222,28 @@ def resolve_deploy_policy(
 def build_deploy_command(config: InferenceLaunchConfig, repo_root: Path) -> str:
     """Build the C++ deploy command from a validated policy selection."""
     deploy_dir = repo_root / "gear_sonic_deploy"
-    checkpoint, obs_config = resolve_deploy_policy(config, deploy_dir)
+    settings = _component(config, "deploy")
+    checkpoint, obs_config = resolve_deploy_policy(settings, deploy_dir)
+    command_endpoint = _runtime_profile(config).endpoint("cpp_command")
     deploy_mode = "sim" if config.sim else "real"
     command = (
         f"cd {shlex.quote(str(deploy_dir))} && "
         f"./deploy.sh "
         f"--yes "
-        f"--input-type {shlex.quote(config.deploy_input_type)} "
-        f"--zmq-host {shlex.quote(config.deploy_zmq_host)} "
+        f"--input-type {shlex.quote(str(settings['input_type']))} "
+        f"--zmq-host {shlex.quote(command_endpoint.host)} "
         f"--hand-type dex1 "
         f"--dex1-kp 1.0 "
         f"--dex1-kd 0.05 "
         f"--cp {shlex.quote(checkpoint)} "
         f"--obs-config {shlex.quote(obs_config)} "
     )
-    if config.deploy_planner:
-        command += f"--planner {shlex.quote(config.deploy_planner)} "
-    if config.deploy_motion_data:
-        command += f"--motion-data {shlex.quote(config.deploy_motion_data)} "
-    if config.deploy_output_type:
-        command += f"--output-type {shlex.quote(config.deploy_output_type)} "
+    if settings["planner"]:
+        command += f"--planner {shlex.quote(str(settings['planner']))} "
+    if settings["motion_data"]:
+        command += f"--motion-data {shlex.quote(str(settings['motion_data']))} "
+    if settings["output_type"]:
+        command += f"--output-type {shlex.quote(str(settings['output_type']))} "
     return command + deploy_mode
 
 
@@ -503,29 +251,12 @@ def build_vla_inference_command(
     config: InferenceLaunchConfig,
     repo_root: Path,
 ) -> str:
-    """Build VLA command with an explicit, manually selected sensor source."""
-    planner_relay_port = _runtime_profile(config).endpoint("planner_relay").port
+    """Build VLA command using the selected runtime profile."""
     return (
         f"cd {shlex.quote(str(repo_root))} && "
         "source .venv_inference/bin/activate && "
-        "python gear_sonic/scripts/run_vla_inference.py "
-        f"--host {shlex.quote(config.policy_host)} "
-        f"--port {config.policy_port} "
-        f"--embodiment-tag {shlex.quote(config.embodiment_tag)} "
-        f"--prompt {shlex.quote(config.prompt)} "
-        f"--action-publish-rate {config.action_publish_rate} "
-        f"--action-horizon {config.action_horizon} "
-        f"--sensor-gateway-endpoint tcp://127.0.0.1:{config.sensor_gateway_port} "
-        f"--sensor-gateway-poll-hz {config.vla_sensor_gateway_poll_hz} "
-        f"--sensor-gateway-request-timeout-ms "
-        f"{config.vla_sensor_gateway_request_timeout_ms} "
-        f"--sensor-gateway-max-age-ms {config.vla_sensor_gateway_max_age_ms} "
-        f"--sensor-gateway-max-skew-ms {config.vla_sensor_gateway_max_skew_ms} "
-        f"--timing-endpoint tcp://127.0.0.1:{config.vla_timing_port} "
-        f"--control-gateway-endpoint tcp://127.0.0.1:"
-        f"{config.control_gateway_dispatch_port} "
-        "--planner-relay-zmq-host localhost "
-        f"--planner-relay-zmq-port {planner_relay_port}"
+        "python -m gear_sonic.utils.inference.vla.service "
+        f"--profile {shlex.quote(config.config)}"
     )
 
 
@@ -534,17 +265,11 @@ def build_control_gateway_command(
     repo_root: Path,
 ) -> str:
     """Build the typed ControlGateway router command."""
-    navigation_status_port = _runtime_profile(config).endpoint("navigation_status").port
-
     return (
         f"cd {shlex.quote(str(repo_root))} && "
         "source .venv_inference/bin/activate && "
-        "python gear_sonic/scripts/run_control_gateway.py "
-        f"--intent-port {config.control_gateway_intent_port} "
-        f"--dispatch-port {config.control_gateway_dispatch_port} "
-        f"--status-port {config.control_gateway_status_port} "
-        f"--navigation-port {config.keyboard_planner_port} "
-        f"--navigation-status-port {navigation_status_port}"
+        "python -m gear_sonic.runtime.gateway.services.control "
+        f"--profile {shlex.quote(config.config)}"
     )
 
 
@@ -553,17 +278,18 @@ def build_data_exporter_command(
     repo_root: Path,
 ) -> str:
     """Build DataExporter with runtime-profile Gateway inputs only."""
-    task_prompt = config.task_prompt or config.prompt
+    settings = _component(config, "data_exporter")
+    task_prompt = str(settings["task_prompt"]) or str(_component(config, "vla")["prompt"])
     command = (
         f"cd {shlex.quote(str(repo_root))} && "
         "source .venv_data_collection/bin/activate && "
-        "python gear_sonic/scripts/run_data_exporter.py "
+        "python -m gear_sonic.utils.data_collection.service "
         f"--profile {shlex.quote(config.config)} "
         f"--task-prompt {shlex.quote(task_prompt)}"
     )
-    if config.dataset_name:
-        command += f" --dataset-name {shlex.quote(config.dataset_name)}"
-    if config.record_chest_camera:
+    if settings["dataset_name"]:
+        command += f" --dataset-name {shlex.quote(str(settings['dataset_name']))}"
+    if settings["record_chest_camera"]:
         command += " --record-chest-camera"
     return command
 
@@ -575,59 +301,32 @@ def build_operator_console_command(
     return (
         f"cd {shlex.quote(str(repo_root))} && "
         "source .venv_inference/bin/activate && "
-        "python gear_sonic/scripts/run_operator_console.py "
-        f"--host 127.0.0.1 --port {config.control_gateway_intent_port}"
+        "python -m gear_sonic.utils.operator.console "
+        f"--profile {shlex.quote(config.config)}"
     )
 
 
-def build_operator_interface_command(
-    config: InferenceLaunchConfig,
-    repo_root: Path,
-) -> str:
-    return build_operator_console_command(config, repo_root)
-
-
 def build_planner_input_command(config: InferenceLaunchConfig, repo_root: Path) -> str:
-    """Build the pane 3 command for the selected REASEN command source."""
+    """Build the worker command for the selected REASEN command source."""
     if config.planner_input == "keyboard":
         return (
             f"cd {repo_root} && "
             f"source .venv_teleop/bin/activate && "
-            f"python gear_sonic/scripts/keyboard_planner_thread_server.py "
-            f"--port {config.keyboard_planner_port} "
-            f"--hz {config.keyboard_planner_publish_rate} "
-            f"--host {config.keyboard_planner_host} "
+            f"python -m gear_sonic.utils.planner_control.keyboard "
+            f"--profile {shlex.quote(config.config)}"
         )
 
-    debug = "--debug " if config.lavira_debug else ""
     local_env = "set -a; [ ! -f .env.local ] || . ./.env.local; set +a; "
     quoted_root = shlex.quote(str(repo_root))
     ready_file = shlex.quote(str(DEPTH_ANYTHING_READY_FILE))
     return (
         f"cd {quoted_root} && "
         f"{local_env}"
-        f"timeout {config.depth_anything_ready_timeout}s sh -c "
+        f"timeout {config.depth_anything_ready_timeout_s}s sh -c "
         f"'while [ ! -f {ready_file} ]; do sleep 0.2; done' || "
         "{ echo '[LaViRA] Depth Anything did not become ready' >&2; exit 1; }; "
-        f".venv_inference/bin/python gear_sonic/scripts/lavira_planner.py "
-        f"--mission {shlex.quote(config.lavira_mission)} "
-        f"--global-target {shlex.quote(config.lavira_global_target)} "
-        f"--qwenvl-model {shlex.quote(config.lavira_qwenvl_model)} "
-        f"--qwenvl-base-url {shlex.quote(config.lavira_qwenvl_base_url)} "
-        f"{debug}"
-        f"--camera-timeout-ms {config.lavira_camera_timeout_ms} "
-        f"--sensor-gateway-endpoint tcp://127.0.0.1:{config.sensor_gateway_port} "
-        f"--sensor-gateway-request-timeout-ms "
-        f"{config.vla_sensor_gateway_request_timeout_ms} "
-        f"--sensor-gateway-max-age-ms {config.vla_sensor_gateway_max_age_ms} "
-        f"--sensor-gateway-max-skew-ms {config.vla_sensor_gateway_max_skew_ms} "
-        f"--qwenvl-timeout-seconds {config.lavira_qwenvl_timeout_seconds} "
-        f"--min-confidence {config.lavira_min_confidence} "
-        "--control-gateway-endpoint "
-        f"tcp://127.0.0.1:{config.control_gateway_dispatch_port} "
-        "--control-gateway-intent-endpoint "
-        f"tcp://127.0.0.1:{config.control_gateway_intent_port} "
-        f"--output-root {shlex.quote(config.lavira_output_root)}"
+        f".venv_inference/bin/python -m gear_sonic.utils.inference.lavira.service "
+        f"--profile {shlex.quote(config.config)}"
     )
 
 
@@ -636,89 +335,10 @@ def build_base_pose_agent_command(
 ) -> str:
     """Build the independent ControlGateway-backed Base-Pose agent."""
 
-    quoted_root = shlex.quote(str(repo_root))
-    dual = (
-        f"--dual-head-camera-stream "
-        f"{shlex.quote(config.base_pose_dual_head_camera_stream)} "
-        f"--dual-head-depth-stream "
-        f"{shlex.quote(config.base_pose_dual_head_depth_stream)} "
-        f"--dual-chest-camera-stream "
-        f"{shlex.quote(config.base_pose_dual_chest_camera_stream)} "
-        f"--dual-chest-depth-stream "
-        f"{shlex.quote(config.base_pose_dual_chest_depth_stream)} "
-        f"--dual-chest-camera-pitch-deg "
-        f"{config.base_pose_dual_chest_camera_pitch_deg} "
-        f"--dual-chest-camera-roll-deg "
-        f"{config.base_pose_dual_chest_camera_roll_deg} "
-        f"--dual-chest-camera-yaw-deg "
-        f"{config.base_pose_dual_chest_camera_yaw_deg} "
-        f"--dual-chest-camera-forward-offset-m "
-        f"{config.base_pose_dual_chest_camera_forward_offset_m} "
-        f"--dual-chest-camera-lateral-offset-m "
-        f"{config.base_pose_dual_chest_camera_lateral_offset_m} "
-        f"--dual-match-tolerance-frames "
-        f"{config.base_pose_dual_match_tolerance_frames} "
-        f"--dual-head-reacquire-frames "
-        f"{config.base_pose_dual_head_reacquire_frames} "
-        f"--dual-head-release-missing-frames "
-        f"{config.base_pose_dual_head_release_missing_frames} "
-        f"--dual-rgbd-buffer-size {config.base_pose_dual_rgbd_buffer_size} "
-        f"--dual-rgbd-poll-hz {config.base_pose_dual_rgbd_poll_hz} "
-    )
-    yoloe = (
-        f"--camera-intrinsics-path {shlex.quote(config.base_pose_camera_intrinsics_path)} "
-        f"--camera-pitch-deg {config.base_pose_camera_pitch_deg} "
-        f"--camera-roll-deg {config.base_pose_camera_roll_deg} "
-        f"--camera-yaw-deg {config.base_pose_camera_yaw_deg} "
-        f"--camera-forward-offset-m {config.base_pose_camera_forward_offset_m} "
-        f"--camera-lateral-offset-m {config.base_pose_camera_lateral_offset_m} "
-        f"{dual}"
-        f"--raw-yoloe-model-path {shlex.quote(config.base_pose_yoloe_model_path)} "
-        f"--target-prompt {shlex.quote(config.base_pose_target_prompt)} "
-        f"--surface-prompt {shlex.quote(config.base_pose_surface_prompt)} "
-        f"--raw-yoloe-device {shlex.quote(config.base_pose_yoloe_device)} "
-        f"--raw-yoloe-confidence {config.base_pose_yoloe_confidence} "
-        f"--raw-yoloe-imgsz {config.base_pose_yoloe_imgsz} "
-        f"--raw-head-target-distance-m {config.base_pose_raw_head_target_distance_m} "
-        f"--raw-chest-target-distance-m "
-        f"{config.base_pose_raw_chest_target_distance_m} "
-        f"--raw-forward-tolerance-m {config.base_pose_raw_forward_tolerance_m} "
-        f"--raw-lateral-tolerance-m {config.base_pose_raw_lateral_tolerance_m} "
-        f"--raw-min-linear-speed-m-s {config.base_pose_raw_min_linear_speed_m_s} "
-        f"--raw-max-lateral-speed-m-s {config.base_pose_raw_max_lateral_speed_m_s} "
-        f"--raw-min-yaw-speed-rad-s {config.base_pose_raw_min_yaw_speed_rad_s} "
-        f"--raw-yaw-tolerance-deg {config.base_pose_raw_yaw_tolerance_deg} "
-        f"--raw-yaw-coarse-speed-rad-s {config.base_pose_raw_yaw_coarse_speed_rad_s} "
-        f"--raw-yaw-trim-speed-rad-s {config.base_pose_raw_yaw_trim_speed_rad_s} "
-        f"--raw-forward-recenter-yaw-speed-rad-s "
-        f"{config.base_pose_raw_forward_recenter_yaw_speed_rad_s} "
-        f"--raw-horizontal-guard-fraction "
-        f"{config.base_pose_raw_horizontal_guard_fraction} "
-        f"--raw-horizontal-recovery-fraction "
-        f"{config.base_pose_raw_horizontal_recovery_fraction} "
-        f"--raw-camera-stale-s {config.base_pose_raw_camera_stale_s} "
-        f"--raw-max-run-s {config.base_pose_raw_max_run_s} "
-        f"--raw-post-stop-sample-frames "
-        f"{config.base_pose_raw_post_stop_sample_frames} "
-        f"--raw-post-stop-deviation-frames "
-        f"{config.base_pose_raw_post_stop_deviation_frames} "
-        "--raw-orientation-telemetry-source "
-        f"{shlex.quote(_runtime_profile(config).endpoint_uri('orientation_telemetry'))} "
-    )
     return (
-        f"cd {quoted_root} && "
-        ".venv_inference/bin/python gear_sonic/scripts/base_pose_agent.py "
-        f"--task {shlex.quote(config.base_pose_task)} "
-        f"--camera-timeout-ms {config.base_pose_camera_timeout_ms} "
-        f"--sensor-gateway-endpoint tcp://127.0.0.1:{config.sensor_gateway_port} "
-        f"--sensor-gateway-request-timeout-ms {config.vla_sensor_gateway_request_timeout_ms} "
-        f"--sensor-gateway-max-age-ms {config.vla_sensor_gateway_max_age_ms} "
-        f"--sensor-gateway-max-skew-ms {config.vla_sensor_gateway_max_skew_ms} "
-        f"--control-gateway-endpoint tcp://127.0.0.1:{config.control_gateway_dispatch_port} "
-        f"--control-gateway-intent-endpoint tcp://127.0.0.1:{config.control_gateway_intent_port} "
-        f"--planner-hz {config.base_pose_planner_hz} "
-        f"{yoloe}"
-        f"--output-root {shlex.quote(config.base_pose_output_root)}"
+        f"cd {shlex.quote(str(repo_root))} && "
+        ".venv_inference/bin/python -m gear_sonic.utils.inference.base_pose.agent "
+        f"--profile {shlex.quote(config.config)}"
     )
 
 
@@ -728,111 +348,52 @@ def build_depth_anything_command(
     """Build the shared RGB-only metric chest-depth process."""
     quoted_root = shlex.quote(str(repo_root))
     ready_file = shlex.quote(str(DEPTH_ANYTHING_READY_FILE))
-    settings = _runtime_profile(config).component("depth_anything")
     return (
         f"PYTHONPATH={quoted_root} {quoted_root}/.venv_depth_anything/bin/python "
-        "gear_sonic/scripts/run_depth_anything.py "
-        f"--sensor-gateway-endpoint tcp://127.0.0.1:{config.sensor_gateway_port} "
-        f"--control-gateway-endpoint tcp://127.0.0.1:{config.control_gateway_dispatch_port} "
-        f"--publish-port {config.depth_anything_port} --ready-file {ready_file} "
-        f"--depth-anything-root {shlex.quote(str(settings['root']))} "
-        f"--checkpoint {shlex.quote(str(settings['checkpoint']))} "
-        f"--encoder {shlex.quote(str(settings['encoder']))} "
-        f"--device {shlex.quote(str(settings['device']))} "
-        f"--inference-hz {settings['inference_hz']} "
-        f"--input-size {settings['input_size']} "
-        f"--model-max-depth-m {settings['model_max_depth_m']} "
-        f"--publish-max-depth-m {settings['publish_max_depth_m']} "
-        + ("--use-amp" if settings["use_amp"] else "--no-use-amp")
+        "-m gear_sonic.utils.inference.lavira.depth_service "
+        f"--profile {shlex.quote(config.config)} --ready-file {ready_file}"
     )
 
 
 def build_navdp_planner_command(config: InferenceLaunchConfig, repo_root: Path) -> str:
     profile = _runtime_profile(config)
-    settings = profile.component("navdp")
-    recording = (
-        "--record-actorray "
-        f"--actorray-output-dir {shlex.quote(str(settings['actorray_output_dir']))} "
-        f"--actorray-record-fps {settings['actorray_record_fps']} "
-        if settings["record_actorray"]
-        else ""
-    )
-    navigation_status = profile.endpoint("navigation_status")
-    navdp_velocity = profile.endpoint("navdp_velocity")
+    fastlio = profile.component("fastlio")
     return (
         "unset COLCON_CURRENT_PREFIX AMENT_PREFIX_PATH CMAKE_PREFIX_PATH; "
         "source /opt/ros/humble/setup.bash && "
-        f"source {shlex.quote(config.fastlio_workspace)}/install/setup.bash && "
+        f"source {shlex.quote(str(fastlio['workspace']))}/install/setup.bash && "
         f"cd {shlex.quote(str(repo_root))} && source .venv_teleop/bin/activate && "
-        "python gear_sonic/scripts/navdp_planner.py "
-        f"--command-endpoint {shlex.quote(profile.endpoint_uri('navigation_command'))} "
-        f"--status-endpoint {shlex.quote(f'tcp://*:{navigation_status.port}')} "
-        f"--output-endpoint {shlex.quote(f'tcp://*:{navdp_velocity.port}')} "
-        f"--sensor-gateway-endpoint "
-        f"{shlex.quote(profile.endpoint_uri('sensor_gateway_metadata'))} "
-        f"--navdp-server {shlex.quote(profile.endpoint_uri('xnavdp_http'))} "
-        f"--sensor-gateway-poll-hz {settings['sensor_gateway_poll_hz']} "
-        f"--sensor-gateway-request-timeout-ms "
-        f"{settings['sensor_gateway_request_timeout_ms']} "
-        f"--sensor-gateway-max-age-ms {settings['sensor_gateway_max_age_ms']} "
-        f"--sensor-gateway-max-skew-ms {settings['sensor_gateway_max_skew_ms']} "
-        f"--control-hz {settings['control_hz']} "
-        f"--mpc-hz {settings['mpc_hz']} "
-        f"--mpc-result-timeout-s {settings['mpc_result_timeout_s']} "
-        f"--heading-preview-s {settings['heading_preview_s']} "
-        f"--goal-tolerance-m {settings['goal_tolerance_m']} "
-        f"--navdp-stop-threshold {settings['stop_threshold']} "
-        f"--odom-timeout-s {settings['odometry_timeout_s']} "
-        f"--trajectory-timeout-s {settings['trajectory_timeout_s']} "
-        f"--navdp-request-timeout-s {settings['request_timeout_s']} "
-        f"--no-visualize --visualization-gateway-endpoint "
-        f"{shlex.quote(profile.endpoint_uri('sensor_gateway_visualization_ingress'))} "
-        f"{recording}"
+        "python -m gear_sonic.utils.inference.navdp.service "
+        f"--profile {shlex.quote(config.config)}"
     )
 
 
 def build_planner_velocity_executor_command(
     config: InferenceLaunchConfig, repo_root: Path
 ) -> str:
-    profile = _runtime_profile(config)
-    settings = profile.component("planner_executor")
-    planner_relay = profile.endpoint("planner_relay")
-    orientation_telemetry = profile.endpoint("orientation_telemetry")
-    navigation_runtime_status = profile.endpoint("navigation_runtime_status")
     orientation_output = (
-        "--orientation-output-endpoint "
-        f"{shlex.quote(f'tcp://*:{orientation_telemetry.port}')} "
+        "--publish-orientation "
         if config.base_pose_enabled
         else ""
     )
     return (
         f"cd {shlex.quote(str(repo_root))} && source .venv_teleop/bin/activate && "
-        "python gear_sonic/scripts/planner_velocity_executor.py "
-        f"--command-endpoint {shlex.quote(profile.endpoint_uri('navigation_command'))} "
-        f"--navdp-velocity-endpoint {shlex.quote(profile.endpoint_uri('navdp_velocity'))} "
-        f"--output-endpoint {shlex.quote(f'tcp://*:{planner_relay.port}')} "
-        "--runtime-status-endpoint "
-        f"{shlex.quote(f'tcp://*:{navigation_runtime_status.port}')} "
-        f"--sensor-gateway-endpoint {shlex.quote(profile.endpoint_uri('sensor_gateway_metadata'))} "
-        f"--control-hz {settings['control_hz']} "
-        f"--manual-velocity-timeout-s {settings['manual_velocity_timeout_s']} "
-        f"--navdp-velocity-timeout-s {settings['navdp_velocity_timeout_s']} "
-        f"--radar-timeout-s {settings['radar_timeout_s']} "
-        f"--sensor-gateway-poll-hz {settings['sensor_gateway_poll_hz']} "
-        f"--sensor-gateway-request-timeout-ms {settings['sensor_gateway_request_timeout_ms']} "
-        f"--sensor-gateway-max-age-ms {settings['sensor_gateway_max_age_ms']} "
+        "python -m gear_sonic.utils.planner_control.executor_service "
+        f"--profile {shlex.quote(config.config)} "
         f"{orientation_output}"
     )
 
 
 def build_navdp_server_command(config: InferenceLaunchConfig) -> str:
-    navdp_port = _runtime_profile(config).endpoint("xnavdp_http").port
+    profile = _runtime_profile(config)
+    navdp_port = profile.endpoint("xnavdp_http").port
+    settings = profile.component("navdp")
     return (
-        f"cd {shlex.quote(config.navdp_root)} && "
+        f"cd {shlex.quote(str(settings['root']))} && "
         "PYTHONUNBUFFERED=1 conda run --no-capture-output -n navdp "
         "python -m eval.src.policy_server "
         f"--port {navdp_port} --embodiment humanoid "
-        f"--checkpoint {shlex.quote(config.navdp_checkpoint)} "
+        f"--checkpoint {shlex.quote(str(settings['checkpoint']))} "
         "--device cuda:0 --real --no-visualization"
     )
 
@@ -875,33 +436,12 @@ def build_navdp_planner_pane_command(
     )
 
 
-def build_livox_command(config: InferenceLaunchConfig) -> str:
-    return (
-        "unset COLCON_CURRENT_PREFIX AMENT_PREFIX_PATH CMAKE_PREFIX_PATH; "
-        "source /opt/ros/humble/setup.bash && "
-        f"export LD_LIBRARY_PATH={shlex.quote(config.livox_sdk_lib)}:$LD_LIBRARY_PATH && "
-        f"source {shlex.quote(config.fastlio_workspace)}/install/setup.bash && "
-        "ros2 launch livox_ros_driver2 msg_MID360_launch.py"
-    )
-
-
-def build_fastlio_command(config: InferenceLaunchConfig) -> str:
-    return (
-        "unset COLCON_CURRENT_PREFIX AMENT_PREFIX_PATH CMAKE_PREFIX_PATH; "
-        "source /opt/ros/humble/setup.bash && "
-        f"export LD_LIBRARY_PATH={shlex.quote(config.livox_sdk_lib)}:$LD_LIBRARY_PATH && "
-        f"source {shlex.quote(config.fastlio_workspace)}/install/setup.bash && "
-        f"ros2 launch fast_lio mapping.launch.py config_file:={shlex.quote(config.fastlio_config)} rviz:=false"
-    )
-
-
 def build_fastlio_supervisor_command(config: InferenceLaunchConfig) -> str:
+    settings = _component(config, "fastlio")
     return (
-        "python gear_sonic/scripts/run_fastlio_supervisor.py "
+        "python -m gear_sonic.utils.inference.navdp.slam_supervisor "
         f"--profile {shlex.quote(config.config)} "
-        f"--config-file {shlex.quote(config.fastlio_config)} "
-        "--control-gateway-endpoint tcp://127.0.0.1:"
-        f"{config.control_gateway_intent_port}"
+        f"--config-file {shlex.quote(str(settings['config']))}"
     )
 
 
@@ -914,13 +454,13 @@ def build_slam_debug_command(config: InferenceLaunchConfig) -> str:
 
 
 def build_sensor_gateway_command(config: InferenceLaunchConfig, repo_root: Path) -> str:
-    profile = _runtime_profile(config)
+    fastlio = _component(config, "fastlio")
     ros_mode = "" if config.keyboard_planner and not config.sim else "--no-enable-ros "
     setup = (
         "unset COLCON_CURRENT_PREFIX AMENT_PREFIX_PATH CMAKE_PREFIX_PATH; "
         "source /opt/ros/humble/setup.bash && "
-        f"export LD_LIBRARY_PATH={shlex.quote(config.livox_sdk_lib)}:$LD_LIBRARY_PATH && "
-        f"source {shlex.quote(config.fastlio_workspace)}/install/setup.bash && "
+        f"export LD_LIBRARY_PATH={shlex.quote(str(fastlio['livox_sdk_lib']))}:$LD_LIBRARY_PATH && "
+        f"source {shlex.quote(str(fastlio['workspace']))}/install/setup.bash && "
         f"cd {shlex.quote(str(repo_root))} && source .venv_teleop/bin/activate && "
         f"export PYTHONPATH={shlex.quote(str(repo_root))}:$PYTHONPATH; "
     )
@@ -930,12 +470,8 @@ def build_sensor_gateway_command(config: InferenceLaunchConfig, repo_root: Path)
         else "--no-enable-depth-anything "
     )
     gateway = (
-        "python gear_sonic/scripts/run_sensor_gateway.py "
-        f"--camera-host {shlex.quote(config.camera_host)} "
-        f"--camera-port {config.camera_port} "
-        f"--rpc-port {config.sensor_gateway_port} "
-        f"--visualization-port {config.sensor_gateway_visualization_port} "
-        f"--vla-timing-port {config.vla_timing_port} "
+        "python -m gear_sonic.runtime.gateway.services.sensor "
+        f"--profile {shlex.quote(config.config)} "
         f"{depth_anything_flag}"
         f"{ros_mode}"
     )
@@ -982,12 +518,8 @@ def build_sensor_gateway_command(config: InferenceLaunchConfig, repo_root: Path)
         background_commands.append(
             (
                 "viewer_pid",
-                "python gear_sonic/scripts/run_operator_cv_viewer.py "
-                f"--sensor-gateway-endpoint tcp://127.0.0.1:{config.sensor_gateway_port} "
-                "--control-gateway-endpoint "
-                f"tcp://127.0.0.1:{config.control_gateway_dispatch_port} "
-                "--navigation-runtime-status-endpoint "
-                f"{shlex.quote(profile.endpoint_uri('navigation_runtime_status'))}",
+                "python -m gear_sonic.utils.operator.cv_viewer "
+                f"--profile {shlex.quote(config.config)}",
                 "/tmp/sonic_opencv_viewer.log",
             )
         )
@@ -997,7 +529,7 @@ def build_sensor_gateway_command(config: InferenceLaunchConfig, repo_root: Path)
             (
                 "depth_anything_pid",
                 build_depth_anything_command(config, repo_root),
-                "/tmp/sonic_depth_anything.log",
+                "/dev/null",
             )
         )
     if not background_commands:
@@ -1029,25 +561,21 @@ def build_sensor_gateway_command(config: InferenceLaunchConfig, repo_root: Path)
 def run_readiness_gate(
     config: InferenceLaunchConfig, repo_root: Path, stage: Literal["lidar", "navigation"]
 ) -> bool:
-    navdp_endpoint = _runtime_profile(config).endpoint("xnavdp_http")
     timeout = (
-        config.lidar_ready_timeout if stage == "lidar" else config.navigation_ready_timeout
+        config.lidar_ready_timeout_s
+        if stage == "lidar"
+        else config.navigation_ready_timeout_s
     )
-    gateway_requirement = (
-        f"--require-sensor-gateway --sensor-gateway-port {config.sensor_gateway_port} "
-        if stage == "navigation"
-        else ""
-    )
+    fastlio = _component(config, "fastlio")
+    gateway_requirement = "--require-sensor-gateway " if stage == "navigation" else ""
     command = (
         "unset COLCON_CURRENT_PREFIX AMENT_PREFIX_PATH CMAKE_PREFIX_PATH; "
         "source /opt/ros/humble/setup.bash && "
-        f"source {shlex.quote(config.fastlio_workspace)}/install/setup.bash && "
+        f"source {shlex.quote(str(fastlio['workspace']))}/install/setup.bash && "
         f"cd {shlex.quote(str(repo_root))} && source .venv_teleop/bin/activate && "
-        f"python gear_sonic/scripts/navdp_readiness_gate.py --stage {stage} "
+        f"python -m gear_sonic.utils.inference.navdp.readiness --stage {stage} "
+        f"--profile {shlex.quote(config.config)} "
         f"--timeout {timeout} "
-        f"--camera-host {shlex.quote(config.camera_host)} --camera-port {config.camera_port} "
-        f"--navdp-host {shlex.quote(navdp_endpoint.host)} "
-        f"--navdp-port {navdp_endpoint.port} "
         f"{gateway_requirement}"
     )
     return subprocess.run(
@@ -1074,6 +602,7 @@ def _dotenv_has_nonempty_value(path: Path, name: str) -> bool:
 def _check_prerequisites(config: InferenceLaunchConfig):
     """Verify that required tools and venvs exist."""
     errors = []
+    profile = _runtime_profile(config)
 
     if not shutil.which("tmux"):
         errors.append("tmux is not installed. Install with: sudo apt install tmux")
@@ -1102,11 +631,14 @@ def _check_prerequisites(config: InferenceLaunchConfig):
                 errors.append(f"{label} not found: {path}")
 
     if config.planner_input == "lavira":
-        if not config.lavira_mission.strip():
-            errors.append("--lavira-mission is required when --planner-input lavira")
-        if not config.lavira_global_target.strip():
+        lavira = profile.component("lavira")
+        navdp = profile.component("navdp")
+        fastlio = profile.component("fastlio")
+        if not str(lavira["mission"]).strip():
+            errors.append("components.lavira.mission is required")
+        if not str(lavira["global_target"]).strip():
             errors.append(
-                "--lavira-global-target is required when --planner-input lavira"
+                "components.lavira.global_target is required"
             )
         if (
             not os.environ.get("DASHSCOPE_API_KEY", "").strip()
@@ -1118,112 +650,38 @@ def _check_prerequisites(config: InferenceLaunchConfig):
             )
         for path, label in (
             (
-                Path(config.navdp_root) / "eval" / "src" / "policy_server.py",
+                Path(str(navdp["root"])) / "eval" / "src" / "policy_server.py",
                 "X-NavDP server",
             ),
-            (Path(config.navdp_checkpoint), "NavDP checkpoint"),
-            (Path(config.fastlio_workspace) / "install" / "setup.bash", "FAST-LIO workspace"),
+            (Path(str(navdp["checkpoint"])), "NavDP checkpoint"),
+            (
+                Path(str(fastlio["workspace"])) / "install" / "setup.bash",
+                "FAST-LIO workspace",
+            ),
             (Path("/opt/ros/humble/setup.bash"), "ROS2 Humble"),
         ):
             if not path.exists():
                 errors.append(f"{label} not found: {path}")
+        camera_endpoint = profile.endpoint("camera_server")
         try:
-            with socket.create_connection((config.camera_host, config.camera_port), timeout=1.0):
+            with socket.create_connection(
+                (camera_endpoint.host, camera_endpoint.port), timeout=1.0
+            ):
                 pass
         except OSError:
             errors.append(
-                f"robot camera is not reachable at {config.camera_host}:{config.camera_port}"
+                "robot camera is not reachable at "
+                f"{camera_endpoint.host}:{camera_endpoint.port}"
             )
 
     if config.base_pose_enabled:
-        if not config.base_pose_task.strip():
-            errors.append("--base-pose-task is required when Base-Pose is enabled")
-        if not config.base_pose_target_prompt.strip():
-            errors.append(
-                "--base-pose-target-prompt is required when Base-Pose is enabled"
-            )
-        if not config.base_pose_surface_prompt.strip():
-            errors.append(
-                "--base-pose-surface-prompt is required when Base-Pose is enabled"
-            )
-        if config.base_pose_planner_hz <= 0.0:
-            errors.append("--base-pose-planner-hz must be positive")
-        head = config.base_pose_dual_head_camera_stream
-        chest = config.base_pose_dual_chest_camera_stream
-        if not head or not chest or head == chest:
-            errors.append("dual Base-Pose camera streams must be distinct")
-        expected_head_depth = f"camera/{head}_depth"
-        expected_chest_depth = f"camera/{chest}_depth"
-        if config.base_pose_dual_head_depth_stream != expected_head_depth:
-            errors.append(
-                "dual head raw depth must match its RGB: "
-                f"--base-pose-dual-head-depth-stream {expected_head_depth}"
-            )
-        if config.base_pose_dual_chest_depth_stream != expected_chest_depth:
-            errors.append(
-                "dual chest raw depth must match its RGB: "
-                f"--base-pose-dual-chest-depth-stream {expected_chest_depth}"
-            )
-        if config.base_pose_dual_match_tolerance_frames <= 0:
-            errors.append("dual match tolerance must be positive")
-        if config.base_pose_dual_head_reacquire_frames <= 0:
-            errors.append("dual head reacquisition frame count must be positive")
-        if config.base_pose_dual_head_release_missing_frames <= 0:
-            errors.append("dual head release missing frame count must be positive")
-        if config.base_pose_dual_rgbd_buffer_size <= 0:
-            errors.append("dual RGB-D buffer size must be positive")
-        if config.base_pose_dual_rgbd_poll_hz <= 0.0:
-            errors.append("dual RGB-D poll frequency must be positive")
-        for value, label in (
-            (config.base_pose_yoloe_confidence, "YOLOE confidence"),
-            (config.base_pose_raw_head_target_distance_m, "head target distance"),
-            (
-                config.base_pose_raw_chest_target_distance_m,
-                "chest target distance",
-            ),
-            (config.base_pose_raw_forward_tolerance_m, "forward tolerance"),
-            (config.base_pose_raw_lateral_tolerance_m, "lateral tolerance"),
-            (config.base_pose_raw_min_linear_speed_m_s, "minimum linear speed"),
-            (config.base_pose_raw_max_lateral_speed_m_s, "maximum lateral speed"),
-            (config.base_pose_raw_min_yaw_speed_rad_s, "minimum yaw speed"),
-            (config.base_pose_raw_yaw_tolerance_deg, "yaw tolerance"),
-            (config.base_pose_raw_yaw_coarse_speed_rad_s, "coarse yaw speed"),
-            (config.base_pose_raw_yaw_trim_speed_rad_s, "trim yaw speed"),
-            (
-                config.base_pose_raw_forward_recenter_yaw_speed_rad_s,
-                "forward recenter yaw speed",
-            ),
-            (config.base_pose_raw_camera_stale_s, "camera stale timeout"),
-            (config.base_pose_raw_max_run_s, "maximum run time"),
-        ):
-            if not math.isfinite(value) or value <= 0.0:
-                errors.append(f"Base-Pose {label} must be finite and positive")
-        if not 0.0 < config.base_pose_yoloe_confidence <= 1.0:
-            errors.append("Base-Pose YOLOE confidence must be in (0, 1]")
-        if config.base_pose_yoloe_imgsz <= 0:
-            errors.append("Base-Pose YOLOE image size must be positive")
-        if config.base_pose_raw_post_stop_sample_frames < 0:
-            errors.append("Base-Pose post-stop sample frames must be non-negative")
-        if not (
-            config.base_pose_raw_post_stop_sample_frames == 0
-            or 0 < config.base_pose_raw_post_stop_deviation_frames
-            <= config.base_pose_raw_post_stop_sample_frames
-        ):
-            errors.append(
-                "Base-Pose post-stop deviation frames must be in "
-                "[1, post-stop sample frames]"
-            )
-        if not (
-            0.0 < config.base_pose_raw_horizontal_guard_fraction
-            < config.base_pose_raw_horizontal_recovery_fraction
-            < 0.5
-        ):
-            errors.append(
-                "Base-Pose horizontal fractions must satisfy 0 < guard < recovery < 0.5"
-            )
+        base_pose = profile.component("base_pose")
+        for key in ("task", "target_prompt", "surface_prompt"):
+            if not str(base_pose[key]).strip():
+                errors.append(f"components.base_pose.{key} is required")
         for relative_path, label in (
-            (config.base_pose_yoloe_model_path, "YOLOE model"),
-            (config.base_pose_camera_intrinsics_path, "camera intrinsics"),
+            (base_pose["raw_yoloe_model_path"], "YOLOE model"),
+            (base_pose["camera_intrinsics_path"], "camera intrinsics"),
         ):
             path = Path(relative_path)
             if not path.is_absolute():
@@ -1258,7 +716,7 @@ def _check_prerequisites(config: InferenceLaunchConfig):
         )
     else:
         try:
-            resolve_deploy_policy(config, deploy_dir)
+            resolve_deploy_policy(profile.component("deploy"), deploy_dir)
         except (ValueError, FileNotFoundError) as exc:
             errors.append(str(exc))
 
@@ -1312,7 +770,7 @@ def _clear_stale_navdp_processes() -> None:
     conda jobs are left untouched.
     """
     patterns = (
-        r"(^|/)(python|python3) gear_sonic/scripts/navdp_planner\.py( |$)",
+        r"(^|/)(python|python3) -m gear_sonic\.utils\.inference\.navdp\.service( |$)",
         r"(^|/)(python|python3) -m eval\.src\.policy_server( |$)",
     )
     for pattern in patterns:
@@ -1322,123 +780,136 @@ def _clear_stale_navdp_processes() -> None:
         subprocess.run(["pkill", "-KILL", "-f", pattern], capture_output=True)
 
 
-def _parse_pane_ids(
-    output: str, expected_count: int = INFERENCE_CORE_PANE_COUNT
-) -> list[str]:
-    indexed = {}
-    for line in output.splitlines():
-        fields = line.split()
-        if len(fields) == 2:
-            indexed[int(fields[0])] = fields[1]
-    if len(indexed) != expected_count or sorted(indexed) != list(range(expected_count)):
-        raise RuntimeError(
-            f"expected {expected_count} tmux panes, found {len(indexed)}"
-        )
-    return [indexed[index] for index in range(expected_count)]
+def _worker_pane_names(config: InferenceLaunchConfig) -> tuple[str, ...]:
+    names = ["deploy", "vla"]
+    if config.keyboard_planner:
+        names.extend(("planner_input", "navdp", "planner_executor"))
+        if config.base_pose_enabled:
+            names.append("base_pose")
+    return tuple(names)
 
 
-def _inference_pane_count(config: InferenceLaunchConfig) -> int:
-    base_pose_runtime_enabled = config.keyboard_planner and config.base_pose_enabled
-    runtime_pane_count = (
-        2 + int(config.keyboard_planner) + int(base_pose_runtime_enabled)
+def _tmux(*args: str, output: bool = False) -> str:
+    result = subprocess.run(
+        ["tmux", *args],
+        check=True,
+        capture_output=output,
+        text=output,
     )
-    return INFERENCE_CORE_PANE_COUNT + runtime_pane_count
+    return result.stdout.strip() if output else ""
 
 
-def _create_tmux_session(
-    pane_count: int = INFERENCE_CORE_PANE_COUNT,
-) -> list[str]:
-    if pane_count < INFERENCE_CORE_PANE_COUNT:
-        raise ValueError(
-            "inference pane_count cannot be smaller than "
-            f"{INFERENCE_CORE_PANE_COUNT}"
-        )
+def _pane_id(target: str) -> str:
+    return _tmux(
+        "display-message",
+        "-p",
+        "-t",
+        target,
+        "#{pane_id}",
+        output=True,
+    )
+
+
+def _split_pane(
+    target: str,
+    shell: tuple[str, ...],
+    *split_args: str,
+) -> str:
+    return _tmux(
+        "split-window",
+        *split_args,
+        "-t",
+        target,
+        "-P",
+        "-F",
+        "#{pane_id}",
+        *shell,
+        output=True,
+    )
+
+
+def _create_tmux_session(config: InferenceLaunchConfig) -> dict[str, str]:
     bash = shutil.which("bash") or "/bin/bash"
-    subprocess.run(
-        [
-            "tmux", "new-session", "-d", "-x", "240", "-y", "60",
-            "-s", SESSION_NAME, bash, "--noprofile", "--norc",
-        ],
-        check=True,
+    shell = (bash, "--noprofile", "--norc")
+    _tmux(
+        "new-session",
+        "-d",
+        "-x",
+        "240",
+        "-y",
+        "60",
+        "-s",
+        SESSION_NAME,
+        "-n",
+        "overview",
+        *shell,
     )
-    subprocess.run(
-        ["tmux", "set-option", "-t", SESSION_NAME, "-g", "mouse", "on"],
-    )
-    subprocess.run(
-        [
-            "tmux", "set-option", "-t", f"{SESSION_NAME}:0", "-w",
-            "remain-on-exit", "on",
-        ],
-        check=True,
-    )
-    subprocess.run(
-        ["tmux", "bind-key", "-T", "root", "C-\\", "kill-session"],
-    )
-    subprocess.run(
-        ["tmux", "rename-window", "-t", f"{SESSION_NAME}:0", "inference"],
-    )
+    _tmux("set-option", "-t", SESSION_NAME, "mouse", "on")
+    _tmux("bind-key", "-T", "root", "C-\\", "kill-session")
 
-    # Build three rows first, then distribute all inference and Gateway panes
-    # over those rows.  Keeping one tmux window avoids a hidden runtime window.
-    top_pane = subprocess.run(
-        ["tmux", "display-message", "-p", "-t", f"{SESSION_NAME}:0.0", "#{pane_id}"],
-        check=True,
-        capture_output=True,
-        text=True,
-    ).stdout.strip()
-    bottom_pane = subprocess.run(
-        [
-            "tmux", "split-window", "-v", "-t", top_pane, "-P", "-F", "#{pane_id}",
-            bash, "--noprofile", "--norc",
-        ],
-        check=True,
-        capture_output=True,
-        text=True,
-    ).stdout.strip()
-    middle_pane = subprocess.run(
-        [
-            "tmux", "split-window", "-v", "-t", top_pane, "-P", "-F", "#{pane_id}",
-            bash, "--noprofile", "--norc",
-        ],
-        check=True,
-        capture_output=True,
-        text=True,
-    ).stdout.strip()
-    row_panes = (top_pane, middle_pane, bottom_pane)
-    columns_per_row = [pane_count // 3] * 3
-    for index in range(pane_count % 3):
-        columns_per_row[index] += 1
-    for row_pane, column_count in zip(row_panes, columns_per_row, strict=True):
-        for _ in range(column_count - 1):
-            subprocess.run(
-                [
-                    "tmux", "split-window", "-h", "-t", row_pane,
-                    bash, "--noprofile", "--norc",
-                ],
-                check=True,
-            )
-    subprocess.run(["tmux", "select-layout", "-t", f"{SESSION_NAME}:0", "tiled"], check=True)
+    # Overview: compact performance/control panes on the left and a full-height
+    # event stream on the right.  The left side is kept wide enough for the
+    # existing SensorGateway dashboard at the launcher's 240-column baseline.
+    performance = _pane_id(f"{SESSION_NAME}:overview.0")
+    events = _split_pane(performance, shell, "-h", "-p", "58")
+    control = _split_pane(performance, shell, "-v", "-p", "42")
+    panes = {
+        "performance": performance,
+        "control": control,
+        "events": events,
+    }
 
-    pane_output = subprocess.run(
-        [
-            "tmux", "list-panes", "-t", f"{SESSION_NAME}:0",
-            "-F", "#{pane_index} #{pane_id}",
-        ],
-        check=True,
-        capture_output=True,
-        text=True,
-    ).stdout
-    pane_ids = _parse_pane_ids(pane_output, pane_count)
+    worker_names = _worker_pane_names(config)
+    _tmux(
+        "new-window",
+        "-d",
+        "-t",
+        SESSION_NAME,
+        "-n",
+        "workers",
+        *shell,
+    )
+    panes[worker_names[0]] = _pane_id(f"{SESSION_NAME}:workers.0")
+    for name in worker_names[1:]:
+        panes[name] = _split_pane(f"{SESSION_NAME}:workers", shell, "-h")
+    _tmux("select-layout", "-t", f"{SESSION_NAME}:workers", "tiled")
+
+    for window in ("overview", "workers"):
+        target = f"{SESSION_NAME}:{window}"
+        _tmux("set-option", "-w", "-t", target, "remain-on-exit", "on")
+        _tmux("set-option", "-w", "-t", target, "pane-border-status", "top")
+        _tmux(
+            "set-option",
+            "-w",
+            "-t",
+            target,
+            "pane-border-format",
+            " #[fg=colour45,bold]#{pane_title}#[default] ",
+        )
+    for name, pane in panes.items():
+        _tmux("select-pane", "-t", pane, "-T", PANE_TITLES[name])
+
+    _tmux("select-window", "-t", f"{SESSION_NAME}:overview")
+    _tmux("select-pane", "-t", panes["control"])
     time.sleep(5)
-    return pane_ids
+    return panes
 
 
 def _send_to_pane(pane_id: str, cmd: str, wait: float = 1.0):
-    subprocess.run(
-        ["tmux", "send-keys", "-t", pane_id, cmd, "C-m"],
-        check=True,
-    )
+    _tmux("send-keys", "-t", pane_id, cmd, "C-m")
     time.sleep(wait)
+
+
+def _start_in_pane(
+    panes: dict[str, str],
+    name: str,
+    label: str,
+    command: str,
+    *,
+    wait: float = 1.0,
+) -> None:
+    print(f"Starting {label} ({name})...")
+    _send_to_pane(panes[name], command, wait=wait)
 
 
 def _check_pane_alive(pane_id: str) -> bool:
@@ -1452,146 +923,106 @@ def _check_pane_alive(pane_id: str) -> bool:
 
 def main(config: InferenceLaunchConfig):
     repo_root = Path(__file__).resolve().parent.parent.parent
+    profile = _runtime_profile(config)
 
     _check_prerequisites(config)
     _kill_existing_session()
     _clear_stale_fastlio_processes()
     _clear_stale_navdp_processes()
 
-    exporter_prompt = config.task_prompt if config.task_prompt else config.prompt
-
-    print("=" * 60)
-    print("  SONIC VLA Inference Launcher")
-    print("=" * 60)
-    print(f"  Launch config:   {config.config}")
-    print(f"  Mode:            {'Simulation' if config.sim else 'Real Robot'}")
-    print(f"  PolicyServer:    {config.policy_host}:{config.policy_port}")
-    print(f"  Embodiment:      {config.embodiment_tag}")
-    print(f"  Prompt:          {config.prompt}")
-    print(f"  Action rate:     {config.action_publish_rate} Hz")
-    print(f"  Action horizon:  {config.action_horizon}")
-    print(f"  Camera:          {config.camera_host}:{config.camera_port}")
-    print(f"  Data exporter:   {'Yes' if config.data_exporter else 'No'}")
-    if config.data_exporter:
-        print(f"    Task prompt:   {exporter_prompt}")
-        print(f"    Chest camera:  {'Yes' if config.record_chest_camera else 'No'}")
-    print(f"  PC IP:           {_get_local_ip()}")
-    print("=" * 60)
+    print(
+        f"Launching {SESSION_NAME} "
+        f"({'simulation' if config.sim else 'real robot'}) from {config.config}"
+    )
+    camera_endpoint = profile.endpoint("camera_server")
 
     base_pose_runtime_enabled = config.keyboard_planner and config.base_pose_enabled
-    pane_ids = _create_tmux_session(_inference_pane_count(config))
+    panes = _create_tmux_session(config)
     print(f"Created tmux session: {SESSION_NAME}")
 
-    # --- Window 1 (sim only): MuJoCo Simulator ---
+    # --- Optional window: MuJoCo Simulator ---
     if config.sim:
-        subprocess.run(
-            ["tmux", "new-window", "-t", SESSION_NAME, "-n", "sim"],
-        )
+        _tmux("new-window", "-t", SESSION_NAME, "-n", "sim")
         sim_cmd = (
             f"cd {repo_root} && "
             f"source .venv_sim/bin/activate && "
-            f"python gear_sonic/scripts/run_sim_loop.py "
+            f"python -m gear_sonic.utils.mujoco_sim.service "
             f"--enable-image-publish --enable-offscreen "
-            f"--camera-port {config.camera_port}"
+            f"--camera-port {camera_endpoint.port}"
         )
         sim_target = f"{SESSION_NAME}:sim"
-        subprocess.run(
-            ["tmux", "send-keys", "-t", sim_target, sim_cmd, "C-m"],
-        )
         print("Starting MuJoCo simulator (window: sim)...")
-        time.sleep(3.0)
+        _send_to_pane(sim_target, sim_cmd, wait=3.0)
 
-        subprocess.run(
-            ["tmux", "select-window", "-t", f"{SESSION_NAME}:inference"],
-        )
+        _tmux("select-window", "-t", f"{SESSION_NAME}:overview")
 
-    # --- Pane 0 (top-left): C++ Deploy ---
+    # Workers retain independent TTYs and scrollback in the second window.
     deploy_cmd = build_deploy_command(config, repo_root)
-
-    print("Starting C++ deploy (pane 0)...")
-    _send_to_pane(pane_ids[0], deploy_cmd, wait=3.0)
-
-    if not _check_pane_alive(pane_ids[0]):
+    _start_in_pane(panes, "deploy", "C++ deploy", deploy_cmd, wait=3.0)
+    if not _check_pane_alive(panes["deploy"]):
         print("WARNING: C++ deploy pane may have failed to start.")
 
-    # Start the two mandatory Gateway boundaries before their clients.
-    runtime_panes = pane_ids[INFERENCE_CORE_PANE_COUNT:]
-    runtime_index = 0
-    print(
-        "Starting SensorGateway with background ROS/OpenCV/Depth Anything services "
-        f"(pane {INFERENCE_CORE_PANE_COUNT + runtime_index})..."
-    )
-    _send_to_pane(
-        runtime_panes[runtime_index],
+    # The overview window directly hosts the performance, control, and event
+    # processes; start both Gateway boundaries before their clients.
+    _start_in_pane(
+        panes,
+        "performance",
+        "SensorGateway with background ROS/OpenCV/Depth Anything services",
         build_sensor_gateway_command(config, repo_root),
         wait=1.0,
     )
     if config.slam_debug and config.keyboard_planner and not config.sim:
         print("SLAM/IMU debug recording: outputs/slam_debug/<launch timestamp>/")
-    runtime_index += 1
-    print(
-        "Starting ControlGateway router "
-        f"(pane {INFERENCE_CORE_PANE_COUNT + runtime_index})..."
-    )
-    _send_to_pane(
-        runtime_panes[runtime_index],
+    _start_in_pane(
+        panes,
+        "events",
+        "ControlGateway router",
         build_control_gateway_command(config, repo_root),
         wait=1.0,
     )
     if config.keyboard_planner:
-        runtime_index += 1
-        print(
-            "Starting shared Planner velocity executor "
-            f"(pane {INFERENCE_CORE_PANE_COUNT + runtime_index})..."
-        )
-        _send_to_pane(
-            runtime_panes[runtime_index],
+        _start_in_pane(
+            panes,
+            "planner_executor",
+            "shared Planner velocity executor",
             build_planner_velocity_executor_command(config, repo_root),
             wait=1.0,
         )
     if base_pose_runtime_enabled:
-        runtime_index += 1
-        print(
-            "Starting Base-Pose agent "
-            f"(pane {INFERENCE_CORE_PANE_COUNT + runtime_index})..."
-        )
-        _send_to_pane(
-            runtime_panes[runtime_index],
+        _start_in_pane(
+            panes,
+            "base_pose",
+            "Base-Pose agent",
             build_base_pose_agent_command(config, repo_root),
             wait=1.0,
         )
 
-    # --- Pane 2: VLA Inference ---
     inference_cmd = build_vla_inference_command(config, repo_root)
+    _start_in_pane(panes, "vla", "VLA inference", inference_cmd, wait=1.0)
 
-    print("Starting VLA inference (pane 2)...")
-    _send_to_pane(pane_ids[2], inference_cmd, wait=1.0)
-
-    # --- Pane 1: standalone operator CLI ---
-    print("Starting standalone operator CLI (pane 1)...")
-    _send_to_pane(
-        pane_ids[1],
-        build_operator_interface_command(config, repo_root),
+    _start_in_pane(
+        panes,
+        "control",
+        "standalone operator CLI",
+        build_operator_console_command(config, repo_root),
         wait=2.0,
     )
 
-    # --- Panes 3-4: semantic target and the combined NavDP planner/server ---
     if config.keyboard_planner:
         planner_input_cmd = build_planner_input_command(config, repo_root)
-        navdp_pane = 4
         commands = [
-            (3, "LaViRA semantic planner", planner_input_cmd),
+            ("planner_input", "LaViRA semantic planner", planner_input_cmd),
             (
-                navdp_pane,
+                "navdp",
                 "NavDP planner",
                 build_navdp_planner_pane_command(config, repo_root),
             ),
         ]
         # Strictly serialized startup: the launcher does not dispatch a later
         # stage until real data has passed the previous readiness gate.
-        print(f"Starting NavDP server in background (pane {navdp_pane})...")
+        print("Starting NavDP server in background (navdp)...")
         _send_to_pane(
-            pane_ids[navdp_pane],
+            panes["navdp"],
             build_navdp_server_background_command(config),
             wait=1.0,
         )
@@ -1607,85 +1038,21 @@ def main(config: InferenceLaunchConfig):
                 "navigation prerequisites did not become ready; LaViRA and NavDP planner were not started"
             )
 
-        for pane, label, command in commands:
-            print(f"Starting {label} (pane {pane})...")
-            _send_to_pane(pane_ids[pane], command, wait=1.0)
+        for name, label, command in commands:
+            _start_in_pane(panes, name, label, command)
 
     if config.data_exporter:
-        subprocess.run(
-            ["tmux", "new-window", "-t", SESSION_NAME, "-n", "data_exporter"],
-        )
+        _tmux("new-window", "-t", SESSION_NAME, "-n", "data_exporter")
         exporter_cmd = build_data_exporter_command(config, repo_root)
-        subprocess.run(
-            ["tmux", "send-keys", "-t", f"{SESSION_NAME}:data_exporter", exporter_cmd, "C-m"],
-        )
         print("Starting data exporter (window: data_exporter)...")
-        time.sleep(2.0)
-        subprocess.run(
-            ["tmux", "select-window", "-t", f"{SESSION_NAME}:inference"],
+        _send_to_pane(
+            f"{SESSION_NAME}:data_exporter",
+            exporter_cmd,
+            wait=2.0,
         )
+        _tmux("select-window", "-t", f"{SESSION_NAME}:overview")
 
-
-    print()
-    print("=" * 60)
-    print("  All components launched!")
-    print()
-    print(f"  tmux session: {SESSION_NAME}")
-    print()
-    if config.sim:
-        print("  Window 'sim':")
-        print("    MuJoCo Simulator (.venv_sim)")
-        print()
-    print("  Window 'inference':")
-    print("    Pane 0: C++ Deploy")
-    print("    Pane 1: SONIC Operator CLI")
-    print("    Pane 2: VLA Inference")
-    print("    Pane 3: LaViRA Semantic + LISTEN_WASD")
-    print("    Pane 4: NavDP Velocity Producer + background Server")
-    runtime_label_index = INFERENCE_CORE_PANE_COUNT
-    print(f"    Pane {runtime_label_index}: Read-only SensorGateway")
-    runtime_label_index += 1
-    print(f"    Pane {runtime_label_index}: ControlGateway Router")
-    runtime_label_index += 1
-    if config.keyboard_planner:
-        print(f"    Pane {runtime_label_index}: Shared Planner Velocity Executor + Safety")
-        runtime_label_index += 1
-    if config.keyboard_planner and config.base_pose_enabled:
-        print(f"    Pane {runtime_label_index}: Base-Pose Agent")
-    if config.data_exporter:
-        print("    Window 'data_exporter':")
-        print("      Data Exporter (.venv_data_collection)")
-        print()
-    print()
-    print("  Planner workflow:")
-    print("    1. In pane 1: k (start) -> o (PLANNER mode)")
-    if config.planner_input == "lavira":
-        if config.base_pose_enabled:
-            print("    2. In pane 1: N starts AgentNav; B starts Base-Pose; Space cancels")
-        else:
-            print("    2. In pane 1: N starts AgentNav; Space cancels and stops")
-    else:
-        print("    2. In pane 3: W/S/A/D/Q/E for safety-guarded locomotion")
-    print("    3. In pane 1: i (POSE mode)")
-    print("  Keyboard controls (type in pane 1):")
-    print("    p        - Pause / resume inference")
-    print("    k        - Start / stop C++ control loop")
-    print("    i        - Send initial pose")
-    print("    [        - Toggle left hand open/closed (initial pose)")
-    print("    ]        - Toggle right hand open/closed (initial pose)")
-    print("    t <text> - Change inference prompt")
-    if config.data_exporter:
-        print("    c        - Start recording episode")
-        print("    e        - Stop recording (success)")
-        print("    f        - Stop recording (failure)")
-    print()
-    print("  Navigation:")
-    print("    Ctrl+b, arrow keys  - Switch between panes")
-    if config.sim or config.data_exporter:
-        print("    Ctrl+b, n / p       - Next / previous window")
-    print("    Ctrl+b, d           - Detach from session")
-    print("    Ctrl+\\              - Kill entire session")
-    print("=" * 60)
+    print(f"All components launched; attaching to tmux session {SESSION_NAME}")
 
     try:
         subprocess.run(["tmux", "attach", "-t", SESSION_NAME])

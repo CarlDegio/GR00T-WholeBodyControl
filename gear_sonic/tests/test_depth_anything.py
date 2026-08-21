@@ -4,27 +4,33 @@ from pathlib import Path
 import sys
 import types
 from types import MappingProxyType
+from unittest.mock import Mock
 
 import numpy as np
 
 
 sys.modules.setdefault("tyro", types.ModuleType("tyro"))
 
-from gear_sonic.runtime.client import MaterializedSnapshot
-from gear_sonic.runtime.contracts import MessageMetadata, SharedMemoryFrame
-from gear_sonic.runtime.snapshot import SensorSnapshot, TimestampBasis
-from gear_sonic.scripts.run_depth_anything import (
+from gear_sonic.runtime.gateway.sensor_client import (
+    MaterializedSnapshot,
+    SensorGatewayClientError,
+)
+from gear_sonic.runtime.protocol import MessageMetadata, SharedMemoryFrame
+from gear_sonic.runtime.gateway.snapshot import SensorSnapshot, TimestampBasis
+from gear_sonic.utils.inference.lavira.depth_service import (
     CAMERA_NAME,
     DEPTH_SOURCE,
     RGB_STREAM,
     DepthAnythingConfig,
+    load_depth_anything_config,
     DepthAnythingInferenceGate,
     DepthAnythingSensorGatewayClient,
     depth_anything_status_payload,
     mark_ready,
     metric_depth_payload,
 )
-from gear_sonic.utils.inference.object_nav import SensorGatewayRGBDCamera
+from gear_sonic.utils.inference.lavira.object_nav import SensorGatewayRGBDCamera
+from gear_sonic.utils.inference.lavira import depth_service
 
 
 def _materialized(
@@ -70,7 +76,7 @@ def _materialized(
 
 
 def test_depth_anything_base_defaults_target_ten_hz() -> None:
-    config = DepthAnythingConfig()
+    config = load_depth_anything_config()
 
     assert config.encoder == "vitb"
     assert config.inference_hz == 10.5
@@ -126,6 +132,43 @@ def test_depth_anything_reads_only_chest_rgb_from_gateway() -> None:
     np.testing.assert_array_equal(packet[0], rgb)
     assert packet[1] == 12.0
     assert packet[2]["fx"] == 500.0
+
+
+def test_depth_anything_logs_camera_failure_and_recovery_once(
+    monkeypatch,
+) -> None:
+    rgb = np.full((2, 3, 3), 17, dtype=np.uint8)
+    materialized = _materialized({RGB_STREAM: rgb})
+
+    class FakeClient:
+        responses = iter(
+            (
+                SensorGatewayClientError("not ready"),
+                SensorGatewayClientError("still unavailable"),
+                materialized,
+            )
+        )
+
+        def read_snapshot(self, _request, **_kwargs):
+            response = next(self.responses)
+            if isinstance(response, Exception):
+                raise response
+            return response
+
+    logger = Mock()
+    monkeypatch.setattr(depth_service, "LOGGER", logger)
+    client = DepthAnythingSensorGatewayClient(
+        "inproc://unused", client=FakeClient()
+    )
+
+    assert client.read() is None
+    assert client.read() is None
+    assert client.read() is not None
+
+    logger.warning.assert_called_once_with(
+        "waiting for chest RGB: %s", "not ready"
+    )
+    logger.info.assert_called_once_with("chest RGB recovered")
 
 
 def test_metric_payload_is_direct_uint16_millimetres_with_metre_scale() -> None:
@@ -204,9 +247,9 @@ def test_lavira_reads_depth_anything_chest_depth_in_metric_units() -> None:
 
     assert fake.request.streams == ("camera/chest_view", depth_stream)
     np.testing.assert_array_equal(snapshot.rgb_bgr, rgb[..., ::-1])
-    np.testing.assert_array_equal(snapshot.depth_raw, depth)
     np.testing.assert_allclose(snapshot.depth_mm, 1500.0)
-    assert snapshot.depth_scale_m == 0.001
+    assert snapshot.fx == 500.0
+    assert snapshot.cx == 1.0
 
 
 def test_mark_ready_replaces_stale_marker(tmp_path: Path) -> None:

@@ -7,10 +7,10 @@ import cv2
 import numpy as np
 import zmq
 
-from gear_sonic.runtime.sensor_gateway import SensorGatewayCore, VisualizationZmqIngress
-from gear_sonic.runtime.shared_memory import read_shared_memory_frame
-from gear_sonic.runtime.snapshot import SnapshotRequest
-from gear_sonic.runtime.visualization import (
+from gear_sonic.runtime.gateway.sensor import SensorGatewayCore, VisualizationZmqIngress
+from gear_sonic.runtime.gateway.shared_memory import read_shared_memory_frame
+from gear_sonic.runtime.gateway.snapshot import SnapshotRequest
+from gear_sonic.runtime.gateway.visualization import (
     NAVDP_ACTOR_RAY_STREAM,
     NAVDP_SLAM_2D_STREAM,
     VISUALIZATION_SCHEMA,
@@ -37,7 +37,7 @@ def test_visualization_ingress_stores_jpeg_in_sensor_gateway_shared_memory() -> 
     metadata = {
         "type": VISUALIZATION_SCHEMA,
         "version": 1,
-        "stream": "visualization/navdp_navigation",
+        "stream": NAVDP_ACTOR_RAY_STREAM,
         "sequence": 4,
         "timestamp_ns": time.monotonic_ns(),
         "shape": list(image.shape),
@@ -48,12 +48,12 @@ def test_visualization_ingress_stores_jpeg_in_sensor_gateway_shared_memory() -> 
     assert ingress.poll_once(timeout_ms=100)
     snapshot = core.select(
         SnapshotRequest(
-            streams=("visualization/navdp_navigation",),
+            streams=(NAVDP_ACTOR_RAY_STREAM,),
             max_age_ms=1000,
             max_skew_ms=0,
         )
     )
-    frame = snapshot.frames["visualization/navdp_navigation"]
+    frame = snapshot.frames[NAVDP_ACTOR_RAY_STREAM]
     restored = cv2.imdecode(read_shared_memory_frame(frame), cv2.IMREAD_COLOR)
 
     assert snapshot.complete
@@ -78,7 +78,7 @@ def test_visualization_default_passes_quality_95_to_jpeg_encoder(monkeypatch) ->
     publisher = VisualizationPublisher("inproc://visualization-quality-test")
     try:
         publisher.publish(
-            "visualization/navdp_navigation", np.zeros((8, 8, 3), dtype=np.uint8)
+            NAVDP_ACTOR_RAY_STREAM, np.zeros((8, 8, 3), dtype=np.uint8)
         )
     finally:
         publisher.close()

@@ -5,9 +5,9 @@ import threading
 
 import pytest
 
-from gear_sonic.pico_video.bridge import PicoUsbLinkChanged
-from gear_sonic.pico_video.usb_network import PicoUsbNetwork, PicoUsbNetworkError
-from gear_sonic.scripts.run_pico_video_bridge import (
+from gear_sonic.utils.pico_video.bridge import PicoUsbLinkChanged
+from gear_sonic.utils.pico_video.usb_network import PicoUsbNetwork, PicoUsbNetworkError
+from gear_sonic.utils.pico_video.service import (
     build_argument_parser,
     run_bridge_supervisor,
     resolve_bridge_settings,
@@ -25,13 +25,11 @@ PICO_USB = PicoUsbNetwork(
 
 def test_bridge_cli_uses_sonic_head_and_sensor_gateway_defaults() -> None:
     parser = build_argument_parser()
-    args = parser.parse_args(
-        ["--gateway-endpoint", "tcp://127.0.0.1:6000", "--control-port", "14579"]
-    )
+    args = parser.parse_args(["--control-port", "14579"])
 
     settings = resolve_bridge_settings(args, usb_network_factory=lambda _interface: PICO_USB)
 
-    assert settings.gateway_endpoint == "tcp://127.0.0.1:6000"
+    assert settings.gateway_endpoint == "tcp://127.0.0.1:5560"
     assert settings.control_host == "192.168.123.61"
     assert settings.control_port == 14579
     assert settings.pico_usb == PICO_USB
@@ -76,10 +74,20 @@ def test_bridge_cli_allows_portable_encoder_and_runtime_overrides() -> None:
     assert settings.stale_fps == 1.0
 
 
-def test_bridge_cli_fails_when_usb_only_is_not_available() -> None:
+def test_bridge_cli_rejects_gateway_override_in_production_usb_mode() -> None:
     args = build_argument_parser().parse_args(
         ["--gateway-endpoint", "tcp://127.0.0.1:6001"]
     )
+
+    with pytest.raises(ValueError, match="profile/--overlay"):
+        resolve_bridge_settings(
+            args,
+            usb_network_factory=lambda _interface: PICO_USB,
+        )
+
+
+def test_bridge_cli_fails_when_usb_only_is_not_available() -> None:
+    args = build_argument_parser().parse_args([])
 
     with pytest.raises(RuntimeError, match="PICO USBOnly"):
         resolve_bridge_settings(
@@ -93,8 +101,6 @@ def test_bridge_cli_fails_when_usb_only_is_not_available() -> None:
 def test_bridge_cli_rejects_manual_bind_address_in_usb_only_mode() -> None:
     args = build_argument_parser().parse_args(
         [
-            "--gateway-endpoint",
-            "tcp://127.0.0.1:6001",
             "--control-host",
             "0.0.0.0",
         ]
@@ -124,8 +130,6 @@ def test_local_test_mode_rejects_non_loopback_bind_address(control_host: str) ->
 def test_stay_alive_waits_for_usb_and_restarts_after_link_change() -> None:
     args = build_argument_parser().parse_args(
         [
-            "--gateway-endpoint",
-            "tcp://127.0.0.1:6001",
             "--stay-alive",
             "--usb-retry-interval-s",
             "0.001",
@@ -187,8 +191,6 @@ def test_stay_alive_is_restricted_to_usb_only_mode() -> None:
 def test_stop_requested_during_bridge_construction_prevents_serve() -> None:
     args = build_argument_parser().parse_args(
         [
-            "--gateway-endpoint",
-            "tcp://127.0.0.1:6001",
             "--stay-alive",
         ]
     )
@@ -235,8 +237,6 @@ def test_stay_alive_does_not_hide_permanent_bridge_failures(
 ) -> None:
     args = build_argument_parser().parse_args(
         [
-            "--gateway-endpoint",
-            "tcp://127.0.0.1:6001",
             "--stay-alive",
             "--usb-retry-interval-s",
             "0.001",
@@ -273,8 +273,6 @@ def test_stay_alive_does_not_hide_permanent_bridge_failures(
 def test_stay_alive_retries_transient_socket_error_only_after_usb_loss() -> None:
     args = build_argument_parser().parse_args(
         [
-            "--gateway-endpoint",
-            "tcp://127.0.0.1:6001",
             "--stay-alive",
             "--usb-retry-interval-s",
             "0.001",

@@ -3,9 +3,9 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from gear_sonic.planner_control import NavigationRuntimeStatus
-from gear_sonic.runtime.contracts import MessageMetadata, OperatorCommand
-from gear_sonic.scripts.run_operator_cv_viewer import (
+from gear_sonic.utils.planner_control import NavigationRuntimeStatus
+from gear_sonic.runtime.protocol import MessageMetadata, OperatorCommand
+from gear_sonic.utils.operator.cv_viewer import (
     ACTOR_RAY_STREAM,
     BASE_POSE_ACTIVE_COLOR,
     CHEST_RGB_STREAM,
@@ -17,6 +17,7 @@ from gear_sonic.scripts.run_operator_cv_viewer import (
     compose_visualization_canvas,
     draw_base_pose_overlays,
     gateway_frame_to_bgr,
+    navigation_status_text,
     parse_base_pose_viewer_overlay,
 )
 
@@ -67,14 +68,13 @@ def test_composer_leaves_missing_views_black() -> None:
     assert not np.any(canvas)
 
 
-def test_base_pose_status_selects_camera_and_tracks_safe_velocity() -> None:
+def test_base_pose_status_selects_camera_and_clears_terminal_overlay() -> None:
     state = NavigationViewerState()
 
     assert state.accept_control(
-        _command("start_base_pose", {"generation": 4}, sequence=0), now=1.0
+        _command("start_base_pose", {"generation": 4}, sequence=0)
     )
     assert state.active
-    assert state.state == "inference"
     assert state.accept_control(
         _command(
             "base_pose_runtime_status",
@@ -86,28 +86,12 @@ def test_base_pose_status_selects_camera_and_tracks_safe_velocity() -> None:
                 "velocity": [0.0, 0.0, 0.2],
             },
             sequence=1,
-        ),
-        now=1.1,
+        )
     )
 
     assert state.camera_stream == HEAD_RGB_STREAM
     assert state.is_active_camera(HEAD_RGB_STREAM)
     assert not state.is_active_camera(CHEST_RGB_STREAM)
-    assert "turn_left" in state.status_text()
-
-    state.accept_runtime(
-        NavigationRuntimeStatus(
-            generation=4,
-            timestamp=10.0,
-            mode="manual_velocity",
-            source="base_pose_agent",
-            requested_velocity=(0.0, 0.0, 0.2),
-            velocity=(0.0, 0.0, 0.2),
-            reason="clear",
-        ),
-        now=1.15,
-    )
-    assert state.velocity == (0.0, 0.0, 0.2)
 
     assert state.accept_control(
         _command(
@@ -119,18 +103,16 @@ def test_base_pose_status_selects_camera_and_tracks_safe_velocity() -> None:
                 "velocity": [0.0, 0.0, 0.0],
             },
             sequence=2,
-        ),
-        now=1.2,
+        )
     )
     assert not state.active
-    assert state.action == "stop"
-    assert state.reason == "aligned"
+    assert state.camera_stream is None
 
 
 def test_base_pose_status_draws_target_desk_and_table_on_active_camera() -> None:
     state = NavigationViewerState()
     state.accept_control(
-        _command("start_base_pose", {"generation": 4}, sequence=0), now=1.0
+        _command("start_base_pose", {"generation": 4}, sequence=0)
     )
     overlay = {
         "target_bbox_xyxy": [10.0, 10.0, 30.0, 30.0],
@@ -149,8 +131,7 @@ def test_base_pose_status_draws_target_desk_and_table_on_active_camera() -> None
                 "viewer_overlay": overlay,
             },
             sequence=1,
-        ),
-        now=1.1,
+        )
     )
     source = np.zeros((48, 64, 3), dtype=np.uint8)
 
@@ -168,8 +149,7 @@ def test_base_pose_status_draws_target_desk_and_table_on_active_camera() -> None
             "base_pose_runtime_status",
             {"generation": 4, "state": "reached"},
             sequence=2,
-        ),
-        now=1.2,
+        )
     )
     assert state.target_bbox_xyxy is None
 
@@ -177,7 +157,7 @@ def test_base_pose_status_draws_target_desk_and_table_on_active_camera() -> None
 def test_base_pose_routes_target_and_table_to_their_source_cameras() -> None:
     state = NavigationViewerState()
     state.accept_control(
-        _command("start_base_pose", {"generation": 4}, sequence=0), now=1.0
+        _command("start_base_pose", {"generation": 4}, sequence=0)
     )
     assert state.accept_control(
         _command(
@@ -200,8 +180,7 @@ def test_base_pose_routes_target_and_table_to_their_source_cameras() -> None:
                 },
             },
             sequence=1,
-        ),
-        now=1.1,
+        )
     )
     source = np.zeros((48, 64, 3), dtype=np.uint8)
 
@@ -239,7 +218,7 @@ def test_base_pose_draws_each_available_overlay_independently(
 ) -> None:
     state = NavigationViewerState()
     state.accept_control(
-        _command("start_base_pose", {"generation": 4}, sequence=0), now=1.0
+        _command("start_base_pose", {"generation": 4}, sequence=0)
     )
     assert state.accept_control(
         _command(
@@ -251,8 +230,7 @@ def test_base_pose_draws_each_available_overlay_independently(
                 "viewer_overlay": overlay,
             },
             sequence=1,
-        ),
-        now=1.1,
+        )
     )
 
     rendered = draw_base_pose_overlays(
@@ -280,10 +258,8 @@ def test_base_pose_viewer_rejects_mask_span_outside_source_image() -> None:
 
 def test_composer_highlights_only_the_active_base_pose_camera() -> None:
     state = NavigationViewerState(
-        owner="basepose",
         active=True,
         generation=2,
-        state="motion",
         camera_stream=HEAD_RGB_STREAM,
     )
     frames = {
@@ -295,7 +271,7 @@ def test_composer_highlights_only_the_active_base_pose_camera() -> None:
         frames,
         width=400,
         height=300,
-        navigation=state,
+        base_pose=state,
     )
 
     np.testing.assert_array_equal(canvas[132, 1], BASE_POSE_ACTIVE_COLOR)
@@ -303,9 +279,7 @@ def test_composer_highlights_only_the_active_base_pose_camera() -> None:
 
 
 def test_wasd_status_reports_key_and_final_safety_filtered_velocity() -> None:
-    state = NavigationViewerState()
-
-    assert state.accept_runtime(
+    owner, text = navigation_status_text(
         NavigationRuntimeStatus(
             generation=2,
             timestamp=10.0,
@@ -314,25 +288,17 @@ def test_wasd_status_reports_key_and_final_safety_filtered_velocity() -> None:
             requested_velocity=(0.3, 0.0, 0.0),
             velocity=(0.0, 0.0, 0.0),
             reason="depth_hard_stop",
-        ),
-        now=2.0,
+        )
     )
 
-    assert state.owner == "wasd"
-    assert state.action == "W"
-    assert state.velocity == (0.0, 0.0, 0.0)
-    assert "REQ +0.30/+0.00/+0.00" in state.status_text()
-    assert "depth_hard_stop" in state.status_text()
+    assert owner == "wasd"
+    assert "W" in text
+    assert "REQ +0.30/+0.00/+0.00" in text
+    assert "depth_hard_stop" in text
 
 
-def test_navdp_runtime_status_preserves_planner_lifecycle() -> None:
-    state = NavigationViewerState()
-    state.accept_control(
-        _command("start_navigation", {"generation": 5}, sequence=0),
-        now=1.0,
-    )
-
-    state.accept_runtime(
+def test_navdp_runtime_status_uses_the_shared_velocity_formatter() -> None:
+    owner, text = navigation_status_text(
         NavigationRuntimeStatus(
             generation=5,
             timestamp=10.0,
@@ -341,52 +307,12 @@ def test_navdp_runtime_status_preserves_planner_lifecycle() -> None:
             requested_velocity=(0.2, 0.0, -0.1),
             velocity=(0.2, 0.0, -0.1),
             reason="clear",
-        ),
-        now=1.1,
+        )
     )
 
-    assert state.owner == "navdp"
-    assert state.state == "active"
-    assert "NAVDP G5" in state.status_text()
-    assert "OUT vx +0.20" in state.status_text()
-
-    state.accept_control(
-        _command(
-            "navigation_status",
-            {"generation": 5, "state": "reached", "reason": "goal_reached"},
-            sequence=1,
-        ),
-        now=1.2,
-    )
-    assert not state.accept_runtime(
-        NavigationRuntimeStatus(
-            generation=5,
-            timestamp=10.1,
-            mode="nav_goal",
-            source="navdp",
-            requested_velocity=(0.2, 0.0, -0.1),
-            velocity=(0.2, 0.0, -0.1),
-            reason="clear",
-        ),
-        now=1.3,
-    )
-    assert state.state == "reached"
-    assert state.velocity == (0.0, 0.0, 0.0)
-
-    assert state.accept_runtime(
-        NavigationRuntimeStatus(
-            generation=5,
-            timestamp=10.2,
-            mode="manual_velocity",
-            source="operator_console",
-            requested_velocity=(0.3, 0.0, 0.0),
-            velocity=(0.3, 0.0, 0.0),
-            reason="clear",
-        ),
-        now=1.4,
-    )
-    assert state.owner == "wasd"
-    assert state.action == "W"
+    assert owner == "navdp"
+    assert "NAVDP G5" in text
+    assert "OUT vx +0.20" in text
 
 
 def test_non_right_wrist_camera_is_converted_to_bgr_without_rotation() -> None:

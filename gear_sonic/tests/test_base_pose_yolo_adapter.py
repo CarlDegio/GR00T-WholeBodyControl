@@ -6,10 +6,16 @@ import math
 import numpy as np
 import pytest
 
-from gear_sonic.scripts.base_pose_agent import BasePoseAgentConfig
-from gear_sonic.scripts.base_pose_yolo_agent import GatewayRawServoAdapter
-from gear_sonic.utils.inference.base_pose_visual_servo import RawServoEvent
-from gear_sonic.utils.inference.base_pose_visual_servo import (
+from gear_sonic.utils.inference.base_pose.agent import (
+    BasePoseAgentConfig,
+    GatewayRawServoAdapter,
+)
+from gear_sonic.utils.inference.base_pose.sensor import (
+    AlignedRGBDSnapshot,
+    BasePoseCameraError,
+)
+from gear_sonic.utils.inference.base_pose.servo import RawServoEvent
+from gear_sonic.utils.inference.base_pose.servo import (
     RawServoCalibration,
     RawServoObservation,
     ServoCommand,
@@ -18,10 +24,9 @@ from gear_sonic.utils.inference.base_pose_visual_servo import (
     TargetGeometry,
     VisualServoController,
 )
-from gear_sonic.utils.inference.base_pose_visual_servo_diagnostics import (
+from gear_sonic.utils.inference.base_pose.diagnostics import (
     DetectionFrameData,
 )
-from gear_sonic.utils.inference.base_pose import AlignedRGBDSnapshot, BasePoseCameraError
 
 
 def _servo_observation(
@@ -106,6 +111,106 @@ def test_yolo_adapter_ignores_stale_and_idle_global_cancels(tmp_path) -> None:
     assert not any("STOP unrelated_navigation_cancel" in line for line in logs)
     assert any("ignored stale cancel" in line for line in logs)
     assert any("STOP base_pose_velocity_timeout" in line for line in logs)
+    assert not (tmp_path / "raw_servo_events.jsonl").exists()
+
+
+def test_yolo_adapter_reports_camera_stale_transitions_once(tmp_path) -> None:
+    events: list[tuple[str, dict[str, object]]] = []
+    now = [1.0]
+    adapter = GatewayRawServoAdapter(
+        BasePoseAgentConfig(
+            task="align to the basket",
+            output_root=str(tmp_path),
+            raw_camera_stale_s=0.1,
+        ),
+        submit_intent=lambda _name, _values: None,
+        report_event=lambda _level, code, _message, **fields: events.append(
+            (code, dict(fields))
+        ),
+        monotonic=lambda: now[0],
+    )
+    assert adapter.start(2, now=1.0)
+    adapter.runtime.phase = "aligning"
+    adapter.runtime.last_observation_at = 1.0
+    adapter.runtime.next_publish_at = 1.0
+
+    now[0] = 1.2
+    adapter.tick()
+    now[0] = 1.3
+    adapter.tick()
+    assert [code for code, _fields in events] == ["CAMERA_STALE"]
+
+    adapter.runtime.events.put(
+        RawServoEvent(
+            2,
+            "observation",
+            observation=_servo_observation(),
+            produced_at_monotonic=1.31,
+        )
+    )
+    now[0] = 1.31
+    adapter.tick()
+
+    assert [code for code, _fields in events] == [
+        "CAMERA_STALE",
+        "CAMERA_RECOVERED",
+    ]
+
+
+def test_yolo_adapter_routes_runtime_warnings_to_events(tmp_path) -> None:
+    events: list[str] = []
+    adapter = GatewayRawServoAdapter(
+        BasePoseAgentConfig(
+            task="align to the basket",
+            output_root=str(tmp_path),
+        ),
+        submit_intent=lambda _name, _values: None,
+        logger=lambda _message: None,
+        report_event=lambda _level, code, _message, **_fields: events.append(code),
+    )
+
+    adapter.runtime.logger(
+        "[RawServo] WARNING diagnostic frame write failed: disk full"
+    )
+    adapter.runtime.logger(
+        "[RawServo] WARNING orientation telemetry unavailable: invalid packet"
+    )
+
+    assert events == ["DIAGNOSTIC_WRITE_FAILED", "ORIENTATION_INVALID"]
+
+
+def test_yolo_adapter_activates_and_reports_control_metrics(tmp_path) -> None:
+    now = [1.0]
+    metrics: list[tuple[dict[str, float], bool]] = []
+    adapter = GatewayRawServoAdapter(
+        BasePoseAgentConfig(
+            task="align to the basket",
+            output_root=str(tmp_path),
+        ),
+        submit_intent=lambda _name, _values: None,
+        report_metrics=lambda values, activate=False: metrics.append(
+            (dict(values), bool(activate))
+        ),
+        monotonic=lambda: now[0],
+    )
+
+    assert adapter.start(2, now=1.0)
+    assert metrics == [({}, True)]
+    adapter.runtime.events.put(
+        RawServoEvent(
+            2,
+            "initialized",
+            observation=_servo_observation(),
+            produced_at_monotonic=1.01,
+        )
+    )
+    now[0] = 1.05
+    adapter.tick()
+
+    values, activate = metrics[-1]
+    assert not activate
+    assert values["worker_to_control"] == pytest.approx(40.0)
+    assert values["control_update"] >= 0.0
 
 
 def test_yolo_adapter_forwards_viewer_overlay_without_touching_velocity(
@@ -244,7 +349,7 @@ def test_incomplete_yoloe_frame_keeps_each_available_viewer_overlay(
     frame = DetectionFrameData(
         frame_index=1,
         camera_timestamp=1.2,
-        rgb=np.zeros((48, 64, 3), dtype=np.uint8),
+        image_size=(64, 48),
         perception_kind="invalid",
         perception_error="partial detection",
         **frame_kwargs,

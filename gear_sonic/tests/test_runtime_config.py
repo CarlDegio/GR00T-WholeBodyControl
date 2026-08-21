@@ -4,21 +4,30 @@ import json
 
 import pytest
 
-from gear_sonic.runtime.config import load_runtime_profile
-from gear_sonic.runtime.endpoints import ENDPOINTS
-from gear_sonic.scripts.lavira_planner import LaviraPlannerConfig
-from gear_sonic.scripts.navdp_planner import NavDPPlannerConfig, XNAVDP_G1_MPC_DEFAULTS
-from gear_sonic.scripts.planner_velocity_executor import PlannerVelocityExecutorConfig
-from gear_sonic.scripts.run_depth_anything import DepthAnythingConfig
-from gear_sonic.scripts.run_vla_inference import InferenceConfig
+from gear_sonic.runtime.profile import (
+    ENDPOINT_SCHEMES,
+    default_runtime_profile_path,
+    load_runtime_profile,
+)
+from gear_sonic.utils.inference.lavira.service import load_lavira_config
+from gear_sonic.utils.inference.navdp.control import XNAVDP_G1_MPC_DEFAULTS
+from gear_sonic.utils.inference.navdp.gateway import load_navdp_planner_config
+from gear_sonic.utils.planner_control.executor_service import (
+    load_planner_velocity_executor_config,
+)
+from gear_sonic.utils.inference.lavira.depth_service import load_depth_anything_config
+from gear_sonic.utils.inference.vla.service import load_inference_config
+from gear_sonic.utils.inference.base_pose.agent import load_base_pose_config
 
 
 def test_default_profile_reproduces_current_topology_and_timing() -> None:
     profile = load_runtime_profile()
 
     assert profile.name == "agent_full_current"
-    for name, address in profile.endpoints.items():
-        assert address.port == ENDPOINTS[name].port
+    assert set(profile.endpoints) == set(ENDPOINT_SCHEMES)
+    assert len({(address.host, address.port) for address in profile.endpoints.values()}) == len(
+        profile.endpoints
+    )
     assert profile.ros_topics == {
         "lidar": "/livox/lidar",
         "lidar_imu": "/livox/imu",
@@ -32,7 +41,7 @@ def test_default_profile_reproduces_current_topology_and_timing() -> None:
             "into the blue basket."
         ),
         "inference_hz": 2.0,
-        "action_publish_hz": 50,
+        "action_publish_rate": 50,
         "action_horizon": 50,
         "sensor_gateway_poll_hz": 50.0,
         "sensor_gateway_request_timeout_ms": 100,
@@ -48,16 +57,20 @@ def test_default_profile_reproduces_current_topology_and_timing() -> None:
         "sensor_gateway_request_timeout_ms": 100,
         "sensor_gateway_max_age_ms": 1000.0,
         "sensor_gateway_max_skew_ms": 5.0,
+        "record_chest_camera": False,
+        "task_prompt": "",
+        "dataset_name": "",
     }
 
 
 def test_profile_parameters_match_current_process_defaults() -> None:
     profile = load_runtime_profile()
-    lavira = LaviraPlannerConfig(mission="", global_target="")
-    navdp = NavDPPlannerConfig()
-    executor = PlannerVelocityExecutorConfig()
-    vla = InferenceConfig()
-    depth_anything = DepthAnythingConfig()
+    lavira = load_lavira_config()
+    navdp = load_navdp_planner_config()
+    executor = load_planner_velocity_executor_config()
+    vla = load_inference_config()
+    base_pose = load_base_pose_config()
+    depth_anything = load_depth_anything_config()
 
     vla_profile = profile.component("vla")
     assert vla_profile["sensor_gateway_poll_hz"] == vla.sensor_gateway_poll_hz
@@ -73,10 +86,15 @@ def test_profile_parameters_match_current_process_defaults() -> None:
 
     assert profile.component("lavira")["camera_timeout_ms"] == lavira.camera_timeout_ms
     assert (
-        profile.component("lavira")["policy_timeout_s"]
+        profile.component("lavira")["qwenvl_timeout_seconds"]
         == lavira.qwenvl_timeout_seconds
     )
     assert profile.component("lavira")["min_confidence"] == lavira.min_confidence
+    assert profile.component("base_pose")["task"] == base_pose.task
+    assert (
+        profile.component("base_pose")["raw_head_target_distance_m"]
+        == base_pose.raw_head_target_distance_m
+    )
 
     navdp_profile = profile.component("navdp")
     assert navdp_profile["control_hz"] == navdp.control_hz
@@ -84,8 +102,8 @@ def test_profile_parameters_match_current_process_defaults() -> None:
     assert navdp_profile["mpc_result_timeout_s"] == navdp.mpc_result_timeout_s
     assert navdp_profile["heading_preview_s"] == navdp.heading_preview_s
     assert navdp_profile["goal_tolerance_m"] == navdp.goal_tolerance_m
-    assert navdp_profile["stop_threshold"] == navdp.navdp_stop_threshold
-    assert navdp_profile["request_timeout_s"] == navdp.navdp_request_timeout_s
+    assert navdp_profile["stop_threshold"] == navdp.stop_threshold
+    assert navdp_profile["request_timeout_s"] == navdp.request_timeout_s
     assert navdp_profile["sensor_gateway_poll_hz"] == navdp.sensor_gateway_poll_hz
     assert (
         navdp_profile["sensor_gateway_request_timeout_ms"]
@@ -96,12 +114,8 @@ def test_profile_parameters_match_current_process_defaults() -> None:
         navdp_profile["sensor_gateway_max_skew_ms"]
         == navdp.sensor_gateway_max_skew_ms
     )
-    assert navdp_profile["odometry_timeout_s"] == navdp.odom_timeout_s
+    assert navdp_profile["odometry_timeout_s"] == navdp.odometry_timeout_s
     assert navdp_profile["trajectory_timeout_s"] == navdp.trajectory_timeout_s
-    assert navdp_profile["visualize"] is navdp.visualize
-    assert navdp_profile["record_actorray"] is navdp.record_actorray
-    assert navdp_profile["actorray_output_dir"] == navdp.actorray_output_dir
-    assert navdp_profile["actorray_record_fps"] == navdp.actorray_record_fps
     assert profile.component("xnavdp_mpc") == XNAVDP_G1_MPC_DEFAULTS
 
     executor_profile = profile.component("planner_executor")
@@ -115,11 +129,8 @@ def test_profile_parameters_match_current_process_defaults() -> None:
         executor_profile["navdp_velocity_timeout_s"]
         == executor.navdp_velocity_timeout_s
     )
-    assert executor.orientation_output_endpoint == ""
-    assert executor.runtime_status_endpoint == "tcp://*:5570"
-
     depth_profile = profile.component("depth_anything")
-    assert depth_profile["root"] == depth_anything.depth_anything_root
+    assert depth_profile["root"] == depth_anything.root
     assert depth_profile["checkpoint"] == depth_anything.checkpoint
     assert depth_profile["encoder"] == depth_anything.encoder
     assert depth_profile["device"] == depth_anything.device
@@ -138,6 +149,8 @@ def test_partial_overlay_changes_only_selected_values(tmp_path) -> None:
                 "endpoints": {"camera_server": {"host": "192.168.123.164"}},
                 "components": {
                     "vla": {"prompt": "pick up the paper ball"},
+                    "lavira": {"min_confidence": 0.75},
+                    "base_pose": {"raw_head_target_distance_m": 1.1},
                     "launcher": {"data_exporter": False},
                 },
             }
@@ -152,8 +165,14 @@ def test_partial_overlay_changes_only_selected_values(tmp_path) -> None:
     assert profile.endpoint_uri("camera_server") == "tcp://192.168.123.164:5555"
     assert profile.endpoint_uri("xnavdp_http") == "http://127.0.0.1:19999"
     assert profile.component("vla")["prompt"] == "pick up the paper ball"
-    assert profile.component("vla")["action_publish_hz"] == 50
+    assert profile.component("vla")["action_publish_rate"] == 50
     assert profile.component("launcher")["data_exporter"] is False
+    assert load_inference_config(overlays=(str(overlay),)).prompt == "pick up the paper ball"
+    assert load_lavira_config(overlays=(str(overlay),)).min_confidence == 0.75
+    assert (
+        load_base_pose_config(overlays=(str(overlay),)).raw_head_target_distance_m
+        == 1.1
+    )
 
 
 def test_profile_rejects_unknown_endpoint_and_port_collisions(tmp_path) -> None:
@@ -169,7 +188,7 @@ def test_profile_rejects_unknown_endpoint_and_port_collisions(tmp_path) -> None:
                 "endpoints": {
                     "camera_server": {
                         "host": "127.0.0.1",
-                        "port": ENDPOINTS["policy_server"].port,
+                        "port": load_runtime_profile().endpoint("policy_server").port,
                     }
                 }
             }

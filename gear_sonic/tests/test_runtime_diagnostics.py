@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import pytest
 
-from gear_sonic.runtime.diagnostics import EndpointHealthMonitor, EndpointState
+from gear_sonic.runtime.gateway.diagnostics import EndpointHealthMonitor, EndpointState
 
 
 def test_endpoint_health_transitions_without_active_probes() -> None:

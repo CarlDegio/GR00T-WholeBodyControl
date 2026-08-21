@@ -12,8 +12,8 @@ import cv2
 import numpy as np
 import pytest
 
-import gear_sonic.pico_video.bridge as bridge_module
-from gear_sonic.pico_video.bridge import (
+import gear_sonic.utils.pico_video.bridge as bridge_module
+from gear_sonic.utils.pico_video.bridge import (
     BridgeSettings,
     create_control_listener,
     LatestFrameSlot,
@@ -21,10 +21,10 @@ from gear_sonic.pico_video.bridge import (
     PicoVideoBridge,
     open_video_connection,
 )
-from gear_sonic.pico_video.encoder import EncoderSettings
-from gear_sonic.pico_video.gateway_source import GatewayFrame
-from gear_sonic.pico_video.protocol import CameraRequest, ProtocolError
-from gear_sonic.pico_video.usb_network import PicoUsbNetwork, PicoUsbNetworkError
+from gear_sonic.utils.pico_video.encoder import EncoderSettings
+from gear_sonic.utils.pico_video.gateway_source import GatewayFrame
+from gear_sonic.utils.pico_video.protocol import CameraRequest, ProtocolError
+from gear_sonic.utils.pico_video.usb_network import PicoUsbNetwork, PicoUsbNetworkError
 
 
 TEST_ACCESS_UNIT = b"\x00\x00\x00\x01\x09\xf0\x00\x00\x01\x65\xaa"

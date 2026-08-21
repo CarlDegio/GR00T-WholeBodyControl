@@ -7,15 +7,15 @@ import numpy as np
 import pytest
 import zmq
 
-from gear_sonic.runtime.client import (
+from gear_sonic.runtime.gateway.sensor_client import (
     SensorGatewayClient,
     SensorGatewayClientError,
     SensorGatewayTimeoutError,
     SnapshotUnavailableError,
 )
-from gear_sonic.runtime.sensor_gateway import SensorGatewayCore, SensorGatewayRpc
-from gear_sonic.runtime.shared_memory import FrameOverwrittenError
-from gear_sonic.runtime.snapshot import SnapshotRequest
+from gear_sonic.runtime.gateway.sensor import SensorGatewayCore, SensorGatewayRpc
+from gear_sonic.runtime.gateway.shared_memory import FrameOverwrittenError
+from gear_sonic.runtime.gateway.snapshot import SnapshotRequest
 
 
 class _RpcThread:
@@ -101,7 +101,7 @@ def test_client_retries_the_whole_snapshot_after_an_overwritten_frame() -> None:
         calls += 1
         if calls == 1:
             raise FrameOverwrittenError("simulated overwrite")
-        from gear_sonic.runtime.shared_memory import read_shared_memory_frame
+        from gear_sonic.runtime.gateway.shared_memory import read_shared_memory_frame
 
         return read_shared_memory_frame(frame)
 

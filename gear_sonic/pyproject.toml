@@ -30,7 +30,7 @@ license = {text = "Apache-2.0"}
 
 [project.optional-dependencies]
 # Teleop: minimal deps for running ZMQ-based teleop
-# pico_manager_thread_server.py + visualization (pyzmq, pyvista, pinocchio FK)
+# utils.teleop.pico_manager + visualization (pyzmq, pyvista, pinocchio FK)
 # Usage: pip install -e "gear_sonic[teleop]"
 teleop = [
     "casadi==3.7.0",
@@ -40,7 +40,7 @@ teleop = [
     "pin",
     "pyvista; platform_machine != 'aarch64'",
 ]
-# MuJoCo simulation (run_sim_loop.py and related scripts)
+# MuJoCo simulation service and related tools
 # Usage: pip install -e "gear_sonic[sim]"
 sim = [
     "mujoco",

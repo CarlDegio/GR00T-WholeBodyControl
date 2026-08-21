@@ -53,7 +53,7 @@ just run g1_deploy_onnx_ref enP8p1s0 policy/release/model_decoder.onnx reference
   --enable-csv-logs
 
 # MuJoCo simulation (disables CRC validation)
-python ../gear_sonic/scripts/run_sim_loop.py
+(cd .. && python -m gear_sonic.utils.mujoco_sim.service)
 just run g1_deploy_onnx_ref lo policy/release/model_decoder.onnx reference/example/ \
   --obs-config policy/release/observation_config.yaml \
   --encoder-file policy/release/model_encoder.onnx \

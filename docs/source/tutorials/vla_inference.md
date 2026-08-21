@@ -8,7 +8,7 @@ using the Sonic whole-body control stack.
 The inference pipeline consists of:
 
 1. **Isaac-GR00T PolicyServer** — loads the VLA model and serves actions over ZMQ
-2. **VLA inference client** (`run_vla_inference.py`) — reads camera + robot state,
+2. **VLA inference client** (`gear_sonic.utils.inference.vla.service`) — reads camera + robot state,
    queries the PolicyServer, and publishes actions to the C++ control loop
 3. **C++ deploy** (`gear_sonic_deploy`) — executes whole-body control on the robot
 4. **Camera server** — provides camera images over ZMQ (runs as a systemd service)
@@ -24,7 +24,7 @@ The inference pipeline consists of:
        ▼
 ┌─────────────────────┐    ZMQ TCP    ┌──────────────────────┐
 │  VLA Inference      │ ◄─────────── │  Camera Server       │
-│  (run_vla_inference)│              │  (on robot)          │
+│  (VLA service)      │              │  (on robot)          │
 └────┬───────────┬────┘              └──────────────────────┘
      │           │
      │ ZMQ PUB   │ ZMQ SUB
@@ -89,34 +89,46 @@ space: 64-dim motion token + 7-dim left hand joints + 7-dim right hand joints.
 
 The easiest way to run inference is with the all-in-one tmux launcher:
 
-```bash
-# Real robot
-python gear_sonic/scripts/launch_inference.py \
-    --prompt "pick up the apple" \
-    --camera-host 192.168.123.164
+Set machine addresses once in `gear_sonic/config/launch_inference.yaml`. Runtime
+addresses live only under `endpoints`; for example:
 
-# Simulation
-python gear_sonic/scripts/launch_inference.py --sim \
-    --prompt "pick up the apple"
-
-# Without data recording
-python gear_sonic/scripts/launch_inference.py \
-    --no-data-exporter \
-    --prompt "pick up the apple"
+```yaml
+endpoints:
+  policy_server: {host: 127.0.0.1, port: 29999}
+  camera_server: {host: 192.168.123.164, port: 5555}
+components:
+  vla:
+    prompt: pick up the apple
 ```
 
-The launcher creates a tmux session with four panes:
+```bash
+# Real robot
+python gear_sonic/scripts/launch_inference.py
+
+# Simulation
+python gear_sonic/scripts/launch_inference.py --sim
+
+# Without data recording
+python gear_sonic/scripts/launch_inference.py --no-data-exporter
+```
+
+The launcher creates two core tmux windows. The default `overview` window keeps
+the operator-facing information in three panes:
 
 | Pane | Component | Description |
 |------|-----------|-------------|
-| 0 (top-left) | C++ Deploy | Whole-body controller |
-| 1 (bottom-left) | Keyboard Publisher | Type keyboard commands here |
-| 2 (top-right) | VLA Inference | Policy client + action loop |
-| 3 (bottom-right) | Data Exporter | Records episodes (optional) |
+| Performance (top-left) | SensorGateway | Sensor health and VLA timing |
+| Control (bottom-left) | Operator CLI | Type keyboard commands here |
+| Events (right) | ControlGateway | Control routing and event output |
+
+The `workers` window preserves six independent worker panes and their full
+scrollback: C++ Deploy, VLA Inference, LaViRA/planner input, NavDP + server,
+PlannerExecutor, and Base-Pose. Simulation and data recording add optional
+windows when enabled.
 
 ### Keyboard Controls
 
-Type these keys in the **Keyboard Publisher** pane (pane 1):
+Type these keys in the `overview` window's **Control** pane:
 
 | Key | Action |
 |-----|--------|
@@ -132,18 +144,19 @@ Type these keys in the **Keyboard Publisher** pane (pane 1):
 
 ### Typical Workflow
 
-1. Wait for all panes to initialize
-2. Click on **pane 0** (C++ Deploy) and press Enter to confirm deployment
-3. Switch to **pane 1** (Keyboard Publisher)
-4. Press `k` to start the C++ control loop (starts in PLANNER mode)
-5. Press `i` to send the initial pose (switches to POSE mode)
+1. Wait for both core windows to initialize; the launcher selects
+   `overview:control` automatically
+2. Press `k` to start the C++ control loop (starts in PLANNER mode)
+3. Press `i` to send the initial pose (switches to POSE mode)
    > **Note:** The initial motion token in `gear_sonic/utils/inference/initial_poses.py`
    > is specific to the SONIC checkpoint used during training. If you change the
    > SONIC checkpoint, you must update `LATENT_INITIAL_MOTION_TOKEN` to a safe
    > standing pose from the new checkpoint's latent space.
-6. Press `p` to unpause the inference loop
-7. The robot will begin executing VLA-predicted actions
-8. Press `p` to pause, `k` to stop the control loop when done
+4. Press `p` to unpause the inference loop
+5. The robot will begin executing VLA-predicted actions
+6. Press `p` to pause, `k` to stop the control loop when done
+
+Use `Ctrl-b 0` for `overview` and `Ctrl-b 1` for `workers`.
 
 ## Manual Setup (Without tmux)
 
@@ -171,57 +184,55 @@ cd gear_sonic_deploy
 
 ```bash
 source .venv_inference/bin/activate
-python gear_sonic/scripts/run_vla_inference.py \
-    --host <policy_server_ip> \
-    --port 5550 \
-    --embodiment-tag unitree_g1_sonic \
-    --prompt "pick up the apple" \
-    --camera-host 192.168.123.164
+python -m gear_sonic.utils.inference.vla.service \
+    --profile gear_sonic/config/launch_inference.yaml
 ```
+
+The selected profile supplies the PolicyServer, SensorGateway, ControlGateway,
+planner relay, timing, action endpoints, and every VLA runtime setting under
+`components.vla`. Use an `--overlay` file for temporary changes; the production
+runner does not accept direct runtime or endpoint overrides.
 
 ### Terminal 4 — Data Exporter (optional)
 
 ```bash
 source .venv_data_collection/bin/activate
-python gear_sonic/scripts/run_data_exporter.py \
-    --task-prompt "pick up the apple" \
-    --camera-host 192.168.123.164
+python -m gear_sonic.utils.data_collection.service \
+    --profile gear_sonic/config/launch_inference.yaml \
+    --task-prompt "pick up the apple"
 ```
 
 ## Configuration Reference
 
-### VLA Inference (`run_vla_inference.py`)
+### VLA Inference (`gear_sonic.utils.inference.vla.service`)
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--host` | `localhost` | PolicyServer host |
-| `--port` | `5550` | PolicyServer port |
-| `--embodiment-tag` | `unitree_g1_sonic` | Embodiment tag |
-| `--prompt` | `demo` | Language prompt |
-| `--action-publish-rate` | `50` | Action publish rate (Hz) |
-| `--action-horizon` | `40` | Actions per inference chunk |
-| `--rate` | `2.5` | Inference rate (Hz) |
-| `--camera-host` | `localhost` | Camera server host |
-| `--camera-port` | `5555` | Camera server port |
-| `--verbose-timing` | `false` | Always print loop timing |
+| `--profile` | default runtime profile | YAML source for every communication endpoint |
+| `--overlay` | none | Partial YAML overlay; may be repeated |
+
+Set `embodiment_tag`, `prompt`, `action_publish_rate`, `action_horizon`,
+`inference_hz`, Gateway cache limits, and `verbose_timing` once under
+`components.vla` in the selected profile.
 
 ### tmux Launcher (`launch_inference.py`)
 
-The launcher exposes all the above flags plus deploy and data exporter options.
-Run `python gear_sonic/scripts/launch_inference.py --help` for the full list.
+The launcher exposes only orchestration switches such as simulation, optional
+workers, planner selection, and diagnostics. Process settings live under
+`components.*`, while addresses live under `endpoints`. Run
+`python gear_sonic/scripts/launch_inference.py --help` for the full list.
 
 ## Remote PolicyServer
 
-When running the PolicyServer on a separate GPU machine:
+When running the PolicyServer on a separate GPU machine, update the runtime
+profile:
 
-```bash
-# On the inference machine, point to the remote server
-python gear_sonic/scripts/launch_inference.py \
-    --policy-host <gpu_machine_ip> \
-    --policy-port 5550 \
-    --camera-host 192.168.123.164 \
-    --prompt "pick up the apple"
+```yaml
+endpoints:
+  policy_server: {host: <gpu_machine_ip>, port: 5550}
 ```
+
+Then launch normally with `python gear_sonic/scripts/launch_inference.py`.
 
 Make sure port 5550 (or your chosen port) is accessible between the two machines.
 
@@ -230,5 +241,5 @@ Make sure port 5550 (or your chosen port) is accessible between the two machines
 The inference loop automatically compensates for network and compute latency.
 When a new action chunk arrives, the system calculates how many actions in the
 chunk are already "stale" based on the time elapsed since inference started,
-and skips to the appropriate action index. This is controlled by `--action-publish-rate`
-and `--action-horizon`.
+and skips to the appropriate action index. This is controlled by
+`components.vla.action_publish_rate` and `components.vla.action_horizon`.
