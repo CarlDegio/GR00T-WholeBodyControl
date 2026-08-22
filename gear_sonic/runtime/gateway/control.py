@@ -176,6 +176,7 @@ class NavigationControlAction:
     agent_event: str | None = None
     reason: str = ""
     segment_id: int = 0
+    skill_id: int = 0
 
 
 class NavigationControlState:
@@ -192,10 +193,13 @@ class NavigationControlState:
         self.manual_hold_s = float(manual_hold_s)
         self.base_pose_command_timeout_s = float(base_pose_command_timeout_s)
         self.generation = 0
+        self.skill_id = 0
         self.segment_id = 0
         self.mode = "listen_wasd"
         self.manual_velocity = (0.0, 0.0, 0.0)
         self.manual_deadline = 0.0
+        self.lavira_task_active = False
+        self.window_id = 0
 
     @property
     def owner(self) -> str | None:
@@ -210,6 +214,8 @@ class NavigationControlState:
             self.generation,
             "ignored",
             reason=f"navigation_busy:{self.owner or self.mode}",
+            skill_id=self.skill_id,
+            segment_id=max(0, self.segment_id),
         )
 
     def handle_key(
@@ -226,27 +232,35 @@ class NavigationControlState:
             if self.mode != "listen_wasd":
                 return self._busy()
             self.generation += 1
+            self.skill_id = 0
             self.segment_id = -1 if normalized == "n" else 0
+            self.window_id = 0
             self.manual_velocity = (0.0, 0.0, 0.0)
             self.manual_deadline = 0.0
             is_lavira = normalized == "n"
+            self.lavira_task_active = is_lavira
             self.mode = "lavira_pending" if is_lavira else "base_pose_inference"
             return NavigationControlAction(
                 self.generation,
                 "stop",
                 agent_event="start_navigation" if is_lavira else "start_base_pose",
+                skill_id=self.skill_id,
             )
         if normalized == " ":
             self.generation += 1
+            self.skill_id = 0
             self.segment_id = 0
+            self.window_id = 0
             self.manual_velocity = (0.0, 0.0, 0.0)
             self.manual_deadline = 0.0
             self.mode = "listen_wasd"
+            self.lavira_task_active = False
             return NavigationControlAction(
                 self.generation,
                 "stop",
                 agent_event="cancel_navigation",
                 reason=str(cancel_reason),
+                skill_id=self.skill_id,
             )
         if self.mode != "listen_wasd":
             return self._busy()
@@ -256,6 +270,7 @@ class NavigationControlState:
             self.generation,
             "manual_velocity",
             velocity=self.manual_velocity,
+            skill_id=self.skill_id,
         )
 
     def tick(self, *, now: float) -> NavigationControlAction | None:
@@ -270,6 +285,7 @@ class NavigationControlState:
                 self.generation,
                 "manual_velocity",
                 velocity=self.manual_velocity,
+                skill_id=self.skill_id,
             )
         if (
             self.mode == "base_pose_motion"
@@ -277,32 +293,39 @@ class NavigationControlState:
             and float(now) >= self.manual_deadline
         ):
             self.generation += 1
+            self.skill_id = 0
             self.manual_velocity = (0.0, 0.0, 0.0)
             self.manual_deadline = 0.0
             self.mode = "listen_wasd"
+            self.lavira_task_active = False
+            self.window_id = 0
             return NavigationControlAction(
                 self.generation,
                 "stop",
                 agent_event="cancel_navigation",
                 reason="base_pose_velocity_timeout",
+                skill_id=self.skill_id,
             )
         return None
 
     def accept_goal(self, parameters: Mapping[str, object]) -> NavigationControlAction:
         generation = int(parameters["generation"])
+        skill_id = int(parameters.get("skill_id", 0))
         segment_id = int(parameters.get("segment_id", 0))
         if (
             generation != self.generation
             or self.mode != "lavira_pending"
-            or segment_id <= self.segment_id
+            or (skill_id, segment_id) <= (self.skill_id, self.segment_id)
         ):
             raise ValueError("stale or unexpected navigation goal")
+        self.skill_id = skill_id
         self.segment_id = segment_id
         self.mode = "lavira_nav"
         return NavigationControlAction(
             generation,
             "nav_goal",
             segment_id=segment_id,
+            skill_id=skill_id,
         )
 
     def accept_heading_goal(
@@ -313,14 +336,17 @@ class NavigationControlState:
             action.generation,
             "heading_goal",
             segment_id=action.segment_id,
+            skill_id=action.skill_id,
         )
 
     def accept_lavira_depth_request(self, parameters: Mapping[str, object]) -> bool:
         generation = int(parameters["generation"])
+        skill_id = int(parameters.get("skill_id", 0))
         segment_id = int(parameters.get("segment_id", self.segment_id))
         return (
             generation == self.generation
             and self.mode == "lavira_pending"
+            and skill_id == self.skill_id
             and segment_id == self.segment_id
         )
 
@@ -328,12 +354,63 @@ class NavigationControlState:
         """Validate LaViRA's DA lease release without changing navigation state."""
 
         generation = int(parameters["generation"])
+        skill_id = int(parameters.get("skill_id", 0))
         segment_id = int(parameters.get("segment_id", self.segment_id))
         return (
             generation == self.generation
             and self.mode == "lavira_pending"
+            and skill_id == self.skill_id
             and segment_id == self.segment_id
         )
+
+    def accept_base_pose_start(
+        self, parameters: Mapping[str, object]
+    ) -> NavigationControlAction:
+        generation = int(parameters["generation"])
+        skill_id = int(parameters.get("skill_id", 0))
+        segment_id = int(parameters.get("segment_id", 0))
+        if (
+            generation != self.generation
+            or self.mode != "lavira_pending"
+            or (skill_id, segment_id) <= (self.skill_id, self.segment_id)
+        ):
+            raise ValueError("stale or unexpected BasePose start")
+        self.skill_id = skill_id
+        self.segment_id = segment_id
+        self.mode = "base_pose_inference"
+        return NavigationControlAction(
+            generation,
+            "stop",
+            segment_id=segment_id,
+            skill_id=skill_id,
+            agent_event="start_base_pose",
+        )
+
+    def accept_vla_command(
+        self, name: str, parameters: Mapping[str, object]
+    ) -> bool:
+        generation = int(parameters.get("generation", -1))
+        skill_id = int(parameters.get("skill_id", 0))
+        if generation != self.generation or not self.lavira_task_active:
+            return False
+        if name == "start_vla_task":
+            if self.mode == "lavira_manipulate" and skill_id == self.skill_id:
+                return True
+            if self.mode != "lavira_pending" or skill_id < self.skill_id:
+                return False
+            if skill_id > self.skill_id:
+                self.segment_id = 0
+            self.skill_id = skill_id
+            self.window_id = int(parameters.get("window_id", 0))
+            self.mode = "lavira_manipulate"
+            return True
+        if self.mode != "lavira_manipulate" or skill_id != self.skill_id:
+            return False
+        window_id = int(parameters.get("window_id", 0))
+        if window_id < self.window_id:
+            return False
+        self.window_id = window_id
+        return name in {"hold_vla_task", "resume_vla_task", "stop_vla_task"}
 
     def accept_base_pose_velocity(
         self,
@@ -342,12 +419,16 @@ class NavigationControlState:
         now: float,
     ) -> NavigationControlAction:
         generation = int(parameters["generation"])
+        skill_id = int(parameters.get("skill_id", 0))
+        segment_id = int(parameters.get("segment_id", self.segment_id))
         if generation != self.generation or self.mode not in {
             "base_pose_inference",
             "base_pose_motion",
             "base_pose_stopping",
         }:
             raise ValueError("stale or unexpected base-pose velocity")
+        if skill_id != self.skill_id or segment_id != self.segment_id:
+            raise ValueError("stale base-pose skill or segment")
         raw_velocity = parameters.get("velocity")
         if not isinstance(raw_velocity, (list, tuple)) or len(raw_velocity) != 3:
             raise ValueError("base_pose_velocity requires [vx, vy, wz]")
@@ -394,6 +475,8 @@ class NavigationControlState:
             generation,
             output_mode,
             velocity=velocity,
+            segment_id=segment_id,
+            skill_id=skill_id,
         )
 
     def accept_status(
@@ -405,6 +488,8 @@ class NavigationControlState:
     ) -> bool:
         if int(payload.get("generation", -1)) != self.generation:
             return False
+        if int(payload.get("skill_id", 0)) != self.skill_id:
+            return False
         if owner is not None and self.owner != owner:
             return False
         if owner == "lavira" and not agent_final:
@@ -413,11 +498,13 @@ class NavigationControlState:
             if self.mode != "lavira_nav":
                 return False
         if payload.get("state") in {"reached", "failed", "stopped"}:
-            self.mode = (
-                "listen_wasd"
-                if agent_final or owner != "lavira"
-                else "lavira_pending"
-            )
+            if owner == "lavira" and agent_final:
+                self.mode = "listen_wasd"
+                self.lavira_task_active = False
+            elif self.lavira_task_active:
+                self.mode = "lavira_pending"
+            else:
+                self.mode = "listen_wasd"
             self.manual_velocity = (0.0, 0.0, 0.0)
             self.manual_deadline = 0.0
         return True

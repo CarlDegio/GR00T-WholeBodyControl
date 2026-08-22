@@ -376,6 +376,7 @@ def main(
             decision = core.decide(now=now, safety=sensors.snapshot())
             owner = (
                 decision.generation,
+                decision.skill_id,
                 decision.segment_id,
                 decision.source,
                 core.mode,
@@ -394,6 +395,7 @@ def main(
                 runtime_status.send_string(
                     build_navigation_runtime_status_message(
                         generation=decision.generation,
+                        skill_id=decision.skill_id,
                         segment_id=decision.segment_id,
                         mode=core.mode,
                         source=decision.source,

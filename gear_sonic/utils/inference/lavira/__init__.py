@@ -1,1 +1,1 @@
-"""Uni-LaViRA VLN/ObjectNav/EQA agent and leased metric-depth runtime."""
+"""Panorama-grounded manipulation agent and leased metric-depth runtime."""

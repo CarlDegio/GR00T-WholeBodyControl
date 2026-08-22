@@ -57,6 +57,12 @@ _COMPONENT_LABELS = dict(
 )
 
 
+def default_inference_log_dir() -> Path:
+    """Return the shared directory used by inference logs and audit artifacts."""
+
+    return Path(__file__).resolve().parents[2] / "outputs" / "logs" / "inference"
+
+
 def configure_file_logging(
     component: str,
     *,
@@ -66,8 +72,9 @@ def configure_file_logging(
     logger = logging.getLogger(f"sonic.{component}")
     if logger.handlers:
         return logger
-    default = Path(__file__).resolve().parents[2] / "outputs" / "logs" / "inference"
-    directory = Path(log_dir) if log_dir is not None else default
+    directory = (
+        Path(log_dir) if log_dir is not None else default_inference_log_dir()
+    )
     directory.mkdir(parents=True, exist_ok=True)
     handler = RotatingFileHandler(
         directory / f"{component}.log", maxBytes=10 << 20, backupCount=3, encoding="utf-8"

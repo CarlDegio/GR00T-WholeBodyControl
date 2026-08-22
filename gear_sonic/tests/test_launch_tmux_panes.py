@@ -370,11 +370,11 @@ def test_yaml_contains_every_launch_parameter() -> None:
 
     assert profile.component("deploy")["policy_variant"] == "sonic_v1_1"
     assert vla.prompt.startswith("Move in front of the table")
-    assert lavira.task_type == "object_nav"
-    assert lavira.mission == "find the blue basket"
+    assert lavira.navigation_mode == "object_nav"
+    assert lavira.mission == "Find the blue basket, then put the medicine bottle into it."
     assert lavira.global_target == "blue basket"
-    assert lavira.la_model == "Qwen3.5-27B-Q4_K_M"
-    assert lavira.va_model == "Qwen3.5-27B-Q4_K_M"
+    assert lavira.la_model == "qwen3.8-max"
+    assert lavira.va_model == "qwen3.5-27b"
     assert loaded.base_pose_enabled is True
     assert base_pose.task == "align to the blue basket"
     assert base_pose.target_prompt == "bluebasket"
@@ -620,8 +620,8 @@ def test_lavira_uses_only_control_and_sensor_gateways() -> None:
     assert "--control-gateway-intent-endpoint" not in command
     assert "--qwenvl-model" not in command
     assert "--qwenvl-timeout-seconds" not in command
-    assert load_lavira_config().la_base_url == "http://127.0.0.1:8000/v1"
-    assert load_lavira_config().va_base_url == "http://127.0.0.1:8001/v1"
+    assert load_lavira_config().la_base_url == "https://dashscope.aliyuncs.com/compatible-mode/v1"
+    assert load_lavira_config().va_base_url == "https://dashscope.aliyuncs.com/compatible-mode/v1"
     assert "--vision-backend" not in command
     assert "--model gpt-" not in command
     assert "codex" not in command.lower()

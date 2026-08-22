@@ -106,6 +106,7 @@ def main(config: NavDPPlannerConfig) -> None:
     )
     gateway.start()
     generation = 0
+    skill_id = 0
     segment_id = 0
     mode = "stop"
     world_goal: tuple[float, float] | None = None
@@ -164,6 +165,7 @@ def main(config: NavDPPlannerConfig) -> None:
                 "type": STATUS_TYPE,
                 "version": 1,
                 "generation": generation,
+                "skill_id": skill_id,
                 "segment_id": segment_id,
                 "state": state,
                 "reason": reason,
@@ -234,10 +236,12 @@ def main(config: NavDPPlannerConfig) -> None:
                 command = decode_navigation_message(commands.recv())
                 if command.generation < generation or (
                     command.generation == generation
-                    and command.segment_id < segment_id
+                    and (command.skill_id, command.segment_id)
+                    < (skill_id, segment_id)
                 ):
                     continue
                 generation = command.generation
+                skill_id = command.skill_id
                 segment_id = command.segment_id
                 mode = command.mode
                 heading_result = None
@@ -556,6 +560,7 @@ def main(config: NavDPPlannerConfig) -> None:
             output.send_string(
                 build_planner_velocity_message(
                     generation=generation,
+                    skill_id=skill_id,
                     segment_id=segment_id,
                     source="navdp",
                     velocity=velocity,
@@ -609,6 +614,7 @@ def main(config: NavDPPlannerConfig) -> None:
             output.send_string(
                 build_planner_velocity_message(
                     generation=generation,
+                    skill_id=skill_id,
                     segment_id=segment_id,
                     source="navdp",
                     velocity=(0.0, 0.0, 0.0),

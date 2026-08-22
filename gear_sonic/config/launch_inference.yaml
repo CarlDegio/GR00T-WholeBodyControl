@@ -62,24 +62,32 @@ components:
     sensor_gateway_max_age_ms: 1000.0
     sensor_gateway_max_skew_ms: 5.0
   lavira:
-    task_type: object_nav
-    mission: find the blue basket
+    navigation_mode: object_nav
+    mission: Find the blue basket, then put the medicine bottle into it.
     global_target: blue basket
-    question: ''
     max_steps: 20
     history_size: 5
-    la_model: Qwen3.5-27B-Q4_K_M
-    la_base_url: http://127.0.0.1:8000/v1
+    la_model: qwen3.8-max
+    la_base_url: https://dashscope.aliyuncs.com/compatible-mode/v1
+    la_enable_thinking: true
     la_timeout_seconds: 180.0
-    va_model: Qwen3.5-27B-Q4_K_M
-    va_base_url: http://127.0.0.1:8001/v1
+    va_model: qwen3.5-27b
+    va_base_url: https://dashscope.aliyuncs.com/compatible-mode/v1
+    va_enable_thinking: false
     va_timeout_seconds: 180.0
     camera_timeout_ms: 15000
     sensor_gateway_request_timeout_ms: 100
     sensor_gateway_max_age_ms: 1000.0
     sensor_gateway_max_skew_ms: 5.0
     min_confidence: 0.6
+    nav_handoff_min_depth_m: 0.3
+    nav_handoff_max_depth_m: 3.0
+    alignment_head_camera_stream: ego_view
     segment_timeout_seconds: 180.0
+    manipulation_window_seconds: 5.0
+    manipulation_max_windows: 12
+    manipulation_timeout_seconds: 180.0
+    vla_start_timeout_seconds: 3.0
   base_pose:
     task: >-
       align to the blue basket

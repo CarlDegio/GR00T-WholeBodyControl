@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import io
 import json
+import logging
 import time
 
 import pytest
@@ -15,8 +17,76 @@ from gear_sonic.runtime.gateway.control import (
     OperatorConsoleRouter,
 )
 from gear_sonic.runtime.gateway.services.control import (
+    EventPaneDisplay,
     build_base_pose_runtime_status,
 )
+from gear_sonic.runtime.telemetry import build_event
+
+
+def test_event_pane_keeps_todo_above_general_events_and_has_placeholders() -> None:
+    output = io.StringIO()
+    display = EventPaneDisplay(stream=output, interactive=False)
+
+    assert "LA TODO · no active task" in display.dashboard_text()
+    assert "Press N" in display.dashboard_text()
+
+    display.accept(build_event(
+        "lavira", logging.INFO, "TASK_ACCEPTED", "task accepted",
+        generation=7,
+    ))
+    assert "generation=7" in display.dashboard_text()
+    assert "Waiting for the Language Agent" in display.dashboard_text()
+
+    display.accept(build_event(
+        "navdp", logging.WARNING, "PATH_BLOCKED", "local path blocked",
+        generation=7,
+    ))
+    display.accept(build_event(
+        "lavira", logging.INFO, "TODO_UPDATED", "TODO updated",
+        generation=7,
+        step=3,
+        todo_list=(
+            "- [x] Find the doorway\n"
+            "- [ ] Approach the basket\n"
+            "- [ ] Align"
+        ),
+    ))
+    panel = display.dashboard_text(width=100, height=30)
+    todo_end = panel.index("RUNTIME EVENTS")
+    event_start = panel.index("[WARNING][NAVDP]")
+    assert "progress=1/3" in panel[:todo_end]
+    assert "✓ Find the doorway" in panel[:todo_end]
+    assert "▶ Approach the basket" in panel[:todo_end]
+    assert "○ Align" in panel[:todo_end]
+    assert event_start > todo_end
+    assert "TODO_UPDATED" not in panel[event_start:]
+
+    display.accept(build_event(
+        "lavira", logging.INFO, "TASK_COMPLETED", "task complete",
+        generation=7,
+    ))
+    assert "LA TODO · no active task" in display.dashboard_text()
+
+
+def test_event_pane_limits_long_todo_to_top_quarter_and_keeps_active_item() -> None:
+    display = EventPaneDisplay(stream=io.StringIO(), interactive=False)
+    todo = "\n".join([
+        *(f"- [x] Completed {index}" for index in range(8)),
+        "- [ ] Current approach",
+        *(f"- [ ] Later {index}" for index in range(8)),
+    ])
+    display.accept(build_event(
+        "lavira", logging.INFO, "TODO_UPDATED", "TODO updated",
+        generation=9, step=11, todo_list=todo,
+    ))
+
+    lines = display.dashboard_text(width=100, height=20).splitlines()
+    separator_index = next(
+        index for index, line in enumerate(lines) if set(line) == {"─"}
+    )
+    assert separator_index <= 5
+    assert "▶ Current approach" in "\n".join(lines[:separator_index])
+    assert "additional TODO line(s)" in "\n".join(lines[:separator_index])
 
 
 def test_latest_only_intent_client_conflates_pending_commands() -> None:
@@ -248,6 +318,87 @@ def test_lavira_generation_accepts_monotonic_segments_until_agent_final() -> Non
         owner="lavira",
     )
     assert state.mode == "listen_wasd"
+
+
+def test_lavira_skill_handoff_rejects_stale_skill_and_enters_terminal_vla() -> None:
+    state = NavigationControlState()
+    started = state.handle_key("n", now=1.0)
+    heading = state.accept_heading_goal({
+        "generation": started.generation,
+        "skill_id": 1,
+        "segment_id": 0,
+        "heading_delta_rad": 0.0,
+    })
+    assert heading.skill_id == 1
+    assert state.accept_status({
+        "generation": started.generation,
+        "skill_id": 1,
+        "segment_id": 0,
+        "state": "reached",
+    }, owner="lavira", agent_final=False)
+    with pytest.raises(ValueError, match="stale"):
+        state.accept_goal({
+            "generation": started.generation,
+            "skill_id": 0,
+            "segment_id": 99,
+        })
+
+    base = state.accept_base_pose_start({
+        "generation": started.generation,
+        "skill_id": 2,
+        "segment_id": 1,
+    })
+    assert base.skill_id == 2
+    assert state.accept_status({
+        "generation": started.generation,
+        "skill_id": 2,
+        "segment_id": 1,
+        "state": "reached",
+        "reason": "aligned",
+    }, owner="base_pose", agent_final=False)
+    assert state.mode == "lavira_pending"
+
+    assert state.accept_vla_command("start_vla_task", {
+        "generation": started.generation,
+        "skill_id": 3,
+        "window_id": 0,
+    })
+    assert state.mode == "lavira_manipulate"
+    assert not state.accept_vla_command("start_vla_task", {
+        "generation": started.generation,
+        "skill_id": 2,
+    })
+    assert state.accept_vla_command("hold_vla_task", {
+        "generation": started.generation,
+        "skill_id": 3,
+        "window_id": 1,
+    })
+
+
+def test_vla_start_accepts_same_skill_after_automatic_la_panorama() -> None:
+    state = NavigationControlState()
+    started = state.handle_key("n", now=1.0)
+    for segment_id in range(4):
+        state.accept_heading_goal({
+            "generation": started.generation,
+            "skill_id": 1,
+            "segment_id": segment_id,
+            "heading_delta_rad": 0.0,
+        })
+        assert state.accept_status({
+            "generation": started.generation,
+            "skill_id": 1,
+            "segment_id": segment_id,
+            "state": "reached",
+        }, owner="lavira", agent_final=False)
+
+    assert state.accept_vla_command("start_vla_task", {
+        "generation": started.generation,
+        "skill_id": 1,
+        "window_id": 0,
+    })
+    assert state.mode == "lavira_manipulate"
+    assert state.segment_id == 3
 
 
 def test_base_pose_velocity_is_bounded_and_times_out_safe() -> None:

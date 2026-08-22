@@ -79,6 +79,7 @@ class SensorGatewayRGBDCamera:
 
     RGB_STREAM = "camera/chest_view"
     DEPTH_STREAM = "derived/depth_anything/chest_view"
+    ODOMETRY_STREAM = "ros/odometry"
 
     def __init__(
         self,
@@ -99,7 +100,9 @@ class SensorGatewayRGBDCamera:
         self._owns_client = client is None
         self._last_timestamp_ns: int | None = None
         self._last_rgb_timestamp_ns: int | None = None
+        self._last_rgb_timestamp_by_stream: dict[str, int] = {}
         self._expected_generation: int | None = None
+        self._expected_skill_id: int | None = None
         self._expected_segment_id: int | None = None
 
     @staticmethod
@@ -107,6 +110,7 @@ class SensorGatewayRGBDCamera:
         snapshot,
         *,
         expected_generation: int | None = None,
+        expected_skill_id: int | None = None,
         expected_segment_id: int | None = None,
     ) -> RGBDSnapshot:
         rgb_frame = snapshot.snapshot.frames[SensorGatewayRGBDCamera.RGB_STREAM]
@@ -166,6 +170,12 @@ class SensorGatewayRGBDCamera:
             raise ObjectNavCameraError(
                 "Gateway Depth Anything frame belongs to a stale segment"
             )
+        if expected_skill_id is not None and int(
+            info.get("inference_skill_id", 0)
+        ) != int(expected_skill_id):
+            raise ObjectNavCameraError(
+                "Gateway Depth Anything frame belongs to a stale skill"
+            )
         if (width, height) != (rgb.shape[1], rgb.shape[0]):
             raise ObjectNavCameraError("Gateway camera_info dimensions do not match RGB-D")
         return RGBDSnapshot(
@@ -197,6 +207,7 @@ class SensorGatewayRGBDCamera:
                     decoded = self._decode(
                         snapshot,
                         expected_generation=self._expected_generation,
+                        expected_skill_id=self._expected_skill_id,
                         expected_segment_id=self._expected_segment_id,
                     )
                     self._last_timestamp_ns = timestamp_ns
@@ -208,13 +219,29 @@ class SensorGatewayRGBDCamera:
             f"timed out waiting for fresh Gateway RGB-D: {last_error or 'no new frame'}"
         )
 
-    def begin_depth_lease(self, generation: int, segment_id: int) -> None:
+    def begin_depth_lease(
+        self, generation: int, skill_id: int, segment_id: int
+    ) -> None:
         self._expected_generation = int(generation)
+        self._expected_skill_id = int(skill_id)
         self._expected_segment_id = int(segment_id)
         self._last_timestamp_ns = None
 
-    def capture_rgb(self, timeout_ms: int | None = None) -> np.ndarray:
-        """Capture one fresh chest RGB frame without acquiring a depth lease."""
+    def capture_rgb(
+        self,
+        timeout_ms: int | None = None,
+        *,
+        camera_stream: str = "chest_view",
+    ) -> np.ndarray:
+        """Capture one fresh RGB frame without acquiring a depth lease."""
+
+        stream_name = str(camera_stream).strip()
+        if not stream_name:
+            raise ObjectNavCameraError("Gateway RGB camera stream is empty")
+        stream = (
+            stream_name if stream_name.startswith("camera/")
+            else f"camera/{stream_name}"
+        )
         effective_timeout = self.timeout_ms if timeout_ms is None else int(timeout_ms)
         deadline = time.monotonic() + effective_timeout / 1000.0
         last_error: Exception | None = None
@@ -222,34 +249,61 @@ class SensorGatewayRGBDCamera:
             try:
                 snapshot = self.client.read_snapshot(
                     SnapshotRequest(
-                        streams=(self.RGB_STREAM,),
+                        streams=(stream,),
                         max_age_ms=self.max_age_ms,
                         max_skew_ms=0.0,
                         timestamp_basis=TimestampBasis.SOURCE,
                     ),
                     retries=1,
                 )
-                frame = snapshot.snapshot.frames[self.RGB_STREAM]
+                frame = snapshot.snapshot.frames[stream]
                 timestamp_ns = frame.source_timestamp_ns
-                rgb = np.asarray(snapshot.arrays[self.RGB_STREAM])
+                rgb = np.asarray(snapshot.arrays[stream])
                 if rgb.ndim != 3 or rgb.shape[2] != 3 or rgb.dtype != np.uint8:
                     raise ObjectNavCameraError(
                         f"Gateway chest RGB must be HxWx3 uint8, got "
                         f"{rgb.shape} {rgb.dtype}"
                     )
                 if (
-                    self._last_rgb_timestamp_ns is None
-                    or timestamp_ns != self._last_rgb_timestamp_ns
+                    self._last_rgb_timestamp_by_stream.get(stream) != timestamp_ns
                 ):
-                    self._last_rgb_timestamp_ns = timestamp_ns
+                    self._last_rgb_timestamp_by_stream[stream] = timestamp_ns
+                    if stream == self.RGB_STREAM:
+                        self._last_rgb_timestamp_ns = timestamp_ns
                     return cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
             except (SensorGatewayClientError, ObjectNavCameraError) as exc:
                 last_error = exc
             time.sleep(0.01)
         raise ObjectNavCameraError(
-            f"timed out waiting for fresh Gateway chest RGB: "
+            f"timed out waiting for fresh Gateway RGB {stream!r}: "
             f"{last_error or 'no new frame'}"
         )
+
+    def current_pose(self) -> tuple[float, float, float]:
+        """Return the latest Fast-LIO x/y/yaw for exploration-loop memory."""
+        try:
+            snapshot = self.client.read_snapshot(
+                SnapshotRequest(
+                    streams=(self.ODOMETRY_STREAM,),
+                    max_age_ms=self.max_age_ms,
+                    max_skew_ms=0.0,
+                    timestamp_basis=TimestampBasis.SOURCE,
+                ),
+                retries=1,
+            )
+            state = np.asarray(
+                snapshot.arrays[self.ODOMETRY_STREAM], dtype=np.float64
+            ).reshape(-1)
+        except SensorGatewayClientError as exc:
+            raise ObjectNavCameraError("Fast-LIO odometry is unavailable") from exc
+        if state.shape != (13,) or not np.all(np.isfinite(state[:7])):
+            raise ObjectNavCameraError("Fast-LIO odometry is malformed")
+        x, y, z, w = map(float, state[3:7])
+        yaw = math.atan2(
+            2.0 * (w * z + x * y),
+            1.0 - 2.0 * (y * y + z * z),
+        )
+        return float(state[0]), float(state[1]), yaw
 
     def close(self) -> None:
         if self._owns_client:

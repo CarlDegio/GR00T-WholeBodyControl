@@ -641,13 +641,11 @@ def _check_prerequisites(config: InferenceLaunchConfig):
             errors.append(
                 "components.lavira.global_target is required"
             )
-        task_type = str(lavira["task_type"])
-        if task_type not in {"vln", "object_nav", "eqa"}:
+        navigation_mode = str(lavira["navigation_mode"])
+        if navigation_mode not in {"vln", "object_nav"}:
             errors.append(
-                "components.lavira.task_type must be vln, object_nav, or eqa"
+                "components.lavira.navigation_mode must be vln or object_nav"
             )
-        if task_type == "eqa" and not str(lavira["question"]).strip():
-            errors.append("components.lavira.question is required for EQA")
         for endpoint_name in ("la_base_url", "va_base_url"):
             if not str(lavira[endpoint_name]).strip():
                 errors.append(f"components.lavira.{endpoint_name} is required")

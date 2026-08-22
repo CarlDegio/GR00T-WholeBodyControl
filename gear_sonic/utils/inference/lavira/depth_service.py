@@ -76,6 +76,7 @@ class DepthAnythingInferenceGate:
     def __init__(self) -> None:
         self.owner: str | None = None
         self.generation = -1
+        self.skill_id = 0
         self.segment_id = 0
 
     @property
@@ -83,20 +84,26 @@ class DepthAnythingInferenceGate:
         return self.owner is not None
 
     def apply(self, name: str, parameters: dict[str, Any]) -> bool:
-        previous = (self.owner, self.generation, self.segment_id)
+        previous = (self.owner, self.generation, self.skill_id, self.segment_id)
         generation = int(parameters.get("generation", -1))
+        skill_id = int(parameters.get("skill_id", 0))
         segment_id = int(parameters.get("segment_id", 0))
         if name == "lavira_depth_request" and (
             generation > self.generation
-            or (generation == self.generation and segment_id >= self.segment_id)
+            or (
+                generation == self.generation
+                and (skill_id, segment_id) >= (self.skill_id, self.segment_id)
+            )
         ):
             self.owner = "lavira"
             self.generation = generation
+            self.skill_id = skill_id
             self.segment_id = segment_id
         elif (
             name == "lavira_rgbd_captured"
             and self.owner == "lavira"
             and generation == self.generation
+            and skill_id == self.skill_id
             and segment_id == self.segment_id
         ):
             self.owner = None
@@ -104,6 +111,7 @@ class DepthAnythingInferenceGate:
             name == "navigation_status"
             and self.owner == "lavira"
             and generation == self.generation
+            and skill_id == self.skill_id
             and segment_id == self.segment_id
             and str(parameters.get("state", "")) in self.TERMINAL_STATES
         ):
@@ -111,8 +119,11 @@ class DepthAnythingInferenceGate:
         elif name == "cancel_navigation" and generation >= self.generation:
             self.owner = None
             self.generation = generation
+            self.skill_id = 0
             self.segment_id = 0
-        return previous != (self.owner, self.generation, self.segment_id)
+        return previous != (
+            self.owner, self.generation, self.skill_id, self.segment_id
+        )
 
 
 def depth_anything_status_payload(gate: DepthAnythingInferenceGate) -> dict[str, Any]:
@@ -122,6 +133,7 @@ def depth_anything_status_payload(gate: DepthAnythingInferenceGate) -> dict[str,
         "active": gate.active,
         "owner": gate.owner or "idle",
         "generation": gate.generation,
+        "skill_id": gate.skill_id,
         "segment_id": gate.segment_id,
         "timestamp": time.time(),
     }
@@ -193,6 +205,7 @@ def metric_depth_payload(
     publish_max_depth_m: float,
     inference_owner: str = "unknown",
     inference_generation: int = -1,
+    inference_skill_id: int = 0,
     inference_segment_id: int = 0,
 ) -> ImageMessageSchema:
     """Encode metric depth as uint16 millimetres with an explicit metre scale."""
@@ -221,6 +234,7 @@ def metric_depth_payload(
             "uses_raw_depth": False,
             "inference_owner": str(inference_owner),
             "inference_generation": int(inference_generation),
+            "inference_skill_id": int(inference_skill_id),
             "inference_segment_id": int(inference_segment_id),
         }
     )
@@ -401,6 +415,7 @@ def main(config: DepthAnythingConfig, *, ready_file: str = "") -> None:
                         publish_max_depth_m=config.publish_max_depth_m,
                         inference_owner=gate.owner or "unknown",
                         inference_generation=gate.generation,
+                        inference_skill_id=gate.skill_id,
                         inference_segment_id=gate.segment_id,
                     ).serialize()
                 )

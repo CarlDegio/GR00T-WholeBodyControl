@@ -82,6 +82,18 @@ def test_profile_parameters_match_current_process_defaults() -> None:
     assert profile.component("lavira")["la_timeout_seconds"] == lavira.la_timeout_seconds
     assert profile.component("lavira")["va_base_url"] == lavira.va_base_url
     assert profile.component("lavira")["min_confidence"] == lavira.min_confidence
+    assert (
+        profile.component("lavira")["nav_handoff_min_depth_m"]
+        == lavira.nav_handoff_min_depth_m
+    )
+    assert (
+        profile.component("lavira")["nav_handoff_max_depth_m"]
+        == lavira.nav_handoff_max_depth_m
+    )
+    assert (
+        profile.component("lavira")["alignment_head_camera_stream"]
+        == lavira.alignment_head_camera_stream
+    )
     assert profile.component("base_pose")["task"] == base_pose.task
     assert (
         profile.component("base_pose")["raw_head_target_distance_m"]
@@ -133,7 +145,13 @@ def test_partial_overlay_changes_only_selected_values(tmp_path) -> None:
                 "endpoints": {"camera_server": {"host": "192.168.123.164"}},
                 "components": {
                     "vla": {"prompt": "pick up the paper ball"},
-                    "lavira": {"min_confidence": 0.75},
+                    "lavira": {
+                        "min_confidence": 0.75,
+                        "nav_handoff_min_depth_m": 0.4,
+                        "nav_handoff_max_depth_m": 2.8,
+                        "la_enable_thinking": False,
+                        "va_enable_thinking": True,
+                    },
                     "base_pose": {"raw_head_target_distance_m": 1.1},
                     "launcher": {"data_exporter": False},
                 },
@@ -152,7 +170,12 @@ def test_partial_overlay_changes_only_selected_values(tmp_path) -> None:
     assert profile.component("vla")["action_publish_rate"] == 50
     assert profile.component("launcher")["data_exporter"] is False
     assert load_inference_config(overlays=(str(overlay),)).prompt == "pick up the paper ball"
-    assert load_lavira_config(overlays=(str(overlay),)).min_confidence == 0.75
+    lavira = load_lavira_config(overlays=(str(overlay),))
+    assert lavira.min_confidence == 0.75
+    assert lavira.nav_handoff_min_depth_m == 0.4
+    assert lavira.nav_handoff_max_depth_m == 2.8
+    assert lavira.la_enable_thinking is False
+    assert lavira.va_enable_thinking is True
     assert load_base_pose_config(overlays=(str(overlay),)).raw_head_target_distance_m == 1.1
 
 
@@ -191,14 +214,14 @@ def test_profile_rejects_unknown_top_level_fields(tmp_path) -> None:
         load_runtime_profile(overlays=[overlay])
 
 
-def test_lavira_task_overlays_validate_eqa_and_reject_retired_fields(tmp_path) -> None:
-    missing_question = tmp_path / "missing_question.yaml"
-    missing_question.write_text(
-        "components:\n  lavira:\n    task_type: eqa\n    question: ''\n",
+def test_lavira_rejects_eqa_and_retired_fields(tmp_path) -> None:
+    retired_eqa = tmp_path / "retired_eqa.yaml"
+    retired_eqa.write_text(
+        "components:\n  lavira:\n    task_type: eqa\n    question: what is visible?\n",
         encoding="utf-8",
     )
-    with pytest.raises(ValueError, match="question is required for EQA"):
-        load_lavira_config(overlays=(str(missing_question),))
+    with pytest.raises(ValueError, match="unknown fields: question, task_type"):
+        load_lavira_config(overlays=(str(retired_eqa),))
 
     old_field = tmp_path / "old_field.yaml"
     old_field.write_text(
@@ -209,13 +232,17 @@ def test_lavira_task_overlays_validate_eqa_and_reject_retired_fields(tmp_path) -
         load_lavira_config(overlays=(str(old_field),))
 
 
-@pytest.mark.parametrize("task_type", ["vln", "object_nav", "eqa"])
-def test_lavira_accepts_each_fixed_yaml_task(task_type: str, tmp_path) -> None:
-    overlay = tmp_path / f"{task_type}.yaml"
-    question = "what is visible?" if task_type == "eqa" else "''"
+@pytest.mark.parametrize("navigation_mode", ["vln", "object_nav"])
+def test_lavira_accepts_each_navigation_mode(navigation_mode: str, tmp_path) -> None:
+    overlay = tmp_path / f"{navigation_mode}.yaml"
     overlay.write_text(
-        "components:\n" "  lavira:\n" f"    task_type: {task_type}\n" f"    question: {question}\n",
+        "components:\n"
+        "  lavira:\n"
+        f"    navigation_mode: {navigation_mode}\n",
         encoding="utf-8",
     )
 
-    assert load_lavira_config(overlays=(str(overlay),)).task_type == task_type
+    assert (
+        load_lavira_config(overlays=(str(overlay),)).navigation_mode
+        == navigation_mode
+    )

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import logging
+import queue
 import threading
 import time
 
@@ -10,6 +12,7 @@ from gear_sonic.utils.inference.lavira.object_nav import ObjectNavResult
 from gear_sonic.utils.inference.lavira.service import (
     LaviraPlannerConfig,
     LaviraPlannerRuntime,
+    LaviraRuntimeEventHandler,
     WorkerResult,
     result_to_goal,
     run_inference_worker,
@@ -38,19 +41,37 @@ def runtime_with_intents():
     return runtime, intents
 
 
-def test_lavira_config_exposes_dual_local_agent_endpoints() -> None:
+def test_lavira_config_exposes_dual_cloud_agent_roles() -> None:
     config = LaviraPlannerConfig("find chair", "chair")
 
-    assert config.task_type == "object_nav"
-    assert config.la_model == "Qwen3.5-27B-Q4_K_M"
-    assert config.va_model == "Qwen3.5-27B-Q4_K_M"
-    assert config.la_base_url.endswith(":8000/v1")
-    assert config.va_base_url.endswith(":8001/v1")
+    assert config.navigation_mode == "object_nav"
+    assert not hasattr(config, "task_type")
+    assert not hasattr(config, "question")
+    assert config.la_model == "qwen3.8-max"
+    assert config.va_model == "qwen3.5-27b"
+    assert config.la_enable_thinking is True
+    assert config.va_enable_thinking is False
+    assert config.la_base_url == "https://dashscope.aliyuncs.com/compatible-mode/v1"
+    assert config.va_base_url == "https://dashscope.aliyuncs.com/compatible-mode/v1"
+    assert config.nav_handoff_min_depth_m == 0.3
+    assert config.nav_handoff_max_depth_m == 3.0
+    assert config.alignment_head_camera_stream == "ego_view"
     assert not hasattr(config, "qwenvl_model")
     assert not hasattr(config, "vision_backend")
     assert not hasattr(config, "model")
     assert not hasattr(config, "debug")
     assert not hasattr(config, "output_root")
+
+    with pytest.raises(TypeError):
+        LaviraPlannerConfig("find chair", "chair", task_type="eqa")
+    with pytest.raises(TypeError):
+        LaviraPlannerConfig("find chair", "chair", question="what color?")
+    with pytest.raises(ValueError, match="depth range"):
+        LaviraPlannerConfig(
+            "find chair", "chair",
+            nav_handoff_min_depth_m=3.0,
+            nav_handoff_max_depth_m=2.0,
+        )
 
 
 def test_result_goal_maps_camera_right_to_negative_base_y() -> None:
@@ -123,6 +144,25 @@ def test_current_segment_status_wakes_agent_but_does_not_end_generation() -> Non
     runtime.start_navigation(1)
     assert not runtime.accept_status({"type": "sonic_navigation_status", "generation": 0, "state": "reached"})
     assert runtime.phase == "nav"
+
+
+def test_vla_active_status_is_available_as_start_ack() -> None:
+    runtime, _ = runtime_with_intents()
+    runtime.start_navigation(1)
+
+    assert runtime.accept_status(
+        {
+            "generation": 1,
+            "skill_id": 3,
+            "segment_id": 0,
+            "state": "active",
+            "reason": "started",
+        },
+        channel="vla_task_status",
+    )
+
+    status = runtime.wait_status(1, 3, 0, 0.1)
+    assert status["state"] == "active"
     assert runtime.accept_status(
         {
             "type": "sonic_navigation_status",
@@ -173,7 +213,7 @@ def test_space_wakes_segment_wait_and_invalidates_late_status() -> None:
 
     def wait() -> None:
         try:
-            runtime.wait_status(1, 3, 10.0)
+            runtime.wait_status(1, 0, 3, 10.0)
         except Exception as exc:
             errors.append(exc)
 
@@ -188,3 +228,61 @@ def test_space_wakes_segment_wait_and_invalidates_late_status() -> None:
     assert not runtime.accept_status(
         {"generation": 1, "segment_id": 3, "state": "reached"}
     )
+
+
+def test_warning_and_error_logs_are_promoted_to_structured_runtime_events() -> None:
+    pending: queue.SimpleQueue[dict[str, object]] = queue.SimpleQueue()
+    handler = LaviraRuntimeEventHandler(pending)
+
+    warning = logging.LogRecord(
+        "sonic.lavira",
+        logging.WARNING,
+        __file__,
+        1,
+        "model retry %s",
+        ("timeout",),
+        None,
+    )
+    handler.handle(warning)
+    payload = pending.get_nowait()
+    assert payload["type"] == "sonic.runtime_event"
+    assert payload["component"] == "lavira"
+    assert payload["code"] == "LOG_WARNING"
+    assert payload["message"] == "model retry timeout"
+
+    already_reported = logging.LogRecord(
+        "sonic.lavira",
+        logging.ERROR,
+        __file__,
+        1,
+        "explicit task error",
+        (),
+        None,
+    )
+    already_reported.runtime_event_emitted = True
+    handler.handle(already_reported)
+    assert pending.empty()
+
+
+def test_runtime_reports_todo_as_structured_event() -> None:
+    events = []
+    runtime = LaviraPlannerRuntime(
+        LaviraPlannerConfig("find chair", "chair"),
+        submit_intent=lambda _name, _parameters: None,
+        report_event=lambda level, code, message, **fields: events.append(
+            (level, code, message, fields)
+        ),
+    )
+
+    runtime.report_todo(7, 3, "- [x] Find doorway\n- [ ] Approach chair")
+
+    assert events == [(
+        logging.INFO,
+        "TODO_UPDATED",
+        "LaViRA TODO updated",
+        {
+            "generation": 7,
+            "step": 3,
+            "todo_list": "- [x] Find doorway\n- [ ] Approach chair",
+        },
+    )]

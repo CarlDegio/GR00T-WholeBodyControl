@@ -28,6 +28,13 @@ def _segment_id(value: int) -> int:
     return result
 
 
+def _skill_id(value: int) -> int:
+    result = int(value)
+    if result < 0:
+        raise ValueError("skill_id cannot be negative")
+    return result
+
+
 def _finite_scalar(value: float, *, field: str) -> float:
     result = float(value)
     if not math.isfinite(result):
@@ -50,6 +57,7 @@ class NavigationCommand:
     generation: int
     timestamp: float
     segment_id: int = 0
+    skill_id: int = 0
     velocity: tuple[float, float, float] | None = None
     goal_base: tuple[float, float] | None = None
     heading_delta_rad: float | None = None
@@ -63,6 +71,7 @@ class NavigationCommand:
             raise ValueError("invalid navigation mode")
         _generation(self.generation)
         _segment_id(self.segment_id)
+        _skill_id(self.skill_id)
         _finite_scalar(self.timestamp, field="navigation timestamp")
         _finite_scalar(self.confidence, field="navigation confidence")
         if self.velocity is not None:
@@ -83,6 +92,7 @@ def build_navigation_message(
     mode: str,
     generation: int,
     segment_id: int = 0,
+    skill_id: int = 0,
     timestamp: float | None = None,
     velocity: Sequence[float] | None = None,
     goal_base: Sequence[float] | None = None,
@@ -99,6 +109,7 @@ def build_navigation_message(
         "version": 1,
         "generation": _generation(generation),
         "segment_id": _segment_id(segment_id),
+        "skill_id": _skill_id(skill_id),
         "mode": mode,
         "timestamp": _finite_scalar(
             time.time() if timestamp is None else timestamp,
@@ -146,6 +157,7 @@ def decode_navigation_message(message: str | bytes | Mapping[str, Any]) -> Navig
         generation=int(payload["generation"]),
         timestamp=float(payload["timestamp"]),
         segment_id=int(payload.get("segment_id", 0)),
+        skill_id=int(payload.get("skill_id", 0)),
         velocity=None
         if velocity is None
         else _finite_tuple(
@@ -172,12 +184,14 @@ class PlannerVelocityCommand:
     source: str
     velocity: tuple[float, float, float]
     segment_id: int = 0
+    skill_id: int = 0
     heading_target_rad: float | None = None
     heading_reference_rad: float | None = None
 
     def __post_init__(self) -> None:
         _generation(self.generation)
         _segment_id(self.segment_id)
+        _skill_id(self.skill_id)
         _finite_scalar(self.timestamp, field="planner velocity timestamp")
         if not self.source:
             raise ValueError("planner velocity source cannot be empty")
@@ -193,6 +207,7 @@ def build_planner_velocity_message(
     *,
     generation: int,
     segment_id: int = 0,
+    skill_id: int = 0,
     source: str,
     velocity: Sequence[float],
     timestamp: float | None = None,
@@ -207,6 +222,7 @@ def build_planner_velocity_message(
         "version": 1,
         "generation": _generation(generation),
         "segment_id": _segment_id(segment_id),
+        "skill_id": _skill_id(skill_id),
         "timestamp": _finite_scalar(
             time.time() if timestamp is None else timestamp,
             field="planner velocity timestamp",
@@ -257,6 +273,7 @@ def decode_planner_velocity_message(
         source=source,
         velocity=velocity,
         segment_id=int(payload.get("segment_id", 0)),
+        skill_id=int(payload.get("skill_id", 0)),
         heading_target_rad=target,
         heading_reference_rad=reference,
     )
@@ -274,10 +291,12 @@ class NavigationRuntimeStatus:
     velocity: tuple[float, float, float]
     reason: str
     segment_id: int = 0
+    skill_id: int = 0
 
     def __post_init__(self) -> None:
         _generation(self.generation)
         _segment_id(self.segment_id)
+        _skill_id(self.skill_id)
         _finite_scalar(self.timestamp, field="runtime status timestamp")
         if self.mode not in {"manual_velocity", "nav_goal", "heading_goal", "stop"}:
             raise ValueError("invalid runtime navigation mode")
@@ -293,6 +312,7 @@ def build_navigation_runtime_status_message(
     *,
     generation: int,
     segment_id: int = 0,
+    skill_id: int = 0,
     mode: str,
     source: str,
     requested_velocity: Sequence[float],
@@ -305,6 +325,7 @@ def build_navigation_runtime_status_message(
     status = NavigationRuntimeStatus(
         generation=_generation(generation),
         segment_id=_segment_id(segment_id),
+        skill_id=_skill_id(skill_id),
         timestamp=_finite_scalar(
             time.time() if timestamp is None else timestamp,
             field="runtime status timestamp",
@@ -324,6 +345,7 @@ def build_navigation_runtime_status_message(
             "version": 1,
             "generation": status.generation,
             "segment_id": status.segment_id,
+            "skill_id": status.skill_id,
             "timestamp": status.timestamp,
             "mode": status.mode,
             "source": status.source,
@@ -355,6 +377,7 @@ def decode_navigation_runtime_status_message(
         generation=int(payload["generation"]),
         timestamp=float(payload["timestamp"]),
         segment_id=int(payload.get("segment_id", 0)),
+        skill_id=int(payload.get("skill_id", 0)),
         mode=mode,
         source=str(payload.get("source", "")),
         requested_velocity=_finite_tuple(

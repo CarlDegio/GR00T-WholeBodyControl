@@ -191,6 +191,9 @@ class GatewayRawServoAdapter:
         self.monotonic = monotonic
         self._publish_enabled = False
         self._terminal_reported = True
+        self.task_generation = 0
+        self.skill_id = 0
+        self.segment_id = 0
         self.runtime = RawServoRuntime(
             config,
             publish=self._publish,
@@ -219,7 +222,9 @@ class GatewayRawServoAdapter:
         velocity = payload["velocity"]
         command = [float(velocity[name]) for name in ("vx", "vy", "wz")]
         parameters: dict[str, object] = {
-            "generation": self.runtime.generation,
+            "generation": self.task_generation,
+            "skill_id": self.skill_id,
+            "segment_id": self.segment_id,
             "velocity": command,
             "action": str(payload.get("action", "visual_servo")),
             "motion_profile": "yoloe_servo",
@@ -233,17 +238,47 @@ class GatewayRawServoAdapter:
             parameters,
         )
 
-    def start(self, generation: int, *, now: float | None = None) -> bool:
+    def start(
+        self,
+        generation: int,
+        *,
+        skill_id: int = 0,
+        segment_id: int = 0,
+        target: object | None = None,
+        surface: object | None = None,
+        reference_bbox: object | None = None,
+        now: float | None = None,
+    ) -> bool:
         timestamp = self.monotonic() if now is None else float(now)
         requested_generation = int(generation)
+        requested_skill_id = int(skill_id)
+        runtime_generation = (
+            requested_generation
+            if requested_skill_id == 0
+            else requested_generation * 1_000_000 + requested_skill_id
+        )
         if (
             self.runtime.phase != "idle"
-            or requested_generation <= self.runtime.generation
+            or runtime_generation <= self.runtime.generation
         ):
             return False
+        if target is not None:
+            normalized_target = str(target).strip()
+            if not normalized_target:
+                return False
+            self.runtime.config.target_prompt = normalized_target
+        if surface is not None:
+            normalized_surface = str(surface).strip()
+            if not normalized_surface:
+                return False
+            self.runtime.config.surface_prompt = normalized_surface
+        self.task_generation = requested_generation
+        self.skill_id = requested_skill_id
+        self.segment_id = int(segment_id)
+        self.runtime.reference_bbox = reference_bbox
         self._publish_enabled = True
         self._terminal_reported = False
-        started = self.runtime.start(requested_generation, now=timestamp)
+        started = self.runtime.start(runtime_generation, now=timestamp)
         if not started:
             self._publish_enabled = False
             self._terminal_reported = True
@@ -260,11 +295,11 @@ class GatewayRawServoAdapter:
     ) -> bool:
         timestamp = self.monotonic() if now is None else float(now)
         requested_generation = int(generation)
-        if requested_generation < self.runtime.generation:
+        if requested_generation < self.task_generation:
             self.logger(
                 "[BasePose/YOLOE] ignored stale cancel "
                 f"generation={requested_generation} "
-                f"active_generation={self.runtime.generation}"
+                f"active_generation={self.task_generation}"
             )
             return False
         self._publish_enabled = False
@@ -272,13 +307,28 @@ class GatewayRawServoAdapter:
             # Global navigation cancellation is also delivered while BasePose
             # is inactive.  Keep generations aligned without reporting a fake
             # operator stop or perturbing the runtime generation twice.
-            self.runtime.generation = requested_generation
+            self.task_generation = requested_generation
+            self.runtime.generation = (
+                requested_generation
+                if self.skill_id == 0
+                else max(
+                    self.runtime.generation,
+                    requested_generation * 1_000_000 + self.skill_id,
+                )
+            )
             self._terminal_reported = True
             return False
         self.runtime.cancel(
             reason,
             timestamp,
-            generation=requested_generation,
+            generation=max(
+                self.runtime.generation,
+                (
+                    requested_generation
+                    if self.skill_id == 0
+                    else requested_generation * 1_000_000 + self.skill_id
+                ),
+            ),
         )
         self._terminal_reported = True
         return True
@@ -295,7 +345,8 @@ class GatewayRawServoAdapter:
                     logging.WARNING,
                     "CAMERA_STALE",
                     "BasePose camera stream is stale; holding position",
-                    generation=self.runtime.generation,
+                    generation=self.task_generation,
+                    skill_id=self.skill_id,
                 )
             elif (
                 was_soft_stale
@@ -306,7 +357,8 @@ class GatewayRawServoAdapter:
                     logging.INFO,
                     "CAMERA_RECOVERED",
                     "BasePose camera stream recovered",
-                    generation=self.runtime.generation,
+                    generation=self.task_generation,
+                    skill_id=self.skill_id,
                 )
         if (
             was_active
@@ -315,14 +367,23 @@ class GatewayRawServoAdapter:
         ):
             reason = self.runtime.controller.terminal_reason or "visual_servo_finished"
             state = "reached" if reason == "aligned" else "failed"
-            self.submit_intent(
-                "base_pose_status",
-                {
-                    "generation": self.runtime.generation,
-                    "state": state,
-                    "reason": reason,
-                },
-            )
+            status: dict[str, object] = {
+                "generation": self.task_generation,
+                "state": state,
+                "reason": reason,
+            }
+            if self.skill_id:
+                status.update(
+                    skill_id=self.skill_id,
+                    segment_id=self.segment_id,
+                )
+            self.submit_intent("base_pose_status", status)
+            if self.skill_id:
+                # The worker uses a composite identity only while an LA ALIGN
+                # invocation is active. Collapse back to the task generation
+                # after draining that invocation so a later standalone B start
+                # remains monotonic on the public generation axis.
+                self.runtime.generation = self.task_generation
             self._terminal_reported = True
             self._publish_enabled = False
 
@@ -502,7 +563,14 @@ def run_base_pose_yolo_agent(config: Any) -> None:
                 generation = int(command.parameters.get("generation", -1))
                 if command.name == "start_base_pose":
                     camera.begin_generation(generation)
-                    adapter.start(generation)
+                    adapter.start(
+                        generation,
+                        skill_id=int(command.parameters.get("skill_id", 0)),
+                        segment_id=int(command.parameters.get("segment_id", 0)),
+                        target=command.parameters.get("target"),
+                        surface=command.parameters.get("surface"),
+                        reference_bbox=command.parameters.get("reference_bbox"),
+                    )
                 else:
                     reason = str(
                         command.parameters.get("reason") or "operator_stop"

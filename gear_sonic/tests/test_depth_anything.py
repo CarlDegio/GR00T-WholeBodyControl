@@ -256,6 +256,30 @@ def test_lavira_reads_depth_anything_chest_depth_in_metric_units() -> None:
     assert snapshot.cx == 1.0
 
 
+def test_lavira_reuses_rgb_capture_interface_for_head_handoff_view() -> None:
+    rgb = np.array(
+        [[[255, 0, 0], [0, 255, 0]], [[0, 0, 255], [255, 255, 255]]],
+        dtype=np.uint8,
+    )
+    stream = "camera/ego_view"
+    materialized = _materialized({stream: rgb}, {stream: {}})
+
+    class FakeClient:
+        request = None
+
+        def read_snapshot(self, request, **_kwargs):
+            self.request = request
+            return materialized
+
+    fake = FakeClient()
+    camera = SensorGatewayRGBDCamera("inproc://unused", client=fake)
+
+    image = camera.capture_rgb(camera_stream="ego_view")
+
+    assert fake.request.streams == (stream,)
+    np.testing.assert_array_equal(image, rgb[..., ::-1])
+
+
 def test_mark_ready_replaces_stale_marker(tmp_path: Path) -> None:
     marker = tmp_path / "depth-anything.ready"
     marker.write_text("stale")

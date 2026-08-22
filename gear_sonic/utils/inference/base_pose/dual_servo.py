@@ -625,23 +625,14 @@ def run_dual_raw_servo_worker(
         str(config.dual_head_camera_stream),
         str(config.dual_chest_camera_stream),
     )
-    surface_prompt = config.surface_prompt
-    target_prompt = config.target_prompt
+    surface_prompt = ""
+    target_prompt = ""
     tolerance = config.dual_match_tolerance_frames
     head_reacquire_frames = config.dual_head_reacquire_frames
     head_release_missing_frames = config.dual_head_release_missing_frames
     camera: Any | None = None
-    tracker: Any = (
-        tracker_factory()
-        if tracker_factory is not None
-        else YoloePersistentTracker(
-            config.raw_yoloe_model_path,
-            confidence=config.raw_yoloe_confidence,
-            imgsz=config.raw_yoloe_imgsz,
-            device=config.raw_yoloe_device,
-            surface_prompt=surface_prompt,
-        )
-    )
+    tracker: Any | None = None
+    tracker_surface_prompt = ""
     perception_pool = ThreadPoolExecutor(
         max_workers=2,
         thread_name_prefix="dual-raw-servo-perception",
@@ -657,6 +648,29 @@ def run_dual_raw_servo_worker(
                 return
             output_dir: Path | None = None
             try:
+                target_prompt = str(config.target_prompt).strip()
+                surface_prompt = str(config.surface_prompt).strip()
+                if not target_prompt or not surface_prompt:
+                    raise RuntimeError("dynamic target and surface prompts are required")
+                if tracker is None or (
+                    tracker_factory is None
+                    and surface_prompt != tracker_surface_prompt
+                ):
+                    tracker = (
+                        tracker_factory()
+                        if tracker_factory is not None
+                        else YoloePersistentTracker(
+                            config.raw_yoloe_model_path,
+                            confidence=config.raw_yoloe_confidence,
+                            imgsz=config.raw_yoloe_imgsz,
+                            device=config.raw_yoloe_device,
+                            surface_prompt=surface_prompt,
+                        )
+                    )
+                    tracker_surface_prompt = surface_prompt
+                    # A monitor with the old text embedding must not survive
+                    # into a new ALIGN skill.
+                    head_monitor_tracker = None
                 if calibrations is None:
                     calibrations = dict(
                         calibration_factory(config)

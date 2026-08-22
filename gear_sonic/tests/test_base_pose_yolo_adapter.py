@@ -84,6 +84,51 @@ def test_yolo_adapter_uses_gateway_generation_directly(tmp_path) -> None:
     assert adapter.runtime.generation == 7
     assert intents[-1][0] == "base_pose_velocity"
     assert intents[-1][1]["generation"] == 7
+
+
+def test_yolo_adapter_accepts_dynamic_align_identity_and_prompts(tmp_path) -> None:
+    intents: list[tuple[str, dict[str, object]]] = []
+    config = BasePoseAgentConfig(
+        task="align dynamically",
+        output_root=str(tmp_path),
+    )
+    adapter = GatewayRawServoAdapter(
+        config,
+        submit_intent=lambda name, values: intents.append((name, dict(values))),
+    )
+    assert adapter.start(
+        7,
+        skill_id=3,
+        segment_id=9,
+        target="blue basket",
+        surface="workbench",
+        reference_bbox=[100, 100, 900, 900],
+        now=1.0,
+    )
+    assert config.target_prompt == "blue basket"
+    assert config.surface_prompt == "workbench"
+    assert intents[-1][1]["generation"] == 7
+    assert intents[-1][1]["skill_id"] == 3
+    assert intents[-1][1]["segment_id"] == 9
+    adapter.runtime.requests.get_nowait()
+    adapter.runtime.events.put(
+        RawServoEvent(
+            adapter.runtime.generation,
+            "error",
+            error="retry alignment",
+            hard=True,
+        )
+    )
+    adapter.tick(now=1.1)
+    assert adapter.runtime.generation == 7
+    assert adapter.start(
+        7,
+        skill_id=4,
+        segment_id=10,
+        target="blue basket",
+        surface="workbench",
+        now=1.2,
+    )
     assert intents[-1][1]["motion_profile"] == "yoloe_servo"
     assert intents[-1][1]["velocity"] == [0.0, 0.0, 0.0]
 

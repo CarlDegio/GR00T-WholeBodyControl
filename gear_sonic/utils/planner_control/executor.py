@@ -9,7 +9,7 @@ from typing import Literal
 import numpy as np
 
 from gear_sonic.runtime.protocol import NavigationCommand, PlannerVelocityCommand
-from gear_sonic.utils.planner_control.safety import depth_requires_stop
+from gear_sonic.utils.planner_control.safety import motion_safety_reason
 from gear_sonic.utils.planner_control.sonic import SonicPlannerState
 
 
@@ -23,6 +23,7 @@ class SafetySnapshot:
 class PlannerExecutorDecision:
     generation: int
     segment_id: int
+    skill_id: int
     source: str
     requested_velocity: tuple[float, float, float]
     velocity: tuple[float, float, float]
@@ -57,6 +58,7 @@ class PlannerVelocityExecutorCore:
         self.sonic = sonic or SonicPlannerState()
         self.generation = 0
         self.segment_id = 0
+        self.skill_id = 0
         self.mode: Literal[
             "stop", "manual_velocity", "nav_goal", "heading_goal"
         ] = "stop"
@@ -70,11 +72,13 @@ class PlannerVelocityExecutorCore:
     def accept_navigation(self, command: NavigationCommand, *, now: float) -> bool:
         if command.generation < self.generation or (
             command.generation == self.generation
-            and command.segment_id < self.segment_id
+            and (command.skill_id, command.segment_id)
+            < (self.skill_id, self.segment_id)
         ):
             return False
         self.generation = command.generation
         self.segment_id = command.segment_id
+        self.skill_id = command.skill_id
         self.mode = command.mode
         self.command_timestamp_s = float(now)
         self.navdp_heading_target_rad = None
@@ -99,6 +103,7 @@ class PlannerVelocityExecutorCore:
             and self.mode != "heading_goal"
             or command.generation != self.generation
             or command.segment_id != self.segment_id
+            or command.skill_id != self.skill_id
             or command.source != "navdp"
         ):
             return False
@@ -126,15 +131,16 @@ class PlannerVelocityExecutorCore:
     ) -> PlannerExecutorDecision:
         requested, reason = self._requested(now)
         velocity = requested
-        radar_age = float(now) - safety.radar_timestamp_s
-        if (
-            safety.radar_timestamp_s <= 0.0
-            or radar_age < 0.0
-            or radar_age > self.radar_timeout_s
-        ):
+        safety_reason = motion_safety_reason(
+            now=now,
+            radar_timestamp_s=safety.radar_timestamp_s,
+            radar_timeout_s=self.radar_timeout_s,
+            depth_m=safety.depth_m,
+        )
+        if safety_reason == "radar_timeout":
             velocity = (0.0, 0.0, 0.0)
             reason = "radar_timeout"
-        elif safety.depth_m is not None and depth_requires_stop(safety.depth_m):
+        elif safety_reason == "depth_hard_stop":
             velocity = (0.0, 0.0, 0.0)
             reason = "depth_hard_stop"
 
@@ -163,6 +169,7 @@ class PlannerVelocityExecutorCore:
         return PlannerExecutorDecision(
             generation=self.generation,
             segment_id=self.segment_id,
+            skill_id=self.skill_id,
             source=self.source,
             requested_velocity=requested,
             velocity=velocity,

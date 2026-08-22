@@ -41,13 +41,16 @@ class InferenceWorkerTest(unittest.TestCase):
                 raise RuntimeError("policy unavailable")
 
         events = []
+        failures = []
         result = run_vla_inference.run_policy_inference_and_process(
             BrokenPolicy(), {},
             lambda *args, **kwargs: events.append((args, kwargs)) or False,
+            failure_callback=failures.append,
         )
 
         self.assertIsNone(result)
         self.assertEqual(events[0][0][1], "INFERENCE_FAILED")
+        self.assertEqual(failures, ["policy unavailable"])
 
     def test_camera_jpeg_wrapper_keeps_bytes_and_uses_existing_protocol(self):
         payload = b"already-encoded-camera-jpeg"

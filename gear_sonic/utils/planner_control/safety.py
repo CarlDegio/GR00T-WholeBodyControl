@@ -5,6 +5,28 @@ from __future__ import annotations
 import numpy as np
 
 
+def motion_safety_reason(
+    *,
+    now: float,
+    radar_timestamp_s: float,
+    radar_timeout_s: float,
+    depth_m: np.ndarray | None,
+) -> str:
+    """Shared fail-closed LiDAR/depth gate for planner and VLA motion."""
+    radar_age = float(now) - float(radar_timestamp_s)
+    if (
+        radar_timestamp_s <= 0.0
+        or radar_age < 0.0
+        or radar_age > float(radar_timeout_s)
+    ):
+        return "radar_timeout"
+    if depth_m is None:
+        return "depth_unavailable"
+    if depth_requires_stop(depth_m):
+        return "depth_hard_stop"
+    return "clear"
+
+
 def depth_requires_stop(
     depth_m: np.ndarray,
     *,
