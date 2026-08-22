@@ -15,16 +15,15 @@ import numpy as np
 
 from gear_sonic.camera.calibration import load_camera_intrinsics
 from gear_sonic.camera.sensor_server import ImageMessageSchema, SensorServer
+from gear_sonic.runtime.gateway.control_client import ControlGatewaySubscriber
+from gear_sonic.runtime.gateway.sensor import DEPTH_ANYTHING_STATUS_TYPE
 from gear_sonic.runtime.gateway.sensor_client import (
     SensorGatewayClient,
     SensorGatewayClientError,
 )
-from gear_sonic.runtime.profile import load_component_config, load_runtime_profile
-from gear_sonic.runtime.gateway.control_client import ControlGatewaySubscriber
-from gear_sonic.runtime.gateway.sensor import DEPTH_ANYTHING_STATUS_TYPE
 from gear_sonic.runtime.gateway.snapshot import SnapshotRequest, TimestampBasis
+from gear_sonic.runtime.profile import load_component_config, load_runtime_profile
 from gear_sonic.runtime.telemetry import configure_file_logging
-
 
 LOGGER = logging.getLogger("sonic.depth_anything")
 DEPTH_SOURCE = "depth-anything-v2-metric-hypersim-vitb"
@@ -67,9 +66,8 @@ class DepthAnythingInferenceGate:
     """Keep DA resident while allowing forward passes only for active consumers."""
 
     ACCEPTED_COMMANDS = {
-        "start_navigation",
+        "lavira_depth_request",
         "lavira_rgbd_captured",
-        "navigation_goal",
         "navigation_status",
         "cancel_navigation",
     }
@@ -78,34 +76,43 @@ class DepthAnythingInferenceGate:
     def __init__(self) -> None:
         self.owner: str | None = None
         self.generation = -1
+        self.segment_id = 0
 
     @property
     def active(self) -> bool:
         return self.owner is not None
 
     def apply(self, name: str, parameters: dict[str, Any]) -> bool:
-        previous = (self.owner, self.generation)
+        previous = (self.owner, self.generation, self.segment_id)
         generation = int(parameters.get("generation", -1))
-        if name == "start_navigation" and generation >= self.generation:
+        segment_id = int(parameters.get("segment_id", 0))
+        if name == "lavira_depth_request" and (
+            generation > self.generation
+            or (generation == self.generation and segment_id >= self.segment_id)
+        ):
             self.owner = "lavira"
             self.generation = generation
+            self.segment_id = segment_id
         elif (
-            name in {"lavira_rgbd_captured", "navigation_goal"}
+            name == "lavira_rgbd_captured"
             and self.owner == "lavira"
             and generation == self.generation
+            and segment_id == self.segment_id
         ):
             self.owner = None
         elif (
             name == "navigation_status"
             and self.owner == "lavira"
             and generation == self.generation
+            and segment_id == self.segment_id
             and str(parameters.get("state", "")) in self.TERMINAL_STATES
         ):
             self.owner = None
         elif name == "cancel_navigation" and generation >= self.generation:
             self.owner = None
             self.generation = generation
-        return previous != (self.owner, self.generation)
+            self.segment_id = 0
+        return previous != (self.owner, self.generation, self.segment_id)
 
 
 def depth_anything_status_payload(gate: DepthAnythingInferenceGate) -> dict[str, Any]:
@@ -115,6 +122,7 @@ def depth_anything_status_payload(gate: DepthAnythingInferenceGate) -> dict[str,
         "active": gate.active,
         "owner": gate.owner or "idle",
         "generation": gate.generation,
+        "segment_id": gate.segment_id,
         "timestamp": time.time(),
     }
 
@@ -185,6 +193,7 @@ def metric_depth_payload(
     publish_max_depth_m: float,
     inference_owner: str = "unknown",
     inference_generation: int = -1,
+    inference_segment_id: int = 0,
 ) -> ImageMessageSchema:
     """Encode metric depth as uint16 millimetres with an explicit metre scale."""
 
@@ -212,6 +221,7 @@ def metric_depth_payload(
             "uses_raw_depth": False,
             "inference_owner": str(inference_owner),
             "inference_generation": int(inference_generation),
+            "inference_segment_id": int(inference_segment_id),
         }
     )
     return ImageMessageSchema(
@@ -259,9 +269,9 @@ class DepthAnythingMetricEstimator:
             raise ValueError(f"unsupported Depth Anything encoder: {config.encoder}")
         sys.path.insert(0, str(root))
 
+        from depth_anything_v2.dpt import DepthAnythingV2
         import torch
         import torch.nn.functional as functional
-        from depth_anything_v2.dpt import DepthAnythingV2
 
         self.torch = torch
         self.functional = functional
@@ -391,6 +401,7 @@ def main(config: DepthAnythingConfig, *, ready_file: str = "") -> None:
                         publish_max_depth_m=config.publish_max_depth_m,
                         inference_owner=gate.owner or "unknown",
                         inference_generation=gate.generation,
+                        inference_segment_id=gate.segment_id,
                     ).serialize()
                 )
             remaining = period - (time.monotonic() - started)

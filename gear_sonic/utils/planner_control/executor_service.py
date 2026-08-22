@@ -13,22 +13,22 @@ from typing import Any, Callable, Mapping
 import numpy as np
 import zmq
 
+from gear_sonic.runtime.gateway.sensor_client import SensorGatewayClient
+from gear_sonic.runtime.gateway.snapshot import SnapshotRequest
+from gear_sonic.runtime.profile import load_component_config, load_runtime_profile
+from gear_sonic.runtime.protocol import decode_cpp_state_array
+from gear_sonic.runtime.telemetry import (
+    build_event,
+    configure_file_logging,
+    emit_event,
+    open_telemetry_publisher,
+)
 from gear_sonic.utils.planner_control import (
     PlannerVelocityExecutorCore,
     SafetySnapshot,
     build_navigation_runtime_status_message,
     decode_navigation_message,
     decode_planner_velocity_message,
-)
-from gear_sonic.runtime.gateway.sensor_client import SensorGatewayClient
-from gear_sonic.runtime.profile import load_component_config, load_runtime_profile
-from gear_sonic.runtime.protocol import decode_cpp_state_array
-from gear_sonic.runtime.gateway.snapshot import SnapshotRequest
-from gear_sonic.runtime.telemetry import (
-    build_event,
-    configure_file_logging,
-    emit_event,
-    open_telemetry_publisher,
 )
 from gear_sonic.utils.teleop.sonic_orientation_telemetry import (
     OrientationTracker,
@@ -317,7 +317,7 @@ def main(
     period = 1.0 / config.control_hz
     last_reason = ""
     last_orientation_error = ""
-    last_owner: tuple[int, str, str] | None = None
+    last_owner: tuple[int, int, str, str] | None = None
     last_orientation_sequence = -1
     try:
         while running:
@@ -374,11 +374,17 @@ def main(
                             )
                             last_orientation_error = message
             decision = core.decide(now=now, safety=sensors.snapshot())
-            owner = (decision.generation, decision.source, core.mode)
+            owner = (
+                decision.generation,
+                decision.segment_id,
+                decision.source,
+                core.mode,
+            )
             if owner != last_owner:
                 LOGGER.info(
-                    "owner generation=%d source=%s mode=%s",
+                    "owner generation=%d segment=%d source=%s mode=%s",
                     decision.generation,
+                    decision.segment_id,
                     decision.source,
                     core.mode,
                 )
@@ -388,6 +394,7 @@ def main(
                 runtime_status.send_string(
                     build_navigation_runtime_status_message(
                         generation=decision.generation,
+                        segment_id=decision.segment_id,
                         mode=core.mode,
                         source=decision.source,
                         requested_velocity=decision.requested_velocity,
@@ -407,6 +414,7 @@ def main(
             if decision.reason != last_reason:
                 fields = {
                     "generation": decision.generation,
+                    "segment_id": decision.segment_id,
                     "source": decision.source,
                     "requested_velocity": decision.requested_velocity,
                     "velocity": decision.velocity,

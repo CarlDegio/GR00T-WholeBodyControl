@@ -175,6 +175,7 @@ class NavigationControlAction:
     velocity: tuple[float, float, float] | None = None
     agent_event: str | None = None
     reason: str = ""
+    segment_id: int = 0
 
 
 class NavigationControlState:
@@ -191,6 +192,7 @@ class NavigationControlState:
         self.manual_hold_s = float(manual_hold_s)
         self.base_pose_command_timeout_s = float(base_pose_command_timeout_s)
         self.generation = 0
+        self.segment_id = 0
         self.mode = "listen_wasd"
         self.manual_velocity = (0.0, 0.0, 0.0)
         self.manual_deadline = 0.0
@@ -224,6 +226,7 @@ class NavigationControlState:
             if self.mode != "listen_wasd":
                 return self._busy()
             self.generation += 1
+            self.segment_id = -1 if normalized == "n" else 0
             self.manual_velocity = (0.0, 0.0, 0.0)
             self.manual_deadline = 0.0
             is_lavira = normalized == "n"
@@ -235,6 +238,7 @@ class NavigationControlState:
             )
         if normalized == " ":
             self.generation += 1
+            self.segment_id = 0
             self.manual_velocity = (0.0, 0.0, 0.0)
             self.manual_deadline = 0.0
             self.mode = "listen_wasd"
@@ -286,16 +290,50 @@ class NavigationControlState:
 
     def accept_goal(self, parameters: Mapping[str, object]) -> NavigationControlAction:
         generation = int(parameters["generation"])
-        if generation != self.generation or self.mode != "lavira_pending":
+        segment_id = int(parameters.get("segment_id", 0))
+        if (
+            generation != self.generation
+            or self.mode != "lavira_pending"
+            or segment_id <= self.segment_id
+        ):
             raise ValueError("stale or unexpected navigation goal")
+        self.segment_id = segment_id
         self.mode = "lavira_nav"
-        return NavigationControlAction(generation, "nav_goal")
+        return NavigationControlAction(
+            generation,
+            "nav_goal",
+            segment_id=segment_id,
+        )
+
+    def accept_heading_goal(
+        self, parameters: Mapping[str, object]
+    ) -> NavigationControlAction:
+        action = self.accept_goal(parameters)
+        return NavigationControlAction(
+            action.generation,
+            "heading_goal",
+            segment_id=action.segment_id,
+        )
+
+    def accept_lavira_depth_request(self, parameters: Mapping[str, object]) -> bool:
+        generation = int(parameters["generation"])
+        segment_id = int(parameters.get("segment_id", self.segment_id))
+        return (
+            generation == self.generation
+            and self.mode == "lavira_pending"
+            and segment_id == self.segment_id
+        )
 
     def accept_lavira_rgbd_captured(self, parameters: Mapping[str, object]) -> bool:
         """Validate LaViRA's DA lease release without changing navigation state."""
 
         generation = int(parameters["generation"])
-        return generation == self.generation and self.mode == "lavira_pending"
+        segment_id = int(parameters.get("segment_id", self.segment_id))
+        return (
+            generation == self.generation
+            and self.mode == "lavira_pending"
+            and segment_id == self.segment_id
+        )
 
     def accept_base_pose_velocity(
         self,
@@ -363,13 +401,23 @@ class NavigationControlState:
         payload: Mapping[str, object],
         *,
         owner: str | None = None,
+        agent_final: bool = True,
     ) -> bool:
         if int(payload.get("generation", -1)) != self.generation:
             return False
         if owner is not None and self.owner != owner:
             return False
+        if owner == "lavira" and not agent_final:
+            if int(payload.get("segment_id", 0)) != self.segment_id:
+                return False
+            if self.mode != "lavira_nav":
+                return False
         if payload.get("state") in {"reached", "failed", "stopped"}:
-            self.mode = "listen_wasd"
+            self.mode = (
+                "listen_wasd"
+                if agent_final or owner != "lavira"
+                else "lavira_pending"
+            )
             self.manual_velocity = (0.0, 0.0, 0.0)
             self.manual_deadline = 0.0
         return True

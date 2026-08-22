@@ -11,8 +11,6 @@ from typing import Mapping
 
 import zmq
 
-from gear_sonic.runtime.profile import RuntimeProfile, load_runtime_profile
-from gear_sonic.runtime.protocol import OperatorCommand
 from gear_sonic.runtime.gateway.control import (
     BASE_POSE_RUNTIME_STATUS_COMMAND,
     ControlGatewayCore,
@@ -20,7 +18,8 @@ from gear_sonic.runtime.gateway.control import (
     NavigationControlAction,
     NavigationControlState,
 )
-from gear_sonic.runtime.protocol import build_navigation_message
+from gear_sonic.runtime.profile import RuntimeProfile, load_runtime_profile
+from gear_sonic.runtime.protocol import OperatorCommand, build_navigation_message
 from gear_sonic.runtime.telemetry import build_event, configure_file_logging, emit_event
 
 
@@ -128,6 +127,7 @@ def run_control_gateway(profile: RuntimeProfile) -> None:
             build_navigation_message(
                 mode=action.mode,
                 generation=action.generation,
+                segment_id=action.segment_id,
                 velocity=action.velocity,
                 source=source,
             )
@@ -135,6 +135,7 @@ def run_control_gateway(profile: RuntimeProfile) -> None:
         if action.agent_event is not None:
             event_parameters: dict[str, object] = {
                 "generation": action.generation,
+                "segment_id": action.segment_id,
             }
             if action.reason:
                 event_parameters["reason"] = action.reason
@@ -174,6 +175,23 @@ def run_control_gateway(profile: RuntimeProfile) -> None:
                                 source=command.metadata.source,
                                 input_key="Space" if key == " " else key.upper(),
                             )
+                        elif command.name == "lavira_depth_request":
+                            if command.metadata.source != "lavira_agent":
+                                raise ValueError(
+                                    "LaViRA depth request requires lavira_agent source"
+                                )
+                            if not navigation.accept_lavira_depth_request(
+                                command.parameters
+                            ):
+                                raise ValueError("stale LaViRA depth request")
+                            dispatch_navigation_event(
+                                "lavira_depth_request", dict(command.parameters)
+                            )
+                            show_command(
+                                command,
+                                "LAVIRA_DEPTH_REQUEST",
+                                "LaViRA depth lease acquired",
+                            )
                         elif command.name == "lavira_rgbd_captured":
                             if command.metadata.source != "lavira_agent":
                                 raise ValueError(
@@ -183,6 +201,9 @@ def run_control_gateway(profile: RuntimeProfile) -> None:
                                 command.parameters
                             ):
                                 raise ValueError("stale LaViRA RGB-D completion")
+                            dispatch_navigation_event(
+                                "lavira_rgbd_captured", dict(command.parameters)
+                            )
                             show_command(command, "LAVIRA_RGBD_CAPTURED", "LaViRA RGB-D captured")
                         elif command.name == "navigation_goal":
                             action = navigation.accept_goal(command.parameters)
@@ -193,6 +214,7 @@ def run_control_gateway(profile: RuntimeProfile) -> None:
                                 build_navigation_message(
                                     mode=action.mode,
                                     generation=action.generation,
+                                    segment_id=action.segment_id,
                                     goal_base=goal,
                                     target=str(command.parameters.get("target", "")),
                                     target_type=str(
@@ -205,11 +227,44 @@ def run_control_gateway(profile: RuntimeProfile) -> None:
                             )
                             dispatch_navigation_event(
                                 "navigation_goal",
-                                {"generation": action.generation},
+                                {
+                                    "generation": action.generation,
+                                    "segment_id": action.segment_id,
+                                },
                             )
                             show_command(command, "NAVIGATION_GOAL", "navigation goal accepted",
                                          goal_base=goal, target=command.parameters.get("target"),
                                          confidence=command.parameters.get("confidence"))
+                        elif command.name == "navigation_heading_goal":
+                            if command.metadata.source != "lavira_agent":
+                                raise ValueError(
+                                    "heading goal requires lavira_agent source"
+                                )
+                            action = navigation.accept_heading_goal(command.parameters)
+                            heading_delta_rad = float(
+                                command.parameters["heading_delta_rad"]
+                            )
+                            navigation_pub.send_string(
+                                build_navigation_message(
+                                    mode=action.mode,
+                                    generation=action.generation,
+                                    segment_id=action.segment_id,
+                                    heading_delta_rad=heading_delta_rad,
+                                )
+                            )
+                            dispatch_navigation_event(
+                                "navigation_heading_goal",
+                                {
+                                    "generation": action.generation,
+                                    "segment_id": action.segment_id,
+                                },
+                            )
+                            show_command(
+                                command,
+                                "NAVIGATION_HEADING_GOAL",
+                                "heading goal accepted",
+                                heading_delta_rad=heading_delta_rad,
+                            )
                         elif command.name == "navigation_agent_status":
                             if command.metadata.source != "lavira_agent":
                                 raise ValueError("navigation status requires lavira_agent source")
@@ -222,15 +277,14 @@ def run_control_gateway(profile: RuntimeProfile) -> None:
                                 build_navigation_message(
                                     mode="stop",
                                     generation=generation,
+                                    segment_id=int(
+                                        command.parameters.get("segment_id", 0)
+                                    ),
                                 )
                             )
                             dispatch_navigation_event(
                                 "navigation_status",
-                                {
-                                    "generation": generation,
-                                    "state": str(command.parameters.get("state", "failed")),
-                                    "reason": str(command.parameters.get("reason", "")),
-                                },
+                                dict(command.parameters),
                             )
                             state = str(command.parameters.get("state", "failed"))
                             level = logging.ERROR if state == "failed" else logging.INFO
@@ -299,6 +353,9 @@ def run_control_gateway(profile: RuntimeProfile) -> None:
                         if command.name not in {
                             "navigation_key",
                             "navigation_goal",
+                            "navigation_heading_goal",
+                            "lavira_depth_request",
+                            "lavira_rgbd_captured",
                             "navigation_agent_status",
                             "base_pose_velocity",
                             "base_pose_status",
@@ -312,7 +369,11 @@ def run_control_gateway(profile: RuntimeProfile) -> None:
             if navigation_status_sub in events:
                 try:
                     payload = navigation_status_sub.recv_json()
-                    if navigation.accept_status(payload):
+                    if navigation.accept_status(
+                        payload,
+                        owner="lavira",
+                        agent_final=False,
+                    ):
                         dispatch_navigation_event("navigation_status", dict(payload))
                         state = str(payload.get("state", "unknown"))
                         level = logging.ERROR if state == "failed" else logging.INFO

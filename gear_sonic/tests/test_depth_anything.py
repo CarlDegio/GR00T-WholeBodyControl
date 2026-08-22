@@ -89,9 +89,13 @@ def test_depth_anything_gate_only_runs_for_lavira_capture() -> None:
     gate = DepthAnythingInferenceGate()
     assert not gate.active
 
-    assert gate.apply("start_navigation", {"generation": 1})
+    assert gate.apply(
+        "lavira_depth_request", {"generation": 1, "segment_id": 2}
+    )
     assert gate.active and gate.owner == "lavira"
-    assert gate.apply("lavira_rgbd_captured", {"generation": 1})
+    assert gate.apply(
+        "lavira_rgbd_captured", {"generation": 1, "segment_id": 2}
+    )
     assert not gate.active
 
     assert not gate.apply("start_base_pose", {"generation": 2})

@@ -2,14 +2,14 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 import base64
+from dataclasses import dataclass
 import json
 import logging
 import math
 import os
 import time
-from typing import Any, Callable, Mapping
+from typing import Any, Callable
 
 import cv2
 import numpy as np
@@ -25,7 +25,6 @@ from gear_sonic.utils.inference.lavira.geometry import (
     POLICY_FRAME_INDEX,
     build_object_nav_geometry_from_frames,
 )
-
 
 LOGGER = logging.getLogger("sonic.lavira")
 
@@ -99,9 +98,17 @@ class SensorGatewayRGBDCamera:
         )
         self._owns_client = client is None
         self._last_timestamp_ns: int | None = None
+        self._last_rgb_timestamp_ns: int | None = None
+        self._expected_generation: int | None = None
+        self._expected_segment_id: int | None = None
 
     @staticmethod
-    def _decode(snapshot) -> RGBDSnapshot:
+    def _decode(
+        snapshot,
+        *,
+        expected_generation: int | None = None,
+        expected_segment_id: int | None = None,
+    ) -> RGBDSnapshot:
         rgb_frame = snapshot.snapshot.frames[SensorGatewayRGBDCamera.RGB_STREAM]
         depth_frame = snapshot.snapshot.frames[SensorGatewayRGBDCamera.DEPTH_STREAM]
         rgb = np.asarray(snapshot.arrays[SensorGatewayRGBDCamera.RGB_STREAM])
@@ -147,6 +154,18 @@ class SensorGatewayRGBDCamera:
             raise ObjectNavCameraError(
                 "Gateway Depth Anything frame is not owned by LaViRA"
             )
+        if expected_generation is not None and int(
+            info.get("inference_generation", -1)
+        ) != int(expected_generation):
+            raise ObjectNavCameraError(
+                "Gateway Depth Anything frame belongs to a stale generation"
+            )
+        if expected_segment_id is not None and int(
+            info.get("inference_segment_id", -1)
+        ) != int(expected_segment_id):
+            raise ObjectNavCameraError(
+                "Gateway Depth Anything frame belongs to a stale segment"
+            )
         if (width, height) != (rgb.shape[1], rgb.shape[0]):
             raise ObjectNavCameraError("Gateway camera_info dimensions do not match RGB-D")
         return RGBDSnapshot(
@@ -175,7 +194,11 @@ class SensorGatewayRGBDCamera:
                 depth_frame = snapshot.snapshot.frames[self.DEPTH_STREAM]
                 timestamp_ns = depth_frame.source_timestamp_ns
                 if self._last_timestamp_ns is None or timestamp_ns != self._last_timestamp_ns:
-                    decoded = self._decode(snapshot)
+                    decoded = self._decode(
+                        snapshot,
+                        expected_generation=self._expected_generation,
+                        expected_segment_id=self._expected_segment_id,
+                    )
                     self._last_timestamp_ns = timestamp_ns
                     return decoded
             except (SensorGatewayClientError, ObjectNavCameraError) as exc:
@@ -183,6 +206,49 @@ class SensorGatewayRGBDCamera:
             time.sleep(0.01)
         raise ObjectNavCameraError(
             f"timed out waiting for fresh Gateway RGB-D: {last_error or 'no new frame'}"
+        )
+
+    def begin_depth_lease(self, generation: int, segment_id: int) -> None:
+        self._expected_generation = int(generation)
+        self._expected_segment_id = int(segment_id)
+        self._last_timestamp_ns = None
+
+    def capture_rgb(self, timeout_ms: int | None = None) -> np.ndarray:
+        """Capture one fresh chest RGB frame without acquiring a depth lease."""
+        effective_timeout = self.timeout_ms if timeout_ms is None else int(timeout_ms)
+        deadline = time.monotonic() + effective_timeout / 1000.0
+        last_error: Exception | None = None
+        while time.monotonic() < deadline:
+            try:
+                snapshot = self.client.read_snapshot(
+                    SnapshotRequest(
+                        streams=(self.RGB_STREAM,),
+                        max_age_ms=self.max_age_ms,
+                        max_skew_ms=0.0,
+                        timestamp_basis=TimestampBasis.SOURCE,
+                    ),
+                    retries=1,
+                )
+                frame = snapshot.snapshot.frames[self.RGB_STREAM]
+                timestamp_ns = frame.source_timestamp_ns
+                rgb = np.asarray(snapshot.arrays[self.RGB_STREAM])
+                if rgb.ndim != 3 or rgb.shape[2] != 3 or rgb.dtype != np.uint8:
+                    raise ObjectNavCameraError(
+                        f"Gateway chest RGB must be HxWx3 uint8, got "
+                        f"{rgb.shape} {rgb.dtype}"
+                    )
+                if (
+                    self._last_rgb_timestamp_ns is None
+                    or timestamp_ns != self._last_rgb_timestamp_ns
+                ):
+                    self._last_rgb_timestamp_ns = timestamp_ns
+                    return cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
+            except (SensorGatewayClientError, ObjectNavCameraError) as exc:
+                last_error = exc
+            time.sleep(0.01)
+        raise ObjectNavCameraError(
+            f"timed out waiting for fresh Gateway chest RGB: "
+            f"{last_error or 'no new frame'}"
         )
 
     def close(self) -> None:
@@ -307,8 +373,8 @@ class QwenVLBBoxClient:
                 "Qwen-VL requires the DASHSCOPE_API_KEY environment variable"
             )
         try:
-            from openai import OpenAI
             import httpx
+            from openai import OpenAI
         except ImportError as exc:
             raise RuntimeError(
                 "Qwen-VL requires the openai and httpx packages; install the inference extra"

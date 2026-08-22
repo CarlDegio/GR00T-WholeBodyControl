@@ -1,17 +1,19 @@
 from __future__ import annotations
 
 import threading
+import time
 
 import pytest
 
+from gear_sonic.utils.inference.lavira.agent import LaViRAAgentCancelled
+from gear_sonic.utils.inference.lavira.object_nav import ObjectNavResult
 from gear_sonic.utils.inference.lavira.service import (
     LaviraPlannerConfig,
     LaviraPlannerRuntime,
     WorkerResult,
-    run_inference_worker,
     result_to_goal,
+    run_inference_worker,
 )
-from gear_sonic.utils.inference.lavira.object_nav import ObjectNavResult
 
 
 def nav_result(
@@ -36,11 +38,15 @@ def runtime_with_intents():
     return runtime, intents
 
 
-def test_lavira_config_exposes_only_qwenvl_policy_settings() -> None:
+def test_lavira_config_exposes_dual_local_agent_endpoints() -> None:
     config = LaviraPlannerConfig("find chair", "chair")
 
-    assert config.qwenvl_model == "qwen3-vl-32b-instruct"
-    assert config.qwenvl_timeout_seconds == 180.0
+    assert config.task_type == "object_nav"
+    assert config.la_model == "Qwen3.5-27B-Q4_K_M"
+    assert config.va_model == "Qwen3.5-27B-Q4_K_M"
+    assert config.la_base_url.endswith(":8000/v1")
+    assert config.va_base_url.endswith(":8001/v1")
+    assert not hasattr(config, "qwenvl_model")
     assert not hasattr(config, "vision_backend")
     assert not hasattr(config, "model")
     assert not hasattr(config, "debug")
@@ -70,7 +76,7 @@ def test_worker_result_publishes_goal_not_timed_velocity_sequence() -> None:
     assert "duration_s" not in parameters
 
 
-def test_current_worker_result_returns_timing_for_main_thread_publish() -> None:
+def test_retired_single_cycle_result_is_still_accepted_without_timing_publish() -> None:
     runtime, _ = runtime_with_intents()
     runtime.start_navigation(1)
     timing = {"camera_rgbd": 0.1, "api_inference": 1.5, "total": 1.7}
@@ -78,11 +84,7 @@ def test_current_worker_result_returns_timing_for_main_thread_publish() -> None:
     result.geometry["timing_s"] = timing
     runtime.results.put(WorkerResult(1, result, None))
 
-    assert runtime.tick() == {
-        "camera_rgbd": 100.0,
-        "api_inference": 1500.0,
-        "total": 1700.0,
-    }
+    assert runtime.tick() is None
 
 
 def test_space_invalidates_generation_and_late_worker_result() -> None:
@@ -116,13 +118,20 @@ def test_new_worker_result_replaces_stale_full_queue_entry() -> None:
     assert runtime.results.get_nowait() is current
 
 
-def test_current_generation_status_returns_to_listen_but_stale_status_is_ignored() -> None:
+def test_current_segment_status_wakes_agent_but_does_not_end_generation() -> None:
     runtime, _ = runtime_with_intents()
     runtime.start_navigation(1)
     assert not runtime.accept_status({"type": "sonic_navigation_status", "generation": 0, "state": "reached"})
     assert runtime.phase == "nav"
-    assert runtime.accept_status({"type": "sonic_navigation_status", "generation": 1, "state": "reached"})
-    assert runtime.phase == "listen_wasd"
+    assert runtime.accept_status(
+        {
+            "type": "sonic_navigation_status",
+            "generation": 1,
+            "segment_id": 0,
+            "state": "reached",
+        }
+    )
+    assert runtime.phase == "nav"
 
 
 def test_worker_releases_da_after_rgbd_capture() -> None:
@@ -155,3 +164,27 @@ def test_worker_releases_da_after_rgbd_capture() -> None:
     assert result.result is not None
     assert result.error is None
     assert ("lavira_rgbd_captured", {"generation": 1}) in intents
+
+
+def test_space_wakes_segment_wait_and_invalidates_late_status() -> None:
+    runtime, _ = runtime_with_intents()
+    runtime.start_navigation(1)
+    errors: list[Exception] = []
+
+    def wait() -> None:
+        try:
+            runtime.wait_status(1, 3, 10.0)
+        except Exception as exc:
+            errors.append(exc)
+
+    waiter = threading.Thread(target=wait)
+    waiter.start()
+    time.sleep(0.01)
+    runtime.cancel(2, "operator_stop")
+    waiter.join(timeout=0.5)
+
+    assert len(errors) == 1
+    assert isinstance(errors[0], LaViRAAgentCancelled)
+    assert not runtime.accept_status(
+        {"generation": 1, "segment_id": 3, "state": "reached"}
+    )

@@ -14,16 +14,16 @@ from typing import Any, Mapping, Sequence
 import numpy as np
 
 from gear_sonic.camera.constants import PRODUCTION_JPEG_QUALITY
-from gear_sonic.utils.inference.navdp.control import LatestMessageWorker
-from gear_sonic.utils.inference.navdp.navigation import Pose2D, update_slam_map
-from gear_sonic.utils.inference.navdp.visualization import filter_livox_points
 from gear_sonic.runtime.gateway.sensor_client import (
     MaterializedSnapshot,
     SensorGatewayClient,
 )
+from gear_sonic.runtime.gateway.snapshot import SnapshotRequest
 from gear_sonic.runtime.profile import load_runtime_profile
 from gear_sonic.runtime.protocol import SharedMemoryFrame
-from gear_sonic.runtime.gateway.snapshot import SnapshotRequest
+from gear_sonic.utils.inference.navdp.control import LatestMessageWorker
+from gear_sonic.utils.inference.navdp.navigation import Pose2D, update_slam_map
+from gear_sonic.utils.inference.navdp.visualization import filter_livox_points
 
 LOGGER = logging.getLogger("sonic.navdp")
 
@@ -43,6 +43,10 @@ class NavDPPlannerConfig:
     odometry_timeout_s: float
     trajectory_timeout_s: float
     request_timeout_s: float
+    heading_angular_speed_rad_s: float
+    heading_tolerance_deg: float
+    heading_stable_frames: int
+    heading_timeout_s: float
     profile: str = ""
     overlay: tuple[str, ...] = ()
 

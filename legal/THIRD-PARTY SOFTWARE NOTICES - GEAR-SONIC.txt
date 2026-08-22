@@ -18,3 +18,25 @@
 # - robosuite (Apache 2.0)
 # - tmux-plugins/tpm (MIT)
 # - BeyondMimic (MIT)
+
+Uni-LaViRA
+-----------
+
+The file `gear_sonic/utils/inference/lavira/agent.py` contains prompt and
+LA/VA orchestration portions adapted from Uni-LaViRA public commit 215e7aca:
+
+  https://github.com/NJU-R-L-Group-Embodied-Lab/uni-lavira-code
+
+Uni-LaViRA is by Hongyu Ding et al. Copyright the Uni-LaViRA contributors.
+Licensed under the Creative Commons
+Attribution-NonCommercial-ShareAlike 4.0 International license
+(CC BY-NC-SA 4.0):
+
+  https://creativecommons.org/licenses/by-nc-sa/4.0/legalcode
+
+The adapted material is not relicensed under Apache-2.0. Use of that material
+is limited to non-commercial purposes, requires attribution, and adaptations
+must be distributed under the same license. Changes in this repository replace
+the original four-camera, robot-driver, ROS1, iPlanner, Unitree SDK, Web/voice,
+and direct-velocity integration with a single chest camera and the existing
+ControlGateway -> NavDP -> PlannerVelocityExecutor -> SONIC safety chain.

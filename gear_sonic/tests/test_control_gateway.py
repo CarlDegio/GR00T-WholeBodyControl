@@ -191,6 +191,65 @@ def test_lavira_rgbd_release_is_valid_only_during_pending_target_confirmation() 
     )
 
 
+def test_lavira_generation_accepts_monotonic_segments_until_agent_final() -> None:
+    state = NavigationControlState()
+    started = state.handle_key("n", now=1.0)
+
+    heading = state.accept_heading_goal(
+        {
+            "generation": started.generation,
+            "segment_id": 0,
+            "heading_delta_rad": 1.57,
+        }
+    )
+    assert heading.mode == "heading_goal"
+    assert state.accept_status(
+        {
+            "generation": started.generation,
+            "segment_id": 0,
+            "state": "reached",
+        },
+        owner="lavira",
+        agent_final=False,
+    )
+    assert state.mode == "lavira_pending"
+    assert state.accept_lavira_depth_request(
+        {"generation": started.generation, "segment_id": 0}
+    )
+    assert state.accept_lavira_rgbd_captured(
+        {"generation": started.generation, "segment_id": 0}
+    )
+
+    goal = state.accept_goal(
+        {"generation": started.generation, "segment_id": 1}
+    )
+    assert goal.segment_id == 1
+    assert not state.accept_status(
+        {
+            "generation": started.generation,
+            "segment_id": 0,
+            "state": "reached",
+        },
+        owner="lavira",
+        agent_final=False,
+    )
+    assert state.accept_status(
+        {
+            "generation": started.generation,
+            "segment_id": 1,
+            "state": "reached",
+        },
+        owner="lavira",
+        agent_final=False,
+    )
+    assert state.mode == "lavira_pending"
+    assert state.accept_status(
+        {"generation": started.generation, "state": "reached"},
+        owner="lavira",
+    )
+    assert state.mode == "listen_wasd"
+
+
 def test_base_pose_velocity_is_bounded_and_times_out_safe() -> None:
     state = NavigationControlState(base_pose_command_timeout_s=0.2)
     started = state.handle_key("b", now=1.0)

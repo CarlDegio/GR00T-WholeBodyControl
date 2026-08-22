@@ -33,14 +33,15 @@ from gear_sonic.utils.inference.navdp.control import (
 from gear_sonic.utils.inference.navdp.gateway import (
     NavDPPlannerConfig,
     NavDPSensorGatewayIngress,
-    load_navdp_planner_config,
     _control_freshness_snapshot,
     _navdp_request,
     _reset_navdp,
     _SharedSensors,
+    load_navdp_planner_config,
 )
 from gear_sonic.utils.inference.navdp.navigation import (
     STATUS_TYPE,
+    HeadingGoalController,
     Pose2D,
     base_goal_to_world,
     closest_timestamped_pose,
@@ -66,6 +67,7 @@ def main(config: NavDPPlannerConfig) -> None:
     navdp_endpoint = profile.endpoint_uri("xnavdp_http")
     sensor_endpoint = profile.endpoint_uri("sensor_gateway_metadata")
     import zmq
+
     from gear_sonic.runtime.gateway.visualization import (
         NAVDP_ACTOR_RAY_STREAM,
         NAVDP_SLAM_2D_STREAM,
@@ -104,6 +106,7 @@ def main(config: NavDPPlannerConfig) -> None:
     )
     gateway.start()
     generation = 0
+    segment_id = 0
     mode = "stop"
     world_goal: tuple[float, float] | None = None
     current_local_goal = (0.0, 0.0)
@@ -116,7 +119,7 @@ def main(config: NavDPPlannerConfig) -> None:
     navdp_initialized = False
     inference_busy = False
     inference_result: queue.Queue[
-        tuple[int, np.ndarray | None, Pose2D | None, str | None, float]
+        tuple[int, int, np.ndarray | None, Pose2D | None, str | None, float]
     ] = queue.Queue(maxsize=1)
     nav_fastlio_reference_yaw: float | None = None
     fastlio_target_heading: float | None = None
@@ -131,6 +134,13 @@ def main(config: NavDPPlannerConfig) -> None:
     server_error = ""
     mpc_error = ""
     last_stale_reason: str | None = None
+    heading_controller = HeadingGoalController(
+        angular_speed_rad_s=config.heading_angular_speed_rad_s,
+        tolerance_rad=math.radians(config.heading_tolerance_deg),
+        stable_frames=config.heading_stable_frames,
+        timeout_s=config.heading_timeout_s,
+    )
+    heading_result = None
 
     def report_event(level: int, code: str, message: str, **fields: object) -> None:
         emit_event(
@@ -154,20 +164,23 @@ def main(config: NavDPPlannerConfig) -> None:
                 "type": STATUS_TYPE,
                 "version": 1,
                 "generation": generation,
+                "segment_id": segment_id,
                 "state": state,
                 "reason": reason,
             }
         )
         LOGGER.log(
             logging.ERROR if state == "failed" else logging.INFO,
-            "navigation status=%s generation=%d reason=%s",
+            "navigation status=%s generation=%d segment=%d reason=%s",
             state,
             generation,
+            segment_id,
             reason,
         )
 
     def infer(
         request_generation: int,
+        request_segment_id: int,
         rgb: np.ndarray,
         depth: np.ndarray,
         goal: tuple[float, float],
@@ -186,6 +199,7 @@ def main(config: NavDPPlannerConfig) -> None:
             )
             item = (
                 request_generation,
+                request_segment_id,
                 result,
                 inference_pose,
                 None,
@@ -194,6 +208,7 @@ def main(config: NavDPPlannerConfig) -> None:
         except Exception as exc:
             item = (
                 request_generation,
+                request_segment_id,
                 None,
                 inference_pose,
                 str(exc),
@@ -217,10 +232,15 @@ def main(config: NavDPPlannerConfig) -> None:
             loop_started = time.monotonic()
             while commands.poll(0):
                 command = decode_navigation_message(commands.recv())
-                if command.generation < generation:
+                if command.generation < generation or (
+                    command.generation == generation
+                    and command.segment_id < segment_id
+                ):
                     continue
                 generation = command.generation
+                segment_id = command.segment_id
                 mode = command.mode
+                heading_result = None
                 trajectory = np.empty((0, 2), dtype=np.float32)
                 trajectory_time = 0.0
                 invalid_count = 0
@@ -239,7 +259,7 @@ def main(config: NavDPPlannerConfig) -> None:
                     world_goal = None
                 elif mode == "stop":
                     world_goal = None
-                else:
+                elif mode == "nav_goal":
                     with sensors.lock:
                         pose = sensors.pose
                     if pose is None or command.goal_base is None:
@@ -251,6 +271,23 @@ def main(config: NavDPPlannerConfig) -> None:
                         fastlio_target_heading = pose.yaw
                         send_metrics({}, activate=True)
                         send_status("active", "goal_accepted")
+                else:
+                    with sensors.lock:
+                        pose = sensors.pose
+                    if pose is None or command.heading_delta_rad is None:
+                        mode = "stop"
+                        send_status("failed", "odometry_unavailable")
+                    else:
+                        world_goal = None
+                        nav_fastlio_reference_yaw = pose.yaw
+                        fastlio_target_heading = None
+                        heading_controller.start(
+                            current_yaw=pose.yaw,
+                            delta_rad=command.heading_delta_rad,
+                            now=time.monotonic(),
+                        )
+                        send_metrics({}, activate=True)
+                        send_status("active", "heading_goal_accepted")
 
             gateway_camera = gateway.poll_camera()
             if gateway_camera is not None:
@@ -285,10 +322,21 @@ def main(config: NavDPPlannerConfig) -> None:
                         server_error = message
 
             while not inference_result.empty():
-                result_generation, result, inference_pose, error, elapsed_s = (
+                (
+                    result_generation,
+                    result_segment_id,
+                    result,
+                    inference_pose,
+                    error,
+                    elapsed_s,
+                ) = (
                     inference_result.get_nowait()
                 )
-                if result_generation != generation or mode != "nav_goal":
+                if (
+                    result_generation != generation
+                    or result_segment_id != segment_id
+                    or mode != "nav_goal"
+                ):
                     continue
                 send_metrics({"policy_inference": elapsed_s * 1000.0})
                 if error or result is None:
@@ -364,6 +412,7 @@ def main(config: NavDPPlannerConfig) -> None:
                         target=infer,
                         args=(
                             generation,
+                            segment_id,
                             latest_rgb.copy(),
                             latest_depth.copy(),
                             current_local_goal,
@@ -442,6 +491,27 @@ def main(config: NavDPPlannerConfig) -> None:
                     mpc_linear_velocity,
                     mpc_angular_velocity,
                 )
+            elif mode == "heading_goal":
+                if pose is None or now - pose_time > config.odometry_timeout_s:
+                    velocity = (0.0, 0.0, 0.0)
+                    mode = "stop"
+                    send_status("failed", "odometry_timeout")
+                else:
+                    heading_result = heading_controller.update(
+                        current_yaw=pose.yaw,
+                        now=now,
+                    )
+                    fastlio_target_heading = heading_result.target_rad
+                    nav_fastlio_reference_yaw = heading_result.reference_rad
+                    velocity = (
+                        0.0,
+                        0.0,
+                        heading_result.angular_velocity_rad_s,
+                    )
+                    if heading_result.state != "active":
+                        mode = "stop"
+                        velocity = (0.0, 0.0, 0.0)
+                        send_status(heading_result.state, heading_result.reason)
             else:
                 velocity = (0.0, 0.0, 0.0)
             pose, pose_time, points = _control_freshness_snapshot(sensors)
@@ -478,7 +548,7 @@ def main(config: NavDPPlannerConfig) -> None:
                     "heading_target_rad": fastlio_target_heading,
                     "heading_reference_rad": nav_fastlio_reference_yaw,
                 }
-                if mode == "nav_goal"
+                if mode in {"nav_goal", "heading_goal"}
                 and fastlio_target_heading is not None
                 and nav_fastlio_reference_yaw is not None
                 else {}
@@ -486,6 +556,7 @@ def main(config: NavDPPlannerConfig) -> None:
             output.send_string(
                 build_planner_velocity_message(
                     generation=generation,
+                    segment_id=segment_id,
                     source="navdp",
                     velocity=velocity,
                     **heading_kwargs,
@@ -538,6 +609,7 @@ def main(config: NavDPPlannerConfig) -> None:
             output.send_string(
                 build_planner_velocity_message(
                     generation=generation,
+                    segment_id=segment_id,
                     source="navdp",
                     velocity=(0.0, 0.0, 0.0),
                 )
@@ -553,6 +625,7 @@ def main(config: NavDPPlannerConfig) -> None:
 
 if __name__ == "__main__":
     import tyro
+
     from gear_sonic.runtime.profile import RuntimeProfileSelection
 
     selection = tyro.cli(RuntimeProfileSelection)

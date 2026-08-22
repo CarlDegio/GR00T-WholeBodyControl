@@ -22,6 +22,7 @@ class SafetySnapshot:
 @dataclass(frozen=True)
 class PlannerExecutorDecision:
     generation: int
+    segment_id: int
     source: str
     requested_velocity: tuple[float, float, float]
     velocity: tuple[float, float, float]
@@ -55,7 +56,10 @@ class PlannerVelocityExecutorCore:
         self.radar_timeout_s = float(radar_timeout_s)
         self.sonic = sonic or SonicPlannerState()
         self.generation = 0
-        self.mode: Literal["stop", "manual_velocity", "nav_goal"] = "stop"
+        self.segment_id = 0
+        self.mode: Literal[
+            "stop", "manual_velocity", "nav_goal", "heading_goal"
+        ] = "stop"
         self.source = "stop"
         self.velocity = (0.0, 0.0, 0.0)
         self.command_timestamp_s = 0.0
@@ -64,9 +68,13 @@ class PlannerVelocityExecutorCore:
         self.navdp_heading_offset_rad: float | None = None
 
     def accept_navigation(self, command: NavigationCommand, *, now: float) -> bool:
-        if command.generation < self.generation:
+        if command.generation < self.generation or (
+            command.generation == self.generation
+            and command.segment_id < self.segment_id
+        ):
             return False
         self.generation = command.generation
+        self.segment_id = command.segment_id
         self.mode = command.mode
         self.command_timestamp_s = float(now)
         self.navdp_heading_target_rad = None
@@ -75,7 +83,7 @@ class PlannerVelocityExecutorCore:
         if command.mode == "manual_velocity":
             self.source = command.source or "manual"
             self.velocity = command.velocity or (0.0, 0.0, 0.0)
-        elif command.mode == "nav_goal":
+        elif command.mode in {"nav_goal", "heading_goal"}:
             self.source = "navdp"
             self.velocity = (0.0, 0.0, 0.0)
         else:
@@ -88,7 +96,9 @@ class PlannerVelocityExecutorCore:
     ) -> bool:
         if (
             self.mode != "nav_goal"
+            and self.mode != "heading_goal"
             or command.generation != self.generation
+            or command.segment_id != self.segment_id
             or command.source != "navdp"
         ):
             return False
@@ -128,7 +138,14 @@ class PlannerVelocityExecutorCore:
             velocity = (0.0, 0.0, 0.0)
             reason = "depth_hard_stop"
 
-        if self.mode == "nav_goal" and self.navdp_heading_target_rad is not None:
+        # A blocked/stale cycle must freeze both translation and the SONIC
+        # heading setpoint.  Otherwise a fresh heading target could still turn
+        # the robot while lidar/depth safety is holding velocity at zero.
+        if (
+            self.mode in {"nav_goal", "heading_goal"}
+            and reason == "clear"
+            and self.navdp_heading_target_rad is not None
+        ):
             if self.navdp_heading_offset_rad is None:
                 assert self.navdp_heading_reference_rad is not None
                 self.navdp_heading_offset_rad = math.remainder(
@@ -145,6 +162,7 @@ class PlannerVelocityExecutorCore:
         )
         return PlannerExecutorDecision(
             generation=self.generation,
+            segment_id=self.segment_id,
             source=self.source,
             requested_velocity=requested,
             velocity=velocity,

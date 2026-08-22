@@ -1,1 +1,1 @@
-"""LaViRA object-navigation and metric-depth runtime."""
+"""Uni-LaViRA VLN/ObjectNav/EQA agent and leased metric-depth runtime."""

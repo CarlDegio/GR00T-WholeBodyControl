@@ -74,21 +74,13 @@ def test_profile_parameters_match_current_process_defaults() -> None:
 
     vla_profile = profile.component("vla")
     assert vla_profile["sensor_gateway_poll_hz"] == vla.sensor_gateway_poll_hz
-    assert (
-        vla_profile["sensor_gateway_request_timeout_ms"]
-        == vla.sensor_gateway_request_timeout_ms
-    )
+    assert vla_profile["sensor_gateway_request_timeout_ms"] == vla.sensor_gateway_request_timeout_ms
     assert vla_profile["sensor_gateway_max_age_ms"] == vla.sensor_gateway_max_age_ms
-    assert (
-        vla_profile["sensor_gateway_max_skew_ms"]
-        == vla.sensor_gateway_max_skew_ms
-    )
+    assert vla_profile["sensor_gateway_max_skew_ms"] == vla.sensor_gateway_max_skew_ms
 
     assert profile.component("lavira")["camera_timeout_ms"] == lavira.camera_timeout_ms
-    assert (
-        profile.component("lavira")["qwenvl_timeout_seconds"]
-        == lavira.qwenvl_timeout_seconds
-    )
+    assert profile.component("lavira")["la_timeout_seconds"] == lavira.la_timeout_seconds
+    assert profile.component("lavira")["va_base_url"] == lavira.va_base_url
     assert profile.component("lavira")["min_confidence"] == lavira.min_confidence
     assert profile.component("base_pose")["task"] == base_pose.task
     assert (
@@ -101,6 +93,7 @@ def test_profile_parameters_match_current_process_defaults() -> None:
     assert navdp_profile["mpc_hz"] == navdp.mpc_hz
     assert navdp_profile["mpc_result_timeout_s"] == navdp.mpc_result_timeout_s
     assert navdp_profile["heading_preview_s"] == navdp.heading_preview_s
+    assert navdp_profile["heading_timeout_s"] == navdp.heading_timeout_s
     assert navdp_profile["goal_tolerance_m"] == navdp.goal_tolerance_m
     assert navdp_profile["stop_threshold"] == navdp.stop_threshold
     assert navdp_profile["request_timeout_s"] == navdp.request_timeout_s
@@ -110,10 +103,7 @@ def test_profile_parameters_match_current_process_defaults() -> None:
         == navdp.sensor_gateway_request_timeout_ms
     )
     assert navdp_profile["sensor_gateway_max_age_ms"] == navdp.sensor_gateway_max_age_ms
-    assert (
-        navdp_profile["sensor_gateway_max_skew_ms"]
-        == navdp.sensor_gateway_max_skew_ms
-    )
+    assert navdp_profile["sensor_gateway_max_skew_ms"] == navdp.sensor_gateway_max_skew_ms
     assert navdp_profile["odometry_timeout_s"] == navdp.odometry_timeout_s
     assert navdp_profile["trajectory_timeout_s"] == navdp.trajectory_timeout_s
     assert profile.component("xnavdp_mpc") == XNAVDP_G1_MPC_DEFAULTS
@@ -121,14 +111,8 @@ def test_profile_parameters_match_current_process_defaults() -> None:
     executor_profile = profile.component("planner_executor")
     assert executor_profile["control_hz"] == executor.control_hz
     assert executor_profile["radar_timeout_s"] == executor.radar_timeout_s
-    assert (
-        executor_profile["manual_velocity_timeout_s"]
-        == executor.manual_velocity_timeout_s
-    )
-    assert (
-        executor_profile["navdp_velocity_timeout_s"]
-        == executor.navdp_velocity_timeout_s
-    )
+    assert executor_profile["manual_velocity_timeout_s"] == executor.manual_velocity_timeout_s
+    assert executor_profile["navdp_velocity_timeout_s"] == executor.navdp_velocity_timeout_s
     depth_profile = profile.component("depth_anything")
     assert depth_profile["root"] == depth_anything.root
     assert depth_profile["checkpoint"] == depth_anything.checkpoint
@@ -169,10 +153,7 @@ def test_partial_overlay_changes_only_selected_values(tmp_path) -> None:
     assert profile.component("launcher")["data_exporter"] is False
     assert load_inference_config(overlays=(str(overlay),)).prompt == "pick up the paper ball"
     assert load_lavira_config(overlays=(str(overlay),)).min_confidence == 0.75
-    assert (
-        load_base_pose_config(overlays=(str(overlay),)).raw_head_target_distance_m
-        == 1.1
-    )
+    assert load_base_pose_config(overlays=(str(overlay),)).raw_head_target_distance_m == 1.1
 
 
 def test_profile_rejects_unknown_endpoint_and_port_collisions(tmp_path) -> None:
@@ -208,3 +189,33 @@ def test_profile_rejects_unknown_top_level_fields(tmp_path) -> None:
 
     with pytest.raises(ValueError, match="unknown runtime profile fields"):
         load_runtime_profile(overlays=[overlay])
+
+
+def test_lavira_task_overlays_validate_eqa_and_reject_retired_fields(tmp_path) -> None:
+    missing_question = tmp_path / "missing_question.yaml"
+    missing_question.write_text(
+        "components:\n  lavira:\n    task_type: eqa\n    question: ''\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="question is required for EQA"):
+        load_lavira_config(overlays=(str(missing_question),))
+
+    old_field = tmp_path / "old_field.yaml"
+    old_field.write_text(
+        "components:\n  lavira:\n    qwenvl_model: retired\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="unknown fields: qwenvl_model"):
+        load_lavira_config(overlays=(str(old_field),))
+
+
+@pytest.mark.parametrize("task_type", ["vln", "object_nav", "eqa"])
+def test_lavira_accepts_each_fixed_yaml_task(task_type: str, tmp_path) -> None:
+    overlay = tmp_path / f"{task_type}.yaml"
+    question = "what is visible?" if task_type == "eqa" else "''"
+    overlay.write_text(
+        "components:\n" "  lavira:\n" f"    task_type: {task_type}\n" f"    question: {question}\n",
+        encoding="utf-8",
+    )
+
+    assert load_lavira_config(overlays=(str(overlay),)).task_type == task_type

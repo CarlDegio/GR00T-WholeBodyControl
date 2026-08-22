@@ -27,6 +27,7 @@ import os
 import shlex
 import shutil
 import signal
+import socket
 import subprocess
 import sys
 import time
@@ -640,14 +641,16 @@ def _check_prerequisites(config: InferenceLaunchConfig):
             errors.append(
                 "components.lavira.global_target is required"
             )
-        if (
-            not os.environ.get("DASHSCOPE_API_KEY", "").strip()
-            and not _dotenv_has_nonempty_value(repo_root / ".env.local", "DASHSCOPE_API_KEY")
-        ):
+        task_type = str(lavira["task_type"])
+        if task_type not in {"vln", "object_nav", "eqa"}:
             errors.append(
-                "Qwen-VL requires DASHSCOPE_API_KEY in the launcher environment "
-                "or the gitignored .env.local file"
+                "components.lavira.task_type must be vln, object_nav, or eqa"
             )
+        if task_type == "eqa" and not str(lavira["question"]).strip():
+            errors.append("components.lavira.question is required for EQA")
+        for endpoint_name in ("la_base_url", "va_base_url"):
+            if not str(lavira[endpoint_name]).strip():
+                errors.append(f"components.lavira.{endpoint_name} is required")
         for path, label in (
             (
                 Path(str(navdp["root"])) / "eval" / "src" / "policy_server.py",

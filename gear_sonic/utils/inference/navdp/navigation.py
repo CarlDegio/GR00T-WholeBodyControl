@@ -3,8 +3,8 @@
 
 from __future__ import annotations
 
-import math
 from dataclasses import dataclass
+import math
 from typing import Sequence
 
 import numpy as np
@@ -17,12 +17,114 @@ from gear_sonic.runtime.protocol import (
     decode_navigation_message,
 )
 
+__all__ = [
+    "COMMAND_TYPE",
+    "STATUS_TYPE",
+    "NavigationCommand",
+    "build_navigation_message",
+    "decode_navigation_message",
+    "Pose2D",
+    "HeadingControlResult",
+    "HeadingGoalController",
+    "heading_goal_target",
+    "wrap_angle",
+]
+
 
 @dataclass(frozen=True)
 class Pose2D:
     x: float
     y: float
     yaw: float
+
+
+def wrap_angle(angle_rad: float) -> float:
+    """Wrap an angle to [-pi, pi] while preserving finite validation."""
+    value = float(angle_rad)
+    if not math.isfinite(value):
+        raise ValueError("heading angle must be finite")
+    return math.remainder(value, 2.0 * math.pi)
+
+
+def heading_goal_target(current_yaw: float, delta_rad: float) -> float:
+    """Convert an Agent-relative turn into an absolute Fast-LIO heading."""
+    return wrap_angle(float(current_yaw) + float(delta_rad))
+
+
+@dataclass(frozen=True)
+class HeadingControlResult:
+    state: str
+    angular_velocity_rad_s: float
+    target_rad: float
+    reference_rad: float
+    error_rad: float
+    reason: str
+
+
+class HeadingGoalController:
+    """Deterministic Fast-LIO heading loop used instead of the X-NavDP network."""
+
+    def __init__(
+        self,
+        *,
+        angular_speed_rad_s: float = 0.4,
+        tolerance_rad: float = math.radians(3.0),
+        stable_frames: int = 3,
+        timeout_s: float = 12.0,
+    ) -> None:
+        if not math.isfinite(angular_speed_rad_s) or angular_speed_rad_s <= 0.0:
+            raise ValueError("heading angular speed must be finite and positive")
+        if not math.isfinite(tolerance_rad) or tolerance_rad <= 0.0:
+            raise ValueError("heading tolerance must be finite and positive")
+        if int(stable_frames) <= 0:
+            raise ValueError("heading stable_frames must be positive")
+        if not math.isfinite(timeout_s) or timeout_s <= 0.0:
+            raise ValueError("heading timeout must be finite and positive")
+        self.angular_speed_rad_s = float(angular_speed_rad_s)
+        self.tolerance_rad = float(tolerance_rad)
+        self.stable_frames = int(stable_frames)
+        self.timeout_s = float(timeout_s)
+        self.reference_rad = 0.0
+        self.target_rad = 0.0
+        self.started_at_s = 0.0
+        self._stable_count = 0
+        self._active = False
+
+    def start(self, *, current_yaw: float, delta_rad: float, now: float) -> None:
+        self.reference_rad = wrap_angle(current_yaw)
+        self.target_rad = heading_goal_target(current_yaw, delta_rad)
+        self.started_at_s = float(now)
+        if not math.isfinite(self.started_at_s):
+            raise ValueError("heading start time must be finite")
+        self._stable_count = 0
+        self._active = True
+
+    def update(self, *, current_yaw: float, now: float) -> HeadingControlResult:
+        if not self._active:
+            raise RuntimeError("heading controller has not been started")
+        error = wrap_angle(self.target_rad - float(current_yaw))
+        if float(now) - self.started_at_s > self.timeout_s:
+            self._active = False
+            return HeadingControlResult(
+                "failed", 0.0, self.target_rad, self.reference_rad, error,
+                "heading_timeout",
+            )
+        if abs(error) <= self.tolerance_rad:
+            self._stable_count += 1
+            velocity = 0.0
+        else:
+            self._stable_count = 0
+            velocity = math.copysign(self.angular_speed_rad_s, error)
+        if self._stable_count >= self.stable_frames:
+            self._active = False
+            return HeadingControlResult(
+                "reached", 0.0, self.target_rad, self.reference_rad, error,
+                "heading_stable",
+            )
+        return HeadingControlResult(
+            "active", velocity, self.target_rad, self.reference_rad, error,
+            "heading_tracking",
+        )
 
 
 def base_goal_to_world(goal: Sequence[float], pose: Pose2D) -> tuple[float, float]:
