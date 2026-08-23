@@ -45,11 +45,9 @@ from gear_sonic.runtime.protocol.cpp_control import (
     build_planner_message,
 )
 from gear_sonic.runtime.protocol.pose import (
-    pack_latent_action_message,
     pack_pose_message,
 )
 from gear_sonic.utils.inference.vla.inference import (
-    calculate_latency_compensated_index,
     prepare_observation_for_eval,
 )
 from gear_sonic.utils.inference.vla.ingress import VlaSensorGatewayIngress
@@ -60,6 +58,18 @@ from gear_sonic.utils.inference.vla.poses import (
     VLA_INITIAL_UPPER_BODY_RAD,
 )
 from gear_sonic.utils.inference.vla.safety import VlaSafetyGate
+from gear_sonic.utils.inference.vla.runtime import (
+    _VlaCommandHandler,
+    _VlaRuntimeState,
+    _consume_task_failure,
+    _consume_vla_result,
+    _enforce_active_task_safety,
+    _pose_policy_is_active,
+    _publish_cached_action,
+    _schedule_vla_inference,
+    _should_schedule_vla_inference,
+    get_action_field,
+)
 from gear_sonic.utils.planner_control.executor_service import PlannerSafetySensorMonitor
 from gear_sonic.utils.teleop.solver.hand.g1_gripper_ik_solver import (
     G1GripperInverseKinematicsSolver,
@@ -288,18 +298,6 @@ def wrap_camera_jpeg_for_video(
     }
 
 
-def get_action_field(action_dict: dict, key: str):
-    """Get action field from dict, checking both with and without 'action.' prefix."""
-    value = action_dict.get(key)
-    if value is not None:
-        return value
-    value = action_dict.get(f"action.{key}")
-    if value is not None:
-        return value
-    raise AssertionError(
-        f"Required action field '{key}' (or 'action.{key}') not found in processed_action. "
-        f"Available keys: {list(action_dict.keys())}"
-    )
 
 
 # ---------------------------------------------------------------------------
@@ -484,27 +482,6 @@ def _inference_worker_loop(
                 failure_callback(str(exc))
 
 
-def _pose_policy_is_active(cpp_loop_running: bool, cpp_mode: str, pause_loop: bool) -> bool:
-    """Return whether a fresh VLA inference/action is allowed to run."""
-    return cpp_loop_running and cpp_mode == "POSE" and not pause_loop
-
-
-def _should_schedule_vla_inference(
-    *,
-    cpp_mode: str,
-    worker_is_busy: bool,
-    request_queue_is_empty: bool,
-    time_since_request: float,
-    inference_interval: float,
-) -> bool:
-    """Capture POSE observations even when action publication is paused."""
-
-    return (
-        cpp_mode == "POSE"
-        and not worker_is_busy
-        and request_queue_is_empty
-        and time_since_request >= inference_interval
-    )
 
 
 # ---------------------------------------------------------------------------
@@ -521,7 +498,7 @@ def _compute_closed_hand_joints(side: str) -> np.ndarray:
 
 def main(config: InferenceConfig):
     service = InferenceServiceContext("vla", config)
-    pause_loop = True
+    state = _VlaRuntimeState()
     profile = service.profile
     policy_endpoint = profile.endpoint("policy_server")
     last_event_at: dict[str, float] = {}
@@ -637,20 +614,12 @@ def main(config: InferenceConfig):
     loop_rate = config.action_publish_rate
     loop_period = 1.0 / loop_rate
 
-    # Track C++ control loop state
-    cpp_loop_running = False
-    cpp_mode = "OFF"  # "OFF", "PLANNER", or "POSE"
-
-    # Track initial pose hand states
-    initial_pose_left_hand_closed = False
-    initial_pose_right_hand_closed = False
-
     def _current_upper_body_planner_order(body_q: np.ndarray) -> np.ndarray:
         return np.array([body_q[i] for i in UPPER_BODY_MUJOCO_INDICES], dtype=np.float32)
 
     def publish_initial_pose():
         # Initial pose publishing in PLANNER mode
-        if cpp_mode != "PLANNER" or not cpp_loop_running:
+        if state.cpp_mode != "PLANNER" or not state.cpp_loop_running:
             record_event(
                 logging.WARNING,
                 "INITIAL_POSE_BLOCKED",
@@ -686,12 +655,12 @@ def main(config: InferenceConfig):
 
         left_hand = (
             _compute_closed_hand_joints("L")
-            if initial_pose_left_hand_closed
+            if state.initial_pose_left_hand_closed
             else np.zeros(7, dtype=np.float32)
         )
         right_hand = (
             _compute_closed_hand_joints("R")
-            if initial_pose_right_hand_closed
+            if state.initial_pose_right_hand_closed
             else np.zeros(7, dtype=np.float32)
         )
 
@@ -743,10 +712,9 @@ def main(config: InferenceConfig):
 
     def send_cpp_control_command(start: bool, planner: bool = False):
         """Send C++ control loop start/stop commands via ZMQ."""
-        nonlocal cpp_loop_running, cpp_mode
         try:
             planner_entry_yaw = None
-            if start and planner and cpp_mode != "PLANNER":
+            if start and planner and state.cpp_mode != "PLANNER":
                 discarded = _discard_pending_planner_messages(planner_relay_sub)
                 measured_yaw = _base_yaw_from_state(
                     gateway_ingress.read_state(clear=False)
@@ -761,7 +729,7 @@ def main(config: InferenceConfig):
                     measured_yaw,
                     discarded,
                 )
-            elif start and not planner and cpp_mode != "POSE":
+            elif start and not planner and state.cpp_mode != "POSE":
                 planner_heading_alignment.clear()
 
             cmd_msg = build_command_message(start=start, stop=not start, planner=planner)
@@ -785,11 +753,11 @@ def main(config: InferenceConfig):
                         height=-1.0,
                     )
                 )
-            cpp_loop_running = start
+            state.cpp_loop_running = start
             if start:
-                cpp_mode = "PLANNER" if planner else "POSE"
+                state.cpp_mode = "PLANNER" if planner else "POSE"
             else:
-                cpp_mode = "OFF"
+                state.cpp_mode = "OFF"
             LOGGER.info(
                 "Sent C++ control command: start=%s mode=%s",
                 start,
@@ -810,10 +778,6 @@ def main(config: InferenceConfig):
                 LOGGER.exception("CPP_COMMAND_FAILED | %s", exc)
             return False
 
-    # Async inference state
-    cached_action_chunk = None
-    action_chunk_index = 0
-    last_inference_request_time = 0.0
     inference_interval = 1.0 / config.inference_hz
 
     inference_queue = queue.Queue(maxsize=1)
@@ -826,283 +790,69 @@ def main(config: InferenceConfig):
             return
         inference_failed_event.set()
         inference_failures.put(str(reason))
-    inference_generation = 0
-    active_generation = -1
-
     def invalidate_inference(reason: str):
         """Invalidate cached, queued, and currently-running inference work."""
-        nonlocal cached_action_chunk, action_chunk_index, last_inference_request_time
-        nonlocal inference_generation
-        inference_generation += 1
-        cached_action_chunk = None
-        action_chunk_index = 0
-        last_inference_request_time = 0.0
+        state.inference_generation += 1
+        state.cached_action_chunk = None
+        state.action_chunk_index = 0
+        state.last_inference_request_time = 0.0
         queued = _drain_queue(inference_queue)
         results = _drain_queue(result_queue)
         LOGGER.info(
             "Invalidated inference generation %s: %s (queued=%s results=%s)",
-            inference_generation,
+            state.inference_generation,
             reason,
             queued,
             results,
         )
 
-    zmq_frame_counter = 0
-    task_generation = -1
-    task_skill_id = 0
-    task_window_id = 0
-    task_active = False
-
-    def publish_task_status(state: str, reason: str, *, window_id: int = 0) -> None:
+    def publish_task_status(status_state: str, reason: str, *, window_id: int = 0) -> None:
         task_status_intent.send("vla_task_status", {
-            "generation": task_generation,
-            "skill_id": task_skill_id,
+            "generation": state.task_generation,
+            "skill_id": state.task_skill_id,
             "segment_id": window_id,
-            "state": state,
+            "state": status_state,
             "reason": reason,
         })
 
     def fail_active_task(reason: str, message: str) -> None:
-        nonlocal task_active, pause_loop
-        task_active = False
-        pause_loop = True
+        state.task_active = False
+        state.pause_loop = True
         invalidate_inference(reason)
-        if cpp_mode == "POSE":
+        if state.cpp_mode == "POSE":
             send_cpp_control_command(start=True, planner=True)
-        publish_task_status("failed", reason, window_id=task_window_id)
+        publish_task_status("failed", reason, window_id=state.task_window_id)
         record_event(
             logging.ERROR,
             "VLA_UNEXPECTED_TERMINATION",
             message,
             reason=reason,
-            generation=task_generation,
-            skill_id=task_skill_id,
-            window_id=task_window_id,
+            generation=state.task_generation,
+            skill_id=state.task_skill_id,
+            window_id=state.task_window_id,
         )
-
-    def check_control_input():
-        nonlocal pause_loop, cpp_loop_running, cpp_mode
-        nonlocal initial_pose_left_hand_closed, initial_pose_right_hand_closed
-        nonlocal zmq_frame_counter
-        nonlocal task_generation, task_skill_id, task_window_id, task_active
-
-        command = control_listener.read_command()
-        if command is None:
-            return
-
-        command_name = command.name
-        if command_name in {
-            "start_vla_task",
-            "hold_vla_task",
-            "resume_vla_task",
-            "stop_vla_task",
-            "cancel_navigation",
-        }:
-            generation = int(command.parameters.get("generation", -1))
-            skill_id = int(command.parameters.get("skill_id", 0))
-            window_id = int(command.parameters.get("window_id", 0))
-            identity = (generation, skill_id)
-            active_identity = (task_generation, task_skill_id)
-            if command_name == "cancel_navigation":
-                if generation < task_generation:
-                    return
-                task_generation = generation
-                task_skill_id = 0
-                task_window_id = 0
-                task_active = False
-                pause_loop = True
-                invalidate_inference("navigation cancelled")
-                if cpp_mode == "POSE":
-                    send_cpp_control_command(start=True, planner=True)
-                return
-            if command_name == "start_vla_task":
-                if identity < active_identity:
-                    return
-                if identity == active_identity:
-                    return  # idempotent duplicate
-                prompt = command.parameters.get("handoff_context")
-                original_task = command.parameters.get("task")
-                if not isinstance(prompt, str) or not prompt.strip():
-                    record_event(logging.ERROR, "VLA_TASK_REJECTED", "Missing VLA handoff context")
-                    return
-                if not isinstance(original_task, str) or not original_task.strip():
-                    record_event(logging.ERROR, "VLA_TASK_REJECTED", "Missing original task")
-                    return
-                safety_reason = vla_safety_gate.reason(
-                    now=time.monotonic(),
-                    safety=vla_safety_monitor.snapshot(),
-                    robot_state_timestamp_s=(
-                        vla_safety_monitor.orientation_snapshot().received_at_s
-                    ),
-                )
-                if safety_reason != "clear":
-                    record_event(
-                        logging.ERROR,
-                        "VLA_SAFETY_BLOCKED",
-                        "VLA task start rejected by the shared safety gate",
-                        reason=safety_reason,
-                        generation=generation,
-                        skill_id=skill_id,
-                    )
-                    task_status_intent.send("vla_task_status", {
-                        "generation": generation,
-                        "skill_id": skill_id,
-                        "segment_id": window_id,
-                        "state": "failed",
-                        "reason": safety_reason,
-                    })
-                    return
-                task_generation, task_skill_id = identity
-                task_window_id = 0
-                task_active = True
-                while not inference_failures.empty():
-                    try:
-                        inference_failures.get_nowait()
-                    except queue.Empty:
-                        break
-                inference_failed_event.clear()
-                if not n1_policy.ping(timeout_ms=1000):
-                    fail_active_task(
-                        "vla_policy_unreachable",
-                        "PolicyServer was unreachable when MANIPULATE started",
-                    )
-                    return
-                language_prompt_ref[0] = prompt
-                zmq_frame_counter = 0
-                invalidate_inference("VLA task started")
-                if cpp_mode == "PLANNER":
-                    if not publish_initial_pose():
-                        fail_active_task(
-                            "vla_initial_pose_failed",
-                            "VLA could not publish its initial pose",
-                        )
-                        return
-                    if not send_cpp_control_command(start=True, planner=False):
-                        fail_active_task(
-                            "vla_pose_mode_failed",
-                            "VLA could not enter POSE mode",
-                        )
-                        return
-                elif cpp_mode == "OFF":
-                    if not send_cpp_control_command(start=True, planner=False):
-                        fail_active_task(
-                            "vla_pose_mode_failed",
-                            "VLA could not start POSE mode",
-                        )
-                        return
-                pause_loop = False
-                activate_vla_metrics()
-                publish_task_status("active", "started", window_id=0)
-                return
-            if identity != active_identity or not task_active or window_id < task_window_id:
-                return
-            task_window_id = window_id
-            if command_name == "hold_vla_task":
-                if pause_loop:
-                    return  # idempotent duplicate
-                pause_loop = True
-                invalidate_inference(f"VLA window {window_id} held")
-                return
-            if command_name == "resume_vla_task":
-                prompt = command.parameters.get("handoff_context")
-                if isinstance(prompt, str) and prompt.strip():
-                    language_prompt_ref[0] = prompt
-                if not pause_loop:
-                    return  # idempotent duplicate
-                pause_loop = False
-                invalidate_inference(f"VLA window {window_id} resumed")
-                activate_vla_metrics()
-                return
-            # stop_vla_task: keep the whole-body controller in safe planner idle.
-            task_active = False
-            pause_loop = True
-            invalidate_inference(f"VLA task stopped at window {window_id}")
-            if cpp_mode == "POSE":
-                send_cpp_control_command(start=True, planner=True)
-            return
-
-        if command_name == "set_prompt":
-            new_prompt = command.parameters.get("prompt")
-            if isinstance(new_prompt, str) and new_prompt:
-                old_prompt = language_prompt_ref[0]
-                language_prompt_ref[0] = new_prompt
-                invalidate_inference("prompt changed")
-                LOGGER.info("Inference prompt changed: %r -> %r", old_prompt, new_prompt)
-            else:
-                record_event(
-                    logging.WARNING,
-                    "INVALID_PROMPT",
-                    "Empty inference prompt ignored",
-                )
-            return
-
-        if command_name == "select_pose_mode":
-            zmq_frame_counter = 0
-            invalidate_inference("entering POSE mode")
-            if cpp_mode == "PLANNER":
-                if not publish_initial_pose():
-                    return
-                send_cpp_control_command(start=True, planner=False)
-            if cpp_mode == "POSE":
-                activate_vla_metrics()
-        elif command_name == "select_planner_mode":
-            zmq_frame_counter = 0
-            invalidate_inference("entering PLANNER mode")
-            if cpp_mode == "POSE":
-                send_cpp_control_command(start=True, planner=True)
-            if cpp_mode == "PLANNER":
-                record_event(
-                    logging.WARNING,
-                    "PLANNER_BLOCKED",
-                    "Planner mode active; remote VLA inference is suspended",
-                )
-        elif command_name == "toggle_policy_pause":
-            if cpp_mode == "PLANNER":
-                record_event(
-                    logging.WARNING,
-                    "PLANNER_BLOCKED",
-                    "Switch to POSE mode before resuming remote VLA inference",
-                )
-            else:
-                pause_loop = not pause_loop
-                invalidate_inference(
-                    "POSE policy resumed" if not pause_loop else "POSE policy paused"
-                )
-                if pause_loop:
-                    record_event(
-                        logging.INFO,
-                        "INFERENCE_PAUSED",
-                        "VLA action publication paused; remote inference remains warm",
-                        remote_requests_continue=True,
-                    )
-                elif cpp_mode == "POSE":
-                    activate_vla_metrics()
-
-        elif command_name == "toggle_control_loop":
-            invalidate_inference("C++ control toggled")
-            if cpp_loop_running:
-                current_planner = cpp_mode == "PLANNER"
-                if send_cpp_control_command(start=False, planner=current_planner):
-                    record_event(
-                        logging.INFO,
-                        "INFERENCE_PAUSED",
-                        "Remote VLA inference paused because the control loop stopped",
-                        remote_requests_continue=False,
-                    )
-            else:
-                if send_cpp_control_command(start=True, planner=True):
-                    record_event(
-                        logging.WARNING,
-                        "PLANNER_BLOCKED",
-                        "Planner mode active; remote VLA inference is suspended",
-                    )
-        elif command_name == "toggle_left_hand_initial_pose":
-            initial_pose_left_hand_closed = not initial_pose_left_hand_closed
-        elif command_name == "toggle_right_hand_initial_pose":
-            initial_pose_right_hand_closed = not initial_pose_right_hand_closed
 
     # Mutable prompt container (single-writer from keyboard, single-reader from inference)
     language_prompt_ref: list[str] = [config.prompt]
+
+    command_handler = _VlaCommandHandler(
+        state,
+        control_listener=control_listener,
+        language_prompt_ref=language_prompt_ref,
+        inference_failures=inference_failures,
+        inference_failed_event=inference_failed_event,
+        vla_safety_gate=vla_safety_gate,
+        vla_safety_monitor=vla_safety_monitor,
+        task_status_intent=task_status_intent,
+        policy=n1_policy,
+        record_event=record_event,
+        invalidate_inference=invalidate_inference,
+        publish_initial_pose=publish_initial_pose,
+        send_cpp_control_command=send_cpp_control_command,
+        activate_vla_metrics=activate_vla_metrics,
+        fail_active_task=fail_active_task,
+        publish_task_status=publish_task_status,
+    )
 
     inference_stop_event = threading.Event()
     inference_busy_event = threading.Event()
@@ -1137,107 +887,47 @@ def main(config: InferenceConfig):
     try:
         while True:
             t_start = time.monotonic()
-            check_control_input()
+            command_handler.handle_next()
             flush_events()
 
-            if task_active:
-                try:
-                    inference_failure = inference_failures.get_nowait()
-                except queue.Empty:
-                    inference_failure = None
-                if inference_failure is not None:
-                    fail_active_task(
-                        f"vla_inference_failed:{inference_failure}",
-                        "VLA inference failed; the task will not be retried",
-                    )
-                    _sleep_remaining(t_start, loop_period)
-                    continue
+            if _consume_task_failure(
+                state,
+                inference_failures,
+                fail_active_task,
+            ):
+                _sleep_remaining(t_start, loop_period)
+                continue
 
-            if task_active and cpp_mode == "POSE" and not pause_loop:
-                safety_reason = vla_safety_gate.reason(
-                    now=t_start,
-                    safety=vla_safety_monitor.snapshot(),
-                    robot_state_timestamp_s=(
-                        vla_safety_monitor.orientation_snapshot().received_at_s
-                    ),
-                )
-                if safety_reason != "clear":
-                    task_active = False
-                    pause_loop = True
-                    invalidate_inference(f"VLA safety blocked: {safety_reason}")
-                    send_cpp_control_command(start=True, planner=True)
-                    task_status_intent.send("vla_task_status", {
-                        "generation": task_generation,
-                        "skill_id": task_skill_id,
-                        "segment_id": task_window_id,
-                        "state": "failed",
-                        "reason": safety_reason,
-                    })
-                    record_event(
-                        logging.ERROR,
-                        "VLA_SAFETY_BLOCKED",
-                        "VLA POSE action stopped by the shared safety gate",
-                        reason=safety_reason,
-                        generation=task_generation,
-                        skill_id=task_skill_id,
-                    )
-
-            # Consume a result before deciding whether another request is due.
-            try:
-                (
-                    result_generation,
-                    processed_action,
-                    inference_start_time,
-                    timing_ms,
-                ) = result_queue.get_nowait()
-                inference_delay = time.monotonic() - inference_start_time
-                timing_ms["action_ready"] = inference_delay * 1000.0
-                if (
-                    result_generation == inference_generation
-                    and _pose_policy_is_active(cpp_loop_running, cpp_mode, pause_loop)
-                ):
-                    service.publish_metrics(
-                        timing_ms,
-                        allowed_names=VLA_TIMING_SEGMENTS,
-                    )
-                    action_chunk_index = calculate_latency_compensated_index(
-                        inference_delay, config.action_publish_rate, config.action_horizon
-                    )
-                    cached_action_chunk = processed_action
-                    if active_generation != inference_generation:
-                        record_event(
-                            logging.INFO,
-                            "INFERENCE_ACTIVE",
-                            "Remote VLA inference returned its first active result",
-                            generation=inference_generation,
-                            prompt=language_prompt_ref[0],
-                            action_ready_ms=timing_ms["action_ready"],
-                        )
-                        active_generation = inference_generation
-            except queue.Empty:
-                pass
-
-            worker_is_busy = inference_busy_event.is_set()
-            now = time.monotonic()
-            should_start = (
-                not inference_failed_event.is_set()
-                and _should_schedule_vla_inference(
-                    cpp_mode=cpp_mode,
-                    worker_is_busy=worker_is_busy,
-                    request_queue_is_empty=inference_queue.empty(),
-                    time_since_request=(now - last_inference_request_time),
-                    inference_interval=inference_interval,
-                )
+            _enforce_active_task_safety(
+                state,
+                now=t_start,
+                vla_safety_gate=vla_safety_gate,
+                vla_safety_monitor=vla_safety_monitor,
+                invalidate_inference=invalidate_inference,
+                send_cpp_control_command=send_cpp_control_command,
+                task_status_intent=task_status_intent,
+                record_event=record_event,
             )
 
-            if should_start:
-                try:
-                    inference_queue.put_nowait(inference_generation)
-                    last_inference_request_time = now
-                except queue.Full:
-                    pass
+            # Consume a result before deciding whether another request is due.
+            _consume_vla_result(
+                state,
+                result_queue,
+                service=service,
+                config=config,
+                language_prompt=language_prompt_ref[0],
+                record_event=record_event,
+            )
+            _schedule_vla_inference(
+                state,
+                now=time.monotonic(),
+                inference_interval=inference_interval,
+                inference_queue=inference_queue,
+                inference_busy_event=inference_busy_event,
+                inference_failed_event=inference_failed_event,
+            )
 
-            if cpp_loop_running and cpp_mode == "PLANNER":
+            if state.cpp_loop_running and state.cpp_mode == "PLANNER":
                 _relay_planner_messages(
                     planner_relay_sub,
                     zmq_socket,
@@ -1247,55 +937,19 @@ def main(config: InferenceConfig):
                 _sleep_remaining(t_start, loop_period)
                 continue
 
-            if pause_loop:
+            if state.pause_loop:
                 time.sleep(0.2)
                 continue
 
-            if cached_action_chunk is None:
+            if state.cached_action_chunk is None:
                 _sleep_remaining(t_start, loop_period)
                 continue
 
-            processed_action = cached_action_chunk
-            if processed_action:
-                motion_token = np.asarray(
-                    get_action_field(processed_action, "motion_token"), dtype=np.float32
-                )
-                left_hand_joints = np.asarray(
-                    get_action_field(processed_action, "left_hand_joints"), dtype=np.float32
-                )
-                right_hand_joints = np.asarray(
-                    get_action_field(processed_action, "right_hand_joints"), dtype=np.float32
-                )
-
-                # Action arrays arrive as (B, T, D); remove the batch dimension.
-                if motion_token.ndim == 3:
-                    motion_token = motion_token[0]
-                if left_hand_joints.ndim == 3:
-                    left_hand_joints = left_hand_joints[0]
-                if right_hand_joints.ndim == 3:
-                    right_hand_joints = right_hand_joints[0]
-
-                horizon = motion_token.shape[0] if motion_token.ndim == 2 else 1
-                current_idx = min(action_chunk_index, horizon - 1)
-                if motion_token.ndim == 2:
-                    motion_token = motion_token[current_idx]
-                if left_hand_joints.ndim == 2:
-                    left_hand_joints = left_hand_joints[current_idx]
-                if right_hand_joints.ndim == 2:
-                    right_hand_joints = right_hand_joints[current_idx]
-
-                frame_index = np.array([zmq_frame_counter], dtype=np.int64)
-                zmq_frame_counter += 1
-                zmq_socket.send(
-                    pack_latent_action_message(
-                        motion_token,
-                        frame_index,
-                        left_hand_joints=left_hand_joints,
-                        right_hand_joints=right_hand_joints,
-                    )
-                )
-
-            action_chunk_index = min(action_chunk_index + 1, config.action_horizon - 1)
+            _publish_cached_action(
+                state,
+                config=config,
+                zmq_socket=zmq_socket,
+            )
 
             _sleep_remaining(t_start, loop_period)
 
