@@ -5,34 +5,13 @@ Provides:
 - ``ZMQStateSubscriber`` — non-blocking SUB on the ``g1_debug`` topic
 """
 
-import msgpack
-import msgpack_numpy as mnp
-import numpy as np
 import zmq
+
+from gear_sonic.runtime.protocol.cpp_state import decode_cpp_state_payload
+from gear_sonic.runtime.zmq_sockets import connect_subscriber
 
 STATE_ZMQ_TOPIC = "g1_debug"
 DEFAULT_STATE_ZMQ_PORT = 5557
-
-
-def _unpack_msgpack_zmq(raw: bytes, topic: str) -> dict:
-    """Strip a ZMQ topic prefix and decode the msgpack payload."""
-    payload = raw[len(topic):]
-    return msgpack.unpackb(payload, raw=False)
-
-
-def _convert_lists_to_numpy(data: dict) -> dict:
-    """Convert list values in a dict to numpy arrays."""
-    if not isinstance(data, dict):
-        return data
-    result = {}
-    for key, value in data.items():
-        if isinstance(value, (list, tuple)):
-            result[key] = np.array(value)
-        elif isinstance(value, dict):
-            result[key] = _convert_lists_to_numpy(value)
-        else:
-            result[key] = value
-    return result
 
 
 class ZMQStateSubscriber:
@@ -47,14 +26,13 @@ class ZMQStateSubscriber:
         port: int = DEFAULT_STATE_ZMQ_PORT,
         topic: str = STATE_ZMQ_TOPIC,
     ):
-        mnp.patch()
         self._ctx = zmq.Context()
-        self._socket = self._ctx.socket(zmq.SUB)
-        self._socket.setsockopt_string(zmq.SUBSCRIBE, topic)
-        self._socket.setsockopt(zmq.CONFLATE, 1)
-        self._socket.setsockopt(zmq.RCVTIMEO, 0)
-        self._socket.connect(f"tcp://{host}:{port}")
+        self._socket = connect_subscriber(
+            self._ctx, f"tcp://{host}:{port}", topic=topic,
+            conflate=True, receive_timeout_ms=0,
+        )
         self._topic = topic
+        self._topic_bytes = topic.encode("utf-8")
         self._msg = None
         print(f"[ZMQStateSubscriber] Connected to tcp://{host}:{port} (topic: {topic})")
 
@@ -65,9 +43,7 @@ class ZMQStateSubscriber:
         except zmq.Again:
             return
 
-        msg = _unpack_msgpack_zmq(raw, self._topic)
-        msg = _convert_lists_to_numpy(msg)
-        self._msg = msg
+        self._msg = decode_cpp_state_payload(raw[len(self._topic_bytes):])
 
     def get_msg(self, clear: bool = True):
         """Return the latest state message (or ``None``)."""

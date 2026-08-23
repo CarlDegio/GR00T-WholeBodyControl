@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import copy
 import threading
 import time
 from typing import Any
@@ -15,8 +14,11 @@ from gear_sonic.runtime.gateway.sensor_client import (
     MaterializedSnapshot,
     SensorGatewayClient,
 )
-from gear_sonic.runtime.protocol import SharedMemoryFrame, decode_cpp_state_array
-from gear_sonic.runtime.gateway.snapshot import SnapshotRequest
+from gear_sonic.runtime.gateway.polling_ingress import (
+    PollingSensorIngress,
+    copy_numpy_tree,
+)
+from gear_sonic.runtime.protocol import decode_cpp_state_array
 
 DATA_EXPORTER_STATE_STREAM = "cpp/state_msgpack"
 DATA_EXPORTER_ROBOT_CONFIG_STREAM = "cpp/robot_config_msgpack"
@@ -82,17 +84,7 @@ def data_exporter_camera_message_from_snapshot(
     }
 
 
-def _copy_value(value: Any) -> Any:
-    if isinstance(value, np.ndarray):
-        return value.copy()
-    if isinstance(value, dict):
-        return {key: _copy_value(item) for key, item in value.items()}
-    if isinstance(value, list):
-        return [_copy_value(item) for item in value]
-    return copy.deepcopy(value)
-
-
-class DataExporterSensorGatewayIngress:
+class DataExporterSensorGatewayIngress(PollingSensorIngress):
     """Background Gateway reader exposing non-blocking exporter sensor caches."""
 
     def __init__(
@@ -109,61 +101,31 @@ class DataExporterSensorGatewayIngress:
     ) -> None:
         if not camera_names or len(set(camera_names)) != len(camera_names):
             raise ValueError("DataExporter camera names must be non-empty and unique")
-        if poll_hz <= 0.0:
-            raise ValueError("DataExporter SensorGateway poll_hz must be positive")
-        if request_timeout_ms <= 0:
-            raise ValueError("DataExporter request_timeout_ms must be positive")
-        if max_age_ms < 0.0 or max_skew_ms < 0.0:
-            raise ValueError("DataExporter Gateway age and skew cannot be negative")
-        self.endpoint = endpoint
         self.camera_names = tuple(camera_names)
         self.defer_video_encoding = bool(defer_video_encoding)
         camera_prefix = "camera_encoded" if self.defer_video_encoding else "camera"
         self.camera_streams = tuple(
             f"{camera_prefix}/{name}" for name in self.camera_names
         )
-        self.poll_hz = float(poll_hz)
-        self.max_age_ms = float(max_age_ms)
-        self.max_skew_ms = float(max_skew_ms)
-        self.client = client or SensorGatewayClient(
+        super().__init__(
             endpoint,
+            thread_name="data-exporter-sensor-gateway",
+            error_prefix="DataExporter",
+            poll_hz=poll_hz,
             request_timeout_ms=request_timeout_ms,
+            max_age_ms=max_age_ms,
+            max_skew_ms=max_skew_ms,
+            client=client,
         )
-        self._owns_client = client is None
         self._condition = threading.Condition()
         self._camera: dict[str, Any] | None = None
         self._camera_received_ns = 0
         self._state: dict[str, Any] | None = None
         self._state_received_ns = 0
         self._robot_config: dict[str, Any] | None = None
-        self._last_sequences: dict[str, int] = {}
-        self._last_error = ""
-        self._last_error_print_s = 0.0
-        self._stop = threading.Event()
-        self._thread = threading.Thread(
-            target=self._run,
-            name="data-exporter-sensor-gateway",
-            daemon=True,
-        )
-        self._started = False
-        self._closed = False
 
-    def _request(self, streams: tuple[str, ...], *, max_skew_ms: float):
-        return self.client.read_snapshot(
-            SnapshotRequest(
-                streams=streams,
-                max_age_ms=self.max_age_ms,
-                max_skew_ms=max_skew_ms,
-            ),
-            retries=0,
-        )
-
-    def _is_new(self, frame: SharedMemoryFrame) -> bool:
-        sequence = frame.metadata.sequence
-        if self._last_sequences.get(frame.stream) == sequence:
-            return False
-        self._last_sequences[frame.stream] = sequence
-        return True
+    def _pollers(self):
+        return self._poll_camera, self._poll_state, self._poll_robot_config
 
     def _poll_camera(self) -> None:
         snapshot = self._request(self.camera_streams, max_skew_ms=self.max_skew_ms)
@@ -204,46 +166,11 @@ class DataExporterSensorGatewayIngress:
             self._robot_config = config
             self._condition.notify_all()
 
-    def _report_error(self, exc: Exception) -> None:
-        message = str(exc)
-        now = time.monotonic()
-        if message != self._last_error or now - self._last_error_print_s >= 2.0:
-            print(f"[DataExporter] SensorGateway waiting: {message}", flush=True)
-            self._last_error = message
-            self._last_error_print_s = now
-
-    def _run(self) -> None:
-        period_s = 1.0 / self.poll_hz
-        while not self._stop.is_set():
-            started = time.monotonic()
-            for poll in (self._poll_camera, self._poll_state, self._poll_robot_config):
-                if self._stop.is_set():
-                    break
-                try:
-                    poll()
-                except Exception as exc:
-                    self._report_error(exc)
-            self._stop.wait(max(0.0, period_s - (time.monotonic() - started)))
-
-    def start(self) -> None:
-        if self._closed:
-            raise RuntimeError("DataExporter SensorGateway ingress is closed")
-        if self._started:
-            return
-        self._started = True
-        self._thread.start()
-
-    def _fresh(self, received_ns: int) -> bool:
-        return bool(
-            received_ns > 0
-            and (time.monotonic_ns() - received_ns) / 1_000_000.0 <= self.max_age_ms
-        )
-
     def read_camera(self) -> dict[str, Any] | None:
         with self._condition:
             if self._camera is None or not self._fresh(self._camera_received_ns):
                 return None
-            return _copy_value(self._camera)
+            return copy_numpy_tree(self._camera)
 
     def read_state(self, *, clear: bool = True) -> dict[str, Any] | None:
         with self._condition:
@@ -253,7 +180,7 @@ class DataExporterSensorGatewayIngress:
             if clear:
                 self._state = None
                 self._state_received_ns = 0
-            return _copy_value(state)
+            return copy_numpy_tree(state)
 
     def wait_for_robot_config(self, timeout_s: float = 0.0) -> dict[str, Any]:
         if timeout_s < 0.0:
@@ -270,18 +197,8 @@ class DataExporterSensorGatewayIngress:
                         f"within {timeout_s}s"
                     )
                 self._condition.wait(remaining)
-            return _copy_value(self._robot_config)
+            return copy_numpy_tree(self._robot_config)
 
-    def close(self) -> None:
-        if self._closed:
-            return
-        self._closed = True
-        self._stop.set()
+    def _wake_waiters(self) -> None:
         with self._condition:
             self._condition.notify_all()
-        if self._started:
-            self._thread.join(timeout=max(1.0, 2.0 / self.poll_hz))
-            if self._thread.is_alive():
-                raise RuntimeError("DataExporter SensorGateway worker did not stop")
-        if self._owns_client:
-            self.client.close()

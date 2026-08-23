@@ -20,10 +20,11 @@ PACKET_VELOCITY = 0
 PACKET_STOP = 1
 _PACKET = struct.Struct("<BQfff")
 
-from gear_sonic.utils.teleop.zmq.zmq_planner_sender import (
+from gear_sonic.runtime.protocol.cpp_control import (
     build_command_message,
     build_planner_message,
 )
+from gear_sonic.runtime.zmq_sockets import bind_publisher, connect_subscriber
 
 
 class LatestVelocity:
@@ -123,14 +124,10 @@ def main() -> None:
     if args.hz <= 0.0:
         raise ValueError("hz must be positive")
     context = zmq.Context.instance()
-    source = context.socket(zmq.SUB)
-    source.setsockopt(zmq.SUBSCRIBE, MESSAGE_PREFIX)
-    source.setsockopt(zmq.CONFLATE, 1)
-    source.setsockopt(zmq.LINGER, 0)
-    source.connect(args.source)
-    output = context.socket(zmq.PUB)
-    output.setsockopt(zmq.LINGER, 0)
-    output.bind(args.output)
+    source = connect_subscriber(
+        context, args.source, topic=MESSAGE_PREFIX, conflate=True, linger_ms=0,
+    )
+    output = bind_publisher(context, args.output, linger_ms=0)
     latest = LatestVelocity(args.timeout)
     planner = PlannerState()
     period = 1.0 / args.hz

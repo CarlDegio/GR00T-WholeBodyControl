@@ -16,13 +16,13 @@ import zmq
 
 from gear_sonic.camera.sensor_server import ImageMessageSchema
 from gear_sonic.runtime.gateway.diagnostics import EndpointHealthMonitor
-from gear_sonic.runtime.gateway.rgb_preview import RgbPreviewWorker
 from gear_sonic.runtime.gateway.shared_memory import SharedMemoryRing
 from gear_sonic.runtime.gateway.snapshot import SensorSnapshotStore, SnapshotRequest
 from gear_sonic.runtime.gateway.visualization import (
     VISUALIZATION_SCHEMA,
     VISUALIZATION_STREAMS,
 )
+from gear_sonic.runtime.zmq_sockets import connect_subscriber
 
 
 DEPTH_ANYTHING_STATUS_TYPE = "sonic.depth_anything_status"
@@ -353,25 +353,16 @@ class CameraZmqIngress:
         core: SensorGatewayCore,
         *,
         expected_hz: float = 30.0,
-        preview_rgb: bool = False,
-        preview_worker: RgbPreviewWorker | None = None,
     ) -> None:
         self.core = core
         self.expected_hz = float(expected_hz)
-        self.socket = context.socket(zmq.SUB)
-        self.socket.setsockopt(zmq.SUBSCRIBE, b"")
-        self.socket.setsockopt(zmq.CONFLATE, 1)
-        self.socket.setsockopt(zmq.LINGER, 0)
-        self.socket.connect(endpoint)
+        self.socket = connect_subscriber(
+            context, endpoint, conflate=True, linger_ms=0,
+        )
         self.core.register_endpoint(
             "source/camera_server",
             expected_hz=self.expected_hz,
         )
-        self._preview = preview_worker if preview_worker is not None else (
-            RgbPreviewWorker(encoded=True) if preview_rgb else None
-        )
-        if self._preview is not None:
-            self._preview.start()
 
     def poll_once(self, timeout_ms: int = 0) -> int:
         if not self.socket.poll(timeout_ms, zmq.POLLIN):
@@ -385,11 +376,9 @@ class CameraZmqIngress:
         )
         encoded_schema = ImageMessageSchema.deserialize(payload, decode_images=False)
         count = 0
-        preview_images: dict[str, bytes | str] = {}
         for name, encoded in encoded_schema.images.items():
             if name.endswith("_depth") or not isinstance(encoded, bytes | bytearray | str):
                 continue
-            preview_images[name] = bytes(encoded) if isinstance(encoded, bytearray) else encoded
             if isinstance(encoded, str):
                 encoded_array = np.frombuffer(encoded.encode("utf-8"), dtype=np.uint8).copy()
                 wire_encoding = "base64_jpeg"
@@ -411,9 +400,6 @@ class CameraZmqIngress:
                     "camera_info": dict(encoded_schema.camera_info.get(name, {})),
                 },
             )
-        if self._preview is not None and preview_images:
-            self._preview.publish(preview_images)
-
         schema = ImageMessageSchema.deserialize(payload)
         for name, image in schema.images.items():
             if not isinstance(image, np.ndarray):
@@ -439,8 +425,6 @@ class CameraZmqIngress:
         return count
 
     def close(self) -> None:
-        if self._preview is not None:
-            self._preview.close()
         self.socket.close(linger=0)
 
 
@@ -459,11 +443,9 @@ class DepthAnythingZmqIngress:
     ) -> None:
         self.core = core
         self.expected_hz = float(expected_hz)
-        self.socket = context.socket(zmq.SUB)
-        self.socket.setsockopt(zmq.SUBSCRIBE, b"")
-        self.socket.setsockopt(zmq.CONFLATE, 1)
-        self.socket.setsockopt(zmq.LINGER, 0)
-        self.socket.connect(endpoint)
+        self.socket = connect_subscriber(
+            context, endpoint, conflate=True, linger_ms=0,
+        )
         self.core.register_endpoint(
             "source/depth_anything", expected_hz=self.expected_hz
         )
@@ -551,17 +533,13 @@ class CppStateZmqIngress:
         self.core = core
         self.topic = topic.encode("utf-8")
         self.expected_hz = float(expected_hz)
-        self.socket = context.socket(zmq.SUB)
-        self.socket.setsockopt(zmq.SUBSCRIBE, self.topic)
-        self.socket.setsockopt(zmq.CONFLATE, 1)
-        self.socket.setsockopt(zmq.LINGER, 0)
-        self.socket.connect(endpoint)
+        self.socket = connect_subscriber(
+            context, endpoint, topic=self.topic, conflate=True, linger_ms=0,
+        )
         self.config_topic = b"robot_config"
-        self.config_socket = context.socket(zmq.SUB)
-        self.config_socket.setsockopt(zmq.SUBSCRIBE, self.config_topic)
-        self.config_socket.setsockopt(zmq.CONFLATE, 1)
-        self.config_socket.setsockopt(zmq.LINGER, 0)
-        self.config_socket.connect(endpoint)
+        self.config_socket = connect_subscriber(
+            context, endpoint, topic=self.config_topic, conflate=True, linger_ms=0,
+        )
         self.core.register_endpoint(
             "source/cpp_state",
             expected_hz=self.expected_hz,

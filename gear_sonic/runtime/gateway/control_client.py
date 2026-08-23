@@ -9,6 +9,7 @@ import zmq
 
 from gear_sonic.runtime.protocol import OperatorCommand
 from gear_sonic.runtime.gateway.control import ControlGatewayCore
+from gear_sonic.runtime.zmq_sockets import connect_push, connect_subscriber
 
 
 class ControlGatewayIntentClient:
@@ -28,17 +29,15 @@ class ControlGatewayIntentClient:
         self.endpoint = endpoint
         self._owns_context = context is None
         self._context = zmq.Context() if context is None else context
-        self._socket = self._context.socket(zmq.PUSH)
-        if latest_only:
-            # Velocity intents describe the desired state now, not a motion
-            # sequence. If the gateway falls behind, retain only the newest
-            # intent so a later stop can replace queued motion immediately.
-            self._socket.setsockopt(zmq.CONFLATE, 1)
-            self._socket.setsockopt(zmq.SNDHWM, 1)
-        else:
-            self._socket.setsockopt(zmq.SNDHWM, 100)
-        self._socket.setsockopt(zmq.LINGER, 0)
-        self._socket.connect(endpoint)
+        # Velocity intents describe the desired state now, not a motion
+        # sequence. If the gateway falls behind, retain only the newest intent.
+        self._socket = connect_push(
+            self._context,
+            endpoint,
+            conflate=latest_only,
+            high_water_mark=1 if latest_only else 100,
+            linger_ms=0,
+        )
         self._core = ControlGatewayCore(source=source, ttl_ms=ttl_ms)
         self._closed = False
 
@@ -75,15 +74,16 @@ class ControlGatewaySubscriber:
         self.endpoint = endpoint
         self._owns_context = context is None
         self._context = zmq.Context() if context is None else context
-        self._socket = self._context.socket(zmq.SUB)
-        self._socket.setsockopt_string(zmq.SUBSCRIBE, "")
         # Do not conflate the shared command stream: a navigation key must not
         # overwrite a preceding POSE/PLANNER transition before consumers can
         # apply their own accepted-name filter.
-        self._socket.setsockopt(zmq.RCVHWM, 100)
-        self._socket.setsockopt(zmq.RCVTIMEO, 0)
-        self._socket.setsockopt(zmq.LINGER, 0)
-        self._socket.connect(endpoint)
+        self._socket = connect_subscriber(
+            self._context,
+            endpoint,
+            high_water_mark=100,
+            receive_timeout_ms=0,
+            linger_ms=0,
+        )
         self._monotonic_ns = monotonic_ns
         self._accepted_names = None if accepted_names is None else frozenset(accepted_names)
         self._last_sequence_by_source: dict[str, int] = {}

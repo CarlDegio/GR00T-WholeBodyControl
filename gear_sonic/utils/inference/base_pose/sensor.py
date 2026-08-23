@@ -11,6 +11,7 @@ from typing import Any, Callable, Mapping
 
 import numpy as np
 
+from gear_sonic.runtime.gateway.rgbd import materialize_rgbd
 from gear_sonic.runtime.gateway.sensor_client import (
     SensorGatewayClient,
     SensorGatewayClientError,
@@ -45,37 +46,23 @@ def _decode_rgbd_snapshot(
     require_depth: bool,
     expected_inference_generation: int | None = None,
 ) -> AlignedRGBDSnapshot:
-    rgb_frame = snapshot.snapshot.frames[rgb_stream]
-    rgb = np.asarray(snapshot.arrays[rgb_stream])
-    if rgb.ndim != 3 or rgb.shape[2] != 3 or rgb.dtype != np.uint8:
-        raise BasePoseCameraError(
-            f"Gateway RGB must be HxWx3 uint8, got {rgb.shape} {rgb.dtype}"
-        )
-    info = dict(rgb_frame.attributes.get("camera_info", {}))
-    depth_raw: np.ndarray | None = None
+    decoded = materialize_rgbd(
+        snapshot,
+        rgb_stream=rgb_stream,
+        depth_stream=depth_stream,
+        require_depth=require_depth,
+        error_type=BasePoseCameraError,
+    )
+    rgb = decoded.rgb
+    info = dict(decoded.camera_info)
+    depth_raw = decoded.depth_raw
     depth_scale_m: float | None = None
     depth_aligned_to: str | None = None
-    depth_source: str | None = None
-    timestamp_ns = rgb_frame.source_timestamp_ns
+    depth_source = decoded.depth_source
+    timestamp_ns = decoded.source_timestamp_ns
     if require_depth:
-        depth_frame = snapshot.snapshot.frames[depth_stream]
-        depth_raw = np.asarray(snapshot.arrays[depth_stream])
-        if depth_raw.ndim != 2 or depth_raw.dtype != np.uint16:
-            raise BasePoseCameraError(
-                f"Gateway depth must be HxW uint16, got "
-                f"{depth_raw.shape} {depth_raw.dtype}"
-            )
-        if depth_raw.shape != rgb.shape[:2]:
-            raise BasePoseCameraError("Gateway RGB and depth shapes do not match")
-        depth_info = dict(depth_frame.attributes.get("camera_info", {}))
-        if depth_info:
-            info = depth_info
         depth_scale_m = float(info.get("depth_scale_m", 0.0))
         depth_aligned_to = str(info.get("depth_aligned_to", ""))
-        depth_source = str(
-            depth_frame.attributes.get("depth_source")
-            or info.get("depth_source", "")
-        ) or None
         if depth_stream.startswith("derived/depth_anything/"):
             if not (depth_source or "").startswith(
                 "depth-anything-v2-metric-"
@@ -114,7 +101,6 @@ def _decode_rgbd_snapshot(
                         f"{inference_generation}, expected "
                         f"{expected_inference_generation}"
                     )
-        timestamp_ns = depth_frame.source_timestamp_ns or timestamp_ns
     try:
         fx, fy, cx, cy = (float(info[name]) for name in ("fx", "fy", "cx", "cy"))
         width, height = int(info["width"]), int(info["height"])
@@ -128,8 +114,8 @@ def _decode_rgbd_snapshot(
         )
     timestamp = timestamp_ns * 1.0e-9 if timestamp_ns > 0 else time.time()
     return AlignedRGBDSnapshot(
-        rgb=rgb.copy(),
-        depth_raw=None if depth_raw is None else depth_raw.copy(),
+        rgb=rgb,
+        depth_raw=depth_raw,
         fx=fx,
         fy=fy,
         cx=cx,

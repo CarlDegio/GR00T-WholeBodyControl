@@ -6,7 +6,7 @@ from dataclasses import dataclass
 import math
 from typing import Sequence
 
-from gear_sonic.utils.teleop.zmq.zmq_planner_sender import build_planner_message
+from gear_sonic.runtime.protocol.cpp_control import build_planner_message
 
 
 @dataclass

@@ -14,6 +14,7 @@ from typing import Any, Callable
 import cv2
 import numpy as np
 
+from gear_sonic.runtime.gateway.rgbd import materialize_rgbd
 from gear_sonic.runtime.gateway.sensor_client import (
     SensorGatewayClient,
     SensorGatewayClientError,
@@ -26,9 +27,7 @@ from gear_sonic.utils.inference.lavira.geometry import (
     POLICY_FRAME_INDEX,
     build_object_nav_geometry_from_frames,
 )
-from gear_sonic.utils.teleop.sonic_orientation_telemetry import (
-    quaternion_yaw_wxyz,
-)
+from gear_sonic.utils.math3d.quaternions import yaw_from_quaternion_wxyz
 
 LOGGER = logging.getLogger("sonic.lavira")
 
@@ -120,26 +119,21 @@ class SensorGatewayRGBDCamera:
         expected_skill_id: int | None = None,
         expected_segment_id: int | None = None,
     ) -> RGBDSnapshot:
-        rgb_frame = snapshot.snapshot.frames[SensorGatewayRGBDCamera.RGB_STREAM]
-        depth_frame = snapshot.snapshot.frames[SensorGatewayRGBDCamera.DEPTH_STREAM]
-        rgb = np.asarray(snapshot.arrays[SensorGatewayRGBDCamera.RGB_STREAM])
-        depth_raw = np.asarray(snapshot.arrays[SensorGatewayRGBDCamera.DEPTH_STREAM])
-        if rgb.ndim != 3 or rgb.shape[2] != 3 or rgb.dtype != np.uint8:
-            raise ObjectNavCameraError(
-                f"Gateway chest RGB must be HxWx3 uint8, got {rgb.shape} {rgb.dtype}"
-            )
-        if depth_raw.ndim != 2 or depth_raw.dtype != np.uint16:
-            raise ObjectNavCameraError(
-                f"Gateway Depth Anything depth must be HxW uint16, got "
-                f"{depth_raw.shape} {depth_raw.dtype}"
-            )
-        if rgb.shape[:2] != depth_raw.shape:
-            raise ObjectNavCameraError(
+        decoded = materialize_rgbd(
+            snapshot,
+            rgb_stream=SensorGatewayRGBDCamera.RGB_STREAM,
+            depth_stream=SensorGatewayRGBDCamera.DEPTH_STREAM,
+            error_type=ObjectNavCameraError,
+            rgb_label="Gateway chest RGB",
+            depth_label="Gateway Depth Anything depth",
+            mismatch_message=(
                 "Gateway RGB and Depth Anything depth shapes do not match"
-            )
-        info = dict(depth_frame.attributes.get("camera_info", {}))
-        if not info:
-            info = dict(rgb_frame.attributes.get("camera_info", {}))
+            ),
+        )
+        rgb = decoded.rgb
+        depth_raw = decoded.depth_raw
+        assert depth_raw is not None
+        info = dict(decoded.camera_info)
         try:
             numeric = {
                 name: float(info[name])
@@ -153,10 +147,7 @@ class SensorGatewayRGBDCamera:
             raise ObjectNavCameraError(
                 "Gateway Depth Anything depth is not aligned to chest_view"
             )
-        depth_source = str(
-            depth_frame.attributes.get("depth_source")
-            or info.get("depth_source", "")
-        )
+        depth_source = decoded.depth_source or ""
         if not depth_source.startswith("depth-anything-v2-metric-"):
             raise ObjectNavCameraError(
                 f"Gateway depth source is not metric Depth Anything: {depth_source!r}"
@@ -453,7 +444,7 @@ class SensorGatewayRGBDCamera:
             state = decode_cpp_state_array(
                 snapshot.arrays[self.ROBOT_STATE_STREAM]
             )
-            yaw = quaternion_yaw_wxyz(state["base_quat"])
+            yaw = yaw_from_quaternion_wxyz(state["base_quat"])
         except (KeyError, TypeError, ValueError, SensorGatewayClientError) as exc:
             raise ObjectNavCameraError(
                 "fresh SONIC measured yaw is unavailable"

@@ -97,7 +97,7 @@ _bootstrap_venv()
 import tyro  # noqa: E402
 import zmq  # noqa: E402
 
-from gear_sonic.utils.teleop.zmq.zmq_planner_sender import (  # noqa: E402
+from gear_sonic.runtime.protocol.cpp_control import (  # noqa: E402
     build_command_message,
     build_planner_message,
 )

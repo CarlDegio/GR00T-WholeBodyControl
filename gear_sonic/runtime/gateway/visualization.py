@@ -10,6 +10,7 @@ import numpy as np
 import zmq
 
 from gear_sonic.camera.constants import PRODUCTION_JPEG_QUALITY
+from gear_sonic.runtime.zmq_sockets import connect_push
 
 VISUALIZATION_SCHEMA = "sonic.visualization_frame"
 NAVDP_ACTOR_RAY_STREAM = "visualization/navdp_actor_ray"
@@ -31,11 +32,9 @@ class VisualizationPublisher:
         self.endpoint = endpoint
         self.jpeg_quality = int(jpeg_quality)
         self.context = zmq.Context()
-        self.socket = self.context.socket(zmq.PUSH)
-        self.socket.setsockopt(zmq.LINGER, 0)
-        self.socket.setsockopt(zmq.SNDHWM, 2)
-        self.socket.setsockopt(zmq.IMMEDIATE, 1)
-        self.socket.connect(endpoint)
+        self.socket = connect_push(
+            self.context, endpoint, high_water_mark=2, immediate=True, linger_ms=0,
+        )
         self.sequence = 0
 
     def publish(self, stream: str, frame_bgr: np.ndarray) -> bool:

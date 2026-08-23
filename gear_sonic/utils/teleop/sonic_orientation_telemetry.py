@@ -8,6 +8,8 @@ import json
 import math
 from typing import Any
 
+from gear_sonic.utils.math3d.quaternions import yaw_from_quaternion_wxyz
+
 
 ORIENTATION_TELEMETRY_TYPE = "sonic_orientation_telemetry"
 ORIENTATION_TELEMETRY_VERSION = 1
@@ -35,26 +37,8 @@ def _wrapped(value: float) -> float:
     return math.remainder(float(value), _TWO_PI)
 
 
-def quaternion_yaw_wxyz(quaternion: Any) -> float:
-    """Return wrapped yaw from a finite, nonzero scalar-first quaternion."""
-    if isinstance(quaternion, (str, bytes)):
-        raise ValueError("base quaternion must contain four finite values")
-    try:
-        values = tuple(float(item) for item in quaternion)
-    except (TypeError, ValueError) as exc:
-        raise ValueError("base quaternion must contain four finite values") from exc
-    if len(values) != 4 or not all(math.isfinite(item) for item in values):
-        raise ValueError("base quaternion must contain four finite values")
-    norm = math.sqrt(sum(item * item for item in values))
-    if norm <= 1.0e-12:
-        raise ValueError("base quaternion norm must be positive")
-    qw, qx, qy, qz = (item / norm for item in values)
-    return _wrapped(
-        math.atan2(
-            2.0 * (qw * qz + qx * qy),
-            1.0 - 2.0 * (qy * qy + qz * qz),
-        )
-    )
+# Backward-compatible export for existing telemetry consumers.
+quaternion_yaw_wxyz = yaw_from_quaternion_wxyz
 
 
 @dataclass(frozen=True)

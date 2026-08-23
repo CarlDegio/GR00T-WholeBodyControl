@@ -20,6 +20,7 @@ from typing import Any, Callable, Mapping, Sequence
 import cv2
 import numpy as np
 
+from gear_sonic.runtime.queues import replace_latest
 from gear_sonic.utils.inference.base_pose.sensor import (
     AlignedRGBDSnapshot,
     BasePoseCameraError,
@@ -1924,16 +1925,7 @@ def _route_worker_event(
     if item.kind != "observation" or observation_events is None:
         events.put(item)
         return None
-    try:
-        observation_events.put_nowait(item)
-        return None
-    except queue.Full:
-        try:
-            displaced = observation_events.get_nowait()
-        except queue.Empty:
-            displaced = None
-        observation_events.put_nowait(item)
-        return displaced
+    return replace_latest(observation_events, item)
 
 
 def _submit_diagnostic_decision(

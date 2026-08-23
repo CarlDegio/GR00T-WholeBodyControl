@@ -23,7 +23,6 @@ def test_script_imports_without_ros2_and_resolves_json_defaults() -> None:
     assert settings.loop_hz == 200.0
     assert settings.expected_hz["odometry"] == 10.0
     assert not settings.enable_ros
-    assert not settings.enable_rgb_preview
 
     assert parser.parse_args(["--no-enable-runtime-metrics"]).enable_runtime_metrics is False
     assert parser.parse_args(["--no-enable-vla-timing"]).enable_runtime_metrics is False
@@ -53,7 +52,6 @@ def test_profile_overlay_is_the_final_endpoint_configuration_layer(tmp_path: Pat
             str(overlay),
             "--no-enable-camera",
             "--no-enable-cpp-state",
-            "--enable-rgb-preview",
         ]
     )
 
@@ -64,7 +62,6 @@ def test_profile_overlay_is_the_final_endpoint_configuration_layer(tmp_path: Pat
     assert settings.rpc_bind_endpoint == "tcp://*:6003"
     assert not settings.enable_camera
     assert not settings.enable_cpp_state
-    assert settings.enable_rgb_preview
     assert "--camera-port" not in parser._option_string_actions
     assert "--rpc-port" not in parser._option_string_actions
 

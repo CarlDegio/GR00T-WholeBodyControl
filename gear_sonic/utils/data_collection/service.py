@@ -22,7 +22,6 @@ Usage (from repo root):
 from collections import deque
 from dataclasses import dataclass
 from datetime import datetime
-import json
 import time
 
 import numpy as np
@@ -41,6 +40,7 @@ from gear_sonic.data.features_sonic_vla import (
 )
 from gear_sonic.runtime.profile import load_runtime_profile
 from gear_sonic.runtime.gateway.control_client import ControlGatewaySubscriber
+from gear_sonic.runtime.protocol.array_message import unpack_array_message
 from gear_sonic.utils.data_collection.ingress import (
     DataExporterSensorGatewayIngress,
 )
@@ -48,7 +48,8 @@ from gear_sonic.utils.data_collection.episode import EpisodeState
 from gear_sonic.utils.data_collection.recording import select_recording_key
 from gear_sonic.utils.data_collection.speech import TextToSpeech
 from gear_sonic.utils.data_collection.telemetry import Telemetry
-from gear_sonic.utils.data_collection.transforms import compute_projected_gravity, quat_to_rot6d
+from gear_sonic.utils.data_collection.transforms import quat_to_rot6d
+from gear_sonic.utils.math3d.orientation import compute_projected_gravity
 
 # ---------------------------------------------------------------------------
 # Config
@@ -106,53 +107,6 @@ class TimeDeltaException(Exception):
         self.reset_timeout_sec = reset_timeout_sec
         self.message = f"{self.failure_count} failures in {self.reset_timeout_sec} seconds"
         super().__init__(self.message)
-
-
-def unpack_pose_message(packed_data: bytes, topic: str = "pose") -> dict:
-    """Unpack a single-frame packed message from the PICO teleop manager.
-
-    Wire format: [topic_prefix][1280-byte JSON header][concatenated binary fields]
-    """
-    HEADER_SIZE = 1280
-
-    topic_bytes = topic.encode("utf-8")
-    if not packed_data.startswith(topic_bytes):
-        raise ValueError(f"Message does not start with expected topic '{topic}'")
-
-    offset = len(topic_bytes)
-    if len(packed_data) < offset + HEADER_SIZE:
-        raise ValueError(f"Packed data too small: {len(packed_data)} < {offset + HEADER_SIZE}")
-
-    header_bytes = packed_data[offset : offset + HEADER_SIZE]
-    null_idx = header_bytes.find(b"\x00")
-    if null_idx > 0:
-        header_bytes = header_bytes[:null_idx]
-
-    header = json.loads(header_bytes.decode("utf-8"))
-    fields = header.get("fields", [])
-
-    result = {"version": header.get("v", 0), "endian": header.get("endian", "le")}
-    current_offset = offset + HEADER_SIZE
-    dtype_map = {
-        "f32": np.float32,
-        "f64": np.float64,
-        "i32": np.int32,
-        "i64": np.int64,
-        "bool": bool,
-    }
-
-    for field in fields:
-        dtype = dtype_map.get(field["dtype"], np.float32)
-        shape = tuple(field["shape"])
-        n_bytes = int(np.prod(shape)) * np.dtype(dtype).itemsize
-        result[field["name"]] = (
-            np.frombuffer(packed_data[current_offset : current_offset + n_bytes], dtype=dtype)
-            .reshape(shape)
-            .copy()
-        )
-        current_offset += n_bytes
-
-    return result
 
 
 class TimingThresholdMonitor:
@@ -381,7 +335,9 @@ class GrootDataCollector:
 
     def _handle_manager_state(self, raw: bytes) -> None:
         try:
-            data = unpack_pose_message(raw, topic="manager_state")
+            data = unpack_array_message(
+                raw, expected_topic="manager_state"
+            ).fields
         except Exception:
             return
 
@@ -395,7 +351,7 @@ class GrootDataCollector:
 
     def _handle_planner_message(self, raw: bytes) -> None:
         try:
-            data = unpack_pose_message(raw, topic="planner")
+            data = unpack_array_message(raw, expected_topic="planner").fields
         except Exception:
             return
 
@@ -442,7 +398,7 @@ class GrootDataCollector:
         G1_R_WRIST_YAW_IDX = 28
 
         try:
-            pose_data = unpack_pose_message(raw, topic="pose")
+            pose_data = unpack_array_message(raw, expected_topic="pose").fields
         except Exception as e:
             print(f"[Sonic] Error unpacking pose message: {e}")
             return

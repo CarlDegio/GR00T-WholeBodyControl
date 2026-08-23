@@ -46,22 +46,11 @@ from gear_sonic.trl.utils.torch_transform import (
     quaternion_to_rotation_matrix,
 )
 
-try:
-    from gear_sonic.utils.teleop.zmq.zmq_planner_sender import (
-        build_command_message,
-        build_planner_message,
-        pack_pose_message,
-    )
-except ImportError:
-
-    def build_command_message(*args, **kwargs) -> bytes:
-        raise RuntimeError("build_command_message unavailable")
-
-    def build_planner_message(*args, **kwargs) -> bytes:
-        raise RuntimeError("build_planner_message unavailable")
-
-    def pack_pose_message(*args, **kwargs) -> bytes:
-        raise RuntimeError("pack_pose_message unavailable")
+from gear_sonic.runtime.protocol.cpp_control import (
+    build_command_message,
+    build_planner_message,
+)
+from gear_sonic.runtime.protocol.pose import pack_pose_message
 
 
 try:
@@ -1779,7 +1768,6 @@ class PlannerStreamer:
 
             vr_3pt_position = None
             vr_3pt_orientation = None
-            vr_3pt_compliance = None
             if stream_mode == StreamMode.PLANNER_VR_3PT:
                 sample = self.reader.get_latest()
                 if sample is not None:
@@ -1799,7 +1787,6 @@ class PlannerStreamer:
                 right_hand_position=right_hand_position,
                 vr_3pt_position=vr_3pt_position,
                 vr_3pt_orientation=vr_3pt_orientation,
-                vr_3pt_compliance=vr_3pt_compliance,
             )
             self.socket.send(msg)
         except Exception as e:

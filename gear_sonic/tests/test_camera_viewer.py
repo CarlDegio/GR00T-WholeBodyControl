@@ -187,7 +187,7 @@ def test_data_collection_launcher_viewer_uses_profile_without_direct_camera() ->
     )
 
 
-def test_data_collection_launcher_enables_sensor_gateway_rgb_preview() -> None:
+def test_data_collection_launcher_uses_sensor_gateway_without_builtin_preview() -> None:
     command = build_sensor_gateway_command(
         DataCollectionLaunchConfig(
             runtime_profile="/tmp/runtime profile.yaml",
@@ -203,7 +203,6 @@ def test_data_collection_launcher_enables_sensor_gateway_rgb_preview() -> None:
         "python -m gear_sonic.runtime.gateway.services.sensor "
         "--profile '/tmp/runtime profile.yaml' "
         "--camera-host 192.168.123.164 --camera-port 5555 "
-        "--enable-rgb-preview "
         "--no-enable-depth-anything --no-enable-ros "
         "--no-enable-visualization --no-enable-vla-timing"
     )

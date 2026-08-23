@@ -11,7 +11,6 @@ import numpy as np
 import zmq
 
 from gear_sonic.camera.sensor_server import ImageMessageSchema
-from gear_sonic.runtime.gateway.fakes import FakeCameraServer, FakeCppService
 from gear_sonic.runtime.gateway.sensor_client import SensorGatewayClient
 from gear_sonic.runtime.gateway.sensor import (
     CameraZmqIngress,
@@ -43,59 +42,19 @@ def _publish_until_ingested(publish, poll, *, timeout_s: float = 1.0) -> int:
     raise TimeoutError("SensorGateway ingress did not receive the fake message")
 
 
-class _RecordingPreview:
-    def __init__(self) -> None:
-        self.start_count = 0
-        self.frames = []
-        self.close_count = 0
-
-    def start(self) -> None:
-        self.start_count += 1
-
-    def publish(self, images) -> None:
-        self.frames.append(dict(images))
-
-    def close(self) -> None:
-        self.close_count += 1
+def _camera_publisher(context: zmq.Context, endpoint: str) -> zmq.Socket:
+    socket = context.socket(zmq.PUB)
+    socket.setsockopt(zmq.LINGER, 0)
+    socket.bind(endpoint)
+    return socket
 
 
-def test_camera_ingress_owns_rgb_preview_lifecycle_and_forwards_rgb_only() -> None:
-    context = zmq.Context()
-    core = SensorGatewayCore(slot_count=2, history_size=4)
-    camera_server = FakeCameraServer(context, "inproc://gateway-rgb-preview")
-    preview = _RecordingPreview()
-    ingress = CameraZmqIngress(
-        context,
-        "inproc://gateway-rgb-preview",
-        core,
-        preview_rgb=True,
-        preview_worker=preview,
-    )
-    schema = ImageMessageSchema(
-        timestamps={"ego_view": 100.0, "chest_view": 100.0, "ego_view_depth": 100.0},
-        images={
-            "ego_view": np.full((2, 3, 3), 10, dtype=np.uint8),
-            "chest_view": np.full((2, 3, 3), 20, dtype=np.uint8),
-            "ego_view_depth": np.full((2, 3), 1200, dtype=np.uint16),
-        },
-        camera_info={},
-    )
+def _publish_camera(socket: zmq.Socket, frame) -> None:
+    socket.send(msgpack.packb(dict(frame), use_bin_type=True))
 
-    try:
-        assert _publish_until_ingested(
-            lambda: camera_server.publish(schema.serialize()),
-            ingress.poll_once,
-        ) == 3
-        assert preview.start_count == 1
-        assert len(preview.frames) == 1
-        assert tuple(preview.frames[0]) == ("ego_view", "chest_view")
-    finally:
-        ingress.close()
-        camera_server.close()
-        core.close()
-        context.term()
 
-    assert preview.close_count == 1
+def _publish_cpp_state(socket: zmq.Socket, state, *, topic: str = "g1_debug") -> None:
+    socket.send(topic.encode("utf-8") + msgpack.packb(dict(state), use_bin_type=True))
 
 
 def test_gateway_core_resizes_ring_without_resetting_sequence() -> None:
@@ -280,14 +239,17 @@ def test_large_ring_write_does_not_hold_the_global_metadata_lock() -> None:
 def test_camera_and_cpp_ingress_are_read_only_copies_of_current_wires(monkeypatch) -> None:
     context = zmq.Context()
     core = SensorGatewayCore(slot_count=2, history_size=4)
-    camera_server = FakeCameraServer(context, "inproc://gateway-camera")
+    camera_server = _camera_publisher(context, "inproc://gateway-camera")
     command_publisher = context.socket(zmq.PUB)
     command_publisher.bind("inproc://gateway-unused-command")
-    cpp_service = FakeCppService(
-        context,
-        state_endpoint="inproc://gateway-cpp-state",
-        command_endpoint="inproc://gateway-unused-command",
-    )
+    state_publisher = context.socket(zmq.PUB)
+    state_publisher.setsockopt(zmq.LINGER, 0)
+    state_publisher.bind("inproc://gateway-cpp-state")
+    command_receiver = context.socket(zmq.SUB)
+    command_receiver.setsockopt(zmq.LINGER, 0)
+    for topic in (b"command", b"planner", b"pose"):
+        command_receiver.setsockopt(zmq.SUBSCRIBE, topic)
+    command_receiver.connect("inproc://gateway-unused-command")
     camera_ingress = CameraZmqIngress(context, "inproc://gateway-camera", core)
     state_ingress = CppStateZmqIngress(context, "inproc://gateway-cpp-state", core)
     rgb_names = ("ego_view", "chest_view", "left_wrist", "right_wrist")
@@ -331,7 +293,7 @@ def test_camera_and_cpp_ingress_are_read_only_copies_of_current_wires(monkeypatc
     }
     try:
         assert _publish_until_ingested(
-            lambda: camera_server.publish(camera_wire),
+            lambda: _publish_camera(camera_server, camera_wire),
             camera_ingress.poll_once,
         ) == 6
         encoded_positions = [
@@ -344,11 +306,13 @@ def test_camera_and_cpp_ingress_are_read_only_copies_of_current_wires(monkeypatc
         ]
         assert max(encoded_positions) < min(decoded_positions)
         assert _publish_until_ingested(
-            lambda: cpp_service.publish_state(state),
+            lambda: _publish_cpp_state(state_publisher, state),
             state_ingress.poll_once,
         ) == 1
         assert _publish_until_ingested(
-            lambda: cpp_service.publish_state(robot_config, topic="robot_config"),
+            lambda: _publish_cpp_state(
+                state_publisher, robot_config, topic="robot_config"
+            ),
             state_ingress.poll_once,
         ) == 1
 
@@ -382,7 +346,7 @@ def test_camera_and_cpp_ingress_are_read_only_copies_of_current_wires(monkeypatc
             snapshot.frames["cpp/robot_config_msgpack"]
         ).tobytes()
         assert msgpack.unpackb(raw_config, raw=False) == robot_config
-        assert cpp_service.receive_command(timeout_ms=0) is None
+        assert not command_receiver.poll(0, zmq.POLLIN)
 
         legacy_wire = {
             **camera_wire,
@@ -395,7 +359,7 @@ def test_camera_and_cpp_ingress_are_read_only_copies_of_current_wires(monkeypatc
             "image_shapes": {"ego_view": [2, 3, 3]},
         }
         assert _publish_until_ingested(
-            lambda: camera_server.publish(legacy_wire),
+            lambda: _publish_camera(camera_server, legacy_wire),
             camera_ingress.poll_once,
         ) == 1
         legacy_snapshot = core.select(
@@ -411,9 +375,10 @@ def test_camera_and_cpp_ingress_are_read_only_copies_of_current_wires(monkeypatc
     finally:
         state_ingress.close()
         camera_ingress.close()
-        cpp_service.close()
+        command_receiver.close(linger=0)
+        state_publisher.close(linger=0)
         command_publisher.close(linger=0)
-        camera_server.close()
+        camera_server.close(linger=0)
         core.close()
         context.term()
 
@@ -421,7 +386,7 @@ def test_camera_and_cpp_ingress_are_read_only_copies_of_current_wires(monkeypatc
 def test_depth_anything_ingress_publishes_metric_chest_depth_only() -> None:
     context = zmq.Context()
     core = SensorGatewayCore(slot_count=2, history_size=4)
-    server = FakeCameraServer(context, "inproc://gateway-depth-anything")
+    server = _camera_publisher(context, "inproc://gateway-depth-anything")
     ingress = DepthAnythingZmqIngress(
         context,
         "inproc://gateway-depth-anything",
@@ -454,7 +419,7 @@ def test_depth_anything_ingress_publishes_metric_chest_depth_only() -> None:
     )
     try:
         assert _publish_until_ingested(
-            lambda: server.publish(schema.serialize()),
+            lambda: _publish_camera(server, schema.serialize()),
             ingress.poll_once,
         ) == 1
         snapshot = core.select(
@@ -476,7 +441,7 @@ def test_depth_anything_ingress_publishes_metric_chest_depth_only() -> None:
         assert frame.attributes["camera_info"]["depth_aligned_to"] == "chest_view"
     finally:
         ingress.close()
-        server.close()
+        server.close(linger=0)
         core.close()
         context.term()
 
@@ -484,7 +449,7 @@ def test_depth_anything_ingress_publishes_metric_chest_depth_only() -> None:
 def test_depth_anything_idle_heartbeat_is_reported_as_intentional_idle() -> None:
     context = zmq.Context()
     core = SensorGatewayCore(slot_count=2, history_size=4)
-    server = FakeCameraServer(context, "inproc://gateway-depth-anything-status")
+    server = _camera_publisher(context, "inproc://gateway-depth-anything-status")
     ingress = DepthAnythingZmqIngress(
         context,
         "inproc://gateway-depth-anything-status",
@@ -500,14 +465,14 @@ def test_depth_anything_idle_heartbeat_is_reported_as_intentional_idle() -> None
     }
     try:
         assert _publish_until_ingested(
-            lambda: server.publish(status),
+            lambda: _publish_camera(server, status),
             ingress.poll_once,
         ) == 1
         health = core.health_payload()
         assert health["streams"]["source/depth_anything"]["state"] == "idle"
     finally:
         ingress.close()
-        server.close()
+        server.close(linger=0)
         core.close()
         context.term()
 

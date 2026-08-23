@@ -14,16 +14,17 @@ from typing import Any, Mapping, Sequence
 import numpy as np
 
 from gear_sonic.camera.constants import PRODUCTION_JPEG_QUALITY
+from gear_sonic.runtime.gateway.rgbd import materialize_rgbd
 from gear_sonic.runtime.gateway.sensor_client import (
     MaterializedSnapshot,
     SensorGatewayClient,
 )
-from gear_sonic.runtime.gateway.snapshot import SnapshotRequest
-from gear_sonic.runtime.profile import load_runtime_profile
-from gear_sonic.runtime.protocol import SharedMemoryFrame
+from gear_sonic.runtime.gateway.polling_ingress import PollingSensorIngress
+from gear_sonic.runtime.profile import load_component_config
 from gear_sonic.utils.inference.navdp.control import LatestMessageWorker
 from gear_sonic.utils.inference.navdp.navigation import Pose2D, update_slam_map
 from gear_sonic.utils.inference.navdp.visualization import filter_livox_points
+from gear_sonic.utils.math3d.quaternions import yaw_from_quaternion_xyzw
 
 LOGGER = logging.getLogger("sonic.navdp")
 
@@ -57,19 +58,13 @@ class NavDPPlannerConfig:
 def load_navdp_planner_config(
     profile: str = "", overlays: tuple[str, ...] = ()
 ) -> NavDPPlannerConfig:
-    runtime = load_runtime_profile(profile or None, overlays=overlays)
-    values = dict(runtime.component("navdp"))
-    for process_setting in ("root", "checkpoint"):
-        values.pop(process_setting)
-    return NavDPPlannerConfig(
-        profile=str(runtime.source_files[0]),
-        overlay=tuple(str(path) for path in runtime.source_files[1:]),
-        **values,
+    return load_component_config(
+        NavDPPlannerConfig,
+        "navdp",
+        profile or None,
+        overlays=overlays,
+        ignored_fields=("root", "checkpoint"),
     )
-
-
-def _quaternion_yaw(x: float, y: float, z: float, w: float) -> float:
-    return math.atan2(2.0 * (w * z + x * y), 1.0 - 2.0 * (y * y + z * z))
 
 
 def _encode_navdp_frames(rgb_bgr: np.ndarray, depth_m: np.ndarray) -> tuple[bytes, bytes]:
@@ -107,7 +102,7 @@ def _update_odometry_state(
     pose = Pose2D(
         float(state[0]),
         float(state[1]),
-        _quaternion_yaw(*map(float, state[3:7])),
+        yaw_from_quaternion_xyzw(state[3:7]),
     )
     timestamp_s = float(source_timestamp_s)
     if timestamp_s <= 0.0:
@@ -177,22 +172,31 @@ def _gateway_camera_frame(
     rgb_stream: str = "camera/chest_view",
     depth_stream: str = "camera/chest_view_depth",
 ) -> GatewayCameraFrame:
-    rgb_frame = snapshot.snapshot.frames[rgb_stream]
-    depth_frame = snapshot.snapshot.frames[depth_stream]
-    camera_info = dict(rgb_frame.attributes.get("camera_info", {}))
-    timestamp_ns = rgb_frame.source_timestamp_ns or depth_frame.source_timestamp_ns
-    rgb = np.asarray(snapshot.arrays[rgb_stream])
-    depth_raw = np.asarray(snapshot.arrays[depth_stream])
-    if rgb.ndim != 3 or depth_raw.ndim != 2 or rgb.shape[:2] != depth_raw.shape:
-        raise ValueError(
-            f"fresh aligned NavDP RGB-D unavailable for {rgb_stream!r} and "
-            f"{depth_stream!r}"
-        )
+    unavailable = (
+        f"fresh aligned NavDP RGB-D unavailable for {rgb_stream!r} and "
+        f"{depth_stream!r}"
+    )
+    decoded = materialize_rgbd(
+        snapshot,
+        rgb_stream=rgb_stream,
+        depth_stream=depth_stream,
+        prefer_depth_info=False,
+        prefer_depth_timestamp=False,
+        validate_dtypes=False,
+        rgb_label="fresh aligned NavDP RGB",
+        depth_label="fresh aligned NavDP depth",
+        mismatch_message=unavailable,
+    )
+    rgb = decoded.rgb
+    depth_raw = decoded.depth_raw
+    assert depth_raw is not None
+    camera_info = dict(decoded.camera_info)
+    timestamp_ns = decoded.source_timestamp_ns
     depth_m = depth_raw.astype(np.float32) * float(
         camera_info.get("depth_scale_m", 0.001)
     )
     return GatewayCameraFrame(
-        rgb=rgb.copy(),
+        rgb=rgb,
         depth_m=depth_m,
         camera_info=camera_info,
         source_timestamp_s=(
@@ -201,7 +205,7 @@ def _gateway_camera_frame(
     )
 
 
-class NavDPSensorGatewayIngress:
+class NavDPSensorGatewayIngress(PollingSensorIngress):
     """Materialize SensorGateway camera, odometry, and point-cloud streams for NavDP."""
 
     CAMERA_STREAMS = ("camera/chest_view", "camera/chest_view_depth")
@@ -222,60 +226,38 @@ class NavDPSensorGatewayIngress:
         depth_stream: str = CAMERA_STREAMS[1],
         client: SensorGatewayClient | None = None,
     ) -> None:
-        if poll_hz <= 0.0:
-            raise ValueError("sensor gateway poll_hz must be positive")
-        if request_timeout_ms <= 0:
-            raise ValueError("sensor gateway request_timeout_ms must be positive")
-        if max_age_ms < 0.0 or max_skew_ms < 0.0:
-            raise ValueError("sensor gateway age and skew cannot be negative")
         if not str(rgb_stream).strip() or not str(depth_stream).strip():
             raise ValueError("NavDP RGB and depth streams are required")
         if str(rgb_stream).strip() == str(depth_stream).strip():
             raise ValueError("NavDP RGB and depth streams must be different")
         self.sensors = sensors
-        self.poll_hz = float(poll_hz)
-        self.max_age_ms = float(max_age_ms)
-        self.max_skew_ms = float(max_skew_ms)
         self.camera_streams = (
             str(rgb_stream).strip(), str(depth_stream).strip(),
         )
-        self.client = client or SensorGatewayClient(
+        super().__init__(
             endpoint,
+            thread_name="navdp-sensor-gateway",
+            error_prefix="NavDP",
+            poll_hz=poll_hz,
             request_timeout_ms=request_timeout_ms,
-        )
-        self._owns_client = client is None
-        self._stop = threading.Event()
-        self._thread = threading.Thread(
-            target=self._run,
-            name="navdp-sensor-gateway",
-            daemon=True,
+            max_age_ms=max_age_ms,
+            max_skew_ms=max_skew_ms,
+            client=client,
         )
         self._camera_lock = threading.Lock()
         self._camera: GatewayCameraFrame | None = None
         self._camera_version = 0
         self._consumed_camera_version = 0
-        self._last_sequences: dict[str, int] = {}
-        self._last_error = ""
         self._lidar_worker = LatestMessageWorker(self._process_lidar)
         self._slam_worker = LatestMessageWorker(self._process_slam_cloud)
-        self._closed = False
 
-    def _request(self, streams: tuple[str, ...], *, max_skew_ms: float):
-        return self.client.read_snapshot(
-            SnapshotRequest(
-                streams=streams,
-                max_age_ms=self.max_age_ms,
-                max_skew_ms=max_skew_ms,
-            ),
-            retries=0,
+    def _pollers(self):
+        return (
+            self._poll_camera,
+            self._poll_odometry,
+            self._poll_lidar,
+            self._poll_slam_cloud,
         )
-
-    def _is_new(self, frame: SharedMemoryFrame) -> bool:
-        sequence = frame.metadata.sequence
-        if self._last_sequences.get(frame.stream) == sequence:
-            return False
-        self._last_sequences[frame.stream] = sequence
-        return True
 
     def _poll_camera(self) -> None:
         snapshot = self._request(
@@ -337,35 +319,14 @@ class NavDPSensorGatewayIngress:
             reset_after_s=self.max_age_ms * 1.0e-3,
         )
 
-    def _run(self) -> None:
-        period_s = 1.0 / self.poll_hz
-        pollers = (
-            self._poll_camera,
-            self._poll_odometry,
-            self._poll_lidar,
-            self._poll_slam_cloud,
-        )
-        while not self._stop.is_set():
-            started = time.monotonic()
-            errors = []
-            for poll in pollers:
-                if self._stop.is_set():
-                    break
-                try:
-                    poll()
-                except Exception as exc:
-                    errors.append(str(exc))
-            message = "; ".join(dict.fromkeys(errors))
-            if message != self._last_error:
-                if message:
-                    LOGGER.warning("SensorGateway waiting: %s", message)
-                elif self._last_error:
-                    LOGGER.info("SensorGateway recovered")
-                self._last_error = message
-            self._stop.wait(max(0.0, period_s - (time.monotonic() - started)))
-
-    def start(self) -> None:
-        self._thread.start()
+    def _report_errors(self, errors: list[Exception]) -> None:
+        message = "; ".join(dict.fromkeys(str(error) for error in errors))
+        if message != self._last_error:
+            if message:
+                LOGGER.warning("SensorGateway waiting: %s", message)
+            elif self._last_error:
+                LOGGER.info("SensorGateway recovered")
+            self._last_error = message
 
     def poll_camera(self) -> GatewayCameraFrame | None:
         with self._camera_lock:
@@ -377,16 +338,9 @@ class NavDPSensorGatewayIngress:
                 return None
             return camera
 
-    def close(self) -> None:
-        if self._closed:
-            return
-        self._closed = True
-        self._stop.set()
-        self._thread.join(timeout=1.0)
+    def _close_resources(self) -> None:
         self._lidar_worker.close()
         self._slam_worker.close()
-        if self._owns_client:
-            self.client.close()
 
 
 def point_plane_distances(

@@ -214,6 +214,7 @@ def load_component_config(
     path: str | Path | None = None,
     *,
     overlays: Sequence[str | Path] = (),
+    ignored_fields: Sequence[str] = (),
 ) -> ComponentConfig:
     """Build one worker config strictly from its runtime-profile component.
 
@@ -224,6 +225,8 @@ def load_component_config(
 
     profile = load_runtime_profile(path, overlays=overlays)
     values = dict(profile.component(component))
+    for name in ignored_fields:
+        values.pop(name)
     config_fields = {field.name for field in fields(config_type)}
     selection_fields = {"profile", "overlay", "config"}
     expected = config_fields - selection_fields
@@ -280,3 +283,23 @@ def load_component_config(
     if "config" in config_fields:
         selection_values["config"] = str(profile.source_files[0])
     return config_type(**selection_values, **values)
+
+
+def parse_component_config(
+    config_type: type[ComponentConfig],
+    component: str,
+    args: list[str] | None = None,
+    *,
+    ignored_fields: Sequence[str] = (),
+) -> ComponentConfig:
+    """Parse the shared profile CLI and build one component config."""
+    import tyro
+
+    selection = tyro.cli(RuntimeProfileSelection, args=args)
+    return load_component_config(
+        config_type,
+        component,
+        selection.profile or None,
+        overlays=selection.overlay,
+        ignored_fields=ignored_fields,
+    )

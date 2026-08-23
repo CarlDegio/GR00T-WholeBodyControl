@@ -1,59 +1,78 @@
-"""Wire contracts shared by velocity producers and the final executor."""
+"""Transport-neutral navigation command and status contracts."""
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 import json
 import math
 import time
 from typing import Any, Literal, Mapping, Sequence, cast
 
+
 COMMAND_TYPE = "sonic_navigation_command"
 STATUS_TYPE = "sonic_navigation_status"
 VELOCITY_TYPE = "sonic_planner_velocity"
 RUNTIME_STATUS_TYPE = "sonic_navigation_runtime_status"
+NavigationMode = Literal["manual_velocity", "nav_goal", "heading_goal", "stop"]
+TurnDirection = Literal["left", "right"]
+_MODES = {"manual_velocity", "nav_goal", "heading_goal", "stop"}
 
 
-def _generation(value: int) -> int:
+def _nonnegative(value: int, field: str) -> int:
     result = int(value)
     if result < 0:
-        raise ValueError("generation cannot be negative")
+        raise ValueError(f"{field} cannot be negative")
     return result
 
 
-def _segment_id(value: int) -> int:
-    result = int(value)
-    if result < 0:
-        raise ValueError("segment_id cannot be negative")
-    return result
-
-
-def _skill_id(value: int) -> int:
-    result = int(value)
-    if result < 0:
-        raise ValueError("skill_id cannot be negative")
-    return result
-
-
-def _finite_scalar(value: float, *, field: str) -> float:
+def _finite(value: float, field: str) -> float:
     result = float(value)
     if not math.isfinite(result):
         raise ValueError(f"{field} must be finite")
     return result
 
 
-def _finite_tuple(values: Sequence[float], *, field: str) -> tuple[float, float, float]:
-    if len(values) != 3:
-        raise ValueError(f"{field} requires three values")
-    result = tuple(float(value) for value in values)
-    if not all(math.isfinite(value) for value in result):
-        raise ValueError(f"{field} must be finite")
-    return result  # type: ignore[return-value]
+def _vector(values: Sequence[float], field: str, size: int = 3) -> tuple[float, ...]:
+    if len(values) != size:
+        raise ValueError(f"{field} requires {size} values")
+    return tuple(_finite(value, field) for value in values)
+
+
+def _mode(value: str, field: str = "navigation mode") -> NavigationMode:
+    if value not in _MODES:
+        raise ValueError(f"invalid {field}")
+    return cast(NavigationMode, value)
+
+
+def _decode(
+    message: str | bytes | Mapping[str, Any], expected_type: str
+) -> dict[str, Any]:
+    value = json.loads(message) if isinstance(message, (str, bytes)) else dict(message)
+    if value.get("type") != expected_type or value.get("version") != 1:
+        raise ValueError(f"unsupported {expected_type}")
+    value.pop("type")
+    value.pop("version")
+    return value
+
+
+def _encode(type_name: str, value: Any) -> dict[str, Any]:
+    return {"type": type_name, "version": 1, **asdict(value)}
+
+
+def _json(payload: Mapping[str, Any]) -> str:
+    return json.dumps(payload, separators=(",", ":"), allow_nan=False)
+
+
+def _timestamped(values: Mapping[str, Any]) -> dict[str, Any]:
+    result = dict(values)
+    if result.get("timestamp") is None:
+        result["timestamp"] = time.time()
+    return result
 
 
 @dataclass(frozen=True)
 class NavigationCommand:
-    mode: Literal["manual_velocity", "nav_goal", "heading_goal", "stop"]
+    mode: NavigationMode
     generation: int
     timestamp: float
     segment_id: int = 0
@@ -61,7 +80,7 @@ class NavigationCommand:
     velocity: tuple[float, float, float] | None = None
     goal_base: tuple[float, float] | None = None
     heading_delta_rad: float | None = None
-    heading_turn_direction: Literal["left", "right"] | None = None
+    heading_turn_direction: TurnDirection | None = None
     heading_max_angular_speed_rad_s: float | None = None
     heading_max_duration_s: float | None = None
     target: str = ""
@@ -70,172 +89,82 @@ class NavigationCommand:
     source: str = ""
 
     def __post_init__(self) -> None:
-        if self.mode not in {"manual_velocity", "nav_goal", "heading_goal", "stop"}:
-            raise ValueError("invalid navigation mode")
-        _generation(self.generation)
-        _segment_id(self.segment_id)
-        _skill_id(self.skill_id)
-        _finite_scalar(self.timestamp, field="navigation timestamp")
-        _finite_scalar(self.confidence, field="navigation confidence")
+        _mode(self.mode)
+        for name in ("generation", "segment_id", "skill_id"):
+            _nonnegative(getattr(self, name), name)
+        _finite(self.timestamp, "navigation timestamp")
+        _finite(self.confidence, "navigation confidence")
         if self.velocity is not None:
-            _finite_tuple(self.velocity, field="velocity")
+            _vector(self.velocity, "velocity")
         if self.goal_base is not None:
-            if len(self.goal_base) != 2:
-                raise ValueError("goal_base requires two values")
-            _finite_scalar(self.goal_base[0], field="goal_base.x")
-            _finite_scalar(self.goal_base[1], field="goal_base.y")
-        if self.heading_delta_rad is not None:
-            _finite_scalar(self.heading_delta_rad, field="heading_delta_rad")
+            _vector(self.goal_base, "goal_base", 2)
+        for name in (
+            "heading_delta_rad",
+            "heading_max_angular_speed_rad_s",
+            "heading_max_duration_s",
+        ):
+            value = getattr(self, name)
+            if value is not None:
+                _finite(value, name)
         if self.heading_turn_direction not in {None, "left", "right"}:
             raise ValueError("heading_turn_direction must be left or right")
-        if self.heading_max_angular_speed_rad_s is not None:
-            speed = _finite_scalar(
-                self.heading_max_angular_speed_rad_s,
-                field="heading_max_angular_speed_rad_s",
-            )
-            if speed <= 0.0:
-                raise ValueError(
-                    "heading_max_angular_speed_rad_s must be positive"
-                )
-        if self.heading_max_duration_s is not None:
-            duration = _finite_scalar(
-                self.heading_max_duration_s,
-                field="heading_max_duration_s",
-            )
-            if duration <= 0.0:
-                raise ValueError("heading_max_duration_s must be positive")
+        if (
+            self.heading_max_angular_speed_rad_s is not None
+            and self.heading_max_angular_speed_rad_s <= 0
+        ):
+            raise ValueError("heading_max_angular_speed_rad_s must be positive")
+        if self.heading_max_duration_s is not None and self.heading_max_duration_s <= 0:
+            raise ValueError("heading_max_duration_s must be positive")
         if self.mode == "heading_goal" and self.heading_delta_rad is None:
             raise ValueError("heading_goal requires heading_delta_rad")
 
+    def to_dict(self) -> dict[str, Any]:
+        payload = _encode(COMMAND_TYPE, self)
+        if self.velocity is None:
+            payload.pop("velocity")
+        else:
+            payload["velocity"] = dict(zip(("vx", "vy", "wz"), self.velocity))
+        if self.goal_base is None:
+            for name in ("goal_base", "target", "target_type", "confidence"):
+                payload.pop(name)
+        else:
+            payload["goal_base"] = dict(zip(("x", "y"), self.goal_base))
+        for name in (
+            "heading_delta_rad",
+            "heading_turn_direction",
+            "heading_max_angular_speed_rad_s",
+            "heading_max_duration_s",
+        ):
+            if payload[name] is None:
+                payload.pop(name)
+        if not self.source:
+            payload.pop("source")
+        return payload
 
-def build_navigation_message(
-    *,
-    mode: str,
-    generation: int,
-    segment_id: int = 0,
-    skill_id: int = 0,
-    timestamp: float | None = None,
-    velocity: Sequence[float] | None = None,
-    goal_base: Sequence[float] | None = None,
-    heading_delta_rad: float | None = None,
-    heading_turn_direction: Literal["left", "right"] | None = None,
-    heading_max_angular_speed_rad_s: float | None = None,
-    heading_max_duration_s: float | None = None,
-    target: str = "",
-    target_type: str = "",
-    confidence: float = 0.0,
-    source: str = "",
-) -> str:
-    if mode not in {"manual_velocity", "nav_goal", "heading_goal", "stop"}:
-        raise ValueError("invalid navigation mode")
-    payload: dict[str, Any] = {
-        "type": COMMAND_TYPE,
-        "version": 1,
-        "generation": _generation(generation),
-        "segment_id": _segment_id(segment_id),
-        "skill_id": _skill_id(skill_id),
-        "mode": mode,
-        "timestamp": _finite_scalar(
-            time.time() if timestamp is None else timestamp,
-            field="navigation timestamp",
-        ),
-    }
-    if velocity is not None:
-        payload["velocity"] = dict(
-            zip(("vx", "vy", "wz"), _finite_tuple(velocity, field="velocity"))
-        )
-    if goal_base is not None:
-        if len(goal_base) != 2:
-            raise ValueError("goal_base requires two values")
-        payload["goal_base"] = {
-            "x": _finite_scalar(goal_base[0], field="goal_base.x"),
-            "y": _finite_scalar(goal_base[1], field="goal_base.y"),
-        }
-        payload.update(
-            target=str(target),
-            target_type=str(target_type),
-            confidence=_finite_scalar(confidence, field="navigation confidence"),
-        )
-    if heading_delta_rad is not None:
-        payload["heading_delta_rad"] = _finite_scalar(
-            heading_delta_rad, field="heading_delta_rad"
-        )
-    if heading_turn_direction is not None:
-        if heading_turn_direction not in {"left", "right"}:
-            raise ValueError("heading_turn_direction must be left or right")
-        payload["heading_turn_direction"] = heading_turn_direction
-    if heading_max_angular_speed_rad_s is not None:
-        speed = _finite_scalar(
-            heading_max_angular_speed_rad_s,
-            field="heading_max_angular_speed_rad_s",
-        )
-        if speed <= 0.0:
-            raise ValueError("heading_max_angular_speed_rad_s must be positive")
-        payload["heading_max_angular_speed_rad_s"] = speed
-    if heading_max_duration_s is not None:
-        duration = _finite_scalar(
-            heading_max_duration_s, field="heading_max_duration_s"
-        )
-        if duration <= 0.0:
-            raise ValueError("heading_max_duration_s must be positive")
-        payload["heading_max_duration_s"] = duration
-    if mode == "heading_goal" and heading_delta_rad is None:
-        raise ValueError("heading_goal requires heading_delta_rad")
-    if source:
-        payload["source"] = str(source)
-    return json.dumps(payload, allow_nan=False)
+    def to_json(self) -> str:
+        return _json(self.to_dict())
 
+    @classmethod
+    def from_dict(cls, payload: Mapping[str, Any]) -> "NavigationCommand":
+        value = _decode(payload, COMMAND_TYPE)
+        velocity = value.pop("velocity", None)
+        goal = value.pop("goal_base", None)
+        if velocity is not None:
+            if not isinstance(velocity, Mapping):
+                raise ValueError("navigation velocity must be an object")
+            value["velocity"] = tuple(velocity[name] for name in ("vx", "vy", "wz"))
+        if goal is not None:
+            if not isinstance(goal, Mapping):
+                raise ValueError("navigation goal must be an object")
+            value["goal_base"] = (goal["x"], goal["y"])
+        value["mode"] = _mode(str(value.get("mode")))
+        if value.get("heading_turn_direction") is not None:
+            value["heading_turn_direction"] = str(value["heading_turn_direction"])
+        return cls(**value)
 
-def decode_navigation_message(message: str | bytes | Mapping[str, Any]) -> NavigationCommand:
-    payload = json.loads(message) if isinstance(message, (str, bytes)) else dict(message)
-    if payload.get("type") != COMMAND_TYPE or payload.get("version") != 1:
-        raise ValueError("unsupported navigation command")
-    mode = payload.get("mode")
-    if mode not in {"manual_velocity", "nav_goal", "heading_goal", "stop"}:
-        raise ValueError("invalid navigation mode")
-    velocity = payload.get("velocity")
-    goal = payload.get("goal_base")
-    return NavigationCommand(
-        mode=mode,
-        generation=int(payload["generation"]),
-        timestamp=float(payload["timestamp"]),
-        segment_id=int(payload.get("segment_id", 0)),
-        skill_id=int(payload.get("skill_id", 0)),
-        velocity=None
-        if velocity is None
-        else _finite_tuple(
-            tuple(float(velocity[key]) for key in ("vx", "vy", "wz")),
-            field="velocity",
-        ),
-        goal_base=None if goal is None else (float(goal["x"]), float(goal["y"])),
-        heading_delta_rad=(
-            None
-            if payload.get("heading_delta_rad") is None
-            else float(payload["heading_delta_rad"])
-        ),
-        heading_turn_direction=(
-            None
-            if payload.get("heading_turn_direction") is None
-            else cast(
-                Literal["left", "right"],
-                str(payload["heading_turn_direction"]),
-            )
-        ),
-        heading_max_angular_speed_rad_s=(
-            None
-            if payload.get("heading_max_angular_speed_rad_s") is None
-            else float(payload["heading_max_angular_speed_rad_s"])
-        ),
-        heading_max_duration_s=(
-            None
-            if payload.get("heading_max_duration_s") is None
-            else float(payload["heading_max_duration_s"])
-        ),
-        target=str(payload.get("target", "")),
-        target_type=str(payload.get("target_type", "")),
-        confidence=float(payload.get("confidence", 0.0)),
-        source=str(payload.get("source", "")),
-    )
+    @classmethod
+    def from_json(cls, message: str | bytes) -> "NavigationCommand":
+        return cls.from_dict(json.loads(message))
 
 
 @dataclass(frozen=True)
@@ -250,103 +179,63 @@ class PlannerVelocityCommand:
     heading_reference_rad: float | None = None
 
     def __post_init__(self) -> None:
-        _generation(self.generation)
-        _segment_id(self.segment_id)
-        _skill_id(self.skill_id)
-        _finite_scalar(self.timestamp, field="planner velocity timestamp")
+        for name in ("generation", "segment_id", "skill_id"):
+            _nonnegative(getattr(self, name), name)
+        _finite(self.timestamp, "planner velocity timestamp")
         if not self.source:
             raise ValueError("planner velocity source cannot be empty")
-        _finite_tuple(self.velocity, field="planner velocity")
+        _vector(self.velocity, "planner velocity")
         if (self.heading_target_rad is None) != (self.heading_reference_rad is None):
             raise ValueError("heading target and reference must be supplied together")
         if self.heading_target_rad is not None:
-            _finite_scalar(self.heading_target_rad, field="heading target")
-            _finite_scalar(self.heading_reference_rad, field="heading reference")
+            _finite(self.heading_target_rad, "heading target")
+            _finite(self.heading_reference_rad, "heading reference")
 
+    def to_dict(self) -> dict[str, Any]:
+        payload = _encode(VELOCITY_TYPE, self)
+        payload["velocity"] = dict(zip(("vx", "vy", "wz"), self.velocity))
+        payload["heading"] = (
+            None
+            if self.heading_target_rad is None
+            else {
+                "target_rad": self.heading_target_rad,
+                "reference_rad": self.heading_reference_rad,
+            }
+        )
+        payload.pop("heading_target_rad")
+        payload.pop("heading_reference_rad")
+        if payload["heading"] is None:
+            payload.pop("heading")
+        return payload
 
-def build_planner_velocity_message(
-    *,
-    generation: int,
-    segment_id: int = 0,
-    skill_id: int = 0,
-    source: str,
-    velocity: Sequence[float],
-    timestamp: float | None = None,
-    heading_target_rad: float | None = None,
-    heading_reference_rad: float | None = None,
-) -> str:
-    if not source:
-        raise ValueError("planner velocity source cannot be empty")
-    command = _finite_tuple(velocity, field="planner velocity")
-    payload: dict[str, Any] = {
-        "type": VELOCITY_TYPE,
-        "version": 1,
-        "generation": _generation(generation),
-        "segment_id": _segment_id(segment_id),
-        "skill_id": _skill_id(skill_id),
-        "timestamp": _finite_scalar(
-            time.time() if timestamp is None else timestamp,
-            field="planner velocity timestamp",
-        ),
-        "source": str(source),
-        "velocity": dict(zip(("vx", "vy", "wz"), command)),
-    }
-    if (heading_target_rad is None) != (heading_reference_rad is None):
-        raise ValueError("heading target and reference must be supplied together")
-    if heading_target_rad is not None:
-        target = float(heading_target_rad)
-        reference = float(heading_reference_rad)
-        if not math.isfinite(target) or not math.isfinite(reference):
-            raise ValueError("planner headings must be finite")
-        payload["heading"] = {"target_rad": target, "reference_rad": reference}
-    return json.dumps(payload, separators=(",", ":"), allow_nan=False)
+    def to_json(self) -> str:
+        return _json(self.to_dict())
 
+    @classmethod
+    def from_dict(cls, payload: Mapping[str, Any]) -> "PlannerVelocityCommand":
+        value = _decode(payload, VELOCITY_TYPE)
+        velocity = value.pop("velocity", None)
+        if not isinstance(velocity, Mapping):
+            raise ValueError("planner velocity object is missing")
+        value["velocity"] = tuple(velocity[name] for name in ("vx", "vy", "wz"))
+        heading = value.pop("heading", None)
+        if heading is not None:
+            if not isinstance(heading, Mapping):
+                raise ValueError("planner heading must be an object")
+            value["heading_target_rad"] = heading["target_rad"]
+            value["heading_reference_rad"] = heading["reference_rad"]
+        return cls(**value)
 
-def decode_planner_velocity_message(
-    message: str | bytes | Mapping[str, Any],
-) -> PlannerVelocityCommand:
-    payload = json.loads(message) if isinstance(message, (str, bytes)) else dict(message)
-    if payload.get("type") != VELOCITY_TYPE or payload.get("version") != 1:
-        raise ValueError("unsupported planner velocity command")
-    source = str(payload.get("source", ""))
-    if not source:
-        raise ValueError("planner velocity source cannot be empty")
-    raw_velocity = payload.get("velocity")
-    if not isinstance(raw_velocity, Mapping):
-        raise ValueError("planner velocity object is missing")
-    velocity = _finite_tuple(
-        tuple(float(raw_velocity[key]) for key in ("vx", "vy", "wz")),
-        field="planner velocity",
-    )
-    heading = payload.get("heading")
-    target: float | None = None
-    reference: float | None = None
-    if heading is not None:
-        if not isinstance(heading, Mapping):
-            raise ValueError("planner heading must be an object")
-        target = float(heading["target_rad"])
-        reference = float(heading["reference_rad"])
-        if not math.isfinite(target) or not math.isfinite(reference):
-            raise ValueError("planner headings must be finite")
-    return PlannerVelocityCommand(
-        generation=int(payload["generation"]),
-        timestamp=float(payload["timestamp"]),
-        source=source,
-        velocity=velocity,
-        segment_id=int(payload.get("segment_id", 0)),
-        skill_id=int(payload.get("skill_id", 0)),
-        heading_target_rad=target,
-        heading_reference_rad=reference,
-    )
+    @classmethod
+    def from_json(cls, message: str | bytes) -> "PlannerVelocityCommand":
+        return cls.from_dict(json.loads(message))
 
 
 @dataclass(frozen=True)
 class NavigationRuntimeStatus:
-    """Final planner command after the shared executor safety boundary."""
-
     generation: int
     timestamp: float
-    mode: Literal["manual_velocity", "nav_goal", "heading_goal", "stop"]
+    mode: NavigationMode
     source: str
     requested_velocity: tuple[float, float, float]
     velocity: tuple[float, float, float]
@@ -355,99 +244,73 @@ class NavigationRuntimeStatus:
     skill_id: int = 0
 
     def __post_init__(self) -> None:
-        _generation(self.generation)
-        _segment_id(self.segment_id)
-        _skill_id(self.skill_id)
-        _finite_scalar(self.timestamp, field="runtime status timestamp")
-        if self.mode not in {"manual_velocity", "nav_goal", "heading_goal", "stop"}:
-            raise ValueError("invalid runtime navigation mode")
-        if not self.source:
-            raise ValueError("runtime status source cannot be empty")
-        _finite_tuple(self.requested_velocity, field="requested velocity")
-        _finite_tuple(self.velocity, field="final velocity")
-        if not self.reason:
-            raise ValueError("runtime status reason cannot be empty")
+        for name in ("generation", "segment_id", "skill_id"):
+            _nonnegative(getattr(self, name), name)
+        _finite(self.timestamp, "runtime status timestamp")
+        _mode(self.mode, "runtime navigation mode")
+        if not self.source or not self.reason:
+            raise ValueError("runtime status source and reason cannot be empty")
+        _vector(self.requested_velocity, "requested velocity")
+        _vector(self.velocity, "final velocity")
+
+    def to_dict(self) -> dict[str, Any]:
+        payload = _encode(RUNTIME_STATUS_TYPE, self)
+        payload["requested_velocity"] = dict(
+            zip(("vx", "vy", "wz"), self.requested_velocity)
+        )
+        payload["velocity"] = dict(zip(("vx", "vy", "wz"), self.velocity))
+        return payload
+
+    def to_json(self) -> str:
+        return _json(self.to_dict())
+
+    @classmethod
+    def from_dict(cls, payload: Mapping[str, Any]) -> "NavigationRuntimeStatus":
+        value = _decode(payload, RUNTIME_STATUS_TYPE)
+        for field in ("requested_velocity", "velocity"):
+            vector = value.get(field)
+            if not isinstance(vector, Mapping):
+                raise ValueError("runtime status velocity objects are missing")
+            value[field] = tuple(vector[name] for name in ("vx", "vy", "wz"))
+        value["mode"] = _mode(str(value.get("mode")), "runtime navigation mode")
+        return cls(**value)
+
+    @classmethod
+    def from_json(cls, message: str | bytes) -> "NavigationRuntimeStatus":
+        return cls.from_dict(json.loads(message))
 
 
-def build_navigation_runtime_status_message(
-    *,
-    generation: int,
-    segment_id: int = 0,
-    skill_id: int = 0,
-    mode: str,
-    source: str,
-    requested_velocity: Sequence[float],
-    velocity: Sequence[float],
-    reason: str,
-    timestamp: float | None = None,
-) -> str:
-    if mode not in {"manual_velocity", "nav_goal", "heading_goal", "stop"}:
-        raise ValueError("invalid runtime navigation mode")
-    status = NavigationRuntimeStatus(
-        generation=_generation(generation),
-        segment_id=_segment_id(segment_id),
-        skill_id=_skill_id(skill_id),
-        timestamp=_finite_scalar(
-            time.time() if timestamp is None else timestamp,
-            field="runtime status timestamp",
-        ),
-        mode=cast(Literal["manual_velocity", "nav_goal", "heading_goal", "stop"], mode),
-        source=str(source),
-        requested_velocity=_finite_tuple(
-            requested_velocity,
-            field="requested velocity",
-        ),
-        velocity=_finite_tuple(velocity, field="final velocity"),
-        reason=str(reason),
+def build_navigation_message(**values: Any) -> str:
+    return NavigationCommand(**_timestamped(values)).to_json()
+
+
+def decode_navigation_message(
+    message: str | bytes | Mapping[str, Any],
+) -> NavigationCommand:
+    return NavigationCommand.from_dict(
+        json.loads(message) if isinstance(message, (str, bytes)) else message
     )
-    return json.dumps(
-        {
-            "type": RUNTIME_STATUS_TYPE,
-            "version": 1,
-            "generation": status.generation,
-            "segment_id": status.segment_id,
-            "skill_id": status.skill_id,
-            "timestamp": status.timestamp,
-            "mode": status.mode,
-            "source": status.source,
-            "requested_velocity": dict(
-                zip(("vx", "vy", "wz"), status.requested_velocity)
-            ),
-            "velocity": dict(zip(("vx", "vy", "wz"), status.velocity)),
-            "reason": status.reason,
-        },
-        separators=(",", ":"),
-        allow_nan=False,
+
+
+def build_planner_velocity_message(**values: Any) -> str:
+    return PlannerVelocityCommand(**_timestamped(values)).to_json()
+
+
+def decode_planner_velocity_message(
+    message: str | bytes | Mapping[str, Any],
+) -> PlannerVelocityCommand:
+    return PlannerVelocityCommand.from_dict(
+        json.loads(message) if isinstance(message, (str, bytes)) else message
     )
+
+
+def build_navigation_runtime_status_message(**values: Any) -> str:
+    return NavigationRuntimeStatus(**_timestamped(values)).to_json()
 
 
 def decode_navigation_runtime_status_message(
     message: str | bytes | Mapping[str, Any],
 ) -> NavigationRuntimeStatus:
-    payload = json.loads(message) if isinstance(message, (str, bytes)) else dict(message)
-    if payload.get("type") != RUNTIME_STATUS_TYPE or payload.get("version") != 1:
-        raise ValueError("unsupported navigation runtime status")
-    requested = payload.get("requested_velocity")
-    velocity = payload.get("velocity")
-    if not isinstance(requested, Mapping) or not isinstance(velocity, Mapping):
-        raise ValueError("runtime status velocity objects are missing")
-    mode = payload.get("mode")
-    if mode not in {"manual_velocity", "nav_goal", "heading_goal", "stop"}:
-        raise ValueError("invalid runtime navigation mode")
-    return NavigationRuntimeStatus(
-        generation=int(payload["generation"]),
-        timestamp=float(payload["timestamp"]),
-        segment_id=int(payload.get("segment_id", 0)),
-        skill_id=int(payload.get("skill_id", 0)),
-        mode=mode,
-        source=str(payload.get("source", "")),
-        requested_velocity=_finite_tuple(
-            tuple(float(requested[name]) for name in ("vx", "vy", "wz")),
-            field="requested velocity",
-        ),
-        velocity=_finite_tuple(
-            tuple(float(velocity[name]) for name in ("vx", "vy", "wz")),
-            field="final velocity",
-        ),
-        reason=str(payload.get("reason", "")),
+    return NavigationRuntimeStatus.from_dict(
+        json.loads(message) if isinstance(message, (str, bytes)) else message
     )

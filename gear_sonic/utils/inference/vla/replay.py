@@ -28,10 +28,7 @@ import pandas as pd
 import zmq
 
 from gear_sonic.utils.data_collection.state_subscriber import ZMQStateSubscriber
-from gear_sonic.utils.teleop.zmq.zmq_planner_sender import (
-    pack_pose_message,
-    pack_pose_v1_message,
-)
+from gear_sonic.runtime.protocol.pose import pack_pose_message, pack_pose_v1_message
 
 
 BODY_JOINT_DIM = 29

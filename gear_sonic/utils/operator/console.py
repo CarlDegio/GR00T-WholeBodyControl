@@ -15,6 +15,7 @@ import zmq
 
 from gear_sonic.runtime.profile import load_runtime_profile
 from gear_sonic.runtime.gateway.control import ControlGatewayCore, OperatorConsoleRouter
+from gear_sonic.runtime.zmq_sockets import connect_push
 
 
 @contextmanager
@@ -55,9 +56,7 @@ def main() -> None:
     ttl_ms = int(profile.component("control_gateway")["command_ttl_ms"])
 
     context = zmq.Context()
-    sender = context.socket(zmq.PUSH)
-    sender.setsockopt(zmq.LINGER, 0)
-    sender.connect(endpoint)
+    sender = connect_push(context, endpoint, linger_ms=0)
     core = ControlGatewayCore(ttl_ms=ttl_ms)
     router = OperatorConsoleRouter()
     print(f"[OperatorCLI] ControlGateway: {endpoint}")

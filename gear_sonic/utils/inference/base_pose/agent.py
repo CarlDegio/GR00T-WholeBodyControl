@@ -6,7 +6,6 @@ from __future__ import annotations
 from dataclasses import dataclass
 import logging
 import math
-import queue
 import threading
 import time
 from typing import Any, Callable, Mapping
@@ -15,22 +14,16 @@ import zmq
 
 from gear_sonic.camera.calibration import DEFAULT_CAMERA_INTRINSICS_PATH
 from gear_sonic.runtime.profile import (
-    RuntimeProfileSelection,
     load_component_config,
-    load_runtime_profile,
+    parse_component_config,
 )
 from gear_sonic.runtime.gateway.control_client import (
     ControlGatewayIntentClient,
     ControlGatewaySubscriber,
 )
-from gear_sonic.runtime.telemetry import (
-    BASE_POSE_TIMING_SEGMENTS,
-    build_event,
-    configure_file_logging,
-    emit_event,
-    open_telemetry_publisher,
-    publish_metrics,
-)
+from gear_sonic.runtime.inference_service import InferenceServiceContext
+from gear_sonic.runtime.telemetry import BASE_POSE_TIMING_SEGMENTS
+from gear_sonic.runtime.zmq_sockets import connect_subscriber
 from gear_sonic.utils.inference.base_pose.dual_servo import (
     run_dual_raw_servo_worker,
 )
@@ -162,10 +155,7 @@ def load_base_pose_config(
 
 
 def parse_base_pose_config(args: list[str] | None = None) -> BasePoseAgentConfig:
-    import tyro
-
-    selection = tyro.cli(RuntimeProfileSelection, args=args)
-    return load_base_pose_config(selection.profile, selection.overlay)
+    return parse_component_config(BasePoseAgentConfig, "base_pose", args)
 
 
 class GatewayRawServoAdapter:
@@ -395,17 +385,10 @@ class GatewayRawServoAdapter:
 def run_base_pose_yolo_agent(config: Any) -> None:
     """Run dual-camera YOLOE without owning the SONIC socket."""
 
-    configure_file_logging("base_pose")
     validate_raw_servo_dependencies(config)
-    profile = load_runtime_profile(config.profile or None, overlays=config.overlay)
+    service = InferenceServiceContext("base_pose", config)
+    profile = service.profile
     context = zmq.Context.instance()
-    event_socket = open_telemetry_publisher(
-        profile.endpoint_uri("runtime_event_ingress")
-    )
-    metrics_socket = open_telemetry_publisher(
-        profile.endpoint_uri("runtime_metrics_ingress")
-    )
-    pending_events: queue.SimpleQueue[dict[str, object]] = queue.SimpleQueue()
 
     def report_event(
         level: int,
@@ -415,17 +398,16 @@ def run_base_pose_yolo_agent(config: Any) -> None:
         write_log: bool = True,
         **fields: object,
     ) -> None:
-        payload = build_event("base_pose", level, code, message, **fields)
-        if write_log:
-            emit_event(payload, logger=LOGGER)
-        pending_events.put(payload)
+        service.event(
+            level,
+            code,
+            message,
+            queued=True,
+            write_log=write_log,
+            **fields,
+        )
 
-    def flush_events() -> None:
-        while True:
-            try:
-                emit_event(pending_events.get_nowait(), socket=event_socket)
-            except queue.Empty:
-                return
+    flush_events = service.flush_events
 
     def log_runtime(message: str) -> None:
         level = (
@@ -438,9 +420,7 @@ def run_base_pose_yolo_agent(config: Any) -> None:
         LOGGER.log(level, message)
 
     def send_metrics(values: Mapping[str, float], *, activate: bool = False) -> None:
-        publish_metrics(
-            metrics_socket,
-            "base_pose",
+        service.publish_metrics(
             values,
             allowed_names=BASE_POSE_TIMING_SEGMENTS,
             activate=activate,
@@ -457,11 +437,9 @@ def run_base_pose_yolo_agent(config: Any) -> None:
     orientation_provider = None
     orientation_endpoint = profile.endpoint_uri("orientation_telemetry")
     if orientation_endpoint:
-        orientation_socket = context.socket(zmq.SUB)
-        orientation_socket.setsockopt(zmq.SUBSCRIBE, b"")
-        orientation_socket.setsockopt(zmq.CONFLATE, 1)
-        orientation_socket.setsockopt(zmq.LINGER, 0)
-        orientation_socket.connect(orientation_endpoint)
+        orientation_socket = connect_subscriber(
+            context, orientation_endpoint, conflate=True, linger_ms=0,
+        )
         latest_orientation = LatestOrientationTelemetry()
         last_warning_at = -math.inf
 
@@ -590,9 +568,7 @@ def run_base_pose_yolo_agent(config: Any) -> None:
         if orientation_socket is not None:
             orientation_socket.close(0)
         report_event(logging.INFO, "STOPPED", "BasePose stopped")
-        flush_events()
-        event_socket.close(0)
-        metrics_socket.close(0)
+        service.close()
 
 
 def main(config: BasePoseAgentConfig) -> None:

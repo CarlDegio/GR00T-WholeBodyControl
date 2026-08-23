@@ -2,16 +2,17 @@
 
 import zmq
 
+from gear_sonic.runtime.zmq_sockets import connect_subscriber
+
 
 class ZMQPoller:
     """Simple ZMQ subscriber for sporadic non-blocking reads."""
 
     def __init__(self, host: str = "localhost", port: int = 5555, topic: str = ""):
         self._context = zmq.Context()
-        self._socket = self._context.socket(zmq.SUB)
-        self._socket.setsockopt_string(zmq.SUBSCRIBE, topic)
-        self._socket.setsockopt(zmq.CONFLATE, 1)
-        self._socket.connect(f"tcp://{host}:{port}")
+        self._socket = connect_subscriber(
+            self._context, f"tcp://{host}:{port}", topic=topic, conflate=True,
+        )
         self._topic = topic
 
     def __del__(self):

@@ -7,6 +7,7 @@ from gear_sonic.runtime.profile.config import (
     default_runtime_profile_path,
     load_component_config,
     load_runtime_profile,
+    parse_component_config,
 )
 from gear_sonic.runtime.profile.endpoints import ENDPOINT_SCHEMES
 
@@ -18,4 +19,5 @@ __all__ = [
     "default_runtime_profile_path",
     "load_component_config",
     "load_runtime_profile",
+    "parse_component_config",
 ]

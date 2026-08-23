@@ -21,7 +21,7 @@ from gear_sonic.utils.planner_control import (
     decode_navigation_runtime_status_message,
     decode_planner_velocity_message,
 )
-from gear_sonic.utils.teleop.zmq.zmq_planner_sender import build_planner_message
+from gear_sonic.runtime.protocol.cpp_control import build_planner_message
 
 
 def _receive_one(

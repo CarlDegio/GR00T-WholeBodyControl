@@ -18,17 +18,13 @@ from gear_sonic.runtime.gateway.control_client import (
     ControlGatewayIntentClient,
     ControlGatewaySubscriber,
 )
+from gear_sonic.runtime.inference_service import InferenceServiceContext
+from gear_sonic.runtime.queues import discard_queued, replace_latest
 from gear_sonic.runtime.profile import (
-    RuntimeProfileSelection,
     load_component_config,
-    load_runtime_profile,
+    parse_component_config,
 )
-from gear_sonic.runtime.telemetry import (
-    build_event,
-    configure_file_logging,
-    emit_event,
-    open_telemetry_publisher,
-)
+from gear_sonic.runtime.telemetry import build_event
 from gear_sonic.utils.inference.lavira.agent import (
     DEFAULT_LA_MODEL,
     DEFAULT_VA_MODEL,
@@ -166,10 +162,7 @@ def load_lavira_config(
 
 
 def parse_lavira_config(args: list[str] | None = None) -> LaviraPlannerConfig:
-    import tyro
-
-    selection = tyro.cli(RuntimeProfileSelection, args=args)
-    return load_lavira_config(selection.profile, selection.overlay)
+    return parse_component_config(LaviraPlannerConfig, "lavira", args)
 
 
 @dataclass(frozen=True)
@@ -234,23 +227,11 @@ class LaviraPlannerRuntime:
     def phase(self) -> str:
         return self.state
 
-    @staticmethod
-    def _discard_queued(queue_: queue.Queue) -> None:
-        try:
-            queue_.get_nowait()
-        except queue.Empty:
-            pass
-
-    @classmethod
-    def _put_latest(cls, queue_: queue.Queue, item: Any) -> None:
-        cls._discard_queued(queue_)
-        queue_.put_nowait(item)
-
     def is_cancelled(self, generation: int) -> bool:
         return self.stop_event.is_set() or generation != self.generation
 
     def publish_worker_result(self, item: WorkerResult) -> None:
-        self._put_latest(self.results, item)
+        replace_latest(self.results, item)
 
     def cancel(self, generation: int, reason: str) -> None:
         if generation < self.generation:
@@ -268,7 +249,7 @@ class LaviraPlannerRuntime:
             self.pending_generation = None
             self.state = "listen_wasd"
             self._terminal_status.clear()
-            self._discard_queued(self.requests)
+            discard_queued(self.requests)
             self._condition.notify_all()
         LOGGER.info("LISTEN_WASD reason=%s", reason)
         self._event(
@@ -295,7 +276,7 @@ class LaviraPlannerRuntime:
             self.pending_generation = generation
             self.state = "nav"
             self._terminal_status.clear()
-            self._put_latest(self.requests, generation)
+            replace_latest(self.requests, generation)
             self._condition.notify_all()
         LOGGER.info(
             "NAV generation=%s navigation_mode=%s mission=%s",
@@ -557,16 +538,13 @@ def _agent(
 
 
 def main(config: LaviraPlannerConfig) -> None:
-    configure_file_logging("lavira")
-    profile = load_runtime_profile(config.profile or None, overlays=config.overlay)
-    event_socket = open_telemetry_publisher(
-        profile.endpoint_uri("runtime_event_ingress")
+    service = InferenceServiceContext(
+        "lavira",
+        config,
+        enable_metrics=False,
     )
-    metrics_socket = open_telemetry_publisher(
-        profile.endpoint_uri("runtime_metrics_ingress")
-    )
-    pending_events: queue.SimpleQueue[dict[str, object]] = queue.SimpleQueue()
-    forwarding_handler = LaviraRuntimeEventHandler(pending_events)
+    profile = service.profile
+    forwarding_handler = LaviraRuntimeEventHandler(service.pending_events)
     LOGGER.addHandler(forwarding_handler)
 
     def report_event(
@@ -584,14 +562,9 @@ def main(config: LaviraPlannerConfig) -> None:
             payload["fields"],
             extra={"runtime_event_emitted": True},
         )
-        pending_events.put(payload)
+        service.pending_events.put(payload)
 
-    def flush_events() -> None:
-        while True:
-            try:
-                emit_event(pending_events.get_nowait(), socket=event_socket)
-            except queue.Empty:
-                return
+    flush_events = service.flush_events
 
     context = zmq.Context.instance()
     intent = ControlGatewayIntentClient(
@@ -660,12 +633,10 @@ def main(config: LaviraPlannerConfig) -> None:
         report_event(logging.INFO, "STOPPED", "LaViRA service stopped")
         runtime.shutdown()
         worker.join(timeout=1.0)
-        flush_events()
         control_gateway.close()
         intent.close()
-        event_socket.close(linger=0)
-        metrics_socket.close(linger=0)
         LOGGER.removeHandler(forwarding_handler)
+        service.close()
 
 
 def result_to_goal(result: ObjectNavResult) -> tuple[float, float]:

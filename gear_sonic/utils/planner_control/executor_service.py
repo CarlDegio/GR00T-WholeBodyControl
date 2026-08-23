@@ -23,6 +23,7 @@ from gear_sonic.runtime.telemetry import (
     emit_event,
     open_telemetry_publisher,
 )
+from gear_sonic.runtime.zmq_sockets import bind_publisher, connect_subscriber
 from gear_sonic.utils.planner_control import (
     PlannerVelocityExecutorCore,
     SafetySnapshot,
@@ -245,19 +246,12 @@ def main(
     status_endpoint = profile.endpoint_uri("navigation_runtime_status")
     orientation_endpoint = profile.endpoint_uri("orientation_telemetry")
     context = zmq.Context.instance()
-    navigation = context.socket(zmq.SUB)
-    navdp = context.socket(zmq.SUB)
-    output = context.socket(zmq.PUB)
-    runtime_status = context.socket(zmq.PUB)
-    for socket in (navigation, navdp, output, runtime_status):
-        socket.setsockopt(zmq.LINGER, 0)
-    runtime_status.setsockopt(zmq.SNDHWM, 1)
-    navigation.setsockopt_string(zmq.SUBSCRIBE, "")
-    navdp.setsockopt_string(zmq.SUBSCRIBE, "")
-    navigation.connect(command_endpoint)
-    navdp.connect(navdp_endpoint)
-    output.bind(output_endpoint)
-    runtime_status.bind(status_endpoint)
+    navigation = connect_subscriber(context, command_endpoint, linger_ms=0)
+    navdp = connect_subscriber(context, navdp_endpoint, linger_ms=0)
+    output = bind_publisher(context, output_endpoint, linger_ms=0)
+    runtime_status = bind_publisher(
+        context, status_endpoint, high_water_mark=1, linger_ms=0,
+    )
     event_socket = open_telemetry_publisher(
         profile.endpoint_uri("runtime_event_ingress")
     )
@@ -274,9 +268,9 @@ def main(
     orientation_output = None
     orientation_tracker = None
     if publish_orientation:
-        orientation_output = context.socket(zmq.PUB)
-        orientation_output.setsockopt(zmq.LINGER, 0)
-        orientation_output.bind(orientation_endpoint)
+        orientation_output = bind_publisher(
+            context, orientation_endpoint, linger_ms=0,
+        )
         orientation_tracker = OrientationTracker()
     sensors = PlannerSafetySensorMonitor(
         profile.endpoint_uri("sensor_gateway_metadata"),

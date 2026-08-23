@@ -12,15 +12,9 @@ from typing import Any, Mapping
 
 import numpy as np
 
-from gear_sonic.runtime.profile import load_runtime_profile
-from gear_sonic.runtime.telemetry import (
-    NAVDP_TIMING_SEGMENTS,
-    build_event,
-    configure_file_logging,
-    emit_event,
-    open_telemetry_publisher,
-    publish_metrics,
-)
+from gear_sonic.runtime.inference_service import InferenceServiceContext
+from gear_sonic.runtime.telemetry import NAVDP_TIMING_SEGMENTS
+from gear_sonic.runtime.zmq_sockets import bind_publisher, connect_subscriber
 from gear_sonic.utils.inference.navdp.control import (
     AsyncMpcSolver,
     MpcSolveRequest,
@@ -84,8 +78,8 @@ def _fresh_sonic_yaw(
 
 
 def main(config: NavDPPlannerConfig) -> None:
-    configure_file_logging("navdp")
-    profile = load_runtime_profile(config.profile or None, overlays=config.overlay)
+    service = InferenceServiceContext("navdp", config)
+    profile = service.profile
     command_endpoint = profile.endpoint_uri("navigation_command")
     output_endpoint = profile.endpoint_uri("navdp_velocity")
     navdp_endpoint = profile.endpoint_uri("xnavdp_http")
@@ -102,24 +96,18 @@ def main(config: NavDPPlannerConfig) -> None:
     install_shutdown_signal_handlers()
 
     context = zmq.Context.instance()
-    commands = context.socket(zmq.SUB)
-    commands.connect(command_endpoint)
-    commands.setsockopt_string(zmq.SUBSCRIBE, "")
-    orientation = context.socket(zmq.SUB)
-    orientation.setsockopt_string(zmq.SUBSCRIBE, "")
-    orientation.setsockopt(zmq.CONFLATE, 1)
-    orientation.setsockopt(zmq.RCVHWM, 1)
-    orientation.connect(orientation_endpoint)
-    status = context.socket(zmq.PUB)
-    status.bind(profile.endpoint_uri("navigation_status"))
-    output = context.socket(zmq.PUB)
-    output.bind(output_endpoint)
-    event_socket = open_telemetry_publisher(
-        profile.endpoint_uri("runtime_event_ingress")
+    commands = connect_subscriber(context, command_endpoint)
+    orientation = connect_subscriber(
+        context,
+        orientation_endpoint,
+        conflate=True,
+        high_water_mark=1,
     )
-    metrics_socket = open_telemetry_publisher(
-        profile.endpoint_uri("runtime_metrics_ingress")
+    status = bind_publisher(
+        context,
+        profile.endpoint_uri("navigation_status"),
     )
+    output = bind_publisher(context, output_endpoint)
     visualization_publisher = (
         VisualizationPublisher(
             profile.endpoint_uri("sensor_gateway_visualization_ingress")
@@ -184,16 +172,10 @@ def main(config: NavDPPlannerConfig) -> None:
     orientation_error = ""
 
     def report_event(level: int, code: str, message: str, **fields: object) -> None:
-        emit_event(
-            build_event("navdp", level, code, message, **fields),
-            socket=event_socket,
-            logger=LOGGER,
-        )
+        service.event(level, code, message, **fields)
 
     def send_metrics(values: Mapping[str, float], *, activate: bool = False) -> None:
-        publish_metrics(
-            metrics_socket,
-            "navdp",
+        service.publish_metrics(
             values,
             allowed_names=NAVDP_TIMING_SEGMENTS,
             activate=activate,
@@ -732,19 +714,21 @@ def main(config: NavDPPlannerConfig) -> None:
         orientation.close(0)
         status.close(0)
         output.close(0)
-        event_socket.close(linger=0)
-        metrics_socket.close(linger=0)
+        service.close()
         visualization_publisher.close()
 
 
 if __name__ == "__main__":
-    import tyro
+    from gear_sonic.runtime.profile import parse_component_config
 
-    from gear_sonic.runtime.profile import RuntimeProfileSelection
-
-    selection = tyro.cli(RuntimeProfileSelection)
     try:
-        main(load_navdp_planner_config(selection.profile, selection.overlay))
+        main(
+            parse_component_config(
+                NavDPPlannerConfig,
+                "navdp",
+                ignored_fields=("root", "checkpoint"),
+            )
+        )
     except Exception:
         LOGGER.exception("fatal NavDP planner failure")
         raise

@@ -5,7 +5,6 @@ from __future__ import annotations
 
 import argparse
 from dataclasses import dataclass
-import math
 import os
 import signal
 import subprocess
@@ -20,6 +19,7 @@ from gear_sonic.utils.inference.navdp.recovery import (
     OdometrySample,
     SlamRecoveryLimits,
 )
+from gear_sonic.utils.math3d.quaternions import yaw_from_quaternion_xyzw
 
 
 _SHUTDOWN_SIGNALS = (signal.SIGHUP, signal.SIGINT, signal.SIGTERM)
@@ -176,17 +176,6 @@ def _restore_signal_handlers(previous_handlers: dict[signal.Signals, Any]) -> No
         signal.signal(signum, handler)
 
 
-def _quaternion_yaw(orientation: Any) -> float:
-    x = float(orientation.x)
-    y = float(orientation.y)
-    z = float(orientation.z)
-    w = float(orientation.w)
-    return math.atan2(
-        2.0 * (w * z + x * y),
-        1.0 - 2.0 * (y * y + z * z),
-    )
-
-
 def odometry_sample(message: Any, *, fallback_timestamp_s: float) -> OdometrySample:
     stamp = message.header.stamp
     timestamp_s = float(stamp.sec) + float(stamp.nanosec) * 1e-9
@@ -198,7 +187,14 @@ def odometry_sample(message: Any, *, fallback_timestamp_s: float) -> OdometrySam
         timestamp_s=timestamp_s,
         x=float(pose.position.x),
         y=float(pose.position.y),
-        yaw=_quaternion_yaw(pose.orientation),
+        yaw=yaw_from_quaternion_xyzw(
+            (
+                pose.orientation.x,
+                pose.orientation.y,
+                pose.orientation.z,
+                pose.orientation.w,
+            )
+        ),
         velocity_x=float(twist.linear.x),
         velocity_y=float(twist.linear.y),
         yaw_rate=float(twist.angular.z),

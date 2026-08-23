@@ -149,8 +149,6 @@ def _validate_bbox(value: Any, *, required: bool) -> list[float] | None:
 def _validate_skill_args(
     skill: str | None,
     args: Mapping[str, Any],
-    *,
-    current_step: int | None = None,
 ) -> None:
     if skill is None:
         if args:
@@ -172,8 +170,7 @@ def _validate_skill_args(
 
 
 def validate_language_action(
-    value: Any, *, current_step: int | None = None,
-    expected_global_target: str | None = None,
+    value: Any, *, expected_global_target: str | None = None,
 ) -> dict[str, Any]:
     if not isinstance(value, dict) or set(value) != LA_KEYS:
         raise LaViRAAgentError("LA output has an invalid object schema")
@@ -223,9 +220,7 @@ def validate_language_action(
     )
     result["decision"] = decision
     result["skill"] = None if skill is None else skill.upper()
-    _validate_skill_args(
-        result["skill"], result["skill_args"], current_step=current_step,
-    )
+    _validate_skill_args(result["skill"], result["skill_args"])
     return result
 
 
@@ -970,7 +965,6 @@ class LaViRAClient:
                 _strict_json_object(
                     self._content(completion, role="LA"), role="LA",
                 ),
-                current_step=current_step,
                 expected_global_target=global_target,
             ),
             messages=self._messages(
@@ -1112,13 +1106,6 @@ class AgentHistoryEntry:
     va_result: str
     evidence: str = ""
 
-    def summary(self) -> str:
-        return (
-            f"skill_id={self.skill_id} skill={self.skill} target={self.target!r} "
-            f"controller={self.controller_state} va={self.va_result} "
-            f"evidence={self.evidence!r}"
-        )
-
 
 @dataclass(frozen=True)
 class LaViRATaskResult:
@@ -1246,15 +1233,12 @@ class LaViRAAgent:
         self._segment_id = -1
         self._skill_id = 0
         self._scan_id = 0
-        self._latest_scan: list[ScanView] = []
         self._scan_anchor_yaw: float | None = None
         self._recent_move_to_views: list[MoveToView] = []
         self._history: list[AgentHistoryEntry] = []
-        self._failed_targets: list[str] = []
         self._latest_transition: dict[str, Any] | None = None
         self._global_target_navigation_ready = False
         self._next_observation_mode = "panorama"
-        self._manipulation_started = False
 
     def _reset_task_context(self) -> None:
         """Start one generation with no images or state from an older task."""
@@ -1263,15 +1247,12 @@ class LaViRAAgent:
         self._segment_id = -1
         self._skill_id = 0
         self._scan_id = 0
-        self._latest_scan = []
         self._scan_anchor_yaw = None
         self._recent_move_to_views = []
         self._history = []
-        self._failed_targets = []
         self._latest_transition = None
         self._global_target_navigation_ready = False
         self._next_observation_mode = "panorama"
-        self._manipulation_started = False
 
     def _event(
         self,
@@ -1663,7 +1644,6 @@ class LaViRAAgent:
                 measured_yaw,
             ))
         self._face_absolute_yaw(generation, skill_id, anchor_yaw)
-        self._latest_scan = views
         return views
 
     def _capture_front_observation(self) -> list[ScanView]:
@@ -1676,7 +1656,6 @@ class LaViRAAgent:
         views = [ScanView(
             self._scan_id, "front", self.camera.capture_rgb(), pose, sonic_yaw,
         )]
-        self._latest_scan = views
         return views
 
     def _face_scan_direction(
@@ -1818,7 +1797,6 @@ class LaViRAAgent:
                 self.camera.capture_rgb() if image_bgr is None else image_bgr
             ),
         ), skill=skill)
-        self._store_transition(skill, result)
         self._event(
             logging.INFO if result["status"] == "SATISFIED" else logging.WARNING,
             "VA_POSTCHECK",
@@ -2169,7 +2147,7 @@ class LaViRAAgent:
 
     def _move_to(
         self, generation: int, skill_id: int, args: Mapping[str, Any],
-        _expected: str, strategic_goal: str,
+        strategic_goal: str,
     ) -> AgentHistoryEntry:
         direction = str(args["view_direction"])
         target = str(args["target"])
@@ -2185,7 +2163,6 @@ class LaViRAAgent:
             strategic_goal=strategic_goal, strategic_stop=False,
         )
         if grounding["status"] != "FOUND":
-            self._failed_targets.append(target)
             post, _ready_view = self._nav_handoff(
                 generation=generation,
                 skill_id=skill_id,
@@ -2219,8 +2196,6 @@ class LaViRAAgent:
         })
         status = self._wait(generation, skill_id, segment)
         move_succeeded = status.get("state") == "reached"
-        if not move_succeeded:
-            self._failed_targets.append(target)
         result_snapshots: dict[str, RGBDSnapshot] = {}
         camera_errors: dict[str, str] = {}
         for label in ("chest", "head"):
@@ -2305,7 +2280,7 @@ class LaViRAAgent:
 
     def _align(
         self, generation: int, skill_id: int, args: Mapping[str, Any],
-        _expected: str, strategic_goal: str,
+        strategic_goal: str,
     ) -> AgentHistoryEntry:
         if args:
             raise LaViRAAgentError("ALIGN skill_args must be empty")
@@ -2366,7 +2341,6 @@ class LaViRAAgent:
         ready, reason = self.readiness(generation, skill_id)
         if not ready:
             raise LaViRAAgentError(f"manipulate_gate:{reason}")
-        self._manipulation_started = True
         self.submit_intent("start_vla_task", {
             "generation": generation, "skill_id": skill_id, "window_id": 0,
             "task": self.manipulation_prompt,
@@ -2418,7 +2392,6 @@ class LaViRAAgent:
         )
         started = self.monotonic()
         unknown_count = 0
-        last_post: dict[str, Any] | None = None
         for window_id in range(1, self.manipulation_max_windows + 1):
             self._check_cancelled(generation)
             self._event(
@@ -2477,7 +2450,6 @@ class LaViRAAgent:
                     unknown_count = 0
             else:
                 unknown_count = 0
-            last_post = post
             if post["transition"] == "TASK_COMPLETE":
                 self.submit_intent("stop_vla_task", {
                     "generation": generation, "skill_id": skill_id,
@@ -2498,7 +2470,7 @@ class LaViRAAgent:
             "window_id": self.manipulation_max_windows,
             "reason": "window_limit",
         })
-        evidence = "" if last_post is None else str(last_post["visual_evidence"])
+        evidence = str(post["visual_evidence"])
         raise LaViRAAgentError(f"manipulate_window_limit:{evidence}")
 
     def run(self, generation: int) -> LaViRATaskResult:
@@ -2523,8 +2495,6 @@ class LaViRAAgent:
             todo = ""
             for step in range(1, self.max_steps + 1):
                 self._check_cancelled(generation)
-                if self._manipulation_started:
-                    raise LaViRAAgentError("navigation_after_manipulate_forbidden")
                 self._skill_id += 1
                 panorama = self._next_observation_mode == "panorama"
                 event_prefix = "PANORAMA" if panorama else "FRONT_OBSERVATION"
@@ -2576,17 +2546,18 @@ class LaViRAAgent:
                     anchor_pose=list(scan_views[0].reference_pose),
                 )
                 expected_global_target = self.global_target or None
-                la = validate_language_action(self.client.language_action(
-                    mission=self.mission,
-                    navigation_mode=self.navigation_mode,
-                    global_target=expected_global_target,
-                    current_step=step,
-                    todo_list=todo,
-                    scan_views=tuple(scan_views),
-                    move_to_views=tuple(self._recent_move_to_views),
-                    transition_result=self._latest_transition,
-                    manipulation_prompt=self.manipulation_prompt,
-                ), current_step=step,
+                la = validate_language_action(
+                    self.client.language_action(
+                        mission=self.mission,
+                        navigation_mode=self.navigation_mode,
+                        global_target=expected_global_target,
+                        current_step=step,
+                        todo_list=todo,
+                        scan_views=tuple(scan_views),
+                        move_to_views=tuple(self._recent_move_to_views),
+                        transition_result=self._latest_transition,
+                        manipulation_prompt=self.manipulation_prompt,
+                    ),
                     expected_global_target=expected_global_target,
                 )
                 if not self.global_target:
@@ -2649,12 +2620,12 @@ class LaViRAAgent:
                     if skill == "MOVE_TO":
                         entry = self._move_to(
                             generation, self._skill_id, args,
-                            la["expected_postcondition"], strategic_goal,
+                            strategic_goal,
                         )
                     elif skill == "ALIGN":
                         entry = self._align(
                             generation, self._skill_id, args,
-                            la["expected_postcondition"], strategic_goal,
+                            strategic_goal,
                         )
                     else:
                         entry = self._manipulate(
@@ -2696,10 +2667,6 @@ class LaViRAAgent:
                     evidence=entry.evidence,
                 )
                 if skill == "MANIPULATE":
-                    if entry.va_result != "SATISFIED":
-                        raise LaViRAAgentError(
-                            "manipulate_returned_without_satisfied_postcheck"
-                        )
                     result = LaViRATaskResult(
                         generation, "reached", "manipulation_completed", step,
                         self._skill_id, max(0, self._segment_id),

@@ -10,8 +10,8 @@ camera server -> CameraZmqIngress -> SensorGateway shared memory/RPC
 ```
 
 The bridge is video-only. It does not send robot commands and does not require
-the SONIC motion-control process. Start with the local animated camera while
-the robot is powered off, then cross the PICO and robot gates separately.
+the SONIC motion-control process. Bring up the live camera and cross the PICO
+and robot gates separately.
 
 ## Prerequisites
 
@@ -26,78 +26,8 @@ sudo apt-get install ffmpeg
 ffmpeg -hide_banner -encoders | grep -E 'h264_nvenc|libx264'
 ```
 
-The production workstation path uses `h264_nvenc`. `libx264` is available for
-the first local check and automated tests.
-
-## Local validation without a robot or PICO
-
-Open three terminals at the repository root and activate `.venv_teleop` in
-each terminal.
-
-### Terminal 1: animated camera server
-
-```bash
-python -m gear_sonic.utils.pico_video.mock_service --port 5555
-```
-
-The source publishes a changing 640x480 RGB card under `ego_view` using the
-normal `ImageMessageSchema` binary-JPEG wire format. Its frame number, time,
-corner colors, and orientation labels make frozen, mirrored, or rotated video
-visible.
-
-### Terminal 2: SensorGateway with camera ingress only
-
-Create a local-test overlay so the mock camera address still comes from a
-profile rather than a production CLI port override:
-
-```bash
-printf 'endpoints:\n  camera_server: {host: 127.0.0.1, port: 5555}\n' \
-  > /tmp/sonic-pico-local.yaml
-```
-
-```bash
-python -m gear_sonic.runtime.gateway.services.sensor \
-  --overlay /tmp/sonic-pico-local.yaml \
-  --no-enable-depth-anything --no-enable-cpp-state --no-enable-ros \
-  --no-enable-visualization --no-enable-vla-timing
-```
-
-This is the required data boundary. Do not connect the bridge directly to
-port 5555.
-
-### Terminal 3: Remote Vision bridge
-
-For the first CPU-only workstation check:
-
-```bash
-python -m gear_sonic.utils.pico_video.service \
-  --gateway-endpoint tcp://127.0.0.1:5560 \
-  --network-mode local-test --encoder libx264 --verbose
-```
-
-For normal use on the RTX workstation:
-
-```bash
-python -m gear_sonic.utils.pico_video.service \
-  --gateway-endpoint tcp://127.0.0.1:5560 \
-  --network-mode local-test --encoder h264_nvenc
-```
-
-The bridge listens for XRoboToolkit control on TCP 13579. It does not connect
-to a video receiver until an `OPEN_CAMERA` request arrives. While there is no
-PICO, this idle state is expected. The H.264 session runs at the negotiated
-30 FPS; a stale/error card is redrawn at 2 FPS and the current card is repeated
-between redraws so the decoder cadence stays stable.
-
-The full robot-free loopback check is:
-
-```bash
-python -m pytest -q gear_sonic/tests/test_pico_video_workstation_integration.py
-```
-
-It starts a fake PICO listener, decodes the resulting H.264 independently, and
-checks 1280x480 output, identical left/right eyes, live-frame updates, and the
-red stale-source card.
+The production workstation path uses `h264_nvenc`. `libx264` remains available
+for diagnosing encoder or driver problems.
 
 ## PICO gate: add the SONIC_HEAD profile
 
@@ -237,21 +167,20 @@ firewall rules.
 In XRoboToolkit Remote Vision, select **SONIC_HEAD** and press **Listen**.
 Expected results are:
 
-- the animated frame counter and timestamp keep changing;
-- `LEFT`, `RIGHT`, `TOP`, and `BOTTOM` have the correct orientation;
+- the live head-camera image keeps updating;
+- the image has the correct orientation;
 - both eyes show the same image without disparity or double vision;
-- stopping Terminal 1 replaces the image with a red `SENSOR FRAME STALE` card;
-- restarting Terminal 1 restores live video without restarting the bridge.
+- stopping the camera source replaces the image with a red `SENSOR FRAME STALE` card;
+- restarting the camera source restores live video without restarting the bridge.
 
-## Robot gate: switch from mock to the live head camera
+## Robot gate: start the live head camera
 
 Do not begin this section until the operator has been notified and confirms
 that the robot camera and PICO are ready. No motion/control process is needed
 for this video check.
 
-1. Stop `gear_sonic.utils.pico_video.mock_service`.
-2. Start the normal composed camera server on the robot.
-3. Start SensorGateway with the deployed runtime profile. If a temporary
+1. Start the normal composed camera server on the robot.
+2. Start SensorGateway with the deployed runtime profile. If a temporary
    camera change is needed, put it in an overlay:
 
    ```bash
@@ -263,9 +192,9 @@ for this video check.
      --no-enable-visualization --no-enable-vla-timing
    ```
 
-4. Keep `gear_sonic.utils.pico_video.service` unchanged. Its input remains
+3. Keep `gear_sonic.utils.pico_video.service` unchanged. Its input remains
    `camera_encoded/ego_view` from SensorGateway.
-5. Confirm disconnect, stale-card, and automatic recovery behavior before
+4. Confirm disconnect, stale-card, and automatic recovery behavior before
    combining the video path with robot teleoperation.
 
 ## Troubleshooting

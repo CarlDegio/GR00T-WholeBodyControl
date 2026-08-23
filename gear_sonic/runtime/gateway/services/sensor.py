@@ -29,6 +29,7 @@ from gear_sonic.runtime.telemetry import (
     metrics_snapshot,
     poll_metrics,
 )
+from gear_sonic.runtime.zmq_sockets import bind_pull
 
 
 @dataclass(frozen=True)
@@ -54,7 +55,6 @@ class SensorGatewaySettings:
     enable_ros: bool
     enable_visualization: bool
     enable_runtime_metrics: bool
-    enable_rgb_preview: bool
     runtime_metrics_window_size: int
 
 
@@ -132,7 +132,6 @@ def resolve_sensor_gateway_settings(args: argparse.Namespace) -> SensorGatewaySe
         enable_ros=bool(args.enable_ros),
         enable_visualization=bool(args.enable_visualization),
         enable_runtime_metrics=bool(args.enable_runtime_metrics),
-        enable_rgb_preview=bool(args.enable_rgb_preview),
         runtime_metrics_window_size=int(component["runtime_metrics_window_size"]),
     )
 
@@ -178,11 +177,6 @@ def build_argument_parser() -> argparse.ArgumentParser:
         dest="enable_runtime_metrics",
         action=argparse.BooleanOptionalAction,
         default=True,
-    )
-    parser.add_argument(
-        "--enable-rgb-preview",
-        action=argparse.BooleanOptionalAction,
-        default=False,
     )
     return parser
 
@@ -370,17 +364,16 @@ def run_sensor_gateway(settings: SensorGatewaySettings) -> None:
                 expected_hz=settings.expected_hz["visualization"],
             )
         if settings.enable_runtime_metrics:
-            metrics_socket = context.socket(zmq.PULL)
-            metrics_socket.setsockopt(zmq.LINGER, 0)
-            metrics_socket.setsockopt(zmq.RCVHWM, 16)
-            metrics_socket.bind(settings.runtime_metrics_bind_endpoint)
+            metrics_socket = bind_pull(
+                context, settings.runtime_metrics_bind_endpoint,
+                high_water_mark=16, linger_ms=0,
+            )
         if settings.enable_camera:
             camera = CameraZmqIngress(
                 context,
                 settings.camera_endpoint,
                 core,
                 expected_hz=settings.expected_hz["camera"],
-                preview_rgb=settings.enable_rgb_preview,
             )
         if settings.enable_depth_anything:
             depth_anything = DepthAnythingZmqIngress(

@@ -17,10 +17,15 @@ def _convert_lists_to_numpy(value: Any) -> Any:
     return value
 
 
-def decode_cpp_state_array(values: np.ndarray) -> dict[str, Any]:
-    """Decode the untouched C++ msgpack state payload stored by SensorGateway."""
-    payload = np.asarray(values, dtype=np.uint8).reshape(-1).tobytes()
+def decode_cpp_state_payload(payload: bytes) -> dict[str, Any]:
+    """Decode one untouched C++ msgpack state payload."""
     decoded = msgpack.unpackb(payload, raw=False, object_hook=mnp.decode)
     if not isinstance(decoded, dict):
         raise ValueError("C++ state payload must decode to a mapping")
     return _convert_lists_to_numpy(decoded)
+
+
+def decode_cpp_state_array(values: np.ndarray) -> dict[str, Any]:
+    """Decode a C++ state payload materialized from SensorGateway."""
+    payload = np.asarray(values, dtype=np.uint8).reshape(-1).tobytes()
+    return decode_cpp_state_payload(payload)

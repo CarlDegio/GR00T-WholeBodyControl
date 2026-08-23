@@ -33,26 +33,28 @@ import sys
 import time
 from typing import Any, Literal
 
+if __package__:
+    from gear_sonic.scripts.launcher import TmuxSession, bootstrap_venv
+else:
+    from launcher import TmuxSession, bootstrap_venv
+
 
 def _bootstrap_venv():
     """Re-exec with the inference Python if tyro is not available."""
     try:
         import tyro  # noqa: F401
-        return
+        available = True
     except ImportError:
-        pass
-
-    repo_root = Path(__file__).resolve().parent.parent.parent
-    venv_python = repo_root / ".venv_inference" / "bin" / "python"
-    if not venv_python.exists():
-        print(
+        available = False
+    bootstrap_venv(
+        available,
+        repo_root=Path(__file__).resolve().parent.parent.parent,
+        venv_name=".venv_inference",
+        missing_message=(
             "ERROR: tyro is not installed and .venv_inference not found.\n"
             "  Run: bash install_scripts/install_inference.sh"
-        )
-        sys.exit(1)
-
-    print(f"Re-launching with {venv_python} ...")
-    os.execv(str(venv_python), [str(venv_python)] + sys.argv)
+        ),
+    )
 
 
 _bootstrap_venv()
@@ -127,6 +129,7 @@ def parse_inference_launch_config(
 
 
 SESSION_NAME = "sonic_inference"
+_TMUX = TmuxSession(SESSION_NAME)
 DEPTH_ANYTHING_READY_FILE = Path("/tmp/sonic_depth_anything_ready")
 PANE_TITLES = {
     "performance": "PERFORMANCE · SensorGateway",
@@ -762,13 +765,6 @@ def _check_prerequisites(config: InferenceLaunchConfig):
         sys.exit(1)
 
 
-def _kill_existing_session():
-    subprocess.run(
-        ["tmux", "kill-session", "-t", SESSION_NAME],
-        capture_output=True,
-    )
-
-
 def _clear_stale_fastlio_processes() -> None:
     """Remove orphaned FAST-LIO launch and mapping processes from older runs."""
     patterns = (
@@ -812,49 +808,10 @@ def _worker_pane_names(config: InferenceLaunchConfig) -> tuple[str, ...]:
     return tuple(names)
 
 
-def _tmux(*args: str, output: bool = False) -> str:
-    result = subprocess.run(
-        ["tmux", *args],
-        check=True,
-        capture_output=output,
-        text=output,
-    )
-    return result.stdout.strip() if output else ""
-
-
-def _pane_id(target: str) -> str:
-    return _tmux(
-        "display-message",
-        "-p",
-        "-t",
-        target,
-        "#{pane_id}",
-        output=True,
-    )
-
-
-def _split_pane(
-    target: str,
-    shell: tuple[str, ...],
-    *split_args: str,
-) -> str:
-    return _tmux(
-        "split-window",
-        *split_args,
-        "-t",
-        target,
-        "-P",
-        "-F",
-        "#{pane_id}",
-        *shell,
-        output=True,
-    )
-
-
 def _create_tmux_session(config: InferenceLaunchConfig) -> dict[str, str]:
     bash = shutil.which("bash") or "/bin/bash"
     shell = (bash, "--noprofile", "--norc")
-    _tmux(
+    _TMUX.command(
         "new-session",
         "-d",
         "-x",
@@ -867,15 +824,15 @@ def _create_tmux_session(config: InferenceLaunchConfig) -> dict[str, str]:
         "overview",
         *shell,
     )
-    _tmux("set-option", "-t", SESSION_NAME, "mouse", "on")
-    _tmux("bind-key", "-T", "root", "C-\\", "kill-session")
+    _TMUX.command("set-option", "-t", SESSION_NAME, "mouse", "on")
+    _TMUX.command("bind-key", "-T", "root", "C-\\", "kill-session")
 
     # Overview: compact performance/control panes on the left and a full-height
     # event stream on the right.  The left side is kept wide enough for the
     # existing SensorGateway dashboard at the launcher's 240-column baseline.
-    performance = _pane_id(f"{SESSION_NAME}:overview.0")
-    events = _split_pane(performance, shell, "-h", "-p", "58")
-    control = _split_pane(performance, shell, "-v", "-p", "42")
+    performance = _TMUX.pane_id(f"{SESSION_NAME}:overview.0")
+    events = _TMUX.split_pane(performance, shell, "-h", "-p", "58")
+    control = _TMUX.split_pane(performance, shell, "-v", "-p", "42")
     panes = {
         "performance": performance,
         "control": control,
@@ -883,7 +840,7 @@ def _create_tmux_session(config: InferenceLaunchConfig) -> dict[str, str]:
     }
 
     worker_names = _worker_pane_names(config)
-    _tmux(
+    _TMUX.command(
         "new-window",
         "-d",
         "-t",
@@ -892,16 +849,16 @@ def _create_tmux_session(config: InferenceLaunchConfig) -> dict[str, str]:
         "workers",
         *shell,
     )
-    panes[worker_names[0]] = _pane_id(f"{SESSION_NAME}:workers.0")
+    panes[worker_names[0]] = _TMUX.pane_id(f"{SESSION_NAME}:workers.0")
     for name in worker_names[1:]:
-        panes[name] = _split_pane(f"{SESSION_NAME}:workers", shell, "-h")
-    _tmux("select-layout", "-t", f"{SESSION_NAME}:workers", "tiled")
+        panes[name] = _TMUX.split_pane(f"{SESSION_NAME}:workers", shell, "-h")
+    _TMUX.command("select-layout", "-t", f"{SESSION_NAME}:workers", "tiled")
 
     for window in ("overview", "workers"):
         target = f"{SESSION_NAME}:{window}"
-        _tmux("set-option", "-w", "-t", target, "remain-on-exit", "on")
-        _tmux("set-option", "-w", "-t", target, "pane-border-status", "top")
-        _tmux(
+        _TMUX.command("set-option", "-w", "-t", target, "remain-on-exit", "on")
+        _TMUX.command("set-option", "-w", "-t", target, "pane-border-status", "top")
+        _TMUX.command(
             "set-option",
             "-w",
             "-t",
@@ -910,17 +867,12 @@ def _create_tmux_session(config: InferenceLaunchConfig) -> dict[str, str]:
             " #[fg=colour45,bold]#{pane_title}#[default] ",
         )
     for name, pane in panes.items():
-        _tmux("select-pane", "-t", pane, "-T", PANE_TITLES[name])
+        _TMUX.command("select-pane", "-t", pane, "-T", PANE_TITLES[name])
 
-    _tmux("select-window", "-t", f"{SESSION_NAME}:overview")
-    _tmux("select-pane", "-t", panes["control"])
+    _TMUX.command("select-window", "-t", f"{SESSION_NAME}:overview")
+    _TMUX.command("select-pane", "-t", panes["control"])
     time.sleep(5)
     return panes
-
-
-def _send_to_pane(pane_id: str, cmd: str, wait: float = 1.0):
-    _tmux("send-keys", "-t", pane_id, cmd, "C-m")
-    time.sleep(wait)
 
 
 def _start_in_pane(
@@ -933,29 +885,18 @@ def _start_in_pane(
     required: bool = False,
 ) -> None:
     print(f"Starting {label} ({name})...")
-    _send_to_pane(panes[name], command, wait=wait)
-    if required and not _check_pane_alive(panes[name]):
+    _TMUX.send(panes[name], command, wait=wait)
+    if required and not _TMUX.pane_alive(panes[name]):
         raise RuntimeError(
             f"{label} exited during startup; inspect "
             "outputs/logs/inference/navdp.log for the fatal error"
         )
-
-
-def _check_pane_alive(pane_id: str) -> bool:
-    result = subprocess.run(
-        ["tmux", "list-panes", "-t", pane_id, "-F", "#{pane_dead}"],
-        capture_output=True,
-        text=True,
-    )
-    return result.stdout.strip() != "1"
-
-
 def main(config: InferenceLaunchConfig):
     repo_root = Path(__file__).resolve().parent.parent.parent
     profile = _runtime_profile(config)
 
     _check_prerequisites(config)
-    _kill_existing_session()
+    _TMUX.kill()
     _clear_stale_fastlio_processes()
     _clear_stale_navdp_processes()
 
@@ -971,7 +912,7 @@ def main(config: InferenceLaunchConfig):
 
     # --- Optional window: MuJoCo Simulator ---
     if config.sim:
-        _tmux("new-window", "-t", SESSION_NAME, "-n", "sim")
+        _TMUX.command("new-window", "-t", SESSION_NAME, "-n", "sim")
         sim_cmd = (
             f"cd {repo_root} && "
             f"source .venv_sim/bin/activate && "
@@ -981,14 +922,14 @@ def main(config: InferenceLaunchConfig):
         )
         sim_target = f"{SESSION_NAME}:sim"
         print("Starting MuJoCo simulator (window: sim)...")
-        _send_to_pane(sim_target, sim_cmd, wait=3.0)
+        _TMUX.send(sim_target, sim_cmd, wait=3.0)
 
-        _tmux("select-window", "-t", f"{SESSION_NAME}:overview")
+        _TMUX.command("select-window", "-t", f"{SESSION_NAME}:overview")
 
     # Workers retain independent TTYs and scrollback in the second window.
     deploy_cmd = build_deploy_command(config, repo_root)
     _start_in_pane(panes, "deploy", "C++ deploy", deploy_cmd, wait=3.0)
-    if not _check_pane_alive(panes["deploy"]):
+    if not _TMUX.pane_alive(panes["deploy"]):
         print("WARNING: C++ deploy pane may have failed to start.")
 
     # The overview window directly hosts the performance, control, and event
@@ -1050,7 +991,7 @@ def main(config: InferenceLaunchConfig):
         # Strictly serialized startup: the launcher does not dispatch a later
         # stage until real data has passed the previous readiness gate.
         print("Starting NavDP server in background (navdp)...")
-        _send_to_pane(
+        _TMUX.send(
             panes["navdp"],
             build_navdp_server_background_command(config),
             wait=1.0,
@@ -1077,28 +1018,19 @@ def main(config: InferenceLaunchConfig):
             )
 
     if config.data_exporter:
-        _tmux("new-window", "-t", SESSION_NAME, "-n", "data_exporter")
+        _TMUX.command("new-window", "-t", SESSION_NAME, "-n", "data_exporter")
         exporter_cmd = build_data_exporter_command(config, repo_root)
         print("Starting data exporter (window: data_exporter)...")
-        _send_to_pane(
+        _TMUX.send(
             f"{SESSION_NAME}:data_exporter",
             exporter_cmd,
             wait=2.0,
         )
-        _tmux("select-window", "-t", f"{SESSION_NAME}:overview")
+        _TMUX.command("select-window", "-t", f"{SESSION_NAME}:overview")
 
     print(f"All components launched; attaching to tmux session {SESSION_NAME}")
 
-    try:
-        subprocess.run(["tmux", "attach", "-t", SESSION_NAME])
-    except KeyboardInterrupt:
-        pass
-
-    result = subprocess.run(
-        ["tmux", "has-session", "-t", SESSION_NAME],
-        capture_output=True,
-    )
-    if result.returncode == 0:
+    if _TMUX.attach():
         print(f"\nSession '{SESSION_NAME}' is still running.")
         print(f"  Reattach:  tmux attach -t {SESSION_NAME}")
         print(f"  Kill:      tmux kill-session -t {SESSION_NAME}")
@@ -1106,10 +1038,7 @@ def main(config: InferenceLaunchConfig):
 
 def _signal_handler(_sig, _frame):
     print("\nShutdown requested...")
-    subprocess.run(
-        ["tmux", "kill-session", "-t", SESSION_NAME],
-        capture_output=True,
-    )
+    _TMUX.kill()
     sys.exit(0)
 
 

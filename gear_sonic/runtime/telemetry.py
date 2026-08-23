@@ -14,6 +14,8 @@ from typing import Mapping, Sequence
 
 import zmq
 
+from gear_sonic.runtime.zmq_sockets import connect_push
+
 EVENT_SCHEMA = "sonic.runtime_event"
 METRICS_SCHEMA = "sonic.runtime_metrics"
 SCHEMA_VERSION = 1
@@ -89,12 +91,10 @@ def configure_file_logging(
 
 
 def open_telemetry_publisher(endpoint: str, *, high_water_mark: int = 4) -> zmq.Socket:
-    socket = zmq.Context.instance().socket(zmq.PUSH)
-    socket.setsockopt(zmq.LINGER, 0)
-    socket.setsockopt(zmq.SNDHWM, int(high_water_mark))
-    socket.setsockopt(zmq.IMMEDIATE, 1)
-    socket.connect(endpoint)
-    return socket
+    return connect_push(
+        zmq.Context.instance(), endpoint, high_water_mark=high_water_mark,
+        immediate=True, linger_ms=0,
+    )
 
 
 def build_event(

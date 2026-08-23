@@ -15,7 +15,6 @@ Uses msgpack-numpy over ZMQ REQ/REP to communicate with an OpenPI policy server.
 """
 
 from dataclasses import dataclass
-import json
 import logging
 import math
 import queue
@@ -32,27 +31,31 @@ from gear_sonic.runtime.gateway.control_client import (
     ControlGatewayIntentClient,
     ControlGatewaySubscriber,
 )
+from gear_sonic.runtime.inference_service import InferenceServiceContext
 from gear_sonic.runtime.profile import (
-    RuntimeProfileSelection,
     load_component_config,
-    load_runtime_profile,
+    parse_component_config,
 )
-from gear_sonic.runtime.telemetry import (
-    VLA_TIMING_SEGMENTS,
-    build_event,
-    configure_file_logging,
-    emit_event,
-    open_telemetry_publisher,
-    publish_metrics,
+from gear_sonic.runtime.queues import drain_queue as _drain_queue
+from gear_sonic.runtime.queues import replace_latest
+from gear_sonic.runtime.telemetry import VLA_TIMING_SEGMENTS
+from gear_sonic.runtime.protocol.array_message import unpack_array_message
+from gear_sonic.runtime.protocol.cpp_control import (
+    build_command_message,
+    build_planner_message,
 )
-from gear_sonic.utils.data_collection.transforms import compute_projected_gravity
+from gear_sonic.runtime.protocol.pose import (
+    pack_latent_action_message,
+    pack_pose_message,
+)
 from gear_sonic.utils.inference.vla.inference import (
     calculate_latency_compensated_index,
     prepare_observation_for_eval,
 )
 from gear_sonic.utils.inference.vla.ingress import VlaSensorGatewayIngress
+from gear_sonic.utils.math3d.quaternions import yaw_from_quaternion_wxyz
+from gear_sonic.utils.math3d.orientation import compute_projected_gravity
 from gear_sonic.utils.inference.vla.poses import (
-    SONIC_STAND_UPPER_BODY_RAD,
     UPPER_BODY_MUJOCO_INDICES,
     VLA_INITIAL_UPPER_BODY_RAD,
 )
@@ -61,14 +64,6 @@ from gear_sonic.utils.planner_control.executor_service import PlannerSafetySenso
 from gear_sonic.utils.teleop.solver.hand.g1_gripper_ik_solver import (
     G1GripperInverseKinematicsSolver,
 )
-from gear_sonic.utils.teleop.zmq.zmq_planner_sender import (
-    build_command_message,
-    build_planner_message,
-    pack_pose_message,
-)
-
-
-PLANNER_HEADER_SIZE = 1280
 LOGGER = logging.getLogger("sonic.vla")
 
 
@@ -86,61 +81,20 @@ def _base_yaw_from_state(state_msg: dict | None) -> float | None:
     if state_msg is None or "base_quat" not in state_msg:
         return None
     quat = np.asarray(state_msg["base_quat"], dtype=np.float64).reshape(-1)
-    if quat.shape != (4,) or not np.all(np.isfinite(quat)):
+    try:
+        return yaw_from_quaternion_wxyz(quat, min_norm=1.0e-8)
+    except ValueError:
         return None
-    norm = float(np.linalg.norm(quat))
-    if norm <= 1e-8:
-        return None
-    w, x, y, z = quat / norm
-    return math.atan2(2.0 * (w * z + x * y), 1.0 - 2.0 * (y * y + z * z))
 
 
 def _facing_from_yaw(yaw: float) -> list[float]:
     return [math.cos(yaw), math.sin(yaw), 0.0]
 
 
-def _unpack_planner_message(message: bytes) -> tuple[int, dict[str, np.ndarray]]:
-    """Decode one planner wire message without depending on another script module."""
-    topic = b"planner"
-    if not message.startswith(topic):
-        raise ValueError("planner relay received a message with the wrong topic")
-    header_start = len(topic)
-    payload_start = header_start + PLANNER_HEADER_SIZE
-    if len(message) < payload_start:
-        raise ValueError("planner message is shorter than its header")
-
-    header_bytes = message[header_start:payload_start].split(b"\x00", 1)[0]
-    header = json.loads(header_bytes.decode("utf-8"))
-    endian = "<" if header.get("endian", "le") == "le" else ">"
-    dtype_map = {
-        "f32": np.dtype(endian + "f4"),
-        "f64": np.dtype(endian + "f8"),
-        "i32": np.dtype(endian + "i4"),
-        "i64": np.dtype(endian + "i8"),
-        "u8": np.dtype("u1"),
-        "bool": np.dtype("?"),
-    }
-    fields: dict[str, np.ndarray] = {}
-    offset = payload_start
-    for field in header.get("fields", []):
-        dtype = dtype_map.get(field["dtype"])
-        if dtype is None:
-            raise ValueError(f"unsupported planner dtype: {field['dtype']}")
-        shape = tuple(int(dim) for dim in field["shape"])
-        byte_count = int(np.prod(shape, dtype=np.int64)) * dtype.itemsize
-        end = offset + byte_count
-        if end > len(message):
-            raise ValueError(f"planner field {field['name']} exceeds payload")
-        fields[field["name"]] = np.frombuffer(
-            message[offset:end], dtype=dtype
-        ).reshape(shape).astype(dtype.newbyteorder("="), copy=True)
-        offset = end
-    return int(header.get("v", 1)), fields
-
-
 def _rotate_planner_message(message: bytes, yaw_offset: float) -> bytes:
     """Rotate planner movement and facing into the active VLA heading frame."""
-    version, fields = _unpack_planner_message(message)
+    decoded = unpack_array_message(message, expected_topic="planner")
+    fields = decoded.fields
     cosine, sine = math.cos(yaw_offset), math.sin(yaw_offset)
     for name in ("movement", "facing"):
         vector = fields.get(name)
@@ -151,7 +105,7 @@ def _rotate_planner_message(message: bytes, yaw_offset: float) -> bytes:
         flat[0] = cosine * x_value - sine * y_value
         flat[1] = sine * x_value + cosine * y_value
         fields[name] = flat.reshape(vector.shape)
-    return pack_pose_message(fields, topic="planner", version=version)
+    return pack_pose_message(fields, topic="planner", version=decoded.version)
 
 
 class PlannerHeadingAlignment:
@@ -179,7 +133,9 @@ class PlannerHeadingAlignment:
             return None
 
         if self.yaw_offset is None:
-            _version, fields = _unpack_planner_message(message)
+            fields = unpack_array_message(
+                message, expected_topic="planner"
+            ).fields
             facing = fields.get("facing")
             if facing is None or facing.size != 3:
                 raise ValueError("planner message has no valid facing direction")
@@ -192,7 +148,9 @@ class PlannerHeadingAlignment:
                 f"offset={self.yaw_offset:+.3f} rad"
             )
         aligned = _rotate_planner_message(message, self.yaw_offset)
-        _version, aligned_fields = _unpack_planner_message(aligned)
+        aligned_fields = unpack_array_message(
+            aligned, expected_topic="planner"
+        ).fields
         facing = aligned_fields["facing"].reshape(3)
         self.last_facing_yaw = math.atan2(float(facing[1]), float(facing[0]))
         return aligned
@@ -227,10 +185,7 @@ def load_inference_config(
 
 
 def parse_inference_config(args: list[str] | None = None) -> InferenceConfig:
-    import tyro
-
-    selection = tyro.cli(RuntimeProfileSelection, args=args)
-    return load_inference_config(selection.profile, selection.overlay)
+    return parse_component_config(InferenceConfig, "vla", args)
 
 
 class _MsgpackNumpyPolicyClient:
@@ -331,67 +286,6 @@ def wrap_camera_jpeg_for_video(
         "dtype": "uint8",
         "data": bytes(encoded),
     }
-
-
-# ---------------------------------------------------------------------------
-# Action packing (latent protocol v4)
-# ---------------------------------------------------------------------------
-
-
-def pack_latent_action_message(
-    motion_token: np.ndarray,
-    frame_index: np.ndarray,
-    left_hand_joints: np.ndarray = None,
-    right_hand_joints: np.ndarray = None,
-) -> bytes:
-    """Pack a single motion-token action into a ZMQ message (Protocol v4).
-
-    Args:
-        motion_token: Shape ``[64]`` (flat) or ``[1, 64]``.
-        frame_index:  Shape ``[1]``.
-        left_hand_joints:  Shape ``[7]`` or ``[1, 7]``, optional.
-        right_hand_joints: Shape ``[7]`` or ``[1, 7]``, optional.
-
-    Returns:
-        Packed ZMQ message bytes.
-    """
-    motion_token = np.asarray(motion_token, dtype=np.float32)
-    frame_index = np.asarray(frame_index, dtype=np.int64)
-
-    if frame_index.ndim == 0:
-        frame_index = np.array([frame_index], dtype=np.int64)
-    elif frame_index.shape[0] != 1:
-        frame_index = frame_index[:1]
-
-    if motion_token.ndim == 1:
-        motion_token = motion_token.reshape(1, -1)
-
-    pose_data = {
-        "token_state": motion_token,
-        "frame_index": frame_index,
-    }
-
-    if left_hand_joints is not None:
-        left_hand_joints = np.asarray(left_hand_joints, dtype=np.float32)
-        if left_hand_joints.ndim == 1:
-            if left_hand_joints.shape[0] != 7:
-                raise ValueError(
-                    f"left_hand_joints must have shape [7], got {left_hand_joints.shape}"
-                )
-            left_hand_joints = left_hand_joints.reshape(1, 7)
-        pose_data["left_hand_joints"] = left_hand_joints
-
-    if right_hand_joints is not None:
-        right_hand_joints = np.asarray(right_hand_joints, dtype=np.float32)
-        if right_hand_joints.ndim == 1:
-            if right_hand_joints.shape[0] != 7:
-                raise ValueError(
-                    f"right_hand_joints must have shape [7], got {right_hand_joints.shape}"
-                )
-            right_hand_joints = right_hand_joints.reshape(1, 7)
-        pose_data["right_hand_joints"] = right_hand_joints
-
-    return pack_pose_message(pose_data, topic="pose", version=4)
 
 
 def get_action_field(action_dict: dict, key: str):
@@ -579,14 +473,7 @@ def _inference_worker_loop(
 
                 if processed_action is not None:
                     item = (request_generation, processed_action, inference_start_time, timing_ms)
-                    try:
-                        result_queue.put_nowait(item)
-                    except queue.Full:
-                        try:
-                            result_queue.get_nowait()
-                        except queue.Empty:
-                            pass
-                        result_queue.put_nowait(item)
+                    replace_latest(result_queue, item)
             finally:
                 busy_event.clear()
         except Exception as exc:
@@ -620,17 +507,6 @@ def _should_schedule_vla_inference(
     )
 
 
-def _drain_queue(target: queue.Queue) -> int:
-    """Remove queued work/results without waiting and return the item count."""
-    drained = 0
-    while True:
-        try:
-            target.get_nowait()
-            drained += 1
-        except queue.Empty:
-            return drained
-
-
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
@@ -644,14 +520,10 @@ def _compute_closed_hand_joints(side: str) -> np.ndarray:
 
 
 def main(config: InferenceConfig):
-    configure_file_logging("vla")
+    service = InferenceServiceContext("vla", config)
     pause_loop = True
-    profile = load_runtime_profile(config.profile or None, overlays=config.overlay)
+    profile = service.profile
     policy_endpoint = profile.endpoint("policy_server")
-    event_socket = open_telemetry_publisher(
-        profile.endpoint_uri("runtime_event_ingress")
-    )
-    pending_events = queue.SimpleQueue()
     last_event_at: dict[str, float] = {}
 
     def record_event(
@@ -667,18 +539,17 @@ def main(config: InferenceConfig):
         if repeat_s and now - last_event_at.get(code, -math.inf) < repeat_s:
             return False
         last_event_at[code] = now
-        payload = build_event("vla", level, code, message, **fields)
-        if write_log:
-            emit_event(payload, logger=LOGGER)
-        pending_events.put(payload)
+        service.event(
+            level,
+            code,
+            message,
+            queued=True,
+            write_log=write_log,
+            **fields,
+        )
         return True
 
-    def flush_events() -> None:
-        while True:
-            try:
-                emit_event(pending_events.get_nowait(), socket=event_socket)
-            except queue.Empty:
-                return
+    flush_events = service.flush_events
 
     robot_model = instantiate_g1_robot_model(waist_location="lower_and_upper_body")
 
@@ -686,14 +557,8 @@ def main(config: InferenceConfig):
         host=policy_endpoint.host,
         port=policy_endpoint.port,
     )
-    timing_socket = open_telemetry_publisher(
-        profile.endpoint_uri("runtime_metrics_ingress")
-    )
-
     def activate_vla_metrics() -> None:
-        publish_metrics(
-            timing_socket,
-            "vla",
+        service.publish_metrics(
             {},
             allowed_names=VLA_TIMING_SEGMENTS,
             activate=True,
@@ -1331,9 +1196,7 @@ def main(config: InferenceConfig):
                     result_generation == inference_generation
                     and _pose_policy_is_active(cpp_loop_running, cpp_mode, pause_loop)
                 ):
-                    publish_metrics(
-                        timing_socket,
-                        "vla",
+                    service.publish_metrics(
                         timing_ms,
                         allowed_names=VLA_TIMING_SEGMENTS,
                     )
@@ -1458,9 +1321,7 @@ def main(config: InferenceConfig):
         task_status_intent.close()
         zmq_context.term()
         n1_policy.close()
-        flush_events()
-        event_socket.close(linger=0)
-        timing_socket.close(linger=0)
+        service.close()
         LOGGER.info("Shutdown complete")
 
 

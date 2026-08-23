@@ -96,11 +96,11 @@ def test_startup_clears_only_stale_navdp_processes(monkeypatch) -> None:
 
 def test_required_worker_must_remain_alive_after_startup(monkeypatch) -> None:
     monkeypatch.setattr(
-        "gear_sonic.scripts.launch_inference._send_to_pane",
+        "gear_sonic.scripts.launch_inference._TMUX.send",
         lambda *_args, **_kwargs: None,
     )
     monkeypatch.setattr(
-        "gear_sonic.scripts.launch_inference._check_pane_alive",
+        "gear_sonic.scripts.launch_inference._TMUX.pane_alive",
         lambda _pane: False,
     )
 
@@ -371,12 +371,16 @@ def test_tmux_session_builds_stacked_overview_and_tiled_workers(monkeypatch) -> 
         split_calls.append((target, split_args))
         return next(split_ids)
 
-    monkeypatch.setattr("gear_sonic.scripts.launch_inference._tmux", fake_tmux)
     monkeypatch.setattr(
-        "gear_sonic.scripts.launch_inference._pane_id",
+        "gear_sonic.scripts.launch_inference._TMUX.command", fake_tmux,
+    )
+    monkeypatch.setattr(
+        "gear_sonic.scripts.launch_inference._TMUX.pane_id",
         lambda _target: next(pane_ids),
     )
-    monkeypatch.setattr("gear_sonic.scripts.launch_inference._split_pane", fake_split)
+    monkeypatch.setattr(
+        "gear_sonic.scripts.launch_inference._TMUX.split_pane", fake_split,
+    )
     monkeypatch.setattr("gear_sonic.scripts.launch_inference.time.sleep", lambda _s: None)
 
     panes = _create_tmux_session(load_inference_launch_config())

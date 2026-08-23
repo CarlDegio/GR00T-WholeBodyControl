@@ -1528,7 +1528,7 @@ def test_strict_schemas_fail_closed():
         validate_language_action(decision(None, result="COMPLETE"))
     with pytest.raises(LaViRAAgentError, match="view_direction is invalid"):
         validate_language_action(
-            move(direction="behind"), current_step=1,
+            move(direction="behind"),
         )
 
 

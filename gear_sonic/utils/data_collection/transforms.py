@@ -3,6 +3,8 @@
 import numpy as np
 from scipy.spatial.transform import Rotation as R
 
+from gear_sonic.utils.math3d.orientation import compute_projected_gravity
+
 
 def quat_to_rot6d(q):
     """Convert scalar-first quaternion(s) (wxyz) to 6D rotation representation.
@@ -69,26 +71,3 @@ def rot6d_to_quat(r):
     if single:
         return q_wxyz[0].astype(np.float32)
     return q_wxyz.astype(np.float32)
-
-
-def compute_projected_gravity(base_quat: np.ndarray) -> np.ndarray:
-    """Compute projected gravity vector in robot's body frame from base quaternion.
-
-    Projects the world gravity vector [0, 0, -1] into the robot's body frame by
-    rotating it by the inverse of the base quaternion.
-
-    Args:
-        base_quat: Base quaternion [qw, qx, qy, qz] of shape (4,)
-
-    Returns:
-        Projected gravity vector [gx, gy, gz] of shape (3,) in robot's body frame
-    """
-    base_quat = np.asarray(base_quat, dtype=np.float64)
-    if base_quat.shape != (4,):
-        raise ValueError(f"base_quat must have shape (4,), got {base_quat.shape}")
-
-    gravity_vec_world = np.array([0.0, 0.0, -1.0])
-    base_rotation = R.from_quat(base_quat, scalar_first=True)
-    projected_gravity = base_rotation.inv().apply(gravity_vec_world)
-
-    return projected_gravity.astype(np.float32)

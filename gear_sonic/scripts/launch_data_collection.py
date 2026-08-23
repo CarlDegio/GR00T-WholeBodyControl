@@ -55,6 +55,11 @@ import sys
 import time
 from typing import Any, get_type_hints
 
+if __package__:
+    from gear_sonic.scripts.launcher import TmuxSession, bootstrap_venv
+else:
+    from launcher import TmuxSession, bootstrap_venv
+
 
 def _launcher_dependencies_available(import_module=importlib.import_module) -> bool:
     try:
@@ -67,20 +72,15 @@ def _launcher_dependencies_available(import_module=importlib.import_module) -> b
 
 def _bootstrap_venv():
     """Re-exec with the data-collection Python if launcher deps are unavailable."""
-    if _launcher_dependencies_available():
-        return
-
-    repo_root = Path(__file__).resolve().parent.parent.parent
-    venv_python = repo_root / ".venv_data_collection" / "bin" / "python"
-    if not venv_python.exists():
-        print(
+    bootstrap_venv(
+        _launcher_dependencies_available(),
+        repo_root=Path(__file__).resolve().parent.parent.parent,
+        venv_name=".venv_data_collection",
+        missing_message=(
             "ERROR: tyro/PyYAML unavailable and .venv_data_collection not found.\n"
             "  Run: bash install_scripts/install_data_collection.sh"
-        )
-        sys.exit(1)
-
-    print(f"Re-launching with {venv_python} ...")
-    os.execv(str(venv_python), [str(venv_python)] + sys.argv)
+        ),
+    )
 
 
 _bootstrap_venv()
@@ -338,33 +338,36 @@ def _check_prerequisites(sim: bool = False, pico_video: bool = True):
 
 def _kill_existing_session():
     """Kill any existing tmux session with our name."""
-    subprocess.run(
-        ["tmux", "kill-session", "-t", SESSION_NAME],
-        capture_output=True,
+    _tmux_session().kill()
+
+
+def _tmux_session() -> TmuxSession:
+    return TmuxSession(
+        SESSION_NAME,
+        runner=subprocess.run,
+        sleeper=time.sleep,
     )
 
 
 def _create_tmux_session():
     """Create a 4-pane tmux layout."""
+    tmux = _tmux_session()
     # Create detached session
-    subprocess.run(
-        ["tmux", "new-session", "-d", "-s", SESSION_NAME],
-        check=True,
-    )
+    tmux.command("new-session", "-d", "-s", SESSION_NAME)
 
     # Enable mouse support (click panes, scroll, resize)
-    subprocess.run(
-        ["tmux", "set-option", "-t", SESSION_NAME, "-g", "mouse", "on"],
+    tmux.command(
+        "set-option", "-t", SESSION_NAME, "-g", "mouse", "on", check=False,
     )
 
     # Bind Ctrl+\ to kill the entire session (no prefix needed)
-    subprocess.run(
-        ["tmux", "bind-key", "-T", "root", "C-\\", "kill-session"],
+    tmux.command(
+        "bind-key", "-T", "root", "C-\\", "kill-session", check=False,
     )
 
     # Rename default window
-    subprocess.run(
-        ["tmux", "rename-window", "-t", f"{SESSION_NAME}:0", "data_collection"],
+    tmux.command(
+        "rename-window", "-t", f"{SESSION_NAME}:0", "data_collection", check=False,
     )
 
     # Split into 4 panes:
@@ -373,18 +376,18 @@ def _create_tmux_session():
     #   2 | 3
 
     # Split horizontally: pane 0 (left) and pane 1 (right)
-    subprocess.run(
-        ["tmux", "split-window", "-t", f"{SESSION_NAME}:0", "-h"],
+    tmux.command(
+        "split-window", "-t", f"{SESSION_NAME}:0", "-h", check=False,
     )
 
     # Split left pane vertically: pane 0 (top-left) and pane 2 (bottom-left)
-    subprocess.run(
-        ["tmux", "split-window", "-t", f"{SESSION_NAME}:0.0", "-v"],
+    tmux.command(
+        "split-window", "-t", f"{SESSION_NAME}:0.0", "-v", check=False,
     )
 
     # Split right pane vertically: pane 1 becomes top-right, new pane 3 bottom-right
-    subprocess.run(
-        ["tmux", "split-window", "-t", f"{SESSION_NAME}:0.2", "-v"],
+    tmux.command(
+        "split-window", "-t", f"{SESSION_NAME}:0.2", "-v", check=False,
     )
 
     # Let all pane shells finish initialization (.bashrc, conda, etc.)
@@ -394,22 +397,13 @@ def _create_tmux_session():
 def _send_to_pane(pane_index: int, cmd: str, wait: float = 1.0):
     """Send a command string to a tmux pane."""
     target = f"{SESSION_NAME}:0.{pane_index}"
-
-    subprocess.run(
-        ["tmux", "send-keys", "-t", target, cmd, "C-m"],
-    )
-    time.sleep(wait)
+    _tmux_session().send(target, cmd, wait=wait, check=False)
 
 
 def _check_pane_alive(pane_index: int) -> bool:
     """Check if a tmux pane's process is still running."""
     target = f"{SESSION_NAME}:0.{pane_index}"
-    result = subprocess.run(
-        ["tmux", "list-panes", "-t", target, "-F", "#{pane_dead}"],
-        capture_output=True,
-        text=True,
-    )
-    return result.stdout.strip() != "1"
+    return _tmux_session().pane_alive(target)
 
 
 def build_camera_viewer_command(
@@ -437,7 +431,6 @@ def build_sensor_gateway_command(
         f"--profile {shlex.quote(config.runtime_profile)} "
         f"--camera-host {shlex.quote(config.camera_host)} "
         f"--camera-port {config.camera_port} "
-        "--enable-rgb-preview "
         "--no-enable-depth-anything --no-enable-ros "
         "--no-enable-visualization --no-enable-vla-timing"
     )
@@ -697,17 +690,8 @@ def main(config: DataCollectionLaunchConfig):
     print("=" * 60)
 
     # Attach to the session
-    try:
-        subprocess.run(["tmux", "attach", "-t", SESSION_NAME])
-    except KeyboardInterrupt:
-        pass
-
     # After detach/exit, offer cleanup
-    result = subprocess.run(
-        ["tmux", "has-session", "-t", SESSION_NAME],
-        capture_output=True,
-    )
-    if result.returncode == 0:
+    if _tmux_session().attach():
         print(f"\nSession '{SESSION_NAME}' is still running.")
         print(f"  Reattach:  tmux attach -t {SESSION_NAME}")
         print(f"  Kill:      tmux kill-session -t {SESSION_NAME}")
@@ -715,10 +699,7 @@ def main(config: DataCollectionLaunchConfig):
 
 def _signal_handler(sig, frame):
     print("\nShutdown requested...")
-    subprocess.run(
-        ["tmux", "kill-session", "-t", SESSION_NAME],
-        capture_output=True,
-    )
+    _tmux_session().kill()
     sys.exit(0)
 
 

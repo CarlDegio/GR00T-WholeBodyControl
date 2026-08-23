@@ -17,6 +17,8 @@ from gear_sonic.utils.inference.navdp.navigation import (
     local_trajectory_to_world,
 )
 from gear_sonic.runtime.profile import load_runtime_profile
+from gear_sonic.runtime.queues import poll_latest as poll_latest_queue
+from gear_sonic.runtime.queues import replace_latest
 
 LOGGER = logging.getLogger("sonic.navdp")
 
@@ -342,31 +344,18 @@ class AsyncMpcSolver:
         self._thread = threading.Thread(target=self._run, daemon=True)
         self._thread.start()
 
-    @staticmethod
-    def _replace(queue_: queue.Queue, item) -> None:
-        try:
-            queue_.get_nowait()
-        except queue.Empty:
-            pass
-        queue_.put_nowait(item)
-
     def submit(self, request: MpcSolveRequest) -> None:
         if not self._closed:
-            self._replace(self._requests, request)
+            replace_latest(self._requests, request)
 
     def poll_latest(self) -> MpcSolveResult | None:
-        latest = None
-        while True:
-            try:
-                latest = self._results.get_nowait()
-            except queue.Empty:
-                return latest
+        return poll_latest_queue(self._results)
 
     def close(self) -> None:
         if self._closed:
             return
         self._closed = True
-        self._replace(self._requests, None)
+        replace_latest(self._requests, None)
         self._thread.join(timeout=1.0)
 
     def _run(self) -> None:
@@ -403,7 +392,7 @@ class AsyncMpcSolver:
                     controller._last_states = None
                 except Exception:
                     pass
-            self._replace(
+            replace_latest(
                 self._results,
                 MpcSolveResult(
                     generation=request.generation,
@@ -430,21 +419,13 @@ class LatestMessageWorker:
     def submit(self, message: Any) -> None:
         if self._closed:
             return
-        try:
-            self._messages.get_nowait()
-        except queue.Empty:
-            pass
-        self._messages.put_nowait(message)
+        replace_latest(self._messages, message)
 
     def close(self) -> None:
         if self._closed:
             return
         self._closed = True
-        try:
-            self._messages.get_nowait()
-        except queue.Empty:
-            pass
-        self._messages.put_nowait(None)
+        replace_latest(self._messages, None)
         self._thread.join(timeout=1.0)
 
     def _run(self) -> None:

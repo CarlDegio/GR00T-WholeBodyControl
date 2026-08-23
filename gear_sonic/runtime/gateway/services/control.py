@@ -31,6 +31,11 @@ from gear_sonic.runtime.telemetry import (
     emit_event,
     format_event,
 )
+from gear_sonic.runtime.zmq_sockets import (
+    bind_publisher,
+    bind_pull,
+    connect_subscriber,
+)
 
 
 class EventPaneDisplay:
@@ -255,29 +260,26 @@ def run_control_gateway(profile: RuntimeProfile) -> None:
     logger = configure_file_logging("control_gateway")
     display = EventPaneDisplay()
     context = zmq.Context()
-    intent_pull = context.socket(zmq.PULL)
-    event_pull = context.socket(zmq.PULL)
-    dispatch_pub = context.socket(zmq.PUB)
-    navigation_pub = context.socket(zmq.PUB)
-    navigation_status_sub = context.socket(zmq.SUB)
-    for socket in (
-        intent_pull,
-        event_pull,
-        dispatch_pub,
-        navigation_pub,
-        navigation_status_sub,
-    ):
-        socket.setsockopt(zmq.LINGER, 0)
-    for socket in (intent_pull, event_pull, navigation_status_sub):
-        socket.setsockopt(zmq.RCVHWM, 100)
-    for socket in (dispatch_pub, navigation_pub):
-        socket.setsockopt(zmq.SNDHWM, 100)
-    intent_pull.bind(profile.endpoint_uri("control_gateway_intent"))
-    event_pull.bind(profile.endpoint_uri("runtime_event_ingress"))
-    dispatch_pub.bind(profile.endpoint_uri("control_gateway_dispatch"))
-    navigation_pub.bind(profile.endpoint_uri("navigation_command"))
-    navigation_status_sub.setsockopt_string(zmq.SUBSCRIBE, "")
-    navigation_status_sub.connect(profile.endpoint_uri("navigation_status"))
+    intent_pull = bind_pull(
+        context, profile.endpoint_uri("control_gateway_intent"),
+        high_water_mark=100, linger_ms=0,
+    )
+    event_pull = bind_pull(
+        context, profile.endpoint_uri("runtime_event_ingress"),
+        high_water_mark=100, linger_ms=0,
+    )
+    dispatch_pub = bind_publisher(
+        context, profile.endpoint_uri("control_gateway_dispatch"),
+        high_water_mark=100, linger_ms=0,
+    )
+    navigation_pub = bind_publisher(
+        context, profile.endpoint_uri("navigation_command"),
+        high_water_mark=100, linger_ms=0,
+    )
+    navigation_status_sub = connect_subscriber(
+        context, profile.endpoint_uri("navigation_status"),
+        high_water_mark=100, linger_ms=0,
+    )
     router = ControlGatewayRouter()
     navigation = NavigationControlState()
     gateway_events = ControlGatewayCore(source="control_gateway_navigation")
