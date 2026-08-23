@@ -61,6 +61,9 @@ class NavigationCommand:
     velocity: tuple[float, float, float] | None = None
     goal_base: tuple[float, float] | None = None
     heading_delta_rad: float | None = None
+    heading_turn_direction: Literal["left", "right"] | None = None
+    heading_max_angular_speed_rad_s: float | None = None
+    heading_max_duration_s: float | None = None
     target: str = ""
     target_type: str = ""
     confidence: float = 0.0
@@ -83,6 +86,24 @@ class NavigationCommand:
             _finite_scalar(self.goal_base[1], field="goal_base.y")
         if self.heading_delta_rad is not None:
             _finite_scalar(self.heading_delta_rad, field="heading_delta_rad")
+        if self.heading_turn_direction not in {None, "left", "right"}:
+            raise ValueError("heading_turn_direction must be left or right")
+        if self.heading_max_angular_speed_rad_s is not None:
+            speed = _finite_scalar(
+                self.heading_max_angular_speed_rad_s,
+                field="heading_max_angular_speed_rad_s",
+            )
+            if speed <= 0.0:
+                raise ValueError(
+                    "heading_max_angular_speed_rad_s must be positive"
+                )
+        if self.heading_max_duration_s is not None:
+            duration = _finite_scalar(
+                self.heading_max_duration_s,
+                field="heading_max_duration_s",
+            )
+            if duration <= 0.0:
+                raise ValueError("heading_max_duration_s must be positive")
         if self.mode == "heading_goal" and self.heading_delta_rad is None:
             raise ValueError("heading_goal requires heading_delta_rad")
 
@@ -97,6 +118,9 @@ def build_navigation_message(
     velocity: Sequence[float] | None = None,
     goal_base: Sequence[float] | None = None,
     heading_delta_rad: float | None = None,
+    heading_turn_direction: Literal["left", "right"] | None = None,
+    heading_max_angular_speed_rad_s: float | None = None,
+    heading_max_duration_s: float | None = None,
     target: str = "",
     target_type: str = "",
     confidence: float = 0.0,
@@ -136,6 +160,25 @@ def build_navigation_message(
         payload["heading_delta_rad"] = _finite_scalar(
             heading_delta_rad, field="heading_delta_rad"
         )
+    if heading_turn_direction is not None:
+        if heading_turn_direction not in {"left", "right"}:
+            raise ValueError("heading_turn_direction must be left or right")
+        payload["heading_turn_direction"] = heading_turn_direction
+    if heading_max_angular_speed_rad_s is not None:
+        speed = _finite_scalar(
+            heading_max_angular_speed_rad_s,
+            field="heading_max_angular_speed_rad_s",
+        )
+        if speed <= 0.0:
+            raise ValueError("heading_max_angular_speed_rad_s must be positive")
+        payload["heading_max_angular_speed_rad_s"] = speed
+    if heading_max_duration_s is not None:
+        duration = _finite_scalar(
+            heading_max_duration_s, field="heading_max_duration_s"
+        )
+        if duration <= 0.0:
+            raise ValueError("heading_max_duration_s must be positive")
+        payload["heading_max_duration_s"] = duration
     if mode == "heading_goal" and heading_delta_rad is None:
         raise ValueError("heading_goal requires heading_delta_rad")
     if source:
@@ -169,6 +212,24 @@ def decode_navigation_message(message: str | bytes | Mapping[str, Any]) -> Navig
             None
             if payload.get("heading_delta_rad") is None
             else float(payload["heading_delta_rad"])
+        ),
+        heading_turn_direction=(
+            None
+            if payload.get("heading_turn_direction") is None
+            else cast(
+                Literal["left", "right"],
+                str(payload["heading_turn_direction"]),
+            )
+        ),
+        heading_max_angular_speed_rad_s=(
+            None
+            if payload.get("heading_max_angular_speed_rad_s") is None
+            else float(payload["heading_max_angular_speed_rad_s"])
+        ),
+        heading_max_duration_s=(
+            None
+            if payload.get("heading_max_duration_s") is None
+            else float(payload["heading_max_duration_s"])
         ),
         target=str(payload.get("target", "")),
         target_type=str(payload.get("target_type", "")),

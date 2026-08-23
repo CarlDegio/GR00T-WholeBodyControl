@@ -78,16 +78,17 @@ class LaviraRuntimeEventHandler(logging.Handler):
 @dataclass
 class LaviraPlannerConfig:
     mission: str
-    global_target: str
+    global_target: str = ""
     navigation_mode: Literal["vln", "object_nav"] = "object_nav"
+    manipulation_prompt: str = ""
     max_steps: int = 20
     history_size: int = 5
     la_model: str = DEFAULT_LA_MODEL
-    la_base_url: str = "https://dashscope.aliyuncs.com/compatible-mode/v1"
-    la_enable_thinking: bool = True
+    la_base_url: str = "https://dashscope-intl.aliyuncs.com/compatible-mode/v1"
+    la_enable_thinking: bool = False
     la_timeout_seconds: float = 180.0
     va_model: str = DEFAULT_VA_MODEL
-    va_base_url: str = "https://dashscope.aliyuncs.com/compatible-mode/v1"
+    va_base_url: str = "https://dashscope-intl.aliyuncs.com/compatible-mode/v1"
     va_enable_thinking: bool = False
     va_timeout_seconds: float = 180.0
     camera_timeout_ms: int = 15000
@@ -99,6 +100,12 @@ class LaviraPlannerConfig:
     nav_handoff_max_depth_m: float = 3.0
     alignment_head_camera_stream: str = "ego_view"
     segment_timeout_seconds: float = 180.0
+    heading_settle_seconds: float = 1.0
+    heading_settle_samples: int = 30
+    heading_settle_bad_sample_threshold: int = 12
+    heading_settle_tolerance_rad: float = math.radians(5.0)
+    heading_correction_speed_rad_s: float = 0.2
+    heading_correction_timeout_seconds: float = 10.0
     manipulation_window_seconds: float = 5.0
     manipulation_max_windows: int = 12
     manipulation_timeout_seconds: float = 180.0
@@ -111,8 +118,9 @@ class LaviraPlannerConfig:
             raise ValueError("components.lavira.navigation_mode must be vln or object_nav")
         if not self.mission.strip():
             raise ValueError("components.lavira.mission is required")
-        if not self.global_target.strip():
-            raise ValueError("components.lavira.global_target is required")
+        self.global_target = self.global_target.strip()
+        if not self.manipulation_prompt.strip():
+            self.manipulation_prompt = self.mission
         if self.max_steps <= 0 or self.history_size <= 0:
             raise ValueError("LaViRA max_steps and history_size must be positive")
         if (
@@ -130,6 +138,18 @@ class LaviraPlannerConfig:
             or self.manipulation_max_windows <= 0
             or self.manipulation_timeout_seconds <= 0
             or self.vla_start_timeout_seconds <= 0
+            or not math.isfinite(float(self.heading_settle_seconds))
+            or self.heading_settle_seconds < 0
+            or self.heading_settle_samples <= 0
+            or self.heading_settle_bad_sample_threshold <= 0
+            or self.heading_settle_bad_sample_threshold > self.heading_settle_samples
+            or not math.isfinite(float(self.heading_settle_tolerance_rad))
+            or self.heading_settle_tolerance_rad <= 0.0
+            or self.heading_settle_tolerance_rad > math.pi
+            or not math.isfinite(float(self.heading_correction_speed_rad_s))
+            or self.heading_correction_speed_rad_s <= 0.0
+            or not math.isfinite(float(self.heading_correction_timeout_seconds))
+            or self.heading_correction_timeout_seconds <= 0.0
         ):
             raise ValueError("LaViRA manipulation limits must be positive")
 
@@ -501,10 +521,23 @@ def _agent(
         navigation_mode=config.navigation_mode,
         mission=config.mission,
         global_target=config.global_target,
+        manipulation_prompt=config.manipulation_prompt,
         max_steps=config.max_steps,
         history_size=config.history_size,
         min_confidence=config.min_confidence,
         segment_timeout_seconds=config.segment_timeout_seconds,
+        heading_settle_seconds=config.heading_settle_seconds,
+        heading_settle_samples=config.heading_settle_samples,
+        heading_settle_bad_sample_threshold=(
+            config.heading_settle_bad_sample_threshold
+        ),
+        heading_settle_tolerance_rad=config.heading_settle_tolerance_rad,
+        heading_correction_speed_rad_s=(
+            config.heading_correction_speed_rad_s
+        ),
+        heading_correction_timeout_seconds=(
+            config.heading_correction_timeout_seconds
+        ),
         camera=camera,
         client=client,
         submit_intent=runtime.submit_intent,

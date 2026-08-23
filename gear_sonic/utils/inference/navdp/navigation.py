@@ -47,7 +47,7 @@ def wrap_angle(angle_rad: float) -> float:
 
 
 def heading_goal_target(current_yaw: float, delta_rad: float) -> float:
-    """Convert an Agent-relative turn into an absolute Fast-LIO heading."""
+    """Convert an Agent-relative turn into an absolute source-frame heading."""
     return wrap_angle(float(current_yaw) + float(delta_rad))
 
 
@@ -57,73 +57,171 @@ class HeadingControlResult:
     angular_velocity_rad_s: float
     target_rad: float
     reference_rad: float
-    error_rad: float
+    remaining_rad: float
     reason: str
 
 
 class HeadingGoalController:
-    """Deterministic Fast-LIO heading loop used instead of the X-NavDP network."""
+    """Drive a SONIC-yaw heading goal with a coarse/fine speed profile."""
 
     def __init__(
         self,
         *,
         angular_speed_rad_s: float = 0.4,
-        tolerance_rad: float = math.radians(3.0),
-        stable_frames: int = 3,
-        timeout_s: float = 12.0,
+        fine_angular_speed_rad_s: float = 0.2,
+        slowdown_angle_rad: float = math.radians(20.0),
+        tolerance_rad: float = math.radians(5.0),
     ) -> None:
         if not math.isfinite(angular_speed_rad_s) or angular_speed_rad_s <= 0.0:
             raise ValueError("heading angular speed must be finite and positive")
-        if not math.isfinite(tolerance_rad) or tolerance_rad <= 0.0:
-            raise ValueError("heading tolerance must be finite and positive")
-        if int(stable_frames) <= 0:
-            raise ValueError("heading stable_frames must be positive")
-        if not math.isfinite(timeout_s) or timeout_s <= 0.0:
-            raise ValueError("heading timeout must be finite and positive")
+        if (
+            not math.isfinite(fine_angular_speed_rad_s)
+            or fine_angular_speed_rad_s <= 0.0
+            or fine_angular_speed_rad_s > angular_speed_rad_s
+        ):
+            raise ValueError(
+                "fine heading angular speed must be positive and no greater "
+                "than the coarse speed"
+            )
+        if (
+            not math.isfinite(slowdown_angle_rad)
+            or not math.isfinite(tolerance_rad)
+            or tolerance_rad <= 0.0
+            or slowdown_angle_rad <= tolerance_rad
+            or slowdown_angle_rad > math.pi
+        ):
+            raise ValueError("heading slowdown and tolerance angles are invalid")
         self.angular_speed_rad_s = float(angular_speed_rad_s)
+        self.fine_angular_speed_rad_s = float(fine_angular_speed_rad_s)
+        self.slowdown_angle_rad = float(slowdown_angle_rad)
         self.tolerance_rad = float(tolerance_rad)
-        self.stable_frames = int(stable_frames)
-        self.timeout_s = float(timeout_s)
         self.reference_rad = 0.0
         self.target_rad = 0.0
         self.started_at_s = 0.0
-        self._stable_count = 0
+        self.turn_delta_rad = 0.0
+        self.turn_direction: str | None = None
+        self.angular_velocity_rad_s = 0.0
+        self.accumulated_yaw_rad = 0.0
+        self._last_yaw_rad = 0.0
+        self._goal_speed_limit_rad_s = self.angular_speed_rad_s
+        self._goal_max_duration_s: float | None = None
         self._active = False
 
-    def start(self, *, current_yaw: float, delta_rad: float, now: float) -> None:
+    def start(
+        self,
+        *,
+        current_yaw: float,
+        delta_rad: float,
+        turn_direction: str | None = None,
+        now: float,
+        max_angular_speed_rad_s: float | None = None,
+        max_duration_s: float | None = None,
+    ) -> None:
         self.reference_rad = wrap_angle(current_yaw)
-        self.target_rad = heading_goal_target(current_yaw, delta_rad)
+        if turn_direction not in {None, "left", "right"}:
+            raise ValueError("heading turn direction must be left or right")
+        wrapped_delta = wrap_angle(delta_rad)
+        if turn_direction == "left":
+            self.turn_delta_rad = float(delta_rad) % (2.0 * math.pi)
+        elif turn_direction == "right":
+            self.turn_delta_rad = -((-float(delta_rad)) % (2.0 * math.pi))
+        else:
+            self.turn_delta_rad = wrapped_delta
+        self.turn_direction = turn_direction
+        self.target_rad = heading_goal_target(current_yaw, self.turn_delta_rad)
         self.started_at_s = float(now)
         if not math.isfinite(self.started_at_s):
             raise ValueError("heading start time must be finite")
-        self._stable_count = 0
+        if max_angular_speed_rad_s is None:
+            self._goal_speed_limit_rad_s = self.angular_speed_rad_s
+        else:
+            speed_limit = float(max_angular_speed_rad_s)
+            if not math.isfinite(speed_limit) or speed_limit <= 0.0:
+                raise ValueError("heading goal speed limit must be positive")
+            self._goal_speed_limit_rad_s = min(
+                self.angular_speed_rad_s, speed_limit,
+            )
+        if max_duration_s is None:
+            self._goal_max_duration_s = None
+        else:
+            duration = float(max_duration_s)
+            if not math.isfinite(duration) or duration <= 0.0:
+                raise ValueError("heading goal maximum duration must be positive")
+            self._goal_max_duration_s = duration
+        self.angular_velocity_rad_s = (
+            0.0
+            if self.turn_delta_rad == 0.0
+            else math.copysign(
+                self._goal_speed_limit_rad_s, self.turn_delta_rad,
+            )
+        )
+        self.accumulated_yaw_rad = 0.0
+        self._last_yaw_rad = self.reference_rad
         self._active = True
 
     def update(self, *, current_yaw: float, now: float) -> HeadingControlResult:
         if not self._active:
             raise RuntimeError("heading controller has not been started")
-        error = wrap_angle(self.target_rad - float(current_yaw))
-        if float(now) - self.started_at_s > self.timeout_s:
+        yaw = wrap_angle(current_yaw)
+        self.accumulated_yaw_rad += wrap_angle(yaw - self._last_yaw_rad)
+        self._last_yaw_rad = yaw
+        elapsed_s = max(0.0, float(now) - self.started_at_s)
+        shortest_remaining_rad = wrap_angle(self.target_rad - yaw)
+        if abs(shortest_remaining_rad) <= self.tolerance_rad:
             self._active = False
+            self.angular_velocity_rad_s = 0.0
             return HeadingControlResult(
-                "failed", 0.0, self.target_rad, self.reference_rad, error,
-                "heading_timeout",
+                "reached",
+                0.0,
+                self.target_rad,
+                self.reference_rad,
+                0.0,
+                "heading_sonic_yaw_reached",
             )
-        if abs(error) <= self.tolerance_rad:
-            self._stable_count += 1
-            velocity = 0.0
-        else:
-            self._stable_count = 0
-            velocity = math.copysign(self.angular_speed_rad_s, error)
-        if self._stable_count >= self.stable_frames:
+        remaining_rad = shortest_remaining_rad
+        requested_magnitude = abs(self.turn_delta_rad)
+        direction_sign = (
+            1.0 if self.turn_direction == "left"
+            else -1.0 if self.turn_direction == "right"
+            else 0.0
+        )
+        directed_progress = direction_sign * self.accumulated_yaw_rad
+        if (
+            direction_sign != 0.0
+            and directed_progress < requested_magnitude
+        ):
+            if direction_sign > 0.0 and remaining_rad < 0.0:
+                remaining_rad += 2.0 * math.pi
+            elif direction_sign < 0.0 and remaining_rad > 0.0:
+                remaining_rad -= 2.0 * math.pi
+        remaining_magnitude = abs(remaining_rad)
+        if (
+            self._goal_max_duration_s is not None
+            and elapsed_s >= self._goal_max_duration_s
+        ):
             self._active = False
+            self.angular_velocity_rad_s = 0.0
             return HeadingControlResult(
-                "reached", 0.0, self.target_rad, self.reference_rad, error,
-                "heading_stable",
+                "reached",
+                0.0,
+                self.target_rad,
+                self.reference_rad,
+                remaining_rad,
+                "heading_adjustment_time_limit",
             )
+        speed = (
+            min(self.fine_angular_speed_rad_s, self._goal_speed_limit_rad_s)
+            if remaining_magnitude <= self.slowdown_angle_rad
+            else self._goal_speed_limit_rad_s
+        )
+        self.angular_velocity_rad_s = math.copysign(speed, remaining_rad)
         return HeadingControlResult(
-            "active", velocity, self.target_rad, self.reference_rad, error,
-            "heading_tracking",
+            "active",
+            self.angular_velocity_rad_s,
+            self.target_rad,
+            self.reference_rad,
+            remaining_rad,
+            "heading_sonic_yaw_tracking",
         )
 
 

@@ -23,6 +23,8 @@ from gear_sonic.scripts.launch_inference import (
     _clear_stale_navdp_processes,
     _create_tmux_session,
     _dotenv_has_nonempty_value,
+    _lavira_api_key_errors,
+    _start_in_pane,
     _worker_pane_names,
     build_base_pose_agent_command,
     build_fastlio_supervisor_command,
@@ -79,14 +81,37 @@ def test_startup_clears_only_stale_navdp_processes(monkeypatch) -> None:
     assert [command[:3] for command in commands] == [
         ["pkill", "-TERM", "-f"],
         ["pkill", "-TERM", "-f"],
+        ["pkill", "-TERM", "-f"],
+        ["pkill", "-KILL", "-f"],
         ["pkill", "-KILL", "-f"],
         ["pkill", "-KILL", "-f"],
     ]
     assert all(
         "gear_sonic\\.utils\\.inference\\.navdp\\.service" in command[-1]
         or "eval\\.src\\.policy_server" in command[-1]
+        or "gear_sonic/scripts/navdp_planner\\.py" in command[-1]
         for command in commands
     )
+
+
+def test_required_worker_must_remain_alive_after_startup(monkeypatch) -> None:
+    monkeypatch.setattr(
+        "gear_sonic.scripts.launch_inference._send_to_pane",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        "gear_sonic.scripts.launch_inference._check_pane_alive",
+        lambda _pane: False,
+    )
+
+    with pytest.raises(RuntimeError, match="NavDP planner exited during startup"):
+        _start_in_pane(
+            {"navdp": "%1"},
+            "navdp",
+            "NavDP planner",
+            "python -m gear_sonic.utils.inference.navdp.service",
+            required=True,
+        )
 
 
 def _write_deploy_policy_files(
@@ -264,6 +289,40 @@ def test_dotenv_key_check_does_not_require_loading_secret(tmp_path: Path) -> Non
     assert not _dotenv_has_nonempty_value(env_file, "MISSING")
 
 
+def test_lavira_role_keys_reuse_shared_dashscope_key(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    for name in (
+        "DASHSCOPE_API_KEY",
+        "LAVIRA_LA_API_KEY",
+        "LAVIRA_VA_API_KEY",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    env_file = tmp_path / ".env.local"
+    env_file.write_text("DASHSCOPE_API_KEY=shared-key\n", encoding="utf-8")
+
+    assert _lavira_api_key_errors(env_file) == ()
+
+
+def test_lavira_startup_reports_each_unresolved_role_key(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    for name in (
+        "DASHSCOPE_API_KEY",
+        "LAVIRA_LA_API_KEY",
+        "LAVIRA_VA_API_KEY",
+    ):
+        monkeypatch.delenv(name, raising=False)
+
+    errors = _lavira_api_key_errors(tmp_path / ".env.local")
+
+    assert len(errors) == 2
+    assert "LaViRA LA API key is missing" in errors[0]
+    assert "LaViRA VA API key is missing" in errors[1]
+
+
 def test_worker_layout_omits_disabled_navigation_components() -> None:
     assert _worker_pane_names(InferenceLaunchConfig(keyboard_planner=False)) == (
         "deploy",
@@ -369,10 +428,14 @@ def test_yaml_contains_every_launch_parameter() -> None:
     profile = load_runtime_profile()
 
     assert profile.component("deploy")["policy_variant"] == "sonic_v1_1"
-    assert vla.prompt.startswith("Move in front of the table")
-    assert lavira.navigation_mode == "object_nav"
-    assert lavira.mission == "Find the blue basket, then put the medicine bottle into it."
-    assert lavira.global_target == "blue basket"
+    assert vla.prompt.startswith("Move in front of the desk with the blue basket")
+    assert lavira.navigation_mode == "vln"
+    assert lavira.mission == (
+        "Walk forward to the trash can, then turn right and walk to a position "
+        "near the desk with the blue basket on it."
+    )
+    assert lavira.global_target == ""
+    assert lavira.manipulation_prompt == vla.prompt
     assert lavira.la_model == "qwen3.8-max"
     assert lavira.va_model == "qwen3.5-27b"
     assert loaded.base_pose_enabled is True
@@ -620,8 +683,8 @@ def test_lavira_uses_only_control_and_sensor_gateways() -> None:
     assert "--control-gateway-intent-endpoint" not in command
     assert "--qwenvl-model" not in command
     assert "--qwenvl-timeout-seconds" not in command
-    assert load_lavira_config().la_base_url == "https://dashscope.aliyuncs.com/compatible-mode/v1"
-    assert load_lavira_config().va_base_url == "https://dashscope.aliyuncs.com/compatible-mode/v1"
+    assert load_lavira_config().la_base_url == "https://dashscope-intl.aliyuncs.com/compatible-mode/v1"
+    assert load_lavira_config().va_base_url == "https://dashscope-intl.aliyuncs.com/compatible-mode/v1"
     assert "--vision-backend" not in command
     assert "--model gpt-" not in command
     assert "codex" not in command.lower()

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 
 import pytest
 
@@ -37,8 +38,8 @@ def test_default_profile_reproduces_current_topology_and_timing() -> None:
     assert profile.component("vla") == {
         "embodiment_tag": "unitree_g1_sonic",
         "prompt": (
-            "Move in front of the table, grasp the medicine bottle, and place it "
-            "into the blue basket."
+            "Move in front of the desk with the blue basket, grasp the medicine "
+            "bottle, and place it into the blue basket."
         ),
         "inference_hz": 2.0,
         "action_publish_rate": 50,
@@ -79,6 +80,11 @@ def test_profile_parameters_match_current_process_defaults() -> None:
     assert vla_profile["sensor_gateway_max_skew_ms"] == vla.sensor_gateway_max_skew_ms
 
     assert profile.component("lavira")["camera_timeout_ms"] == lavira.camera_timeout_ms
+    assert (
+        profile.component("lavira")["heading_settle_seconds"]
+        == lavira.heading_settle_seconds
+        == 1.0
+    )
     assert profile.component("lavira")["la_timeout_seconds"] == lavira.la_timeout_seconds
     assert profile.component("lavira")["va_base_url"] == lavira.va_base_url
     assert profile.component("lavira")["min_confidence"] == lavira.min_confidence
@@ -105,7 +111,12 @@ def test_profile_parameters_match_current_process_defaults() -> None:
     assert navdp_profile["mpc_hz"] == navdp.mpc_hz
     assert navdp_profile["mpc_result_timeout_s"] == navdp.mpc_result_timeout_s
     assert navdp_profile["heading_preview_s"] == navdp.heading_preview_s
-    assert navdp_profile["heading_timeout_s"] == navdp.heading_timeout_s
+    assert navdp.heading_angular_speed_rad_s == pytest.approx(0.4)
+    assert navdp.heading_fine_angular_speed_rad_s == pytest.approx(0.2)
+    assert navdp.heading_slowdown_angle_rad == pytest.approx(math.radians(20.0))
+    assert navdp.heading_goal_tolerance_rad == pytest.approx(math.radians(5.0))
+    assert navdp.heading_orientation_timeout_s == pytest.approx(0.3)
+    assert not hasattr(navdp, "heading_timeout_s")
     assert navdp_profile["goal_tolerance_m"] == navdp.goal_tolerance_m
     assert navdp_profile["stop_threshold"] == navdp.stop_threshold
     assert navdp_profile["request_timeout_s"] == navdp.request_timeout_s

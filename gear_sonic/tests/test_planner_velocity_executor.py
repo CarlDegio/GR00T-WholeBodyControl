@@ -301,3 +301,109 @@ def test_navdp_fastlio_heading_is_rebased_to_current_sonic_heading() -> None:
     core.decide(now=5.1, safety=fresh_safety(5.1))
 
     assert core.sonic.heading == pytest.approx(math.remainder(1.5, 2.0 * math.pi))
+
+
+def test_heading_goal_integrates_angular_velocity_instead_of_jumping_to_target() -> None:
+    core = PlannerVelocityExecutorCore(control_hz=20.0)
+    core.sonic.heading = 1.0
+    core.accept_navigation(
+        NavigationCommand(
+            mode="heading_goal",
+            generation=3,
+            timestamp=1.0,
+            heading_delta_rad=-math.pi / 2.0,
+        ),
+        now=5.0,
+    )
+    core.accept_planner_velocity(
+        PlannerVelocityCommand(
+            3,
+            1.0,
+            "navdp",
+            (0.0, 0.0, -0.4),
+            heading_target_rad=-1.3,
+            heading_reference_rad=0.2,
+        ),
+        now=5.1,
+    )
+
+    core.decide(now=5.1, safety=fresh_safety(5.1))
+    assert core.sonic.heading == pytest.approx(0.98)
+
+    core.decide(now=5.15, safety=fresh_safety(5.15))
+    assert core.sonic.heading == pytest.approx(0.96)
+
+
+def test_heading_goal_safety_block_freezes_incremental_facing() -> None:
+    core = PlannerVelocityExecutorCore(control_hz=20.0)
+    core.accept_navigation(
+        NavigationCommand(
+            mode="heading_goal",
+            generation=4,
+            timestamp=1.0,
+            heading_delta_rad=math.pi / 2.0,
+        ),
+        now=8.0,
+    )
+    core.accept_planner_velocity(
+        PlannerVelocityCommand(
+            4,
+            1.0,
+            "navdp",
+            (0.0, 0.0, 0.4),
+            heading_target_rad=1.5,
+            heading_reference_rad=0.0,
+        ),
+        now=8.1,
+    )
+
+    blocked = core.decide(now=8.1, safety=SafetySnapshot())
+    assert blocked.reason == "radar_timeout"
+    assert blocked.velocity == (0.0, 0.0, 0.0)
+    assert core.sonic.heading == pytest.approx(0.0)
+
+    core.decide(now=8.15, safety=fresh_safety(8.15))
+    assert core.sonic.heading == pytest.approx(0.02)
+
+
+def test_heading_goal_keeps_replanning_until_zero_velocity_snaps_to_target() -> None:
+    core = PlannerVelocityExecutorCore(control_hz=20.0)
+    core.sonic.heading = 1.0
+    core.accept_navigation(
+        NavigationCommand(
+            mode="heading_goal",
+            generation=5,
+            timestamp=1.0,
+            heading_delta_rad=0.01,
+        ),
+        now=9.0,
+    )
+    core.accept_planner_velocity(
+        PlannerVelocityCommand(
+            5,
+            1.0,
+            "navdp",
+            (0.0, 0.0, 0.4),
+            heading_target_rad=0.21,
+            heading_reference_rad=0.2,
+        ),
+        now=9.1,
+    )
+
+    core.decide(now=9.1, safety=fresh_safety(9.1))
+    assert core.sonic.heading == pytest.approx(1.02)
+
+    core.accept_planner_velocity(
+        PlannerVelocityCommand(
+            5,
+            1.1,
+            "navdp",
+            (0.0, 0.0, 0.0),
+            heading_target_rad=0.21,
+            heading_reference_rad=0.2,
+        ),
+        now=9.15,
+    )
+    core.decide(now=9.15, safety=fresh_safety(9.15))
+
+    assert core.sonic.heading == pytest.approx(1.01)

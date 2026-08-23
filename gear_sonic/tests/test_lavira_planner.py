@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import math
 import queue
 import threading
 import time
@@ -45,17 +46,26 @@ def test_lavira_config_exposes_dual_cloud_agent_roles() -> None:
     config = LaviraPlannerConfig("find chair", "chair")
 
     assert config.navigation_mode == "object_nav"
+    assert config.manipulation_prompt == "find chair"
     assert not hasattr(config, "task_type")
     assert not hasattr(config, "question")
     assert config.la_model == "qwen3.8-max"
     assert config.va_model == "qwen3.5-27b"
-    assert config.la_enable_thinking is True
+    assert config.la_enable_thinking is False
     assert config.va_enable_thinking is False
-    assert config.la_base_url == "https://dashscope.aliyuncs.com/compatible-mode/v1"
-    assert config.va_base_url == "https://dashscope.aliyuncs.com/compatible-mode/v1"
+    assert config.la_base_url == "https://dashscope-intl.aliyuncs.com/compatible-mode/v1"
+    assert config.va_base_url == "https://dashscope-intl.aliyuncs.com/compatible-mode/v1"
     assert config.nav_handoff_min_depth_m == 0.3
     assert config.nav_handoff_max_depth_m == 3.0
     assert config.alignment_head_camera_stream == "ego_view"
+    assert config.heading_settle_seconds == pytest.approx(1.0)
+    assert config.heading_settle_samples == 30
+    assert config.heading_settle_bad_sample_threshold == 12
+    assert config.heading_settle_tolerance_rad == pytest.approx(
+        math.radians(5.0)
+    )
+    assert config.heading_correction_speed_rad_s == pytest.approx(0.2)
+    assert config.heading_correction_timeout_seconds == pytest.approx(10.0)
     assert not hasattr(config, "qwenvl_model")
     assert not hasattr(config, "vision_backend")
     assert not hasattr(config, "model")
@@ -71,6 +81,10 @@ def test_lavira_config_exposes_dual_cloud_agent_roles() -> None:
             "find chair", "chair",
             nav_handoff_min_depth_m=3.0,
             nav_handoff_max_depth_m=2.0,
+        )
+    with pytest.raises(ValueError, match="limits"):
+        LaviraPlannerConfig(
+            "find chair", "chair", heading_settle_seconds=-0.1,
         )
 
 

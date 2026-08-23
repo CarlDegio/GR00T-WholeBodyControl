@@ -105,7 +105,7 @@ def format_actor_ray_control_text(velocity: Sequence[float]) -> str:
 def actor_ray_velocity_arrow(
     velocity: Sequence[float],
     *,
-    max_speed_mps: float = 0.30,
+    max_speed_mps: float = 0.40,
     max_length_px: int = 100,
     preview_s: float = 1.0,
 ) -> tuple[tuple[int, int], tuple[int, int]]:

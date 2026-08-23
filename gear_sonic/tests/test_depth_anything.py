@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import math
+import msgpack
 from pathlib import Path
 import sys
 import types
@@ -7,6 +9,7 @@ from types import MappingProxyType
 from unittest.mock import Mock
 
 import numpy as np
+import pytest
 
 
 sys.modules.setdefault("tyro", types.ModuleType("tyro"))
@@ -278,6 +281,84 @@ def test_lavira_reuses_rgb_capture_interface_for_head_handoff_view() -> None:
 
     assert fake.request.streams == (stream,)
     np.testing.assert_array_equal(image, rgb[..., ::-1])
+
+
+def test_lavira_captures_head_hardware_aligned_rgbd_for_nav_handoff() -> None:
+    rgb = np.array(
+        [[[255, 0, 0], [0, 255, 0]], [[0, 0, 255], [255, 255, 255]]],
+        dtype=np.uint8,
+    )
+    depth = np.full((2, 2), 1250, dtype=np.uint16)
+    rgb_stream = "camera/ego_view"
+    depth_stream = "camera/ego_view_depth"
+    info = {
+        "fx": 500.0,
+        "fy": 501.0,
+        "cx": 1.0,
+        "cy": 1.0,
+        "width": 2,
+        "height": 2,
+        "depth_scale_m": 0.001,
+        "depth_aligned_to": "ego_view",
+    }
+    materialized = _materialized(
+        {rgb_stream: rgb, depth_stream: depth},
+        {
+            rgb_stream: {"camera_info": info},
+            depth_stream: {"camera_info": info},
+        },
+    )
+
+    class FakeClient:
+        request = None
+
+        def read_snapshot(self, request, **_kwargs):
+            self.request = request
+            return materialized
+
+    fake = FakeClient()
+    camera = SensorGatewayRGBDCamera("inproc://unused", client=fake)
+
+    snapshot = camera.capture_camera_aligned_rgbd(camera_stream="ego_view")
+
+    assert fake.request.streams == (rgb_stream, depth_stream)
+    np.testing.assert_array_equal(snapshot.rgb_bgr, rgb[..., ::-1])
+    np.testing.assert_allclose(snapshot.depth_mm, 1250.0)
+    assert snapshot.fx == 500.0
+    assert snapshot.cx == 1.0
+
+
+def test_lavira_reads_fresh_sonic_measured_yaw_from_cpp_state() -> None:
+    expected_yaw = 0.7
+    payload = msgpack.packb({
+        "base_quat": [
+            math.cos(expected_yaw / 2.0),
+            0.0,
+            0.0,
+            math.sin(expected_yaw / 2.0),
+        ],
+    }, use_bin_type=True)
+    stream = SensorGatewayRGBDCamera.ROBOT_STATE_STREAM
+    materialized = _materialized({
+        stream: np.frombuffer(payload, dtype=np.uint8),
+    })
+
+    class FakeClient:
+        request = None
+
+        def read_snapshot(self, request, **_kwargs):
+            self.request = request
+            return materialized
+
+    fake = FakeClient()
+    camera = SensorGatewayRGBDCamera("inproc://unused", client=fake)
+
+    yaw = camera.current_sonic_yaw()
+
+    assert yaw == pytest.approx(expected_yaw)
+    assert fake.request.streams == (stream,)
+    assert fake.request.max_age_ms == pytest.approx(300.0)
+    assert fake.request.timestamp_basis is TimestampBasis.RECEIVE
 
 
 def test_mark_ready_replaces_stale_marker(tmp_path: Path) -> None:

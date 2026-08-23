@@ -34,6 +34,8 @@ class NavDPPlannerConfig:
     sensor_gateway_request_timeout_ms: int
     sensor_gateway_max_age_ms: float
     sensor_gateway_max_skew_ms: float
+    rgb_stream: str
+    depth_stream: str
     control_hz: float
     mpc_hz: float
     mpc_result_timeout_s: float
@@ -44,9 +46,10 @@ class NavDPPlannerConfig:
     trajectory_timeout_s: float
     request_timeout_s: float
     heading_angular_speed_rad_s: float
-    heading_tolerance_deg: float
-    heading_stable_frames: int
-    heading_timeout_s: float
+    heading_fine_angular_speed_rad_s: float
+    heading_slowdown_angle_rad: float
+    heading_goal_tolerance_rad: float
+    heading_orientation_timeout_s: float
     profile: str = ""
     overlay: tuple[str, ...] = ()
 
@@ -168,9 +171,12 @@ def _update_slam_cloud_state(
             )
 
 
-def _gateway_camera_frame(snapshot: MaterializedSnapshot) -> GatewayCameraFrame:
-    rgb_stream = "camera/ego_view"
-    depth_stream = "camera/ego_view_depth"
+def _gateway_camera_frame(
+    snapshot: MaterializedSnapshot,
+    *,
+    rgb_stream: str = "camera/chest_view",
+    depth_stream: str = "camera/chest_view_depth",
+) -> GatewayCameraFrame:
     rgb_frame = snapshot.snapshot.frames[rgb_stream]
     depth_frame = snapshot.snapshot.frames[depth_stream]
     camera_info = dict(rgb_frame.attributes.get("camera_info", {}))
@@ -178,7 +184,10 @@ def _gateway_camera_frame(snapshot: MaterializedSnapshot) -> GatewayCameraFrame:
     rgb = np.asarray(snapshot.arrays[rgb_stream])
     depth_raw = np.asarray(snapshot.arrays[depth_stream])
     if rgb.ndim != 3 or depth_raw.ndim != 2 or rgb.shape[:2] != depth_raw.shape:
-        raise ValueError("fresh aligned ego-view RGB-D unavailable")
+        raise ValueError(
+            f"fresh aligned NavDP RGB-D unavailable for {rgb_stream!r} and "
+            f"{depth_stream!r}"
+        )
     depth_m = depth_raw.astype(np.float32) * float(
         camera_info.get("depth_scale_m", 0.001)
     )
@@ -195,7 +204,7 @@ def _gateway_camera_frame(snapshot: MaterializedSnapshot) -> GatewayCameraFrame:
 class NavDPSensorGatewayIngress:
     """Materialize SensorGateway camera, odometry, and point-cloud streams for NavDP."""
 
-    CAMERA_STREAMS = ("camera/ego_view", "camera/ego_view_depth")
+    CAMERA_STREAMS = ("camera/chest_view", "camera/chest_view_depth")
     ODOMETRY_STREAM = "ros/odometry"
     LIDAR_STREAM = "ros/livox_lidar_xyz"
     SLAM_CLOUD_STREAM = "ros/registered_cloud_xyz"
@@ -209,6 +218,8 @@ class NavDPSensorGatewayIngress:
         request_timeout_ms: int = 100,
         max_age_ms: float = 1000.0,
         max_skew_ms: float = 5.0,
+        rgb_stream: str = CAMERA_STREAMS[0],
+        depth_stream: str = CAMERA_STREAMS[1],
         client: SensorGatewayClient | None = None,
     ) -> None:
         if poll_hz <= 0.0:
@@ -217,10 +228,17 @@ class NavDPSensorGatewayIngress:
             raise ValueError("sensor gateway request_timeout_ms must be positive")
         if max_age_ms < 0.0 or max_skew_ms < 0.0:
             raise ValueError("sensor gateway age and skew cannot be negative")
+        if not str(rgb_stream).strip() or not str(depth_stream).strip():
+            raise ValueError("NavDP RGB and depth streams are required")
+        if str(rgb_stream).strip() == str(depth_stream).strip():
+            raise ValueError("NavDP RGB and depth streams must be different")
         self.sensors = sensors
         self.poll_hz = float(poll_hz)
         self.max_age_ms = float(max_age_ms)
         self.max_skew_ms = float(max_skew_ms)
+        self.camera_streams = (
+            str(rgb_stream).strip(), str(depth_stream).strip(),
+        )
         self.client = client or SensorGatewayClient(
             endpoint,
             request_timeout_ms=request_timeout_ms,
@@ -260,14 +278,20 @@ class NavDPSensorGatewayIngress:
         return True
 
     def _poll_camera(self) -> None:
-        snapshot = self._request(self.CAMERA_STREAMS, max_skew_ms=self.max_skew_ms)
-        rgb_frame = snapshot.snapshot.frames[self.CAMERA_STREAMS[0]]
-        depth_frame = snapshot.snapshot.frames[self.CAMERA_STREAMS[1]]
+        snapshot = self._request(
+            self.camera_streams, max_skew_ms=self.max_skew_ms,
+        )
+        rgb_frame = snapshot.snapshot.frames[self.camera_streams[0]]
+        depth_frame = snapshot.snapshot.frames[self.camera_streams[1]]
         rgb_is_new = self._is_new(rgb_frame)
         depth_is_new = self._is_new(depth_frame)
         if not (rgb_is_new or depth_is_new):
             return
-        camera = _gateway_camera_frame(snapshot)
+        camera = _gateway_camera_frame(
+            snapshot,
+            rgb_stream=self.camera_streams[0],
+            depth_stream=self.camera_streams[1],
+        )
         with self._camera_lock:
             self._camera = camera
             self._camera_version += 1

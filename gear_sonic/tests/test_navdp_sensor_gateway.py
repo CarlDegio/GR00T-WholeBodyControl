@@ -99,12 +99,12 @@ def test_gateway_camera_builds_the_same_navdp_rgb_depth_and_intrinsics() -> None
     source_ns = 123_000_000_000
     materialized = _snapshot(
         {
-            "camera/ego_view": rgb,
-            "camera/ego_view_depth": depth,
+            "camera/chest_view": rgb,
+            "camera/chest_view_depth": depth,
         },
         received_ns=time.monotonic_ns(),
         source_ns=source_ns,
-        attributes={"camera/ego_view": {"camera_info": info}},
+        attributes={"camera/chest_view": {"camera_info": info}},
     )
     gateway = _gateway_camera_frame(materialized)
 
@@ -267,11 +267,11 @@ def test_gateway_ingress_materializes_all_navdp_inputs_from_one_service() -> Non
     cloud = np.asarray([[1.1, 2.1, 0.2], [1.2, 2.2, 0.3]], dtype=np.float32)
     for stream, values, attributes in (
         (
-            "camera/ego_view",
+            "camera/chest_view",
             rgb,
             {"camera_info": {"depth_scale_m": 0.001, "fx": 300.0}},
         ),
-        ("camera/ego_view_depth", depth, {}),
+        ("camera/chest_view_depth", depth, {}),
         ("ros/odometry", odometry, {}),
         ("ros/livox_lidar_xyz", lidar, {}),
         ("ros/registered_cloud_xyz", cloud, {}),

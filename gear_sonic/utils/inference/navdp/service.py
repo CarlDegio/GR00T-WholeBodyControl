@@ -55,8 +55,32 @@ from gear_sonic.utils.inference.navdp.visualization import (
     render_slam_world_panel,
 )
 from gear_sonic.utils.planner_control import build_planner_velocity_message
+from gear_sonic.utils.teleop.sonic_orientation_telemetry import (
+    OrientationTelemetrySample,
+    decode_orientation_telemetry,
+)
 
 LOGGER = logging.getLogger("sonic.navdp")
+
+
+def _fresh_sonic_yaw(
+    sample: OrientationTelemetrySample | None,
+    *,
+    now_s: float,
+    timeout_s: float,
+) -> float | None:
+    """Return the executor's measured SONIC yaw only while its state is fresh."""
+    if (
+        sample is None
+        or sample.actual_yaw_rad is None
+        or sample.state_age_s is None
+    ):
+        return None
+    total_age_s = max(0.0, float(now_s) - sample.emitted_at_monotonic_s)
+    total_age_s += sample.state_age_s
+    if total_age_s > float(timeout_s):
+        return None
+    return sample.actual_yaw_rad
 
 
 def main(config: NavDPPlannerConfig) -> None:
@@ -66,6 +90,7 @@ def main(config: NavDPPlannerConfig) -> None:
     output_endpoint = profile.endpoint_uri("navdp_velocity")
     navdp_endpoint = profile.endpoint_uri("xnavdp_http")
     sensor_endpoint = profile.endpoint_uri("sensor_gateway_metadata")
+    orientation_endpoint = profile.endpoint_uri("orientation_telemetry")
     import zmq
 
     from gear_sonic.runtime.gateway.visualization import (
@@ -80,6 +105,11 @@ def main(config: NavDPPlannerConfig) -> None:
     commands = context.socket(zmq.SUB)
     commands.connect(command_endpoint)
     commands.setsockopt_string(zmq.SUBSCRIBE, "")
+    orientation = context.socket(zmq.SUB)
+    orientation.setsockopt_string(zmq.SUBSCRIBE, "")
+    orientation.setsockopt(zmq.CONFLATE, 1)
+    orientation.setsockopt(zmq.RCVHWM, 1)
+    orientation.connect(orientation_endpoint)
     status = context.socket(zmq.PUB)
     status.bind(profile.endpoint_uri("navigation_status"))
     output = context.socket(zmq.PUB)
@@ -103,8 +133,16 @@ def main(config: NavDPPlannerConfig) -> None:
         request_timeout_ms=config.sensor_gateway_request_timeout_ms,
         max_age_ms=config.sensor_gateway_max_age_ms,
         max_skew_ms=config.sensor_gateway_max_skew_ms,
+        rgb_stream=config.rgb_stream,
+        depth_stream=config.depth_stream,
     )
     gateway.start()
+    LOGGER.info(
+        "SensorGateway camera rgb=%s depth=%s goal_tolerance_m=%.3f",
+        config.rgb_stream,
+        config.depth_stream,
+        config.goal_tolerance_m,
+    )
     generation = 0
     skill_id = 0
     segment_id = 0
@@ -122,8 +160,8 @@ def main(config: NavDPPlannerConfig) -> None:
     inference_result: queue.Queue[
         tuple[int, int, np.ndarray | None, Pose2D | None, str | None, float]
     ] = queue.Queue(maxsize=1)
-    nav_fastlio_reference_yaw: float | None = None
-    fastlio_target_heading: float | None = None
+    heading_reference_yaw: float | None = None
+    heading_target_yaw: float | None = None
     mpc_solver = AsyncMpcSolver()
     mpc_reference = np.empty((0, 2), dtype=np.float64)
     mpc_reference_version = 0
@@ -137,11 +175,13 @@ def main(config: NavDPPlannerConfig) -> None:
     last_stale_reason: str | None = None
     heading_controller = HeadingGoalController(
         angular_speed_rad_s=config.heading_angular_speed_rad_s,
-        tolerance_rad=math.radians(config.heading_tolerance_deg),
-        stable_frames=config.heading_stable_frames,
-        timeout_s=config.heading_timeout_s,
+        fine_angular_speed_rad_s=config.heading_fine_angular_speed_rad_s,
+        slowdown_angle_rad=config.heading_slowdown_angle_rad,
+        tolerance_rad=config.heading_goal_tolerance_rad,
     )
     heading_result = None
+    latest_orientation: OrientationTelemetrySample | None = None
+    orientation_error = ""
 
     def report_event(level: int, code: str, message: str, **fields: object) -> None:
         emit_event(
@@ -223,15 +263,43 @@ def main(config: NavDPPlannerConfig) -> None:
         inference_busy = False
 
     LOGGER.info(
-        "command=%s output=%s sensors=%s",
+        "command=%s output=%s sensors=%s orientation=%s",
         command_endpoint,
         output_endpoint,
         sensor_endpoint,
+        orientation_endpoint,
     )
     period = 1.0 / config.control_hz
     try:
         while True:
             loop_started = time.monotonic()
+            while orientation.poll(0):
+                try:
+                    sample = decode_orientation_telemetry(orientation.recv())
+                except ValueError as exc:
+                    message = str(exc)
+                    if message != orientation_error:
+                        report_event(
+                            logging.WARNING,
+                            "SONIC_ORIENTATION_INVALID",
+                            "discarding invalid SONIC orientation telemetry",
+                            error=message,
+                        )
+                    orientation_error = message
+                    continue
+                if (
+                    latest_orientation is None
+                    or sample.emitted_at_monotonic_s
+                    >= latest_orientation.emitted_at_monotonic_s
+                ):
+                    latest_orientation = sample
+                if orientation_error:
+                    report_event(
+                        logging.INFO,
+                        "SONIC_ORIENTATION_RECOVERED",
+                        "SONIC orientation telemetry recovered",
+                    )
+                    orientation_error = ""
             while commands.poll(0):
                 command = decode_navigation_message(commands.recv())
                 if command.generation < generation or (
@@ -271,24 +339,36 @@ def main(config: NavDPPlannerConfig) -> None:
                         send_status("failed", "odometry_unavailable")
                     else:
                         world_goal = base_goal_to_world(command.goal_base, pose)
-                        nav_fastlio_reference_yaw = pose.yaw
-                        fastlio_target_heading = pose.yaw
+                        heading_reference_yaw = pose.yaw
+                        heading_target_yaw = pose.yaw
                         send_metrics({}, activate=True)
                         send_status("active", "goal_accepted")
                 else:
-                    with sensors.lock:
-                        pose = sensors.pose
-                    if pose is None or command.heading_delta_rad is None:
+                    now = time.monotonic()
+                    sonic_yaw = _fresh_sonic_yaw(
+                        latest_orientation,
+                        now_s=now,
+                        timeout_s=config.heading_orientation_timeout_s,
+                    )
+                    if sonic_yaw is None or command.heading_delta_rad is None:
                         mode = "stop"
-                        send_status("failed", "odometry_unavailable")
+                        send_status("failed", "sonic_orientation_unavailable")
                     else:
                         world_goal = None
-                        nav_fastlio_reference_yaw = pose.yaw
-                        fastlio_target_heading = None
+                        # These protocol fields are source-neutral. For a heading
+                        # goal they carry SONIC yaw so the executor can rebase it
+                        # into its command-facing frame.
+                        heading_reference_yaw = sonic_yaw
+                        heading_target_yaw = None
                         heading_controller.start(
-                            current_yaw=pose.yaw,
+                            current_yaw=sonic_yaw,
                             delta_rad=command.heading_delta_rad,
-                            now=time.monotonic(),
+                            turn_direction=command.heading_turn_direction,
+                            now=now,
+                            max_angular_speed_rad_s=(
+                                command.heading_max_angular_speed_rad_s
+                            ),
+                            max_duration_s=command.heading_max_duration_s,
                         )
                         send_metrics({}, activate=True)
                         send_status("active", "heading_goal_accepted")
@@ -427,6 +507,8 @@ def main(config: NavDPPlannerConfig) -> None:
 
             zero_action_aborted = False
             new_mpc_solution = False
+            emit_heading_target = False
+            terminal_heading_status: tuple[str, str] | None = None
             result = mpc_solver.poll_latest()
             if (
                 result is not None
@@ -486,7 +568,7 @@ def main(config: NavDPPlannerConfig) -> None:
                         ),
                         command_available=mpc_solution_available,
                     )
-                    fastlio_target_heading = fastlio_heading_target_from_mpc(
+                    heading_target_yaw = fastlio_heading_target_from_mpc(
                         fastlio_yaw=pose.yaw,
                         mpc_angular_velocity=mpc_angular_velocity,
                         heading_preview_s=config.heading_preview_s,
@@ -496,26 +578,49 @@ def main(config: NavDPPlannerConfig) -> None:
                     mpc_angular_velocity,
                 )
             elif mode == "heading_goal":
-                if pose is None or now - pose_time > config.odometry_timeout_s:
-                    velocity = (0.0, 0.0, 0.0)
+                emit_heading_target = True
+                sonic_yaw = _fresh_sonic_yaw(
+                    latest_orientation,
+                    now_s=now,
+                    timeout_s=config.heading_orientation_timeout_s,
+                )
+                if sonic_yaw is None:
                     mode = "stop"
-                    send_status("failed", "odometry_timeout")
+                    velocity = (0.0, 0.0, 0.0)
+                    terminal_heading_status = (
+                        "failed", "sonic_orientation_timeout",
+                    )
                 else:
                     heading_result = heading_controller.update(
-                        current_yaw=pose.yaw,
+                        current_yaw=sonic_yaw,
                         now=now,
                     )
-                    fastlio_target_heading = heading_result.target_rad
-                    nav_fastlio_reference_yaw = heading_result.reference_rad
+                    heading_target_yaw = heading_result.target_rad
+                    heading_reference_yaw = heading_result.reference_rad
                     velocity = (
                         0.0,
                         0.0,
                         heading_result.angular_velocity_rad_s,
                     )
                     if heading_result.state != "active":
+                        LOGGER.log(
+                            logging.ERROR
+                            if heading_result.state == "failed"
+                            else logging.INFO,
+                            "heading finished state=%s requested_rad=%.6f "
+                            "accumulated_sonic_yaw_rad=%.6f remaining_rad=%.6f "
+                            "reason=%s",
+                            heading_result.state,
+                            heading_controller.turn_delta_rad,
+                            heading_controller.accumulated_yaw_rad,
+                            heading_result.remaining_rad,
+                            heading_result.reason,
+                        )
                         mode = "stop"
                         velocity = (0.0, 0.0, 0.0)
-                        send_status(heading_result.state, heading_result.reason)
+                        terminal_heading_status = (
+                            heading_result.state, heading_result.reason,
+                        )
             else:
                 velocity = (0.0, 0.0, 0.0)
             pose, pose_time, points = _control_freshness_snapshot(sensors)
@@ -549,12 +654,12 @@ def main(config: NavDPPlannerConfig) -> None:
             current_rays = actor_ray_from_points(points)
             heading_kwargs = (
                 {
-                    "heading_target_rad": fastlio_target_heading,
-                    "heading_reference_rad": nav_fastlio_reference_yaw,
+                    "heading_target_rad": heading_target_yaw,
+                    "heading_reference_rad": heading_reference_yaw,
                 }
-                if mode in {"nav_goal", "heading_goal"}
-                and fastlio_target_heading is not None
-                and nav_fastlio_reference_yaw is not None
+                if (mode in {"nav_goal", "heading_goal"} or emit_heading_target)
+                and heading_target_yaw is not None
+                and heading_reference_yaw is not None
                 else {}
             )
             output.send_string(
@@ -567,6 +672,8 @@ def main(config: NavDPPlannerConfig) -> None:
                     **heading_kwargs,
                 )
             )
+            if terminal_heading_status is not None:
+                send_status(*terminal_heading_status)
             if zero_action_aborted:
                 stop_reason = "navdp_zero_action"
                 send_status("stopped", stop_reason)
@@ -622,6 +729,7 @@ def main(config: NavDPPlannerConfig) -> None:
             )
         gateway.close()
         commands.close(0)
+        orientation.close(0)
         status.close(0)
         output.close(0)
         event_socket.close(linger=0)
@@ -635,4 +743,8 @@ if __name__ == "__main__":
     from gear_sonic.runtime.profile import RuntimeProfileSelection
 
     selection = tyro.cli(RuntimeProfileSelection)
-    main(load_navdp_planner_config(selection.profile, selection.overlay))
+    try:
+        main(load_navdp_planner_config(selection.profile, selection.overlay))
+    except Exception:
+        LOGGER.exception("fatal NavDP planner failure")
+        raise

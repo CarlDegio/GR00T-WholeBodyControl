@@ -600,6 +600,30 @@ def _dotenv_has_nonempty_value(path: Path, name: str) -> bool:
     return False
 
 
+def _lavira_api_key_errors(env_file: Path) -> tuple[str, ...]:
+    """Report role keys that cannot resolve from process or dotenv settings."""
+
+    def available(*names: str) -> bool:
+        return any(
+            bool(os.environ.get(name, "").strip())
+            or _dotenv_has_nonempty_value(env_file, name)
+            for name in names
+        )
+
+    errors = []
+    if not available("LAVIRA_LA_API_KEY", "DASHSCOPE_API_KEY"):
+        errors.append(
+            "LaViRA LA API key is missing; set LAVIRA_LA_API_KEY or "
+            "DASHSCOPE_API_KEY in the environment or .env.local"
+        )
+    if not available("LAVIRA_VA_API_KEY", "DASHSCOPE_API_KEY"):
+        errors.append(
+            "LaViRA VA API key is missing; set LAVIRA_VA_API_KEY or "
+            "DASHSCOPE_API_KEY in the environment or .env.local"
+        )
+    return tuple(errors)
+
+
 def _check_prerequisites(config: InferenceLaunchConfig):
     """Verify that required tools and venvs exist."""
     errors = []
@@ -632,15 +656,12 @@ def _check_prerequisites(config: InferenceLaunchConfig):
                 errors.append(f"{label} not found: {path}")
 
     if config.planner_input == "lavira":
+        errors.extend(_lavira_api_key_errors(repo_root / ".env.local"))
         lavira = profile.component("lavira")
         navdp = profile.component("navdp")
         fastlio = profile.component("fastlio")
         if not str(lavira["mission"]).strip():
             errors.append("components.lavira.mission is required")
-        if not str(lavira["global_target"]).strip():
-            errors.append(
-                "components.lavira.global_target is required"
-            )
         navigation_mode = str(lavira["navigation_mode"])
         if navigation_mode not in {"vln", "object_nav"}:
             errors.append(
@@ -773,6 +794,7 @@ def _clear_stale_navdp_processes() -> None:
     patterns = (
         r"(^|/)(python|python3) -m gear_sonic\.utils\.inference\.navdp\.service( |$)",
         r"(^|/)(python|python3) -m eval\.src\.policy_server( |$)",
+        r"(^|/)(python|python3) ([^ ]*/)?gear_sonic/scripts/navdp_planner\.py( |$)",
     )
     for pattern in patterns:
         subprocess.run(["pkill", "-TERM", "-f", pattern], capture_output=True)
@@ -908,9 +930,15 @@ def _start_in_pane(
     command: str,
     *,
     wait: float = 1.0,
+    required: bool = False,
 ) -> None:
     print(f"Starting {label} ({name})...")
     _send_to_pane(panes[name], command, wait=wait)
+    if required and not _check_pane_alive(panes[name]):
+        raise RuntimeError(
+            f"{label} exited during startup; inspect "
+            "outputs/logs/inference/navdp.log for the fatal error"
+        )
 
 
 def _check_pane_alive(pane_id: str) -> bool:
@@ -1040,7 +1068,13 @@ def main(config: InferenceLaunchConfig):
             )
 
         for name, label, command in commands:
-            _start_in_pane(panes, name, label, command)
+            _start_in_pane(
+                panes,
+                name,
+                label,
+                command,
+                required=name == "navdp",
+            )
 
     if config.data_exporter:
         _tmux("new-window", "-t", SESSION_NAME, "-n", "data_exporter")

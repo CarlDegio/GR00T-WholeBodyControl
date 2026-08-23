@@ -144,9 +144,15 @@ class PlannerVelocityExecutorCore:
             velocity = (0.0, 0.0, 0.0)
             reason = "depth_hard_stop"
 
-        # A blocked/stale cycle must freeze both translation and the SONIC
-        # heading setpoint.  Otherwise a fresh heading target could still turn
-        # the robot while lidar/depth safety is holding velocity at zero.
+        # Nav goals carry absolute Fast-LIO headings, while heading goals carry
+        # the executor's measured SONIC yaw. Both include their own reference,
+        # so the target can be rebased into SONIC's command-heading frame.
+        # Heading goals advance by wz * dt until NavDP's SONIC target-error
+        # check sends zero; that final zero snaps the facing setpoint to the
+        # requested heading. Keeping the setpoint moving while yaw is short of
+        # the goal forces the zero-speed C++ planner to continue replanning. A
+        # blocked cycle freezes both paths because safety replaced ``velocity``
+        # with zero and ``reason`` is not clear.
         if (
             self.mode in {"nav_goal", "heading_goal"}
             and reason == "clear"
@@ -158,10 +164,22 @@ class PlannerVelocityExecutorCore:
                     self.sonic.heading - self.navdp_heading_reference_rad,
                     2.0 * math.pi,
                 )
-            self.sonic.heading = math.remainder(
+            target_heading = math.remainder(
                 self.navdp_heading_target_rad + self.navdp_heading_offset_rad,
                 2.0 * math.pi,
             )
+            if self.mode == "nav_goal":
+                self.sonic.heading = target_heading
+            else:
+                step = float(velocity[2]) * self.period_s
+                self.sonic.heading = (
+                    target_heading
+                    if abs(step) <= 1.0e-12
+                    else math.remainder(
+                        self.sonic.heading + step,
+                        2.0 * math.pi,
+                    )
+                )
         message = self.sonic.message(
             velocity,
             dt=self.period_s if self.mode == "manual_velocity" else 0.0,

@@ -53,7 +53,7 @@ components:
     #  place another paper ball into the same basket, and finally return both arms
     #  to the sides of the body.
     prompt: &vla_task_prompt >-
-      Move in front of the table, grasp the medicine bottle, and place it into the blue basket.
+      Move in front of the desk with the blue basket, grasp the medicine bottle, and place it into the blue basket.
     inference_hz: 2.0
     action_publish_rate: 50
     action_horizon: 50
@@ -62,17 +62,18 @@ components:
     sensor_gateway_max_age_ms: 1000.0
     sensor_gateway_max_skew_ms: 5.0
   lavira:
-    navigation_mode: object_nav
-    mission: Find the blue basket, then put the medicine bottle into it.
-    global_target: blue basket
+    navigation_mode: vln
+    mission: Walk forward to the trash can, then turn right and walk to a position near the desk with the blue basket on it.
+    global_target: ''  # Inferred and frozen from the first LA response.
+    manipulation_prompt: *vla_task_prompt
     max_steps: 20
     history_size: 5
     la_model: qwen3.8-max
-    la_base_url: https://dashscope.aliyuncs.com/compatible-mode/v1
-    la_enable_thinking: true
+    la_base_url: https://dashscope-intl.aliyuncs.com/compatible-mode/v1
+    la_enable_thinking: false
     la_timeout_seconds: 180.0
     va_model: qwen3.5-27b
-    va_base_url: https://dashscope.aliyuncs.com/compatible-mode/v1
+    va_base_url: https://dashscope-intl.aliyuncs.com/compatible-mode/v1
     va_enable_thinking: false
     va_timeout_seconds: 180.0
     camera_timeout_ms: 15000
@@ -84,6 +85,12 @@ components:
     nav_handoff_max_depth_m: 3.0
     alignment_head_camera_stream: ego_view
     segment_timeout_seconds: 180.0
+    heading_settle_seconds: 1.0
+    heading_settle_samples: 30
+    heading_settle_bad_sample_threshold: 12
+    heading_settle_tolerance_rad: 0.08726646259971647
+    heading_correction_speed_rad_s: 0.2
+    heading_correction_timeout_seconds: 10.0
     manipulation_window_seconds: 5.0
     manipulation_max_windows: 12
     manipulation_timeout_seconds: 180.0
@@ -144,11 +151,13 @@ components:
   navdp:
     root: /home/user/Project/NavDP/baselines/x-navdp
     checkpoint: /home/user/Project/NavDP/baselines/x-navdp/checkpoints/x-navdp_posttrain.ckpt
+    rgb_stream: camera/chest_view
+    depth_stream: camera/chest_view_depth
     control_hz: 20.0
     mpc_hz: 10.0
     mpc_result_timeout_s: 0.3
     heading_preview_s: 0.6
-    goal_tolerance_m: 0.5
+    goal_tolerance_m: 2.0
     stop_threshold: -4.0
     request_timeout_s: 10.0
     sensor_gateway_poll_hz: 20.0
@@ -158,9 +167,10 @@ components:
     odometry_timeout_s: 0.3
     trajectory_timeout_s: 2.5
     heading_angular_speed_rad_s: 0.4
-    heading_tolerance_deg: 3.0
-    heading_stable_frames: 3
-    heading_timeout_s: 12.0
+    heading_fine_angular_speed_rad_s: 0.2
+    heading_slowdown_angle_rad: 0.3490658503988659
+    heading_goal_tolerance_rad: 0.08726646259971647
+    heading_orientation_timeout_s: 0.3
   fastlio:
     workspace: /home/user/Project/fastlio_humanoid_ws
     livox_sdk_lib: /home/user/Project/livox_sdk2_install/lib
@@ -175,8 +185,8 @@ components:
     sensor_gateway_max_age_ms: 1000.0
   xnavdp_mpc:
     horizon_steps: 30
-    desired_velocity: 0.3
-    max_linear_velocity: 0.3
+    desired_velocity: 0.4
+    max_linear_velocity: 0.4
     max_angular_velocity: 0.8
     reference_gap: 3
     dt: 0.1

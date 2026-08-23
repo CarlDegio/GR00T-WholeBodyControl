@@ -443,6 +443,33 @@ def run_control_gateway(profile: RuntimeProfile) -> None:
                             heading_delta_rad = float(
                                 command.parameters["heading_delta_rad"]
                             )
+                            heading_turn_direction = (
+                                None
+                                if command.parameters.get(
+                                    "heading_turn_direction"
+                                ) is None
+                                else str(command.parameters[
+                                    "heading_turn_direction"
+                                ])
+                            )
+                            heading_max_angular_speed_rad_s = (
+                                None
+                                if command.parameters.get(
+                                    "heading_max_angular_speed_rad_s"
+                                ) is None
+                                else float(command.parameters[
+                                    "heading_max_angular_speed_rad_s"
+                                ])
+                            )
+                            heading_max_duration_s = (
+                                None
+                                if command.parameters.get(
+                                    "heading_max_duration_s"
+                                ) is None
+                                else float(command.parameters[
+                                    "heading_max_duration_s"
+                                ])
+                            )
                             navigation_pub.send_string(
                                 build_navigation_message(
                                     mode=action.mode,
@@ -450,6 +477,15 @@ def run_control_gateway(profile: RuntimeProfile) -> None:
                                     skill_id=action.skill_id,
                                     segment_id=action.segment_id,
                                     heading_delta_rad=heading_delta_rad,
+                                    heading_turn_direction=(
+                                        heading_turn_direction
+                                    ),
+                                    heading_max_angular_speed_rad_s=(
+                                        heading_max_angular_speed_rad_s
+                                    ),
+                                    heading_max_duration_s=(
+                                        heading_max_duration_s
+                                    ),
                                 )
                             )
                             dispatch_navigation_event(
@@ -465,6 +501,11 @@ def run_control_gateway(profile: RuntimeProfile) -> None:
                                 "NAVIGATION_HEADING_GOAL",
                                 "heading goal accepted",
                                 heading_delta_rad=heading_delta_rad,
+                                heading_turn_direction=heading_turn_direction,
+                                heading_max_angular_speed_rad_s=(
+                                    heading_max_angular_speed_rad_s
+                                ),
+                                heading_max_duration_s=heading_max_duration_s,
                             )
                         elif command.name == "navigation_agent_status":
                             if command.metadata.source != "lavira_agent":

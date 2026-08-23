@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import json
+import math
+import signal
 import struct
 import sys
-import signal
 import threading
 import time
 from types import SimpleNamespace
+
 import numpy as np
 import pytest
 
@@ -34,6 +36,7 @@ from gear_sonic.utils.inference.navdp.gateway import (
     point_plane_distances,
 )
 from gear_sonic.utils.inference.navdp.navigation import (
+    HeadingGoalController,
     NavigationCommand,
     Pose2D,
     base_goal_to_world,
@@ -44,6 +47,7 @@ from gear_sonic.utils.inference.navdp.navigation import (
     local_trajectory_to_world,
     update_slam_map,
 )
+from gear_sonic.utils.inference.navdp.service import _fresh_sonic_yaw
 from gear_sonic.utils.inference.navdp.visualization import (
     _VIZ_CENTER,
     actor_ray_from_points,
@@ -55,10 +59,16 @@ from gear_sonic.utils.inference.navdp.visualization import (
     render_slam_world_panel,
 )
 from gear_sonic.utils.planner_control import SonicPlannerState, depth_requires_stop
+from gear_sonic.utils.teleop.sonic_orientation_telemetry import (
+    OrientationTelemetrySample,
+)
 
 
 def test_navdp_goal_tolerance_matches_production_profile() -> None:
-    assert load_navdp_planner_config().goal_tolerance_m == pytest.approx(0.5)
+    config = load_navdp_planner_config()
+    assert config.goal_tolerance_m == pytest.approx(2.0)
+    assert config.rgb_stream == "camera/chest_view"
+    assert config.depth_stream == "camera/chest_view_depth"
 
 
 def test_navdp_runs_unthrottled_inference_with_ten_hz_mpc() -> None:
@@ -68,8 +78,117 @@ def test_navdp_runs_unthrottled_inference_with_ten_hz_mpc() -> None:
     assert config.mpc_result_timeout_s == pytest.approx(0.3)
     assert not hasattr(config, "inference_hz")
     assert config.heading_preview_s == pytest.approx(0.6)
+    assert config.heading_angular_speed_rad_s == pytest.approx(0.4)
+    assert config.heading_fine_angular_speed_rad_s == pytest.approx(0.2)
+    assert config.heading_slowdown_angle_rad == pytest.approx(math.radians(20.0))
+    assert config.heading_goal_tolerance_rad == pytest.approx(math.radians(5.0))
+    assert config.heading_orientation_timeout_s == pytest.approx(0.3)
     assert not hasattr(config, "radar_timeout_s")
     assert config.trajectory_timeout_s == pytest.approx(2.5)
+
+
+def test_heading_goal_slows_and_stops_on_sonic_error_across_wraparound() -> None:
+    controller = HeadingGoalController()
+    controller.start(current_yaw=3.0, delta_rad=math.pi / 2.0, now=10.0)
+
+    crossed_wrap = controller.update(current_yaw=-2.5, now=10.5)
+    almost_done = controller.update(current_yaw=-1.8, now=11.0)
+    completed = controller.update(current_yaw=-1.7, now=11.1)
+
+    assert crossed_wrap.state == almost_done.state == "active"
+    assert crossed_wrap.angular_velocity_rad_s == pytest.approx(0.4)
+    assert crossed_wrap.reason == "heading_sonic_yaw_tracking"
+    assert almost_done.angular_velocity_rad_s == pytest.approx(0.2)
+    assert completed.state == "reached"
+    assert completed.angular_velocity_rad_s == 0.0
+    assert completed.reason == "heading_sonic_yaw_reached"
+    assert controller.accumulated_yaw_rad == pytest.approx(1.583185307179586)
+
+
+def test_heading_goal_can_force_left_at_the_pi_boundary() -> None:
+    controller = HeadingGoalController()
+    requested_left_turn = math.pi + math.radians(0.62)
+    controller.start(
+        current_yaw=-1.5,
+        delta_rad=requested_left_turn,
+        turn_direction="left",
+        now=10.0,
+    )
+
+    initial = controller.update(current_yaw=-1.5, now=10.1)
+    almost_done = controller.update(current_yaw=1.5, now=17.6)
+    completed = controller.update(
+        current_yaw=controller.target_rad,
+        now=18.0,
+    )
+
+    assert initial.state == almost_done.state == "active"
+    assert initial.angular_velocity_rad_s == pytest.approx(0.4)
+    assert initial.remaining_rad == pytest.approx(requested_left_turn)
+    assert almost_done.angular_velocity_rad_s == pytest.approx(0.2)
+    assert completed.state == "reached"
+    assert completed.angular_velocity_rad_s == 0.0
+
+
+def test_forced_left_heading_uses_shortest_correction_after_overshoot() -> None:
+    controller = HeadingGoalController()
+    controller.start(
+        current_yaw=0.0,
+        delta_rad=math.pi,
+        turn_direction="left",
+        now=10.0,
+    )
+
+    turning_left = controller.update(current_yaw=3.0, now=17.5)
+    correcting_right = controller.update(current_yaw=-3.0, now=18.3)
+
+    assert turning_left.angular_velocity_rad_s == pytest.approx(0.2)
+    assert correcting_right.state == "active"
+    assert correcting_right.angular_velocity_rad_s == pytest.approx(-0.2)
+    assert correcting_right.remaining_rad == pytest.approx(-0.14159265358979312)
+
+
+def test_heading_goal_has_no_global_timeout_but_adjustments_can_be_limited() -> None:
+    controller = HeadingGoalController()
+    controller.start(current_yaw=-1.2, delta_rad=math.pi / 2.0, now=20.0)
+
+    still_turning = controller.update(current_yaw=-1.2, now=120.0)
+
+    assert still_turning.state == "active"
+    assert still_turning.angular_velocity_rad_s == pytest.approx(0.4)
+
+    controller.start(
+        current_yaw=-1.2,
+        delta_rad=math.pi / 2.0,
+        now=200.0,
+        max_angular_speed_rad_s=0.2,
+        max_duration_s=10.0,
+    )
+    adjusting = controller.update(current_yaw=-1.2, now=209.9)
+    time_limited = controller.update(current_yaw=-1.2, now=210.0)
+
+    assert adjusting.state == "active"
+    assert adjusting.angular_velocity_rad_s == pytest.approx(0.2)
+    assert time_limited.state == "reached"
+    assert time_limited.angular_velocity_rad_s == 0.0
+    assert time_limited.reason == "heading_adjustment_time_limit"
+
+
+def test_heading_goal_only_uses_fresh_sonic_yaw() -> None:
+    sample = OrientationTelemetrySample(
+        emitted_at_monotonic_s=10.0,
+        actual_yaw_rad=1.25,
+        actual_heading_rad=0.4,
+        heading_setpoint_rad=0.5,
+        heading_lag_rad=0.1,
+        state_age_s=0.05,
+    )
+
+    assert _fresh_sonic_yaw(sample, now_s=10.1, timeout_s=0.3) == pytest.approx(
+        1.25
+    )
+    assert _fresh_sonic_yaw(sample, now_s=10.26, timeout_s=0.3) is None
+    assert _fresh_sonic_yaw(None, now_s=10.0, timeout_s=0.3) is None
 
 
 def test_xnavdp_g1_mpc_defaults_keep_three_second_horizon() -> None:
@@ -77,8 +196,8 @@ def test_xnavdp_g1_mpc_defaults_keep_three_second_horizon() -> None:
 
     assert defaults == {
         "horizon_steps": 30,
-        "desired_velocity": 0.3,
-        "max_linear_velocity": 0.3,
+        "desired_velocity": 0.4,
+        "max_linear_velocity": 0.4,
         "max_angular_velocity": 0.8,
         "reference_gap": 3,
         "dt": 0.1,
@@ -139,9 +258,9 @@ def test_xnavdp_request_keeps_lateral_trajectory_axis_unchanged(monkeypatch) -> 
 
 def test_xnavdp_adaptive_speed_matches_length_and_curvature_limits() -> None:
     kwargs = {"max_angular_velocity": 0.8, "curvature_speed_gain": 0.15}
-    assert xnavdp_adaptive_speed(2.0, 0.0, **kwargs) == pytest.approx(0.3)
-    assert xnavdp_adaptive_speed(1.0, 0.0, **kwargs) == pytest.approx(0.15)
-    assert xnavdp_adaptive_speed(0.01, 0.0, **kwargs) == pytest.approx(0.0015)
+    assert xnavdp_adaptive_speed(2.0, 0.0, **kwargs) == pytest.approx(0.4)
+    assert xnavdp_adaptive_speed(1.0, 0.0, **kwargs) == pytest.approx(0.2)
+    assert xnavdp_adaptive_speed(0.01, 0.0, **kwargs) == pytest.approx(0.002)
     assert xnavdp_adaptive_speed(2.0, 10.0, **kwargs) == pytest.approx(0.012)
 
 
@@ -493,8 +612,8 @@ def test_mpc_defaults_match_xnavdp_g1_with_sonic_timing() -> None:
 
     assert controller.horizon_steps == 30
     assert controller.dt == pytest.approx(0.1)
-    assert controller.desired_velocity == pytest.approx(0.15)
-    assert controller.max_linear_velocity == pytest.approx(0.3)
+    assert controller.desired_velocity == pytest.approx(0.2)
+    assert controller.max_linear_velocity == pytest.approx(0.4)
     assert controller.max_angular_velocity == pytest.approx(0.8)
     assert controller.reference_gap == 3
 
