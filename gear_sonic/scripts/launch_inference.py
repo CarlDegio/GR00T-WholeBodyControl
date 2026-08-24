@@ -34,8 +34,26 @@ import time
 from typing import Any, Literal
 
 if __package__:
+    from gear_sonic.scripts.cleanup_inference import (
+        FASTLIO_PROCESS_PATTERNS,
+        GATEWAY_PROCESS_PATTERNS,
+        INFERENCE_PROCESS_PATTERNS,
+        NAVDP_PROCESS_PATTERNS,
+        POLICY_PROCESS_PATTERNS,
+        cleanup_shared_memory_files,
+        terminate_matching_processes,
+    )
     from gear_sonic.scripts.launcher import TmuxSession, bootstrap_venv
 else:
+    from cleanup_inference import (
+        FASTLIO_PROCESS_PATTERNS,
+        GATEWAY_PROCESS_PATTERNS,
+        INFERENCE_PROCESS_PATTERNS,
+        NAVDP_PROCESS_PATTERNS,
+        POLICY_PROCESS_PATTERNS,
+        cleanup_shared_memory_files,
+        terminate_matching_processes,
+    )
     from launcher import TmuxSession, bootstrap_venv
 
 
@@ -407,21 +425,40 @@ def build_navdp_server_background_command(config: InferenceLaunchConfig) -> str:
 
     server = build_navdp_server_command(config)
     return (
+        "_navdp_server_alive() { "
+        "if [ -n \"${NAVDP_SERVER_PGID:-}\" ]; then "
+        "kill -0 -- \"-${NAVDP_SERVER_PGID}\" 2>/dev/null; "
+        "else kill -0 \"${NAVDP_SERVER_PID}\" 2>/dev/null; fi; "
+        "}; "
+        "_signal_navdp_server() { "
+        "if [ -n \"${NAVDP_SERVER_PGID:-}\" ]; then "
+        "kill \"-$1\" -- \"-${NAVDP_SERVER_PGID}\" 2>/dev/null; "
+        "else kill \"-$1\" \"${NAVDP_SERVER_PID}\" 2>/dev/null; fi; "
+        "}; "
         "_stop_navdp_server() { "
         "if [ -n \"${NAVDP_SERVER_PID:-}\" ]; then "
-        "kill -- \"-${NAVDP_SERVER_PID}\" 2>/dev/null || "
-        "kill \"${NAVDP_SERVER_PID}\" 2>/dev/null || true; "
+        "_signal_navdp_server TERM || true; "
+        "for _navdp_stop_attempt in 1 2 3 4 5; do "
+        "_navdp_server_alive || break; sleep 0.2; done; "
+        "_navdp_server_alive && _signal_navdp_server KILL || true; "
         "wait \"${NAVDP_SERVER_PID}\" 2>/dev/null || true; "
-        "unset NAVDP_SERVER_PID; "
+        "unset NAVDP_SERVER_PID NAVDP_SERVER_PGID; "
         "fi; "
         "}; "
-        "trap _stop_navdp_server EXIT HUP; "
+        "_shutdown_navdp_pane() { "
+        "NAVDP_PANE_STATUS=$?; trap - EXIT HUP INT TERM; "
+        "_stop_navdp_server; exit \"${NAVDP_PANE_STATUS}\"; "
+        "}; "
+        "trap _shutdown_navdp_pane EXIT HUP INT TERM; "
         f"{server} "
         "> >(sed -u 's/^/[NavDP server] /') "
         "2> >(sed -u 's/^/[NavDP server:stderr] /' >&2) & "
         "NAVDP_SERVER_PID=$!; "
+        "NAVDP_SERVER_PGID=$(ps -o pgid= -p \"${NAVDP_SERVER_PID}\" "
+        "| tr -d ' '); "
         "echo \"[NavDP server] started in background as PID "
-        "${NAVDP_SERVER_PID}; logs are routed to this pane\""
+        "${NAVDP_SERVER_PID}, PGID ${NAVDP_SERVER_PGID}; "
+        "logs are routed to this pane\""
     )
 
 
@@ -435,7 +472,7 @@ def build_navdp_planner_pane_command(
         f"{planner}; "
         "NAVDP_PLANNER_STATUS=$?; "
         "_stop_navdp_server; "
-        "trap - EXIT HUP; "
+        "trap - EXIT HUP INT TERM; "
         "exit \"${NAVDP_PLANNER_STATUS}\""
     )
 
@@ -767,15 +804,11 @@ def _check_prerequisites(config: InferenceLaunchConfig):
 
 def _clear_stale_fastlio_processes() -> None:
     """Remove orphaned FAST-LIO launch and mapping processes from older runs."""
-    patterns = (
-        r"(^|/)ros2 launch fast_lio mapping\.launch\.py( |$)",
-        r"(^|/)fastlio_mapping( |$)",
+    terminate_matching_processes(
+        FASTLIO_PROCESS_PATTERNS,
+        runner=subprocess.run,
+        sleeper=time.sleep,
     )
-    for pattern in patterns:
-        subprocess.run(["pkill", "-TERM", "-f", pattern], capture_output=True)
-    time.sleep(0.5)
-    for pattern in patterns:
-        subprocess.run(["pkill", "-KILL", "-f", pattern], capture_output=True)
 
 
 def _clear_stale_navdp_processes() -> None:
@@ -784,19 +817,49 @@ def _clear_stale_navdp_processes() -> None:
     A dead pane can leave both the planner's ZMQ publishers and the policy
     server alive with a deleted pseudo-terminal.  Besides occupying the fixed
     ports, that planner keeps publishing its last in-memory SLAM map forever.
-    Match only the two repository-owned entry points so unrelated Python and
+    Match only the repository-owned entry points so unrelated Python and
     conda jobs are left untouched.
     """
-    patterns = (
-        r"(^|/)(python|python3) -m gear_sonic\.utils\.inference\.navdp\.service( |$)",
-        r"(^|/)(python|python3) -m eval\.src\.policy_server( |$)",
-        r"(^|/)(python|python3) ([^ ]*/)?gear_sonic/scripts/navdp_planner\.py( |$)",
+    terminate_matching_processes(
+        NAVDP_PROCESS_PATTERNS,
+        runner=subprocess.run,
+        sleeper=time.sleep,
     )
-    for pattern in patterns:
-        subprocess.run(["pkill", "-TERM", "-f", pattern], capture_output=True)
-    time.sleep(0.5)
-    for pattern in patterns:
-        subprocess.run(["pkill", "-KILL", "-f", pattern], capture_output=True)
+
+
+def _clear_stale_policy_processes() -> None:
+    """Remove the pane-owned VLA client without touching external servers."""
+    terminate_matching_processes(
+        POLICY_PROCESS_PATTERNS,
+        runner=subprocess.run,
+        sleeper=time.sleep,
+    )
+
+
+def _clear_stale_gateway_processes() -> None:
+    """Stop an orphaned SensorGateway before unlinking its shared memory."""
+    terminate_matching_processes(
+        GATEWAY_PROCESS_PATTERNS,
+        runner=subprocess.run,
+        sleeper=time.sleep,
+    )
+    cleanup_shared_memory_files()
+
+
+def _clear_all_inference_processes() -> None:
+    """Remove every repository-owned inference process after tmux exits."""
+    terminate_matching_processes(
+        INFERENCE_PROCESS_PATTERNS,
+        runner=subprocess.run,
+        sleeper=time.sleep,
+    )
+    cleanup_shared_memory_files()
+
+
+def _tmux_cleanup_hook(repo_root: Path) -> str:
+    cleanup_script = repo_root / "gear_sonic" / "scripts" / "cleanup_inference.py"
+    cleanup_command = shlex.join((sys.executable, str(cleanup_script)))
+    return f"run-shell -b {shlex.quote(cleanup_command)}"
 
 
 def _worker_pane_names(config: InferenceLaunchConfig) -> tuple[str, ...]:
@@ -826,6 +889,11 @@ def _create_tmux_session(config: InferenceLaunchConfig) -> dict[str, str]:
     )
     _TMUX.command("set-option", "-t", SESSION_NAME, "mouse", "on")
     _TMUX.command("bind-key", "-T", "root", "C-\\", "kill-session")
+    cleanup_hook = _tmux_cleanup_hook(Path(__file__).resolve().parents[2])
+    # pane-died/pane-exited cover the pane program terminating.  kill-pane
+    # removes the pane directly and only emits its command-level after hook.
+    for hook in ("pane-died", "pane-exited", "after-kill-pane"):
+        _TMUX.command("set-hook", "-t", SESSION_NAME, hook, cleanup_hook)
 
     # Overview: compact performance/control panes on the left and a full-height
     # event stream on the right.  The left side is kept wide enough for the
@@ -899,6 +967,7 @@ def main(config: InferenceLaunchConfig):
     _TMUX.kill()
     _clear_stale_fastlio_processes()
     _clear_stale_navdp_processes()
+    _clear_stale_gateway_processes()
 
     print(
         f"Launching {SESSION_NAME} "
@@ -1034,15 +1103,19 @@ def main(config: InferenceLaunchConfig):
         print(f"\nSession '{SESSION_NAME}' is still running.")
         print(f"  Reattach:  tmux attach -t {SESSION_NAME}")
         print(f"  Kill:      tmux kill-session -t {SESSION_NAME}")
+    else:
+        _clear_all_inference_processes()
 
 
 def _signal_handler(_sig, _frame):
     print("\nShutdown requested...")
     _TMUX.kill()
+    _clear_all_inference_processes()
     sys.exit(0)
 
 
 if __name__ == "__main__":
     signal.signal(signal.SIGINT, _signal_handler)
+    signal.signal(signal.SIGTERM, _signal_handler)
     config = parse_inference_launch_config()
     main(config)

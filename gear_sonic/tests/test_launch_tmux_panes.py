@@ -19,12 +19,15 @@ from gear_sonic.utils.inference.vla.service import load_inference_config
 from gear_sonic.scripts.launch_inference import (
     InferenceLaunchConfig,
     _check_prerequisites,
+    _clear_stale_gateway_processes,
+    _clear_stale_policy_processes,
     _clear_stale_fastlio_processes,
     _clear_stale_navdp_processes,
     _create_tmux_session,
     _dotenv_has_nonempty_value,
     _lavira_api_key_errors,
     _start_in_pane,
+    _tmux_cleanup_hook,
     _worker_pane_names,
     build_base_pose_agent_command,
     build_fastlio_supervisor_command,
@@ -92,6 +95,45 @@ def test_startup_clears_only_stale_navdp_processes(monkeypatch) -> None:
         or "gear_sonic/scripts/navdp_planner\\.py" in command[-1]
         for command in commands
     )
+
+
+def test_cleanup_clears_stale_vla_without_touching_external_inference_server(
+    monkeypatch,
+) -> None:
+    commands: list[list[str]] = []
+    monkeypatch.setattr(
+        "gear_sonic.scripts.launch_inference.subprocess.run",
+        lambda command, **_kwargs: commands.append(command),
+    )
+    monkeypatch.setattr("gear_sonic.scripts.launch_inference.time.sleep", lambda _s: None)
+
+    _clear_stale_policy_processes()
+
+    assert [command[:3] for command in commands] == [
+        ["pkill", "-TERM", "-f"],
+        ["pkill", "-KILL", "-f"],
+    ]
+    assert all("gear_sonic\\.utils\\.inference\\.vla\\.service" in command[-1] for command in commands)
+    assert all("g1_sonic_zmq_policy" not in command[-1] for command in commands)
+
+
+def test_stale_gateway_is_stopped_before_shared_memory_is_unlinked(
+    monkeypatch,
+) -> None:
+    events: list[str] = []
+    monkeypatch.setattr(
+        "gear_sonic.scripts.launch_inference.subprocess.run",
+        lambda command, **_kwargs: events.append(" ".join(command[:2])),
+    )
+    monkeypatch.setattr("gear_sonic.scripts.launch_inference.time.sleep", lambda _s: None)
+    monkeypatch.setattr(
+        "gear_sonic.scripts.launch_inference.cleanup_shared_memory_files",
+        lambda: events.append("unlink"),
+    )
+
+    _clear_stale_gateway_processes()
+
+    assert events == ["pkill -TERM", "pkill -KILL", "unlink"]
 
 
 def test_required_worker_must_remain_alive_after_startup(monkeypatch) -> None:
@@ -404,6 +446,16 @@ def test_tmux_session_builds_stacked_overview_and_tiled_workers(monkeypatch) -> 
         ("sonic_inference:workers", ("-h",)),
     ] * 5
     assert ("select-layout", "-t", "sonic_inference:workers", "tiled") in tmux_commands
+    cleanup_hook = _tmux_cleanup_hook(Path(__file__).resolve().parents[2])
+    assert (
+        "set-hook", "-t", "sonic_inference", "pane-died", cleanup_hook,
+    ) in tmux_commands
+    assert (
+        "set-hook", "-t", "sonic_inference", "pane-exited", cleanup_hook,
+    ) in tmux_commands
+    assert (
+        "set-hook", "-t", "sonic_inference", "after-kill-pane", cleanup_hook,
+    ) in tmux_commands
     assert tmux_commands[-2:] == [
         ("select-window", "-t", "sonic_inference:overview"),
         ("select-pane", "-t", "%control"),
@@ -633,9 +685,12 @@ def test_navdp_stack_commands_use_ros_topics_and_official_xnavdp_server() -> Non
     assert "NAVDP_SERVER_PID=$!" in background_server
     assert "[NavDP server:stderr]" in background_server
     assert "logs are routed to this pane" in background_server
-    assert "trap _stop_navdp_server EXIT HUP" in background_server
+    assert "trap _shutdown_navdp_pane EXIT HUP INT TERM" in background_server
+    assert "NAVDP_SERVER_PGID=$(ps -o pgid=" in background_server
+    assert "_signal_navdp_server KILL" in background_server
     assert "-m gear_sonic.utils.inference.navdp.service" in planner_pane
     assert "_stop_navdp_server" in planner_pane
+    assert "trap - EXIT HUP INT TERM" in planner_pane
     assert 'exit "${NAVDP_PLANNER_STATUS}"' in planner_pane
     subprocess.run(
         ["bash", "-n"],
@@ -687,8 +742,8 @@ def test_lavira_uses_only_control_and_sensor_gateways() -> None:
     assert "--control-gateway-intent-endpoint" not in command
     assert "--qwenvl-model" not in command
     assert "--qwenvl-timeout-seconds" not in command
-    assert load_lavira_config().la_base_url == "https://dashscope-intl.aliyuncs.com/compatible-mode/v1"
-    assert load_lavira_config().va_base_url == "https://dashscope-intl.aliyuncs.com/compatible-mode/v1"
+    assert load_lavira_config().la_base_url == "https://ws-6yzgj1m087a053ip.cn-beijing.maas.aliyuncs.com/compatible-mode/v1"
+    assert load_lavira_config().va_base_url == "https://ws-6yzgj1m087a053ip.cn-beijing.maas.aliyuncs.com/compatible-mode/v1"
     assert "--vision-backend" not in command
     assert "--model gpt-" not in command
     assert "codex" not in command.lower()

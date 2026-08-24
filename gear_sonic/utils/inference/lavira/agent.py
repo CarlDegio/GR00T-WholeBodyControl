@@ -30,7 +30,7 @@ from gear_sonic.utils.inference.lavira.geometry import (
     POLICY_FRAME_INDEX,
     build_object_nav_geometry_from_frames,
 )
-from gear_sonic.utils.inference.lavira.object_nav import RGBDSnapshot
+from gear_sonic.utils.inference.lavira.camera import RGBDSnapshot
 from gear_sonic.runtime.telemetry import default_inference_log_dir
 
 LOGGER = logging.getLogger("sonic.lavira")
@@ -257,29 +257,31 @@ def validate_postcheck(
     valid_transitions = set().union(*TRANSITIONS_BY_SKILL.values())
     if transition not in valid_transitions:
         raise LaViRAAgentError("VA POSTCHECK transition is invalid")
-    if skill is not None and transition not in TRANSITIONS_BY_SKILL.get(skill, set()):
+    result = dict(value)
+    if skill == "MANIPULATE":
+        # The visual status is the evidence-bearing output. The manipulation
+        # transition is a deterministic runtime decision, so do not abort a
+        # physical task merely because VA selected another globally valid
+        # transition from the shared POSTCHECK vocabulary.
+        transition = {
+            "SATISFIED": "TASK_COMPLETE",
+            "NOT_SATISFIED": "CONTINUE_MANIPULATION",
+            "UNKNOWN": "UNKNOWN",
+        }[value["status"]]
+        result["transition"] = transition
+    elif skill is not None and transition not in TRANSITIONS_BY_SKILL.get(skill, set()):
         raise LaViRAAgentError(
-            f"VA POSTCHECK transition is invalid for {skill}"
+            f"VA POSTCHECK transition is invalid for {skill}: {transition}"
         )
     if value["status"] == "UNKNOWN" and transition != "UNKNOWN":
         raise LaViRAAgentError("VA UNKNOWN postcheck requires UNKNOWN transition")
     if transition == "TASK_COMPLETE" and value["status"] != "SATISFIED":
         raise LaViRAAgentError("VA TASK_COMPLETE requires SATISFIED postcheck")
-    if skill == "MANIPULATE":
-        expected_transition = {
-            "SATISFIED": "TASK_COMPLETE",
-            "NOT_SATISFIED": "CONTINUE_MANIPULATION",
-            "UNKNOWN": "UNKNOWN",
-        }[value["status"]]
-        if transition != expected_transition:
-            raise LaViRAAgentError(
-                "VA MANIPULATE postcheck status/transition mismatch"
-            )
     if not isinstance(value["visual_evidence"], str):
         raise LaViRAAgentError("VA visual_evidence must be a string")
     if not _finite(value["confidence"]) or not 0.0 <= float(value["confidence"]) <= 1.0:
         raise LaViRAAgentError("VA confidence is invalid")
-    return dict(value)
+    return result
 
 
 def validate_alignment_grounding(value: Any) -> dict[str, Any]:
@@ -472,90 +474,14 @@ def _g1_view_label(direction: str, current_step: int, image_index: int) -> str:
     return f"Image {image_index}: {labels[direction]} (Step {current_step})."
 
 
-def language_action_prompt(
-    mission: str,
-    navigation_mode: str,
-    global_target: str | None,
-    current_step: int,
-    todo_list: str,
-    observation_mode: str,
-    transition_result: Mapping[str, Any] | None,
-    manipulation_prompt: str | None = None,
-) -> str:
-    manipulation_task = str(manipulation_prompt or mission).strip()
-    current_todo = todo_list.strip() or (
-        "(No TODO exists yet. Create the initial working checklist from the "
-        "mission and current visual evidence in this same response.)"
-    )
-    navigation_guidance = (
-        "Follow the route language and use visible route landmarks/openings."
-        if navigation_mode == "vln"
-        else "Explore for the named object and use useful landmarks/openings."
-    )
-    visual_context = (
-        "The first five labeled images are the fresh Current Direction Views "
-        "captured at this step: front (0 deg), front_right (-45 deg), right "
-        "(-90 deg), left (+90 deg), and front_left (+45 deg). The rear "
-        "direction is intentionally not observed and must not be inferred or "
-        "selected."
-        if observation_mode == "panorama"
-        else "The first labeled image is the fresh fixed-front observation. "
-        "The robot did not rotate for this LA request."
-    )
-    transition_text = (
-        "No previous skill transition is available for the first step."
-        if transition_result is None
-        else json.dumps(dict(transition_result), ensure_ascii=False)
-    )
+def _language_action_contract() -> str:
+    """Stable LA decision contract kept at the front for prefix caching."""
+
     allowed_move_directions = "front|front_right|right|left|front_left"
-    frozen_global_target = str(global_target or "").strip()
-    global_target_context = (
-        "**FROZEN GLOBAL TARGET**: "
-        f"{json.dumps(frozen_global_target, ensure_ascii=False)}"
-        if frozen_global_target
-        else ""
-    )
-    global_target_instruction = (
-        "Return the frozen GLOBAL TARGET exactly as provided. Never rename, "
-        "replace, or broaden it during this task generation."
-        if frozen_global_target
-        else (
-            "Infer one GLOBAL TARGET now from MISSION and MANIPULATION TASK. "
-            "It is the final concrete, visually groundable navigation "
-            "destination whose vicinity must be reached before alignment and "
-            "manipulation. Do not choose an intermediate route landmark or a "
-            "small object that will be grasped, moved, placed, or operated on. "
-            "Include visible distinguishing context needed to select the "
-            "correct destination instance. Return a concise English "
-            "detector-friendly noun phrase. The runtime freezes this first "
-            "value for the rest of the task generation."
-        )
-    )
-    return f"""
-**ROLE**: You are an intelligent humanoid robot agent using a generic checklist
-to guide your actions.
-**MISSION**: {json.dumps(mission, ensure_ascii=False)}
-{global_target_context}
-**NAVIGATION MODE**: {navigation_mode}. {navigation_guidance}
-**MANIPULATION TASK AFTER NAVIGATION**:
-{json.dumps(manipulation_task, ensure_ascii=False)}
-
-**Current TODO List**:
-{current_todo}
-
-**Current Step**: {current_step}
-
-**VISUAL CONTEXT**:
-- {visual_context}
-- Any following images are the five most recent successful MOVE_TO result
-  observations, ordered from oldest to newest.
-
-**LATEST VA TRANSITION DISCRIMINATOR**:
-{transition_text}
+    return f"""**ROLE**: You are an intelligent humanoid robot agent using a
+generic checklist to guide your actions.
 
 **Task**:
-0. **Global Target**:
-   - {global_target_instruction}
 1. **Continuously maintain the TODO list**:
    - On the first request, create the working checklist and choose the first
      action in this same response. There is no separate initial planning call.
@@ -601,6 +527,112 @@ to guide your actions.
 "reasoning":"...","decision":"EXECUTE|FAIL",
 "skill":"MOVE_TO|ALIGN|MANIPULATE|null","skill_args":{{}},
 "expected_postcondition":"..."}}"""
+
+
+def _language_action_context(
+    mission: str,
+    navigation_mode: str,
+    global_target: str | None,
+    current_step: int,
+    todo_list: str,
+    observation_mode: str,
+    transition_result: Mapping[str, Any] | None,
+    manipulation_prompt: str | None = None,
+) -> str:
+    manipulation_task = str(manipulation_prompt or mission).strip()
+    current_todo = todo_list.strip() or (
+        "(No TODO exists yet. Create the initial working checklist from the "
+        "mission and current visual evidence in this same response.)"
+    )
+    navigation_guidance = (
+        "Follow the route language and use visible route landmarks/openings."
+        if navigation_mode == "vln"
+        else "Explore for the named object and use useful landmarks/openings."
+    )
+    visual_context = (
+        "The first five labeled images are the fresh Current Direction Views "
+        "captured at this step: front (0 deg), front_right (-45 deg), right "
+        "(-90 deg), left (+90 deg), and front_left (+45 deg). The rear "
+        "direction is intentionally not observed and must not be inferred or "
+        "selected."
+        if observation_mode == "panorama"
+        else "The first labeled image is the fresh fixed-front observation. "
+        "The robot did not rotate for this LA request."
+    )
+    transition_text = (
+        "No previous skill transition is available for the first step."
+        if transition_result is None
+        else json.dumps(dict(transition_result), ensure_ascii=False)
+    )
+    frozen_global_target = str(global_target or "").strip()
+    global_target_context = (
+        "**FROZEN GLOBAL TARGET**: "
+        f"{json.dumps(frozen_global_target, ensure_ascii=False)}"
+        if frozen_global_target
+        else ""
+    )
+    global_target_instruction = (
+        "Return the frozen GLOBAL TARGET exactly as provided. Never rename, "
+        "replace, or broaden it during this task generation."
+        if frozen_global_target
+        else (
+            "Infer one GLOBAL TARGET now from MISSION and MANIPULATION TASK. "
+            "It is the final concrete, visually groundable navigation "
+            "destination whose vicinity must be reached before alignment and "
+            "manipulation. Do not choose an intermediate route landmark or a "
+            "small object that will be grasped, moved, placed, or operated on. "
+            "Include visible distinguishing context needed to select the "
+            "correct destination instance. Return a concise English "
+            "detector-friendly noun phrase. The runtime freezes this first "
+            "value for the rest of the task generation."
+        )
+    )
+    return f"""**MISSION**: {json.dumps(mission, ensure_ascii=False)}
+{global_target_context}
+**NAVIGATION MODE**: {navigation_mode}. {navigation_guidance}
+**MANIPULATION TASK AFTER NAVIGATION**:
+{json.dumps(manipulation_task, ensure_ascii=False)}
+
+**Current TODO List**:
+{current_todo}
+
+**Current Step**: {current_step}
+
+**VISUAL CONTEXT**:
+- {visual_context}
+- Any following images are the five most recent successful MOVE_TO result
+  observations, ordered from oldest to newest.
+
+**LATEST VA TRANSITION DISCRIMINATOR**:
+{transition_text}
+
+0. **Global Target**:
+   - {global_target_instruction}"""
+
+
+def language_action_prompt(
+    mission: str,
+    navigation_mode: str,
+    global_target: str | None,
+    current_step: int,
+    todo_list: str,
+    observation_mode: str,
+    transition_result: Mapping[str, Any] | None,
+    manipulation_prompt: str | None = None,
+) -> str:
+    """Return the complete LA prompt in cache-friendly contract-first order."""
+
+    context = _language_action_context(
+        mission,
+        navigation_mode,
+        global_target,
+        current_step,
+        todo_list,
+        observation_mode,
+        transition_result,
+        manipulation_prompt,
+    )
+    return f"{_language_action_contract()}\n\n{context}"
 
 
 def _va_context(
@@ -684,8 +716,18 @@ exactly:
 
 def postcheck_prompt(
     *, mission: str, global_target: str, strategic_goal: str,
-    strategic_stop: bool, expected: str,
+    strategic_stop: bool, expected: str, skill: str | None = None,
 ) -> str:
+    transition_contract = (
+        "For this MANIPULATE check, use exactly: SATISFIED -> TASK_COMPLETE; "
+        "NOT_SATISFIED -> CONTINUE_MANIPULATION; UNKNOWN -> UNKNOWN. Do not "
+        "return a navigation or alignment transition."
+        if skill == "MANIPULATE"
+        else (
+            "UNKNOWN status must use UNKNOWN transition; TASK_COMPLETE "
+            "requires SATISFIED."
+        )
+    )
     return f"""**ROLE**: You are a humanoid robot agent's TACTICAL EYES in
 POSTCHECK mode.
 {_va_context(mission, global_target, strategic_goal, strategic_stop)}
@@ -700,8 +742,8 @@ action.
    CONTINUE_NAVIGATION, READY_TO_ALIGN, RETRY_ALIGN, RETURN_TO_NAVIGATION,
    READY_TO_MANIPULATE, CONTINUE_MANIPULATION, TASK_COMPLETE, or UNKNOWN.
    Base the decision only on visible evidence and the requested postcondition,
-   without inferring or naming the controller action. UNKNOWN status must use
-   UNKNOWN transition; TASK_COMPLETE requires SATISFIED.
+   without inferring or naming the controller action.
+3. **Active Transition Contract**: {transition_contract}
 
 Return exactly:
 {{"mode":"POSTCHECK","status":"SATISFIED|NOT_SATISFIED|UNKNOWN",
@@ -921,13 +963,23 @@ class LaViRAClient:
         transition_result: Mapping[str, Any] | None = None,
         manipulation_prompt: str | None = None,
     ) -> dict[str, Any]:
-        content: list[dict[str, Any]] = [{
-            "type": "text",
-            "text": (
+        content: list[dict[str, Any]] = [
+            {"type": "text", "text": _language_action_contract()},
+            {"type": "text", "text": _language_action_context(
+                mission,
+                navigation_mode,
+                global_target,
+                current_step,
+                todo_list,
+                "panorama" if len(scan_views) == 5 else "front",
+                transition_result,
+                manipulation_prompt,
+            )},
+            {"type": "text", "text": (
                 f"Navigation Task: {json.dumps(mission, ensure_ascii=False)}\n\n"
                 f"- Current Step: {current_step}"
-            ),
-        }]
+            )},
+        ]
         recent_move_views = move_to_views[-5:]
         for index, view in enumerate(recent_move_views):
             content.extend([
@@ -951,14 +1003,6 @@ class LaViRAClient:
                     ),
                 },
             ])
-        content.append({
-            "type": "text",
-            "text": language_action_prompt(
-                mission, navigation_mode, global_target, current_step, todo_list,
-                "panorama" if len(scan_views) == 5 else "front",
-                transition_result, manipulation_prompt,
-            ),
-        })
         return self._create(
             self.la_client, request_kind="la_decision", model=self.la_model,
             response_parser=lambda completion: validate_language_action(
@@ -970,7 +1014,13 @@ class LaViRAClient:
             messages=self._messages(
                 content, enable_thinking=self.la_enable_thinking,
                 system_instruction=(
-                    (
+                    "ALIGN is forbidden until navigation has completed "
+                    "successfully for that GLOBAL TARGET and the latest "
+                    "harness transition is READY_TO_ALIGN. Reaching an "
+                    "intermediate landmark cannot authorize ALIGN. Once ALIGN "
+                    "is authorized, VA selects its BasePose target "
+                    "independently from the visible operation objects. "
+                    + (
                         "Runtime contract: infer and return one GLOBAL TARGET "
                         "from the mission and manipulation task in this first "
                         "response. The runtime will freeze it for this task "
@@ -982,12 +1032,6 @@ class LaViRAClient:
                             "unchanged. "
                         )
                     )
-                    + "ALIGN is forbidden until navigation has completed "
-                    "successfully for that GLOBAL TARGET and the latest "
-                    "harness transition is READY_TO_ALIGN. Reaching an "
-                    "intermediate landmark cannot authorize ALIGN. Once ALIGN "
-                    "is authorized, VA selects its BasePose target "
-                    "independently from the visible operation objects."
                 ),
             ),
             max_tokens=1200, temperature=0, timeout=self.la_timeout_seconds,
@@ -1053,7 +1097,7 @@ class LaViRAClient:
     def postcheck(
         self, *, mission: str, global_target: str, strategic_goal: str,
         strategic_stop: bool, expected_postcondition: str,
-        image_bgr: np.ndarray,
+        image_bgr: np.ndarray, skill: str | None = None,
     ) -> dict[str, Any]:
         return self._create(
             self.va_client, request_kind="va_postcheck", model=self.va_model,
@@ -1061,7 +1105,8 @@ class LaViRAClient:
                 _strict_json_object(
                     self._content(completion, role="VA POSTCHECK"),
                     role="VA POSTCHECK",
-                )
+                ),
+                skill=skill,
             ),
             messages=self._messages([
                 {"type": "image_url", "image_url": {"url": _image_data_url(image_bgr)}},
@@ -1070,6 +1115,7 @@ class LaViRAClient:
                     strategic_goal=strategic_goal,
                     strategic_stop=strategic_stop,
                     expected=expected_postcondition,
+                    skill=skill,
                 )},
             ], enable_thinking=self.va_enable_thinking),
             max_tokens=768, temperature=0, timeout=self.va_timeout_seconds,
@@ -1140,7 +1186,7 @@ class LaViRAAgent:
         manipulation_window_seconds: float = 5.0,
         manipulation_max_windows: int = 12,
         manipulation_timeout_seconds: float = 180.0,
-        vla_start_timeout_seconds: float = 3.0,
+        vla_start_timeout_seconds: float = 6.0,
         heading_settle_seconds: float = 1.0,
         heading_settle_samples: int = 30,
         heading_settle_bad_sample_threshold: int = 12,
@@ -1793,6 +1839,7 @@ class LaViRAAgent:
             strategic_goal=strategic_goal,
             strategic_stop=strategic_stop,
             expected_postcondition=expected,
+            skill=skill,
             image_bgr=(
                 self.camera.capture_rgb() if image_bgr is None else image_bgr
             ),
@@ -2422,21 +2469,48 @@ class LaViRAAgent:
                 raise LaViRAAgentError(
                     f"manipulate_safety:{failure.get('reason', 'unknown')}"
                 )
-            self.submit_intent("hold_vla_task", {
-                "generation": generation, "skill_id": skill_id,
-                "window_id": window_id,
-            })
             post = self._postcheck(
                 "MANIPULATE", expected, generation=generation,
                 skill_id=skill_id, strategic_goal=strategic_goal,
                 strategic_stop=True, window_id=window_id,
             )
+            # VA runs on the LaViRA thread while the independent VLA service
+            # keeps publishing actions.  Never pause the POSE stream merely to
+            # wait for a visual verdict; only completion, failure, timeout, or
+            # cancellation is allowed to stop continuous manipulation.
+            self._check_cancelled(generation)
+            failure = self.poll_failure(generation, skill_id)
+            if failure is not None:
+                self.submit_intent("stop_vla_task", {
+                    "generation": generation,
+                    "skill_id": skill_id,
+                    "window_id": window_id,
+                    "reason": str(failure.get("reason", "safety_failure")),
+                })
+                raise LaViRAAgentError(
+                    f"manipulate_safety:{failure.get('reason', 'unknown')}"
+                )
             if post["status"] == "UNKNOWN":
                 post = self._postcheck(
                     "MANIPULATE", expected, generation=generation,
                     skill_id=skill_id, strategic_goal=strategic_goal,
                     strategic_stop=True, window_id=window_id,
                 )
+                self._check_cancelled(generation)
+                failure = self.poll_failure(generation, skill_id)
+                if failure is not None:
+                    self.submit_intent("stop_vla_task", {
+                        "generation": generation,
+                        "skill_id": skill_id,
+                        "window_id": window_id,
+                        "reason": str(
+                            failure.get("reason", "safety_failure")
+                        ),
+                    })
+                    raise LaViRAAgentError(
+                        "manipulate_safety:"
+                        f"{failure.get('reason', 'unknown')}"
+                    )
                 if post["status"] == "UNKNOWN":
                     unknown_count += 1
                     if unknown_count >= 3:
@@ -2460,11 +2534,6 @@ class LaViRAAgent:
                     skill_id, "MANIPULATE", self.global_target, "stopped",
                     "SATISFIED", post["visual_evidence"],
                 )
-            self.submit_intent("resume_vla_task", {
-                "generation": generation, "skill_id": skill_id,
-                "window_id": window_id,
-                "handoff_context": self.manipulation_prompt,
-            })
         self.submit_intent("stop_vla_task", {
             "generation": generation, "skill_id": skill_id,
             "window_id": self.manipulation_max_windows,

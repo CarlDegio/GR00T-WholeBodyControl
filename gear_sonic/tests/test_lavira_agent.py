@@ -30,7 +30,7 @@ from gear_sonic.utils.inference.lavira.agent import (
     validate_language_action,
     validate_postcheck,
 )
-from gear_sonic.utils.inference.lavira.object_nav import RGBDSnapshot
+from gear_sonic.utils.inference.lavira.camera import RGBDSnapshot
 from gear_sonic.utils.planner_control.executor import PlannerVelocityExecutorCore
 
 
@@ -336,6 +336,7 @@ def test_lavira_cloud_calls_preserve_role_specific_thinking_mode(tmp_path) -> No
         strategic_stop=False,
         expected_postcondition="basket aligned",
         image_bgr=image,
+        skill="MANIPULATE",
     )
 
     assert [call["extra_body"] for call in calls] == [
@@ -345,19 +346,27 @@ def test_lavira_cloud_calls_preserve_role_specific_thinking_mode(tmp_path) -> No
         {"enable_thinking": False},
     ]
     la_system_prompt = calls[0]["messages"][0]["content"]
-    assert la_system_prompt.startswith("/no_think\n\nRuntime contract:")
+    assert la_system_prompt.startswith(
+        "/no_think\n\nALIGN is forbidden until navigation has completed"
+    )
     assert "ALIGN is forbidden until navigation has completed" in la_system_prompt
     assert 'frozen GLOBAL TARGET "basket" unchanged' in la_system_prompt
     assert "intermediate landmark cannot authorize ALIGN" in la_system_prompt
     assert calls[1]["messages"][0]["content"] == "/no_think"
+    postcheck_text = calls[3]["messages"][1]["content"][1]["text"]
+    assert "SATISFIED -> TASK_COMPLETE" in postcheck_text
+    assert "NOT_SATISFIED -> CONTINUE_MANIPULATION" in postcheck_text
     la_content = calls[0]["messages"][1]["content"]
     assert sum(item["type"] == "image_url" for item in la_content) == 6
     la_labels = [
         item["text"] for item in la_content if item["type"] == "text"
     ]
-    assert la_labels[0] == 'Navigation Task: "find basket"\n\n- Current Step: 3'
-    assert la_labels[1] == "PLAN-1"
-    assert la_labels[2:7] == [
+    assert la_labels[0].startswith("**ROLE**: You are an intelligent humanoid")
+    assert "**JSON RESPONSE FORMAT**" in la_labels[0]
+    assert '**MISSION**: "find basket"' in la_labels[1]
+    assert la_labels[2] == 'Navigation Task: "find basket"\n\n- Current Step: 3'
+    assert la_labels[3] == "PLAN-1"
+    assert la_labels[4:9] == [
         "Image 1: The current FORWARD view (Step 3).",
         "Image 2: The view 45 deg to the RIGHT of the forward view (Step 3).",
         "Image 3: The view after turning 90 deg to the RIGHT (Step 3).",
@@ -375,9 +384,10 @@ def test_lavira_cloud_calls_preserve_role_specific_thinking_mode(tmp_path) -> No
         == "Image 1: The current FORWARD view (Step 3)."
     ) - 1
     assert plan_image_index < current_image_index
+    assert current_image_index > 1
     assert "absolute_yaw" not in json.dumps(la_content)
     assert "controller=" not in json.dumps(la_content)
-    la_prompt = la_content[-1]["text"]
+    la_prompt = "\n\n".join(la_labels[:2])
     assert '**MISSION**: "find basket"' in la_prompt
     assert '**FROZEN GLOBAL TARGET**: "basket"' in la_prompt
     assert "**Current Step**: 3" in la_prompt
@@ -954,7 +964,9 @@ def test_va_context_contains_mission_strategy_and_terminal_stop_flag():
     assert [call["strategic_stop"] for call in client.postcheck_calls] == [
         False, False, True,
     ]
-    assert all("skill" not in call for call in client.postcheck_calls)
+    assert [call.get("skill") for call in client.postcheck_calls] == [
+        None, None, "MANIPULATE",
+    ]
     assert all(
         not any(
             skill_name in call["strategic_goal"]
@@ -1322,13 +1334,12 @@ def test_manipulation_recovers_in_vla_then_system_completes_after_va_success():
     assert result.steps == 3
     names = [name for name, _ in intents]
     assert names.count("start_vla_task") == 1
-    assert names.count("resume_vla_task") == 1
+    assert names.count("hold_vla_task") == 0
+    assert names.count("resume_vla_task") == 0
     assert names.count("stop_vla_task") == 1
     start = next(args for name, args in intents if name == "start_vla_task")
-    resume = next(args for name, args in intents if name == "resume_vla_task")
     assert start["task"] == static_prompt
     assert start["handoff_context"] == static_prompt
-    assert resume["handoff_context"] == static_prompt
     assert all(
         call["mission"] == "find the basket and put the bottle in it"
         for call in client.grounding_calls
@@ -1486,11 +1497,16 @@ def test_strict_schemas_fail_closed():
         validate_postcheck({**postcheck(), "status": "FOUND"})
     with pytest.raises(LaViRAAgentError, match="invalid for ALIGN"):
         validate_postcheck(ready_to_align(), skill="ALIGN")
-    with pytest.raises(LaViRAAgentError, match="status/transition mismatch"):
-        validate_postcheck(
-            postcheck("SATISFIED", transition="CONTINUE_MANIPULATION"),
-            skill="MANIPULATE",
-        )
+    normalized = validate_postcheck(
+        postcheck("SATISFIED", transition="READY_TO_MANIPULATE"),
+        skill="MANIPULATE",
+    )
+    assert normalized["transition"] == "TASK_COMPLETE"
+    normalized = validate_postcheck(
+        postcheck("NOT_SATISFIED", transition="READY_TO_MANIPULATE"),
+        skill="MANIPULATE",
+    )
+    assert normalized["transition"] == "CONTINUE_MANIPULATION"
     with pytest.raises(LaViRAAgentError, match="schema"):
         validate_alignment_grounding({**alignment_grounding(), "extra": True})
     with pytest.raises(LaViRAAgentError, match="complete physical object"):

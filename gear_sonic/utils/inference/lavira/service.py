@@ -33,10 +33,7 @@ from gear_sonic.utils.inference.lavira.agent import (
     LaViRAClient,
     LaViRATaskResult,
 )
-from gear_sonic.utils.inference.lavira.object_nav import (
-    ObjectNavResult,
-    SensorGatewayRGBDCamera,
-)
+from gear_sonic.utils.inference.lavira.camera import SensorGatewayRGBDCamera
 
 LOGGER = logging.getLogger("sonic.lavira")
 EventReporter = Callable[..., None]
@@ -80,11 +77,11 @@ class LaviraPlannerConfig:
     max_steps: int = 20
     history_size: int = 5
     la_model: str = DEFAULT_LA_MODEL
-    la_base_url: str = "https://dashscope-intl.aliyuncs.com/compatible-mode/v1"
+    la_base_url: str = "https://ws-6yzgj1m087a053ip.cn-beijing.maas.aliyuncs.com/compatible-mode/v1"
     la_enable_thinking: bool = False
     la_timeout_seconds: float = 180.0
     va_model: str = DEFAULT_VA_MODEL
-    va_base_url: str = "https://dashscope-intl.aliyuncs.com/compatible-mode/v1"
+    va_base_url: str = "https://ws-6yzgj1m087a053ip.cn-beijing.maas.aliyuncs.com/compatible-mode/v1"
     va_enable_thinking: bool = False
     va_timeout_seconds: float = 180.0
     camera_timeout_ms: int = 15000
@@ -105,7 +102,7 @@ class LaviraPlannerConfig:
     manipulation_window_seconds: float = 5.0
     manipulation_max_windows: int = 12
     manipulation_timeout_seconds: float = 180.0
-    vla_start_timeout_seconds: float = 3.0
+    vla_start_timeout_seconds: float = 6.0
     profile: str = ""
     overlay: tuple[str, ...] = ()
 
@@ -168,7 +165,7 @@ def parse_lavira_config(args: list[str] | None = None) -> LaviraPlannerConfig:
 @dataclass(frozen=True)
 class WorkerResult:
     generation: int
-    result: LaViRATaskResult | ObjectNavResult | None
+    result: LaViRATaskResult | None
     error: str | None
 
 
@@ -398,22 +395,6 @@ class LaviraPlannerRuntime:
                 continue
             self.pending_generation = None
             self.state = "listen_wasd"
-            if isinstance(item.result, ObjectNavResult):
-                if item.result.outcome == "NAVIGATE":
-                    policy = item.result.policy
-                    self.submit_intent(
-                        "navigation_goal",
-                        {
-                            "generation": item.generation,
-                            "skill_id": 0,
-                            "segment_id": 0,
-                            "goal_base": result_to_goal(item.result),
-                            "target": str(policy.get("target", self.config.global_target)),
-                            "target_type": str(policy.get("target_type", "global_target")),
-                            "confidence": float(policy.get("confidence", 0.0)),
-                        },
-                    )
-                return
             result = item.result or LaViRATaskResult(
                 item.generation,
                 "failed",
@@ -637,50 +618,5 @@ def main(config: LaviraPlannerConfig) -> None:
         intent.close()
         LOGGER.removeHandler(forwarding_handler)
         service.close()
-
-
-def result_to_goal(result: ObjectNavResult) -> tuple[float, float]:
-    """Compatibility helper for callers of the retired single-cycle runner."""
-    distance = float(result.geometry["mean_range"])
-    angle = math.radians(float(result.geometry["angle_deg"]))
-    return distance * math.cos(angle), distance * math.sin(angle)
-
-
-def run_inference_worker(factory: Callable[[], Any], runtime: LaviraPlannerRuntime) -> None:
-    """Compatibility worker; production uses :func:`run_agent_worker`."""
-    runner = None
-    try:
-        while not runtime.stop_event.is_set():
-            generation = runtime.requests.get()
-            if generation is None:
-                break
-            released = False
-
-            def release_depth() -> None:
-                nonlocal released
-                if not released:
-                    released = True
-                    runtime.submit_intent(
-                        "lavira_rgbd_captured",
-                        {"generation": generation},
-                    )
-
-            try:
-                runner = runner or factory()
-                item = WorkerResult(
-                    generation,
-                    runner.run_once(rgbd_capture_complete=release_depth),
-                    None,
-                )
-            except Exception as exc:
-                item = WorkerResult(generation, None, str(exc))
-            finally:
-                release_depth()
-            runtime.publish_worker_result(item)
-    finally:
-        if runner is not None and hasattr(runner, "close"):
-            runner.close()
-
-
 if __name__ == "__main__":
     main(parse_lavira_config())

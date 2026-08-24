@@ -32,7 +32,7 @@ from gear_sonic.utils.inference.lavira.depth_service import (
     mark_ready,
     metric_depth_payload,
 )
-from gear_sonic.utils.inference.lavira.object_nav import SensorGatewayRGBDCamera
+from gear_sonic.utils.inference.lavira.camera import SensorGatewayRGBDCamera
 from gear_sonic.utils.inference.lavira import depth_service
 
 

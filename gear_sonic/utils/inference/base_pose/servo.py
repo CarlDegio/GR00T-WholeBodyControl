@@ -1198,20 +1198,24 @@ class VisualServoController:
         return float(yaw_error), table_was_visible and not table_visible
 
     def _yaw_is_stable(self, yaw_error: float) -> bool:
-        if (
-            not self.yaw_error_trusted
-            or abs(yaw_error) > self.yaw_tolerance_rad
-        ):
-            return False
+        # Completion follows the trusted physical yaw estimate.  The executor's
+        # virtual heading-setpoint mismatch remains useful diagnostics, but it
+        # must not block a pose that is visually aligned.
         return (
-            self.heading_setpoint_error_rad is None
-            or abs(self.heading_setpoint_error_rad) <= self.yaw_tolerance_rad
+            self.yaw_error_trusted
+            and abs(yaw_error) <= self.yaw_tolerance_rad
         )
 
     def _yaw_command(self, *, speed_limit: float) -> ServoCommand:
+        # A live table edge is the freshest measurement of the yaw error that
+        # matters physically.  Drive directly from it even when the executor's
+        # virtual heading setpoint has already reached the visual target.  When
+        # the edge is absent, retain the setpoint error as the bounded
+        # orientation-propagation fallback.
+        live_visual_yaw = self.table_visible_last_update
         control_error = (
             self.last_errors[2]
-            if self.heading_setpoint_error_rad is None
+            if live_visual_yaw or self.heading_setpoint_error_rad is None
             else self.heading_setpoint_error_rad
         )
         if not self.yaw_error_trusted or not math.isfinite(control_error):
@@ -1219,7 +1223,8 @@ class VisualServoController:
             return self.current
         desired_wz = self._clip(
             self.heading_setpoint_gain * control_error
-            if self.heading_setpoint_error_rad is not None
+            if not live_visual_yaw
+            and self.heading_setpoint_error_rad is not None
             else control_error,
             speed_limit,
         )

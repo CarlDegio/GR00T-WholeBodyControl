@@ -68,6 +68,7 @@ from gear_sonic.utils.inference.vla.runtime import (
     _publish_cached_action,
     _schedule_vla_inference,
     _should_schedule_vla_inference,
+    _stream_hold_is_active,
     get_action_field,
 )
 from gear_sonic.utils.planner_control.executor_service import PlannerSafetySensorMonitor
@@ -817,6 +818,7 @@ def main(config: InferenceConfig):
 
     def fail_active_task(reason: str, message: str) -> None:
         state.task_active = False
+        state.task_stream_hold_active = False
         state.pause_loop = True
         invalidate_inference(reason)
         if state.cpp_mode == "POSE":
@@ -900,7 +902,6 @@ def main(config: InferenceConfig):
 
             _enforce_active_task_safety(
                 state,
-                now=t_start,
                 vla_safety_gate=vla_safety_gate,
                 vla_safety_monitor=vla_safety_monitor,
                 invalidate_inference=invalidate_inference,
@@ -938,6 +939,14 @@ def main(config: InferenceConfig):
                 continue
 
             if state.pause_loop:
+                if _stream_hold_is_active(state):
+                    _publish_cached_action(
+                        state,
+                        config=config,
+                        zmq_socket=zmq_socket,
+                    )
+                    _sleep_remaining(t_start, loop_period)
+                    continue
                 time.sleep(0.2)
                 continue
 

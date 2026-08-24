@@ -143,8 +143,13 @@ class SharedMemoryRing:
             self._unlinked = True
 
     def shutdown(self) -> None:
-        self.close()
-        self.unlink()
+        # Remove the persistent POSIX name first.  Even if closing the local
+        # mapping raises (for example because an exported view is still
+        # alive), a later process must not inherit a leaked /dev/shm entry.
+        try:
+            self.unlink()
+        finally:
+            self.close()
 
     def __enter__(self) -> "SharedMemoryRing":
         return self

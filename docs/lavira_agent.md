@@ -21,10 +21,10 @@ endpoint for two separate roles:
 components:
   lavira:
     la_model: qwen3.8-max
-    la_base_url: https://dashscope-intl.aliyuncs.com/compatible-mode/v1
+    la_base_url: https://ws-6yzgj1m087a053ip.cn-beijing.maas.aliyuncs.com/compatible-mode/v1
     la_enable_thinking: false
     va_model: qwen3.5-27b
-    va_base_url: https://dashscope-intl.aliyuncs.com/compatible-mode/v1
+    va_base_url: https://ws-6yzgj1m087a053ip.cn-beijing.maas.aliyuncs.com/compatible-mode/v1
     va_enable_thinking: false
     nav_handoff_min_depth_m: 0.3
     nav_handoff_max_depth_m: 3.0
@@ -178,8 +178,11 @@ The runtime owns the effective NAV/ALIGN transition:
   operation objects and BasePose is aligned. If neither view is complete it
   produces `RETRY_ALIGN`, or `RETURN_TO_NAVIGATION` when the alignment target
   could not be grounded.
-- MANIPULATE continues to use the original visual POSTCHECK result directly for
-  `CONTINUE_MANIPULATION`, `TASK_COMPLETE`, or `UNKNOWN`.
+- MANIPULATE uses the visual POSTCHECK `status` as evidence and derives its
+  transition deterministically: `NOT_SATISFIED` continues manipulation,
+  `SATISFIED` completes the task, and `UNKNOWN` remains unknown. The request
+  includes this restricted transition contract so a navigation/alignment
+  transition cannot terminate manipulation.
 
 The transition vocabulary remains:
 
@@ -194,8 +197,11 @@ either continue with another MOVE_TO or accept ALIGN, while MANIPULATE requires
 `READY_TO_MANIPULATE`. MOVE_TO and ALIGN recovery remain repeatable. VA does not
 directly switch ControlGateway modes. All image context and task-local state are
 cleared when a new task generation starts. VLA receives exactly
-`components.lavira.manipulation_prompt` on both task start and resume; VA
-incomplete evidence is not appended to the VLA language prompt.
+`components.lavira.manipulation_prompt` at task start. During MANIPULATE, VA
+postchecks run on the LaViRA decision thread without sending `hold_vla_task` or
+`resume_vla_task`; the independent VLA service keeps its 50 Hz POSE action
+stream continuous. Only completion, safety failure, timeout, or cancellation
+stops VLA. VA incomplete evidence is not appended to the VLA language prompt.
 
 LA emits only `EXECUTE` or `FAIL`; it does not make a final `COMPLETE`
 decision. Once MANIPULATE returns the paired `SATISFIED` / `TASK_COMPLETE` VA

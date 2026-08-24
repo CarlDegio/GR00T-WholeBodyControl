@@ -599,6 +599,123 @@ def test_yaw_filter_compares_consecutive_valid_raw_samples_across_gap() -> None:
     assert yaw_error == pytest.approx(resumed_yaw)
 
 
+def test_live_table_yaw_drives_wz_when_virtual_setpoint_is_already_aligned() -> None:
+    controller = VisualServoController(
+        target_distance_m=0.8,
+        min_yaw_speed_rad_s=0.1,
+        yaw_trim_speed_rad_s=0.1,
+    )
+    observation = _observation(
+        bbox=(240.0, 120.0, 400.0, 360.0),
+        yaw=-0.17,
+    )
+    observation = replace(
+        observation,
+        target=replace(
+            observation.target,
+            forward_m=0.8,
+            right_m=0.0,
+        ),
+    )
+    orientation = {
+        "actual_heading_rad": 0.60,
+        "heading_setpoint_rad": 0.43,
+        "state_age_s": 0.01,
+        "telemetry_age_s": 0.01,
+    }
+
+    command = controller.update(
+        observation,
+        now=0.1,
+        orientation=orientation,
+        joint_completion=True,
+    )
+
+    assert controller.heading_setpoint_error_rad == pytest.approx(0.0)
+    assert command.velocity == (0.0, 0.0, -0.1)
+
+
+def test_missing_table_yaw_falls_back_to_virtual_setpoint_error() -> None:
+    controller = VisualServoController(
+        target_distance_m=0.8,
+        min_yaw_speed_rad_s=0.1,
+        yaw_trim_speed_rad_s=0.1,
+    )
+    visible = _observation(
+        bbox=(240.0, 120.0, 400.0, 360.0),
+        yaw=-0.17,
+    )
+    visible = replace(
+        visible,
+        target=replace(
+            visible.target,
+            forward_m=0.8,
+            right_m=0.0,
+        ),
+    )
+    orientation = {
+        "actual_heading_rad": 0.60,
+        "heading_setpoint_rad": 0.43,
+        "state_age_s": 0.01,
+        "telemetry_age_s": 0.01,
+    }
+    controller.update(
+        visible,
+        now=0.1,
+        orientation=orientation,
+        joint_completion=True,
+    )
+
+    command = controller.update(
+        replace(visible, table=None),
+        now=0.2,
+        orientation=orientation,
+        joint_completion=True,
+    )
+
+    assert controller.yaw_error_source == "propagated_heading"
+    assert controller.heading_setpoint_error_rad == pytest.approx(0.0)
+    assert command.velocity == (0.0, 0.0, 0.0)
+
+
+def test_completion_ignores_virtual_heading_setpoint_error() -> None:
+    controller = VisualServoController(
+        target_distance_m=0.8,
+        stable_frames=1,
+        chest_approach_only=True,
+    )
+    observation = _observation(
+        bbox=(240.0, 120.0, 400.0, 360.0),
+        yaw=0.0,
+    )
+    observation = replace(
+        observation,
+        target=replace(
+            observation.target,
+            forward_m=0.8,
+            right_m=0.0,
+        ),
+    )
+    orientation = {
+        "actual_heading_rad": 0.6,
+        "heading_setpoint_rad": -0.4,
+        "state_age_s": 0.01,
+        "telemetry_age_s": 0.01,
+    }
+
+    command = controller.update(
+        observation,
+        now=0.1,
+        orientation=orientation,
+        joint_completion=True,
+    )
+
+    assert controller.heading_setpoint_error_rad == pytest.approx(1.0)
+    assert command.velocity == (0.0, 0.0, 0.0)
+    assert controller.phase is ServoPhase.DONE
+    assert controller.terminal_reason == "aligned"
+
+
 def test_joint_completion_stops_chest_approach_at_chest_standoff() -> None:
     controller = VisualServoController(
         target_distance_m=0.7,

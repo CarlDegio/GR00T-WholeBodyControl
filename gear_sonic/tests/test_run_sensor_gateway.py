@@ -2,8 +2,36 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+import signal
+import threading
 
 from gear_sonic.runtime.gateway.services import sensor as run_sensor_gateway
+
+
+def test_tmux_sighup_uses_the_normal_sensor_gateway_shutdown_path(
+    monkeypatch,
+) -> None:
+    installed: dict[signal.Signals, object] = {}
+    restored: dict[signal.Signals, object] = {}
+
+    def fake_signal(signum, handler):
+        if signum in installed:
+            restored[signum] = handler
+            return installed[signum]
+        installed[signum] = handler
+        return f"previous-{signum.name}"
+
+    monkeypatch.setattr(run_sensor_gateway.signal, "signal", fake_signal)
+    stop = threading.Event()
+
+    previous = run_sensor_gateway._install_shutdown_signal_handlers(stop)
+    assert set(installed) == {signal.SIGHUP, signal.SIGINT, signal.SIGTERM}
+
+    installed[signal.SIGHUP](signal.SIGHUP, None)
+    assert stop.is_set()
+
+    run_sensor_gateway._restore_signal_handlers(previous)
+    assert restored == previous
 
 
 def test_script_imports_without_ros2_and_resolves_json_defaults() -> None:

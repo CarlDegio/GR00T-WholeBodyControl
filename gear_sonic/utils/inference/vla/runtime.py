@@ -22,6 +22,31 @@ if TYPE_CHECKING:
 LOGGER = logging.getLogger("sonic.vla")
 
 
+def _current_vla_safety_reason(
+    vla_safety_gate,
+    vla_safety_monitor,
+    *,
+    monotonic=None,
+) -> str:
+    """Evaluate safety against snapshots captured before the current time.
+
+    The monitor updates on another thread. Reading ``now`` before copying its
+    orientation can make a newly received sample appear to come from the
+    future, which the fail-closed gate correctly rejects. Capture both
+    snapshots first so their timestamps cannot be newer than the comparison
+    time used for this evaluation.
+    """
+
+    safety = vla_safety_monitor.snapshot()
+    orientation = vla_safety_monitor.orientation_snapshot()
+    clock = time.monotonic if monotonic is None else monotonic
+    return vla_safety_gate.reason(
+        now=clock(),
+        safety=safety,
+        robot_state_timestamp_s=orientation.received_at_s,
+    )
+
+
 def get_action_field(action_dict: dict, key: str):
     """Get action field from dict, checking both with and without 'action.' prefix."""
     value = action_dict.get(key)
@@ -76,6 +101,37 @@ class _VlaRuntimeState:
     task_skill_id: int = 0
     task_window_id: int = 0
     task_active: bool = False
+    # A LaViRA visual postcheck pauses fresh policy actions, but the C++ POSE
+    # input still requires a continuous stream.  While this flag is set the
+    # service republishes the terminal action from the current policy chunk.
+    task_stream_hold_active: bool = False
+
+
+def _invalidate_inference_preserving_action(
+    state: _VlaRuntimeState,
+    invalidate_inference,
+    reason: str,
+) -> None:
+    """Invalidate stale inference work without opening a C++ action-stream gap."""
+
+    cached_action = state.cached_action_chunk
+    action_index = state.action_chunk_index
+    invalidate_inference(reason)
+    state.cached_action_chunk = cached_action
+    state.action_chunk_index = action_index
+
+
+def _stream_hold_is_active(state: _VlaRuntimeState) -> bool:
+    """Return whether the current LaViRA hold has a safe action to republish."""
+
+    return (
+        state.task_active
+        and state.task_stream_hold_active
+        and state.pause_loop
+        and state.cpp_loop_running
+        and state.cpp_mode == "POSE"
+        and state.cached_action_chunk is not None
+    )
 
 
 class _VlaCommandHandler:
@@ -167,6 +223,7 @@ class _VlaCommandHandler:
         self.state.task_skill_id = 0
         self.state.task_window_id = 0
         self.state.task_active = False
+        self.state.task_stream_hold_active = False
         self.state.pause_loop = True
         self.invalidate_inference("navigation cancelled")
         if self.state.cpp_mode == "POSE":
@@ -192,12 +249,9 @@ class _VlaCommandHandler:
             )
             return
         generation, skill_id = identity
-        safety_reason = self.vla_safety_gate.reason(
-            now=time.monotonic(),
-            safety=self.vla_safety_monitor.snapshot(),
-            robot_state_timestamp_s=(
-                self.vla_safety_monitor.orientation_snapshot().received_at_s
-            ),
+        safety_reason = _current_vla_safety_reason(
+            self.vla_safety_gate,
+            self.vla_safety_monitor,
         )
         if safety_reason != "clear":
             self.record_event(
@@ -222,6 +276,7 @@ class _VlaCommandHandler:
         self.state.task_generation, self.state.task_skill_id = identity
         self.state.task_window_id = 0
         self.state.task_active = True
+        self.state.task_stream_hold_active = False
         while not self.inference_failures.empty():
             try:
                 self.inference_failures.get_nowait()
@@ -279,7 +334,23 @@ class _VlaCommandHandler:
             if self.state.pause_loop:
                 return
             self.state.pause_loop = True
-            self.invalidate_inference(f"VLA window {window_id} held")
+            self.state.task_stream_hold_active = (
+                self.state.cached_action_chunk is not None
+            )
+            _invalidate_inference_preserving_action(
+                self.state,
+                self.invalidate_inference,
+                f"VLA window {window_id} held with streamed terminal action",
+            )
+            if not self.state.task_stream_hold_active:
+                self.record_event(
+                    logging.WARNING,
+                    "VLA_STREAM_HOLD_UNAVAILABLE",
+                    "VLA postcheck hold began before the first policy action",
+                    generation=self.state.task_generation,
+                    skill_id=self.state.task_skill_id,
+                    window_id=window_id,
+                )
             return
         if command.name == "resume_vla_task":
             prompt = command.parameters.get("handoff_context")
@@ -288,10 +359,16 @@ class _VlaCommandHandler:
             if not self.state.pause_loop:
                 return
             self.state.pause_loop = False
-            self.invalidate_inference(f"VLA window {window_id} resumed")
+            self.state.task_stream_hold_active = False
+            _invalidate_inference_preserving_action(
+                self.state,
+                self.invalidate_inference,
+                f"VLA window {window_id} resumed from streamed hold",
+            )
             self.activate_vla_metrics()
             return
         self.state.task_active = False
+        self.state.task_stream_hold_active = False
         self.state.pause_loop = True
         self.invalidate_inference(f"VLA task stopped at window {window_id}")
         if self.state.cpp_mode == "POSE":
@@ -342,6 +419,7 @@ class _VlaCommandHandler:
             )
             return
         self.state.pause_loop = not self.state.pause_loop
+        self.state.task_stream_hold_active = False
         self.invalidate_inference(
             "POSE policy resumed"
             if not self.state.pause_loop
@@ -412,7 +490,6 @@ def _consume_task_failure(
 def _enforce_active_task_safety(
     state: _VlaRuntimeState,
     *,
-    now: float,
     vla_safety_gate,
     vla_safety_monitor,
     invalidate_inference,
@@ -423,19 +500,17 @@ def _enforce_active_task_safety(
     if (
         not state.task_active
         or state.cpp_mode != "POSE"
-        or state.pause_loop
+        or (state.pause_loop and not state.task_stream_hold_active)
     ):
         return
-    safety_reason = vla_safety_gate.reason(
-        now=now,
-        safety=vla_safety_monitor.snapshot(),
-        robot_state_timestamp_s=(
-            vla_safety_monitor.orientation_snapshot().received_at_s
-        ),
+    safety_reason = _current_vla_safety_reason(
+        vla_safety_gate,
+        vla_safety_monitor,
     )
     if safety_reason == "clear":
         return
     state.task_active = False
+    state.task_stream_hold_active = False
     state.pause_loop = True
     invalidate_inference(f"VLA safety blocked: {safety_reason}")
     send_cpp_control_command(start=True, planner=True)

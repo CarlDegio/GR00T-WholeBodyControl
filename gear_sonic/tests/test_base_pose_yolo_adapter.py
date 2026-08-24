@@ -121,6 +121,8 @@ def test_yolo_adapter_accepts_dynamic_align_identity_and_prompts(tmp_path) -> No
     )
     adapter.tick(now=1.1)
     assert adapter.runtime.generation == 7
+    assert adapter.skill_id == 0
+    assert adapter.segment_id == 0
     assert adapter.start(
         7,
         skill_id=4,
@@ -131,6 +133,64 @@ def test_yolo_adapter_accepts_dynamic_align_identity_and_prompts(tmp_path) -> No
     )
     assert intents[-1][1]["motion_profile"] == "yoloe_servo"
     assert intents[-1][1]["velocity"] == [0.0, 0.0, 0.0]
+
+
+def test_yolo_adapter_skill_cancel_allows_later_standalone_start(tmp_path) -> None:
+    intents: list[tuple[str, dict[str, object]]] = []
+    adapter = GatewayRawServoAdapter(
+        BasePoseAgentConfig(
+            task="align dynamically",
+            output_root=str(tmp_path),
+        ),
+        submit_intent=lambda name, values: intents.append((name, dict(values))),
+    )
+
+    assert adapter.start(
+        1,
+        skill_id=3,
+        segment_id=17,
+        target="blue basket",
+        surface="desk",
+        now=1.0,
+    )
+    assert adapter.runtime.generation == 1_000_003
+
+    assert adapter.cancel(2, "operator_stop", now=1.1)
+    assert adapter.runtime.phase == "idle"
+    assert adapter.runtime.generation == 2
+    assert adapter.task_generation == 2
+    assert adapter.skill_id == 0
+    assert adapter.segment_id == 0
+
+    assert adapter.start(4, now=1.2)
+    assert adapter.runtime.generation == 4
+    assert intents[-1][0] == "base_pose_velocity"
+    assert intents[-1][1]["generation"] == 4
+
+
+def test_yolo_adapter_reports_idle_start_rejection_to_clear_gateway(tmp_path) -> None:
+    intents: list[tuple[str, dict[str, object]]] = []
+    logs: list[str] = []
+    adapter = GatewayRawServoAdapter(
+        BasePoseAgentConfig(
+            task="align to the basket",
+            output_root=str(tmp_path),
+        ),
+        submit_intent=lambda name, values: intents.append((name, dict(values))),
+        logger=logs.append,
+    )
+    adapter.runtime.generation = 10
+
+    assert not adapter.start(4, now=1.0)
+    assert intents[-1] == (
+        "base_pose_status",
+        {
+            "generation": 4,
+            "state": "failed",
+            "reason": "stale_generation:4<=10",
+        },
+    )
+    assert any("start rejected" in line for line in logs)
 
 
 def test_yolo_adapter_ignores_stale_and_idle_global_cancels(tmp_path) -> None:

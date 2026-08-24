@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from multiprocessing import shared_memory
 import subprocess
 import sys
 
@@ -54,6 +55,14 @@ def test_shared_memory_ring_rejects_oversized_frame() -> None:
     with SharedMemoryRing("tiny", slot_count=2, slot_size_bytes=8) as ring:
         with pytest.raises(ValueError, match="slot capacity"):
             ring.write(np.zeros((3,), dtype=np.float32), received_ns=1)
+
+
+def test_shared_memory_ring_context_unlinks_its_persistent_name() -> None:
+    with SharedMemoryRing("cleanup", slot_count=2, slot_size_bytes=8) as ring:
+        name = ring.name
+
+    with pytest.raises(FileNotFoundError):
+        shared_memory.SharedMemory(name=name, create=False)
 
 
 def test_shared_memory_reader_rejects_inconsistent_shape_metadata() -> None:

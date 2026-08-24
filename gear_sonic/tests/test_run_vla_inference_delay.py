@@ -12,6 +12,11 @@ from gear_sonic.utils.inference.vla.service import (
     _should_schedule_vla_inference,
     prepare_observation_from_sensors,
 )
+from gear_sonic.utils.inference.vla.runtime import (
+    _VlaRuntimeState,
+    _invalidate_inference_preserving_action,
+    _stream_hold_is_active,
+)
 
 
 class InferenceWorkerTest(unittest.TestCase):
@@ -240,6 +245,58 @@ class InferenceWorkerTest(unittest.TestCase):
         self.assertEqual(_drain_queue(self.result_queue), 1)
         self.assertTrue(self.inference_queue.empty())
         self.assertTrue(self.result_queue.empty())
+
+    def test_visual_postcheck_hold_preserves_terminal_action_stream(self):
+        cached_action = {"motion_token": "current-window"}
+        state = _VlaRuntimeState(
+            pause_loop=True,
+            cpp_loop_running=True,
+            cpp_mode="POSE",
+            cached_action_chunk=cached_action,
+            action_chunk_index=17,
+            task_active=True,
+            task_stream_hold_active=True,
+        )
+        invalidated = []
+
+        def invalidate(reason):
+            invalidated.append(reason)
+            state.cached_action_chunk = None
+            state.action_chunk_index = 0
+
+        _invalidate_inference_preserving_action(
+            state,
+            invalidate,
+            "visual postcheck",
+        )
+
+        self.assertEqual(invalidated, ["visual postcheck"])
+        self.assertIs(state.cached_action_chunk, cached_action)
+        self.assertEqual(state.action_chunk_index, 17)
+        self.assertTrue(_stream_hold_is_active(state))
+
+    def test_stream_hold_never_publishes_outside_active_pose_task(self):
+        state = _VlaRuntimeState(
+            pause_loop=True,
+            cpp_loop_running=True,
+            cpp_mode="POSE",
+            cached_action_chunk={"motion_token": "hold"},
+            task_active=True,
+            task_stream_hold_active=True,
+        )
+
+        for attribute, inactive_value in (
+            ("pause_loop", False),
+            ("cpp_loop_running", False),
+            ("cpp_mode", "PLANNER"),
+            ("cached_action_chunk", None),
+            ("task_active", False),
+            ("task_stream_hold_active", False),
+        ):
+            original = getattr(state, attribute)
+            setattr(state, attribute, inactive_value)
+            self.assertFalse(_stream_hold_is_active(state), attribute)
+            setattr(state, attribute, original)
 
 
 if __name__ == "__main__":

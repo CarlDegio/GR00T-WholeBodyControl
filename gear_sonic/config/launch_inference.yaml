@@ -69,11 +69,11 @@ components:
     max_steps: 20
     history_size: 5
     la_model: qwen3.8-max
-    la_base_url: https://dashscope-intl.aliyuncs.com/compatible-mode/v1
+    la_base_url: https://ws-6yzgj1m087a053ip.cn-beijing.maas.aliyuncs.com/compatible-mode/v1
     la_enable_thinking: false
     la_timeout_seconds: 180.0
     va_model: qwen3.5-27b
-    va_base_url: https://dashscope-intl.aliyuncs.com/compatible-mode/v1
+    va_base_url: https://ws-6yzgj1m087a053ip.cn-beijing.maas.aliyuncs.com/compatible-mode/v1
     va_enable_thinking: false
     va_timeout_seconds: 180.0
     camera_timeout_ms: 15000
@@ -91,10 +91,13 @@ components:
     heading_settle_tolerance_rad: 0.08726646259971647
     heading_correction_speed_rad_s: 0.2
     heading_correction_timeout_seconds: 10.0
+    # VA checks at this cadence, but never pauses the continuous VLA action stream.
     manipulation_window_seconds: 5.0
     manipulation_max_windows: 12
     manipulation_timeout_seconds: 180.0
-    vla_start_timeout_seconds: 3.0
+    # VLA performs a synchronous 3 s initial-pose ramp before acknowledging
+    # POSE readiness. Include margin for policy ping and message scheduling.
+    vla_start_timeout_seconds: 6.0
   base_pose:
     task: >-
       align to the blue basket
@@ -131,14 +134,14 @@ components:
     raw_yoloe_device: '0'
     raw_yoloe_confidence: 0.25
     raw_yoloe_imgsz: 640
-    raw_head_target_distance_m: 0.9
-    raw_chest_target_distance_m: 0.7
+    raw_head_target_distance_m: 1.1
+    raw_chest_target_distance_m: 0.9
     raw_forward_tolerance_m: 0.10
     raw_lateral_tolerance_m: 0.10
     raw_min_linear_speed_m_s: 0.35
     raw_max_lateral_speed_m_s: 0.40
     raw_min_yaw_speed_rad_s: 0.10
-    raw_yaw_tolerance_deg: 3
+    raw_yaw_tolerance_deg: 5
     raw_yaw_coarse_speed_rad_s: 0.30
     raw_yaw_trim_speed_rad_s: 0.10
     raw_forward_recenter_yaw_speed_rad_s: 0.30

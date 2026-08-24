@@ -32,6 +32,9 @@ from gear_sonic.runtime.telemetry import (
 from gear_sonic.runtime.zmq_sockets import bind_pull
 
 
+_SHUTDOWN_SIGNALS = (signal.SIGHUP, signal.SIGINT, signal.SIGTERM)
+
+
 @dataclass(frozen=True)
 class SensorGatewaySettings:
     profile_name: str
@@ -319,6 +322,27 @@ class _HealthDisplay:
             self.active = False
 
 
+def _install_shutdown_signal_handlers(
+    stop: threading.Event,
+) -> dict[signal.Signals, object]:
+    """Route terminal and tmux shutdown through the normal cleanup path."""
+
+    def request_stop(_signum=None, _frame=None) -> None:
+        stop.set()
+
+    return {
+        signum: signal.signal(signum, request_stop)
+        for signum in _SHUTDOWN_SIGNALS
+    }
+
+
+def _restore_signal_handlers(
+    previous_handlers: dict[signal.Signals, object],
+) -> None:
+    for signum, handler in previous_handlers.items():
+        signal.signal(signum, handler)
+
+
 def run_sensor_gateway(settings: SensorGatewaySettings) -> None:
     if settings.health_print_interval_s < 0.0:
         raise ValueError("health_print_interval_s cannot be negative")
@@ -348,11 +372,7 @@ def run_sensor_gateway(settings: SensorGatewaySettings) -> None:
     stop = threading.Event()
     health_display = _HealthDisplay()
 
-    def request_stop(_signum=None, _frame=None) -> None:
-        stop.set()
-
-    previous_sigint = signal.signal(signal.SIGINT, request_stop)
-    previous_sigterm = signal.signal(signal.SIGTERM, request_stop)
+    previous_signal_handlers = _install_shutdown_signal_handlers(stop)
     try:
         rpc = SensorGatewayRpcServer(context, settings.rpc_bind_endpoint, core)
         rpc.start()
@@ -500,26 +520,29 @@ def run_sensor_gateway(settings: SensorGatewaySettings) -> None:
                 next_health = now + settings.health_print_interval_s
             stop.wait(max(0.0, period_s - (time.monotonic() - loop_started)))
     finally:
-        health_display.close()
-        signal.signal(signal.SIGINT, previous_sigint)
-        signal.signal(signal.SIGTERM, previous_sigterm)
-        if ros is not None:
-            ros.close()
-        if visualization is not None:
-            visualization.close()
-        if metrics_socket is not None:
-            metrics_socket.close(linger=0)
-        if cpp_state is not None:
-            cpp_state.close()
-        if camera is not None:
-            camera.close()
-        if depth_anything is not None:
-            depth_anything.close()
-        if rpc is not None:
-            rpc.close()
-        core.close()
-        context.term()
-        logger.info("STOPPED shared-memory segments released")
+        try:
+            health_display.close()
+            if ros is not None:
+                ros.close()
+            if visualization is not None:
+                visualization.close()
+            if metrics_socket is not None:
+                metrics_socket.close(linger=0)
+            if cpp_state is not None:
+                cpp_state.close()
+            if camera is not None:
+                camera.close()
+            if depth_anything is not None:
+                depth_anything.close()
+            if rpc is not None:
+                rpc.close()
+            core.close()
+            context.term()
+            logger.info("STOPPED shared-memory segments released")
+        finally:
+            # Keep SIGHUP routed to request_stop until every shared-memory
+            # name is gone; a repeated pane shutdown cannot interrupt cleanup.
+            _restore_signal_handlers(previous_signal_handlers)
 
 
 def main() -> None:

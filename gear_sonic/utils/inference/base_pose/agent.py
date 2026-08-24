@@ -228,6 +228,50 @@ class GatewayRawServoAdapter:
             parameters,
         )
 
+    def _retire_invocation(self, generation: int) -> None:
+        """Return a completed invocation to the public generation axis."""
+
+        self.task_generation = int(generation)
+        self.runtime.generation = self.task_generation
+        self.skill_id = 0
+        self.segment_id = 0
+
+    def _reject_start(
+        self,
+        *,
+        generation: int,
+        skill_id: int,
+        segment_id: int,
+        reason: str,
+        clear_gateway_owner: bool,
+    ) -> None:
+        message = (
+            "[BasePose/YOLOE] start rejected "
+            f"generation={generation} skill_id={skill_id} "
+            f"segment_id={segment_id} reason={reason}"
+        )
+        self.logger(message)
+        if self.report_event is not None:
+            self.report_event(
+                logging.WARNING,
+                "START_REJECTED",
+                message,
+                generation=generation,
+                skill_id=skill_id,
+                segment_id=segment_id,
+                reason=reason,
+            )
+        if not clear_gateway_owner:
+            return
+        status: dict[str, object] = {
+            "generation": generation,
+            "state": "failed",
+            "reason": reason,
+        }
+        if skill_id:
+            status.update(skill_id=skill_id, segment_id=segment_id)
+        self.submit_intent("base_pose_status", status)
+
     def start(
         self,
         generation: int,
@@ -247,24 +291,55 @@ class GatewayRawServoAdapter:
             if requested_skill_id == 0
             else requested_generation * 1_000_000 + requested_skill_id
         )
-        if (
-            self.runtime.phase != "idle"
-            or runtime_generation <= self.runtime.generation
-        ):
+        requested_segment_id = int(segment_id)
+        if self.runtime.phase != "idle":
+            self._reject_start(
+                generation=requested_generation,
+                skill_id=requested_skill_id,
+                segment_id=requested_segment_id,
+                reason=f"runtime_busy:{self.runtime.phase}",
+                clear_gateway_owner=False,
+            )
+            return False
+        if runtime_generation <= self.runtime.generation:
+            self._reject_start(
+                generation=requested_generation,
+                skill_id=requested_skill_id,
+                segment_id=requested_segment_id,
+                reason=(
+                    "stale_generation:"
+                    f"{runtime_generation}<={self.runtime.generation}"
+                ),
+                clear_gateway_owner=True,
+            )
             return False
         if target is not None:
             normalized_target = str(target).strip()
             if not normalized_target:
+                self._reject_start(
+                    generation=requested_generation,
+                    skill_id=requested_skill_id,
+                    segment_id=requested_segment_id,
+                    reason="empty_target",
+                    clear_gateway_owner=True,
+                )
                 return False
             self.runtime.config.target_prompt = normalized_target
         if surface is not None:
             normalized_surface = str(surface).strip()
             if not normalized_surface:
+                self._reject_start(
+                    generation=requested_generation,
+                    skill_id=requested_skill_id,
+                    segment_id=requested_segment_id,
+                    reason="empty_surface",
+                    clear_gateway_owner=True,
+                )
                 return False
             self.runtime.config.surface_prompt = normalized_surface
         self.task_generation = requested_generation
         self.skill_id = requested_skill_id
-        self.segment_id = int(segment_id)
+        self.segment_id = requested_segment_id
         self.runtime.reference_bbox = reference_bbox
         self._publish_enabled = True
         self._terminal_reported = False
@@ -272,6 +347,15 @@ class GatewayRawServoAdapter:
         if not started:
             self._publish_enabled = False
             self._terminal_reported = True
+            self._reject_start(
+                generation=requested_generation,
+                skill_id=requested_skill_id,
+                segment_id=requested_segment_id,
+                reason="runtime_start_failed",
+                clear_gateway_owner=self.runtime.phase == "idle",
+            )
+            if self.runtime.phase == "idle":
+                self._retire_invocation(requested_generation)
         elif self.report_metrics is not None:
             self.report_metrics({}, activate=True)
         return started
@@ -297,15 +381,7 @@ class GatewayRawServoAdapter:
             # Global navigation cancellation is also delivered while BasePose
             # is inactive.  Keep generations aligned without reporting a fake
             # operator stop or perturbing the runtime generation twice.
-            self.task_generation = requested_generation
-            self.runtime.generation = (
-                requested_generation
-                if self.skill_id == 0
-                else max(
-                    self.runtime.generation,
-                    requested_generation * 1_000_000 + self.skill_id,
-                )
-            )
+            self._retire_invocation(requested_generation)
             self._terminal_reported = True
             return False
         self.runtime.cancel(
@@ -320,6 +396,7 @@ class GatewayRawServoAdapter:
                 ),
             ),
         )
+        self._retire_invocation(requested_generation)
         self._terminal_reported = True
         return True
 
@@ -373,7 +450,7 @@ class GatewayRawServoAdapter:
                 # invocation is active. Collapse back to the task generation
                 # after draining that invocation so a later standalone B start
                 # remains monotonic on the public generation axis.
-                self.runtime.generation = self.task_generation
+                self._retire_invocation(self.task_generation)
             self._terminal_reported = True
             self._publish_enabled = False
 
