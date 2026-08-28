@@ -1,6 +1,8 @@
 import queue
 import threading
+import time
 import unittest
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import gear_sonic.utils.inference.vla.service as run_vla_inference
@@ -13,7 +15,10 @@ from gear_sonic.utils.inference.vla.service import (
     prepare_observation_from_sensors,
 )
 from gear_sonic.utils.inference.vla.runtime import (
+    _VlaCommandHandler,
     _VlaRuntimeState,
+    _activate_pending_pose_task,
+    _consume_vla_result,
     _invalidate_inference_preserving_action,
     _stream_hold_is_active,
 )
@@ -221,6 +226,13 @@ class InferenceWorkerTest(unittest.TestCase):
                 **common,
             )
         )
+        self.assertTrue(
+            _should_schedule_vla_inference(
+                cpp_mode="PLANNER",
+                prepose_warmup=True,
+                **common,
+            )
+        )
         # POSE pause gates robot action publication, not observation requests.
         self.assertTrue(
             _should_schedule_vla_inference(
@@ -297,6 +309,157 @@ class InferenceWorkerTest(unittest.TestCase):
             setattr(state, attribute, inactive_value)
             self.assertFalse(_stream_hold_is_active(state), attribute)
             setattr(state, attribute, original)
+
+    def test_task_start_holds_planner_until_first_action_is_ready(self):
+        state = _VlaRuntimeState(
+            pause_loop=True,
+            cpp_loop_running=True,
+            cpp_mode="PLANNER",
+        )
+        events = []
+        mode_commands = []
+        statuses = []
+        initial_pose_calls = []
+        failures = []
+
+        class ClearGate:
+            def reason(self, **_kwargs):
+                return "clear"
+
+        class Monitor:
+            def snapshot(self):
+                return object()
+
+            def orientation_snapshot(self):
+                return SimpleNamespace(received_at_s=time.monotonic())
+
+        handler = _VlaCommandHandler(
+            state,
+            control_listener=SimpleNamespace(),
+            language_prompt_ref=["old prompt"],
+            inference_failures=queue.SimpleQueue(),
+            inference_failed_event=threading.Event(),
+            vla_safety_gate=ClearGate(),
+            vla_safety_monitor=Monitor(),
+            task_status_intent=SimpleNamespace(
+                send=lambda name, payload: statuses.append((name, payload))
+            ),
+            policy=SimpleNamespace(ping=lambda **_kwargs: True),
+            record_event=lambda *args, **kwargs: events.append((args, kwargs)),
+            invalidate_inference=lambda reason: events.append(((reason,), {})),
+            publish_initial_pose=lambda: initial_pose_calls.append(True) or True,
+            send_cpp_control_command=lambda **kwargs: mode_commands.append(kwargs) or True,
+            activate_vla_metrics=lambda: None,
+            fail_active_task=lambda reason, message: failures.append((reason, message)),
+            publish_task_status=lambda *args, **kwargs: statuses.append((args, kwargs)),
+        )
+        command = SimpleNamespace(parameters={
+            "generation": 7,
+            "skill_id": 4,
+            "window_id": 0,
+            "task": "collect the bottle",
+            "handoff_context": "collect the bottle",
+        })
+
+        handler._start_task(command, (7, 4), (-1, 0), 0)
+
+        self.assertTrue(state.task_active)
+        self.assertTrue(state.task_pose_entry_pending)
+        self.assertTrue(state.pause_loop)
+        self.assertEqual(state.cpp_mode, "PLANNER")
+        self.assertEqual(initial_pose_calls, [True])
+        self.assertEqual(mode_commands, [])
+        self.assertEqual(statuses, [])
+        self.assertEqual(failures, [])
+
+    def test_first_action_waits_for_fresh_safety_before_pose_entry(self):
+        state = _VlaRuntimeState(
+            pause_loop=True,
+            cpp_loop_running=True,
+            cpp_mode="PLANNER",
+            inference_generation=7,
+            task_generation=3,
+            task_skill_id=4,
+            task_active=True,
+            task_pose_entry_pending=True,
+        )
+        result_queue = queue.Queue()
+        first_action = {"motion_token": "first action"}
+        result_queue.put((
+            7,
+            first_action,
+            time.monotonic() - 2.0,
+            {"policy_roundtrip": 2000.0},
+        ))
+        metrics = []
+        events = []
+        service = SimpleNamespace(
+            publish_metrics=lambda values, **kwargs: metrics.append((values, kwargs))
+        )
+        config = SimpleNamespace(action_publish_rate=50, action_horizon=50)
+
+        _consume_vla_result(
+            state,
+            result_queue,
+            service=service,
+            config=config,
+            language_prompt="collect the bottle",
+            record_event=lambda *args, **kwargs: events.append((args, kwargs)),
+        )
+
+        self.assertIs(state.cached_action_chunk, first_action)
+        self.assertEqual(state.action_chunk_index, 0)
+        self.assertGreaterEqual(state.pending_action_ready_ms, 2000.0)
+        self.assertEqual(events[-1][0][1], "INFERENCE_READY")
+
+        class MutableGate:
+            reason_value = "radar_timeout"
+
+            def reason(self, **_kwargs):
+                return self.reason_value
+
+        class Monitor:
+            def snapshot(self):
+                return object()
+
+            def orientation_snapshot(self):
+                return SimpleNamespace(received_at_s=time.monotonic())
+
+        gate = MutableGate()
+        mode_commands = []
+        statuses = []
+
+        def send_cpp_control_command(*, start, planner):
+            mode_commands.append((start, planner))
+            state.cpp_loop_running = start
+            state.cpp_mode = "PLANNER" if planner else "POSE"
+            return True
+
+        activation_args = dict(
+            vla_safety_gate=gate,
+            vla_safety_monitor=Monitor(),
+            send_cpp_control_command=send_cpp_control_command,
+            activate_vla_metrics=lambda: None,
+            publish_task_status=lambda *args, **kwargs: statuses.append((args, kwargs)),
+            fail_active_task=lambda *_args: self.fail("activation unexpectedly failed"),
+            record_event=lambda *args, **kwargs: events.append((args, kwargs)),
+            language_prompt="collect the bottle",
+        )
+
+        self.assertFalse(_activate_pending_pose_task(state, **activation_args))
+        self.assertEqual(mode_commands, [])
+        self.assertEqual(statuses, [])
+        self.assertTrue(state.task_pose_entry_pending)
+
+        gate.reason_value = "clear"
+        self.assertTrue(_activate_pending_pose_task(state, **activation_args))
+        self.assertEqual(mode_commands, [(True, False)])
+        self.assertEqual(statuses[0][0], ("active", "started"))
+        self.assertEqual(statuses[0][1], {"window_id": 0})
+        self.assertEqual(state.cpp_mode, "POSE")
+        self.assertFalse(state.pause_loop)
+        self.assertFalse(state.task_pose_entry_pending)
+        self.assertEqual(state.active_generation, 7)
 
 
 if __name__ == "__main__":

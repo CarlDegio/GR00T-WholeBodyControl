@@ -117,8 +117,8 @@ def test_base_pose_status_draws_target_desk_and_table_on_active_camera() -> None
     overlay = {
         "target_bbox_xyxy": [10.0, 10.0, 30.0, 30.0],
         "target_lateral_anchor_px": [20.0, 20.0],
-        "table_edge_endpoints_px": [[5.0, 35.0], [55.0, 35.0]],
-        "desk_mask_row_spans": [[32, 4, 60], [33, 4, 60]],
+        "yaw_align_edge_endpoints_px": [[5.0, 35.0], [55.0, 35.0]],
+        "completed_yaw_align_target_mask_row_spans": [[32, 4, 60], [33, 4, 60]],
         "image_size": [64, 48],
     }
     assert state.accept_control(
@@ -142,7 +142,7 @@ def test_base_pose_status_draws_target_desk_and_table_on_active_camera() -> None
     assert not np.any(chest)
     np.testing.assert_array_equal(head[10, 10], (0, 255, 0))
     np.testing.assert_array_equal(head[35, 40], (0, 0, 255))
-    assert state.desk_mask_row_spans == ((32, 4, 60), (33, 4, 60))
+    assert state.completed_yaw_align_target_mask_row_spans == ((32, 4, 60), (33, 4, 60))
 
     state.accept_control(
         _command(
@@ -169,13 +169,13 @@ def test_base_pose_routes_target_and_table_to_their_source_cameras() -> None:
                 "camera_stream": "ego_view",
                 "viewer_overlay": {
                     "target_camera_stream": "chest_view",
-                    "table_camera_stream": "ego_view",
+                    "yaw_align_geometry_camera_stream": "ego_view",
                     "target_bbox_xyxy": [10.0, 10.0, 30.0, 30.0],
-                    "table_edge_endpoints_px": [
+                    "yaw_align_edge_endpoints_px": [
                         [5.0, 35.0],
                         [55.0, 35.0],
                     ],
-                    "desk_mask_row_spans": [[32, 4, 60]],
+                    "completed_yaw_align_target_mask_row_spans": [[32, 4, 60]],
                     "image_size": [64, 48],
                 },
             },
@@ -200,12 +200,12 @@ def test_base_pose_routes_target_and_table_to_their_source_cameras() -> None:
     (
         ({"target_bbox_xyxy": [10.0, 10.0, 30.0, 30.0]}, (10, 10)),
         (
-            {"table_edge_endpoints_px": [[5.0, 35.0], [55.0, 35.0]]},
+            {"yaw_align_edge_endpoints_px": [[5.0, 35.0], [55.0, 35.0]]},
             (35, 40),
         ),
         (
             {
-                "desk_mask_row_spans": [[32, 4, 60]],
+                "completed_yaw_align_target_mask_row_spans": [[32, 4, 60]],
                 "image_size": [64, 48],
             },
             (32, 20),
@@ -249,7 +249,7 @@ def test_base_pose_viewer_rejects_mask_span_outside_source_image() -> None:
             {
                 "viewer_overlay": {
                     "target_bbox_xyxy": [1.0, 1.0, 4.0, 3.0],
-                    "desk_mask_row_spans": [[48, 0, 64]],
+                    "completed_yaw_align_target_mask_row_spans": [[48, 0, 64]],
                     "image_size": [64, 48],
                 }
             }

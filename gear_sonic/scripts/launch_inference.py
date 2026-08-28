@@ -738,7 +738,7 @@ def _check_prerequisites(config: InferenceLaunchConfig):
 
     if config.base_pose_enabled:
         base_pose = profile.component("base_pose")
-        for key in ("task", "target_prompt", "surface_prompt"):
+        for key in ("task", "target_prompt", "yaw_align_target_prompt"):
             if not str(base_pose[key]).strip():
                 errors.append(f"components.base_pose.{key} is required")
         for relative_path, label in (

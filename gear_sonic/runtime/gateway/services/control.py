@@ -188,7 +188,13 @@ class ControlGatewayRuntime:
         *,
         source: str,
         input_key: str | None = None,
+        agent_parameters: Mapping[str, object] | None = None,
     ) -> bool:
+        if agent_parameters and "surface" in agent_parameters:
+            raise ValueError(
+                "legacy BasePose surface field is not supported; use "
+                "yaw_align_target"
+            )
         if action.mode == "ignored":
             self.show_event(
                 logging.WARNING,
@@ -217,6 +223,10 @@ class ControlGatewayRuntime:
             }
             if action.reason:
                 event_parameters["reason"] = action.reason
+            if action.agent_event == "start_base_pose" and agent_parameters:
+                for name in ("target", "yaw_align_target"):
+                    if name in agent_parameters:
+                        event_parameters[name] = agent_parameters[name]
             self.dispatch_navigation_event(action.agent_event, event_parameters)
             self.show_event(
                 logging.INFO,
@@ -388,6 +398,7 @@ class ControlGatewayRuntime:
             action,
             source=command.metadata.source,
             input_key="Space" if key == " " else key.upper(),
+            agent_parameters=command.parameters,
         )
         return DispatchDisposition.HANDLED
 
@@ -551,10 +562,21 @@ class ControlGatewayRuntime:
         self,
         command: OperatorCommand,
     ) -> DispatchDisposition:
+        if "surface" in command.parameters:
+            raise ValueError(
+                "legacy BasePose surface field is not supported; use "
+                "yaw_align_target"
+            )
         if command.metadata.source != "lavira_agent":
             # Operator-key BasePose start has already been normalized by
             # NavigationControlState and must still reach the consumer.
             return DispatchDisposition.FORWARD_ORIGINAL
+        for name in ("target", "yaw_align_target"):
+            value = command.parameters.get(name)
+            if not isinstance(value, str) or not value.strip():
+                raise ValueError(
+                    f"LaViRA BasePose start requires non-empty {name}"
+                )
         action = self.navigation.accept_base_pose_start(command.parameters)
         self._send_navigation_stop(
             generation=action.generation,

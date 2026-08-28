@@ -13,10 +13,12 @@ from gear_sonic.runtime.gateway.control_client import ControlGatewayIntentClient
 from gear_sonic.runtime.gateway.control import (
     ControlGatewayCore,
     ControlGatewayRouter,
+    NavigationControlAction,
     NavigationControlState,
     OperatorConsoleRouter,
 )
 from gear_sonic.runtime.gateway.services.control import (
+    ControlGatewayRuntime,
     EventPaneDisplay,
     build_base_pose_runtime_status,
 )
@@ -115,6 +117,73 @@ def test_latest_only_intent_client_conflates_pending_commands() -> None:
         client.close()
         receiver.close()
         context.term()
+
+
+def test_standalone_base_pose_start_forwards_dynamic_align_parameters() -> None:
+    runtime = object.__new__(ControlGatewayRuntime)
+    runtime.navigation_pub = type(
+        "NavigationPublisher",
+        (),
+        {"send_string": lambda self, _payload: None},
+    )()
+    dispatched: list[tuple[str, dict[str, object]]] = []
+    runtime.dispatch_navigation_event = (
+        lambda name, parameters: dispatched.append((name, parameters))
+    )
+    runtime.show_event = lambda *_args, **_kwargs: None
+    action = NavigationControlAction(
+        generation=4,
+        mode="stop",
+        agent_event="start_base_pose",
+        skill_id=0,
+        segment_id=0,
+    )
+
+    assert runtime.publish_navigation_action(
+        action,
+        source="standalone_align",
+        input_key="B",
+        agent_parameters={
+            "key": "b",
+            "target": "rubbish bin",
+            "yaw_align_target": "rubbish bin",
+            "ignored": "not forwarded",
+        },
+    )
+
+    assert dispatched == [(
+        "start_base_pose",
+        {
+            "generation": 4,
+            "skill_id": 0,
+            "segment_id": 0,
+            "target": "rubbish bin",
+            "yaw_align_target": "rubbish bin",
+        },
+    )]
+
+
+def test_standalone_base_pose_start_rejects_legacy_surface_field() -> None:
+    runtime = object.__new__(ControlGatewayRuntime)
+    action = NavigationControlAction(
+        generation=4,
+        mode="stop",
+        agent_event="start_base_pose",
+        skill_id=0,
+        segment_id=0,
+    )
+
+    with pytest.raises(ValueError, match="legacy BasePose surface field"):
+        runtime.publish_navigation_action(
+            action,
+            source="standalone_align",
+            input_key="B",
+            agent_parameters={
+                "key": "b",
+                "target": "cardboard box",
+                "surface": "cardboard box",
+            },
+        )
 
 
 def test_core_adds_identity_lifetime_and_typed_semantics() -> None:

@@ -47,7 +47,7 @@ class BasePoseAgentConfig:
     profile: str = ""
     overlay: tuple[str, ...] = ()
     target_prompt: str = "bluebasket"
-    surface_prompt: str = "desk"
+    yaw_align_target_prompt: str = "cardboard box"
     planner_hz: float = 20.0
     final_stop_count: int = 3
 
@@ -83,8 +83,11 @@ class BasePoseAgentConfig:
     raw_yoloe_device: str = "0"
     raw_yoloe_confidence: float = 0.25
     raw_yoloe_imgsz: int = 640
+    raw_diagnostic_image_interval_frames: int = 5
     raw_head_target_distance_m: float = 1.00
+    raw_head_approach_cutoff_m: float = 1.30
     raw_chest_target_distance_m: float = 0.80
+    raw_chest_approach_cutoff_m: float = 1.30
     raw_forward_tolerance_m: float = 0.10
     raw_lateral_tolerance_m: float = 0.10
     raw_min_linear_speed_m_s: float = 0.40
@@ -105,9 +108,9 @@ class BasePoseAgentConfig:
         self.target_prompt = str(self.target_prompt).strip()
         if not self.target_prompt:
             raise ValueError("target_prompt must be non-empty")
-        self.surface_prompt = str(self.surface_prompt).strip()
-        if not self.surface_prompt:
-            raise ValueError("surface_prompt must be non-empty")
+        self.yaw_align_target_prompt = str(self.yaw_align_target_prompt).strip()
+        if not self.yaw_align_target_prompt:
+            raise ValueError("yaw_align_target_prompt must be non-empty")
         for value, name in (
             (self.dual_match_tolerance_frames, "dual_match_tolerance_frames"),
             (self.dual_head_reacquire_frames, "dual_head_reacquire_frames"),
@@ -121,16 +124,38 @@ class BasePoseAgentConfig:
         for value, name in (
             (self.raw_head_target_distance_m, "raw_head_target_distance_m"),
             (
+                self.raw_head_approach_cutoff_m,
+                "raw_head_approach_cutoff_m",
+            ),
+            (
                 self.raw_chest_target_distance_m,
                 "raw_chest_target_distance_m",
+            ),
+            (
+                self.raw_chest_approach_cutoff_m,
+                "raw_chest_approach_cutoff_m",
             ),
             (self.raw_forward_tolerance_m, "raw_forward_tolerance_m"),
             (self.raw_lateral_tolerance_m, "raw_lateral_tolerance_m"),
         ):
             if not math.isfinite(value) or value <= 0.0:
                 raise ValueError(f"{name} must be finite and positive")
+        if self.raw_head_approach_cutoff_m <= self.raw_head_target_distance_m:
+            raise ValueError(
+                "raw_head_approach_cutoff_m must exceed "
+                "raw_head_target_distance_m"
+            )
+        if self.raw_chest_approach_cutoff_m <= self.raw_chest_target_distance_m:
+            raise ValueError(
+                "raw_chest_approach_cutoff_m must exceed "
+                "raw_chest_target_distance_m"
+            )
         if self.raw_post_stop_sample_frames < 0:
             raise ValueError("raw_post_stop_sample_frames must be non-negative")
+        if self.raw_diagnostic_image_interval_frames < 0:
+            raise ValueError(
+                "raw_diagnostic_image_interval_frames must be non-negative"
+            )
         if not (
             self.raw_post_stop_sample_frames == 0
             or 0 < self.raw_post_stop_deviation_frames
@@ -279,7 +304,7 @@ class GatewayRawServoAdapter:
         skill_id: int = 0,
         segment_id: int = 0,
         target: object | None = None,
-        surface: object | None = None,
+        yaw_align_target: object | None = None,
         reference_bbox: object | None = None,
         now: float | None = None,
     ) -> bool:
@@ -325,18 +350,18 @@ class GatewayRawServoAdapter:
                 )
                 return False
             self.runtime.config.target_prompt = normalized_target
-        if surface is not None:
-            normalized_surface = str(surface).strip()
-            if not normalized_surface:
+        if yaw_align_target is not None:
+            normalized_yaw_align_target = str(yaw_align_target).strip()
+            if not normalized_yaw_align_target:
                 self._reject_start(
                     generation=requested_generation,
                     skill_id=requested_skill_id,
                     segment_id=requested_segment_id,
-                    reason="empty_surface",
+                    reason="empty_yaw_align_target",
                     clear_gateway_owner=True,
                 )
                 return False
-            self.runtime.config.surface_prompt = normalized_surface
+            self.runtime.config.yaw_align_target_prompt = normalized_yaw_align_target
         self.task_generation = requested_generation
         self.skill_id = requested_skill_id
         self.segment_id = requested_segment_id
@@ -457,6 +482,22 @@ class GatewayRawServoAdapter:
     def shutdown(self) -> None:
         self._publish_enabled = False
         self.runtime.shutdown()
+
+
+def _dual_worker_kwargs(adapter: Any, camera: Any) -> dict[str, Any]:
+    """Build callbacks whose names must match the dual-worker contract."""
+
+    return {
+        "observation_events": adapter.runtime.observation_events,
+        "diagnostics": adapter.runtime.diagnostics,
+        "camera_factory": lambda: camera,
+        "yaw_alignment_required": (
+            lambda: adapter.runtime.controller.yaw_alignment_required
+        ),
+        "position_fallback_allowed": (
+            lambda: adapter.runtime.controller.position_fallback_allowed
+        ),
+    }
 
 
 def run_base_pose_yolo_agent(config: Any) -> None:
@@ -580,15 +621,7 @@ def run_base_pose_yolo_agent(config: Any) -> None:
         f"chest={config.dual_chest_camera_stream}/"
         f"{config.dual_chest_depth_stream}"
     )
-    worker_kwargs: dict[str, Any] = {
-        "observation_events": adapter.runtime.observation_events,
-        "diagnostics": adapter.runtime.diagnostics,
-        "camera_factory": lambda: camera,
-        "table_required": lambda: adapter.runtime.controller.table_required,
-        "position_fallback_allowed": (
-            lambda: adapter.runtime.controller.position_fallback_allowed
-        ),
-    }
+    worker_kwargs = _dual_worker_kwargs(adapter, camera)
     worker = threading.Thread(
         target=run_dual_raw_servo_worker,
         args=(
@@ -623,7 +656,7 @@ def run_base_pose_yolo_agent(config: Any) -> None:
                         skill_id=int(command.parameters.get("skill_id", 0)),
                         segment_id=int(command.parameters.get("segment_id", 0)),
                         target=command.parameters.get("target"),
-                        surface=command.parameters.get("surface"),
+                        yaw_align_target=command.parameters.get("yaw_align_target"),
                         reference_bbox=command.parameters.get("reference_bbox"),
                     )
                 else:

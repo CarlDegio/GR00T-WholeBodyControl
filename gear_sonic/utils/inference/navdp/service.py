@@ -52,6 +52,30 @@ from gear_sonic.utils.planner_control import build_planner_velocity_message
 LOGGER = logging.getLogger("sonic.navdp")
 
 
+def _navigation_status_payload(
+    state: _NavDPRuntimeState,
+    status_state: str,
+    reason: str,
+) -> dict[str, object]:
+    """Build one additive-v1 status payload from the current NavDP state."""
+
+    payload: dict[str, object] = {
+        "type": STATUS_TYPE,
+        "version": 1,
+        "generation": state.generation,
+        "skill_id": state.skill_id,
+        "segment_id": state.segment_id,
+        "state": status_state,
+        "reason": reason,
+    }
+    if status_state == "reached" and state.world_goal is not None:
+        payload["goal_world"] = {
+            "x": float(state.world_goal[0]),
+            "y": float(state.world_goal[1]),
+        }
+    return payload
+
+
 def main(config: NavDPPlannerConfig) -> None:
     service = InferenceServiceContext("navdp", config)
     profile = service.profile
@@ -129,17 +153,7 @@ def main(config: NavDPPlannerConfig) -> None:
         )
 
     def send_status(status_state: str, reason: str) -> None:
-        status.send_json(
-            {
-                "type": STATUS_TYPE,
-                "version": 1,
-                "generation": state.generation,
-                "skill_id": state.skill_id,
-                "segment_id": state.segment_id,
-                "state": status_state,
-                "reason": reason,
-            }
-        )
+        status.send_json(_navigation_status_payload(state, status_state, reason))
         LOGGER.log(
             logging.ERROR if status_state == "failed" else logging.INFO,
             "navigation status=%s generation=%d segment=%d reason=%s",

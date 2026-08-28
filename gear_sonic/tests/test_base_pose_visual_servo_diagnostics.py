@@ -1,9 +1,14 @@
 from __future__ import annotations
 
+from dataclasses import replace
 import json
+
+import cv2
+import numpy as np
 
 from gear_sonic.utils.inference.base_pose.diagnostics import (
     AsyncFrameDiagnosticsWriter,
+    CameraImageData,
     DetectionFrameData,
     FrameDiagnosticsWriter,
 )
@@ -55,6 +60,53 @@ def test_writer_creates_only_jsonl(tmp_path) -> None:
     assert "annotated_image" not in record
 
 
+def test_writer_saves_sampled_camera_rgb_with_mask_and_head_lines(
+    tmp_path,
+) -> None:
+    rgb = np.zeros((40, 60, 3), dtype=np.uint8)
+    mask = np.zeros((40, 60), dtype=np.uint8)
+    mask[22:34, 20:40] = 1
+    head = CameraImageData(
+        camera_stream="ego_view",
+        camera_timestamp=12.5,
+        rgb=rgb,
+        target_mask=mask,
+        candidate_lines_px=(((5.0, 6.0), (54.0, 6.0)),),
+        selected_line_px=((5.0, 12.0), (54.0, 12.0)),
+    )
+    chest = CameraImageData(
+        camera_stream="chest_view",
+        camera_timestamp=12.6,
+        rgb=np.full_like(rgb, 32),
+    )
+    writer = FrameDiagnosticsWriter(tmp_path)
+    writer.write(
+        replace(_frame(5), camera_images=(head, chest)),
+        control_applied=False,
+        controller_state=None,
+        command=None,
+    )
+
+    record = json.loads((tmp_path / "raw_servo_frames.jsonl").read_text())
+    assert [item["camera_stream"] for item in record["image_artifacts"]] == [
+        "ego_view",
+        "chest_view",
+    ]
+    assert record["image_artifacts"][0]["target_mask"]
+    assert record["image_artifacts"][0]["candidate_line_count"] == 1
+    assert record["image_artifacts"][0]["selected_line"]
+
+    head_path = tmp_path / "diagnostic_images/ego_view/frame_000005.jpg"
+    chest_path = tmp_path / "diagnostic_images/chest_view/frame_000005.jpg"
+    assert head_path.is_file()
+    assert chest_path.is_file()
+    annotated = cv2.cvtColor(cv2.imread(str(head_path)), cv2.COLOR_BGR2RGB)
+    # Selected line is green and the target mask is a magenta overlay.
+    assert int(annotated[12, 30, 1]) > int(annotated[12, 30, 0])
+    assert int(annotated[28, 30, 0]) > int(annotated[28, 30, 1])
+    assert int(annotated[28, 30, 2]) > int(annotated[28, 30, 1])
+
+
 def test_async_writer_failure_does_not_stop_later_frames(tmp_path) -> None:
     written: list[int] = []
     logs: list[str] = []
@@ -83,3 +135,31 @@ def test_async_writer_failure_does_not_stop_later_frames(tmp_path) -> None:
     assert written == [1]
     assert len(logs) == 1
     assert "continuing with later frames" in logs[0]
+
+
+def test_async_writer_saves_initial_camera_images_without_control_frame(
+    tmp_path,
+) -> None:
+    diagnostics = AsyncFrameDiagnosticsWriter()
+    diagnostics.submit_camera_images(
+        1,
+        tmp_path,
+        -1,
+        (
+            CameraImageData(
+                camera_stream="ego_view",
+                camera_timestamp=1.0,
+                rgb=np.zeros((4, 6, 3), dtype=np.uint8),
+            ),
+            CameraImageData(
+                camera_stream="chest_view",
+                camera_timestamp=1.1,
+                rgb=np.zeros((4, 6, 3), dtype=np.uint8),
+            ),
+        ),
+    )
+    diagnostics.close()
+
+    assert (tmp_path / "diagnostic_images/ego_view/initial.jpg").is_file()
+    assert (tmp_path / "diagnostic_images/chest_view/initial.jpg").is_file()
+    assert not (tmp_path / "raw_servo_frames.jsonl").exists()

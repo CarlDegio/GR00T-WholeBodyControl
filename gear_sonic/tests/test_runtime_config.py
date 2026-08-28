@@ -38,8 +38,8 @@ def test_default_profile_reproduces_current_topology_and_timing() -> None:
     assert profile.component("vla") == {
         "embodiment_tag": "unitree_g1_sonic",
         "prompt": (
-            "Move in front of the desk with the blue basket, grasp the medicine "
-            "bottle, and place it into the blue basket."
+            "Grasp the empty cardboard box, lift it, place it securely onto "
+            "the handcart, and release it."
         ),
         "inference_hz": 2.0,
         "action_publish_rate": 50,

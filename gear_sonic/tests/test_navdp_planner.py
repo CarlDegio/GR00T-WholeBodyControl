@@ -47,7 +47,15 @@ from gear_sonic.utils.inference.navdp.navigation import (
     local_trajectory_to_world,
     update_slam_map,
 )
-from gear_sonic.utils.inference.navdp.service import _fresh_sonic_yaw
+from gear_sonic.utils.inference.navdp.runtime import (
+    _NavDPRuntimeState,
+    _NavDPSensorCycle,
+    _schedule_navigation_inference,
+)
+from gear_sonic.utils.inference.navdp.service import (
+    _fresh_sonic_yaw,
+    _navigation_status_payload,
+)
 from gear_sonic.utils.inference.navdp.visualization import (
     _VIZ_CENTER,
     actor_ray_from_points,
@@ -481,6 +489,55 @@ def test_world_goal_remains_fixed_as_robot_moves_and_rotates() -> None:
     assert local_goal_from_world(world, Pose2D(1.0, 3.0, np.pi / 2)) == pytest.approx(
         (1.0, 0.0)
     )
+
+
+def test_reached_status_returns_navdp_fixed_fastlio_world_goal() -> None:
+    config = load_navdp_planner_config()
+    state = _NavDPRuntimeState(
+        generation=8,
+        skill_id=3,
+        segment_id=11,
+        mode="nav_goal",
+        world_goal=(4.25, -1.5),
+    )
+    cycle = _NavDPSensorCycle(
+        pose=Pose2D(3.0, -1.5, math.pi / 2.0),
+        pose_time=1.0,
+        pose_history=[],
+        slam_map_xy=np.empty((0, 2), dtype=np.float32),
+        robot_history=np.empty((0, 2), dtype=np.float32),
+    )
+    statuses = []
+
+    def send_status(status_state, reason, **fields):
+        statuses.append((status_state, reason, fields))
+
+    _schedule_navigation_inference(
+        state,
+        cycle,
+        config=config,
+        infer=lambda *_args: pytest.fail("goal within tolerance must not infer"),
+        send_status=send_status,
+    )
+
+    assert state.mode == "stop"
+    assert statuses == [(
+        "reached",
+        "goal_within_2m",
+        {},
+    )]
+    assert _navigation_status_payload(
+        state, statuses[0][0], statuses[0][1]
+    ) == {
+        "type": "sonic_navigation_status",
+        "version": 1,
+        "generation": 8,
+        "skill_id": 3,
+        "segment_id": 11,
+        "state": "reached",
+        "reason": "goal_within_2m",
+        "goal_world": {"x": 4.25, "y": -1.5},
+    }
 
 
 def test_livox_filter_uses_translation_without_legacy_yaw_rotation() -> None:

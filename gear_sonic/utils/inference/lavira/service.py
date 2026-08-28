@@ -71,6 +71,7 @@ class LaviraRuntimeEventHandler(logging.Handler):
 @dataclass
 class LaviraPlannerConfig:
     mission: str
+    alignment_prompt: str
     global_target: str = ""
     navigation_mode: Literal["vln", "object_nav"] = "object_nav"
     manipulation_prompt: str = ""
@@ -102,7 +103,7 @@ class LaviraPlannerConfig:
     manipulation_window_seconds: float = 5.0
     manipulation_max_windows: int = 12
     manipulation_timeout_seconds: float = 180.0
-    vla_start_timeout_seconds: float = 6.0
+    vla_start_timeout_seconds: float = 25.0
     profile: str = ""
     overlay: tuple[str, ...] = ()
 
@@ -114,6 +115,9 @@ class LaviraPlannerConfig:
         self.global_target = self.global_target.strip()
         if not self.manipulation_prompt.strip():
             self.manipulation_prompt = self.mission
+        self.alignment_prompt = self.alignment_prompt.strip()
+        if not self.alignment_prompt:
+            raise ValueError("components.lavira.alignment_prompt is required")
         if self.max_steps <= 0 or self.history_size <= 0:
             raise ValueError("LaViRA max_steps and history_size must be positive")
         if (
@@ -484,6 +488,7 @@ def _agent(
         mission=config.mission,
         global_target=config.global_target,
         manipulation_prompt=config.manipulation_prompt,
+        alignment_prompt=config.alignment_prompt,
         max_steps=config.max_steps,
         history_size=config.history_size,
         min_confidence=config.min_confidence,

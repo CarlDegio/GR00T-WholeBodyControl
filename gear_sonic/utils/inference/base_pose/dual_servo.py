@@ -26,24 +26,100 @@ from gear_sonic.utils.inference.base_pose.servo import (
     RawServoCalibration,
     RawServoEvent,
     RawServoObservation,
-    TableGeometry,
+    YawAlignGeometry,
     TrackedInstance,
     YoloePersistentTracker,
     _diagnostic_frame,
     _observation,
+    _prompts_match,
     _publish_worker_event,
+    _rgb_edge_line_segments,
+    _select_nearest_pixel_segment,
     _resolve_target,
-    _surface_geometry_components,
+    _yaw_align_target_geometry_components,
 )
 from gear_sonic.utils.inference.base_pose.diagnostics import (
     AsyncFrameDiagnosticsWriter,
+    CameraImageData,
 )
 
 JOINT_CHEST_LOSS_GRACE_FRAMES = 5
 JOINT_CHEST_LOSS_ZERO_HOLD_FRAMES = 5
 JOINT_HEAD_YAW_LOSS_GRACE_FRAMES = 10
 JOINT_HEAD_YAW_LOSS_ZERO_HOLD_FRAMES = 10
-TEXT_PROMPT_MODE = "target_text_surface_text"
+TEXT_PROMPT_MODE = "target_text_yaw_align_target_text"
+
+
+def _camera_image_data(
+    stream_name: str,
+    snapshot: AlignedRGBDSnapshot,
+    *,
+    target: TrackedInstance | None = None,
+    edge_intersection: np.ndarray | None = None,
+    selected_yaw_align_geometry: YawAlignGeometry | None = None,
+) -> CameraImageData:
+    """Copy one sampled RGB frame plus same-frame perception annotations."""
+
+    candidate_lines: tuple[
+        tuple[tuple[float, float], tuple[float, float]], ...
+    ] = ()
+    if (
+        edge_intersection is not None
+        and snapshot.depth_raw is not None
+        and snapshot.depth_scale_m is not None
+    ):
+        depth_valid_segments = []
+        for segment in _rgb_edge_line_segments(edge_intersection):
+            try:
+                _select_nearest_pixel_segment(
+                    [segment],
+                    depth_raw=snapshot.depth_raw,
+                    depth_scale_m=snapshot.depth_scale_m,
+                )
+            except ValueError:
+                continue
+            depth_valid_segments.append(segment)
+        candidate_lines = tuple(
+            (
+                tuple(float(value) for value in segment.endpoint_a),
+                tuple(float(value) for value in segment.endpoint_b),
+            )
+            for segment in depth_valid_segments
+        )
+    selected_line = (
+        None
+        if selected_yaw_align_geometry is None
+        else selected_yaw_align_geometry.line_endpoints_px
+    )
+    return CameraImageData(
+        camera_stream=str(stream_name),
+        camera_timestamp=float(snapshot.timestamp),
+        rgb=np.asarray(snapshot.rgb).copy(),
+        target_mask=(
+            None if target is None else np.asarray(target.mask).copy()
+        ),
+        candidate_lines_px=candidate_lines,
+        selected_line_px=selected_line,
+    )
+
+
+def _peek_diagnostic_snapshots(
+    camera: Any,
+    stream_names: Sequence[str],
+    latest_by_stream: dict[str, AlignedRGBDSnapshot],
+) -> None:
+    """Refresh diagnostic RGBs without advancing inference stream cursors."""
+
+    peek_stream = getattr(camera, "peek_stream", None)
+    if not callable(peek_stream):
+        return
+    for stream_name in stream_names:
+        try:
+            snapshot = peek_stream(stream_name)
+        except Exception:
+            continue
+        if snapshot is not None:
+            latest_by_stream[stream_name] = snapshot
 
 
 def _joint_head_yaw_loss_details(missing_frames: int) -> dict[str, Any]:
@@ -225,6 +301,8 @@ def detect_dual_camera_eligibility(
     *,
     tracker: Any,
     logger: Callable[[str], None] = print,
+    targets_out: dict[str, TrackedInstance | None] | None = None,
+    yaw_align_targets_out: dict[str, TrackedInstance | None] | None = None,
 ) -> tuple[set[str], dict[str, str]]:
     """Select initial cameras using fixed-text YOLOE detections only."""
 
@@ -232,7 +310,7 @@ def detect_dual_camera_eligibility(
     prompt_artifact = tracker.start_all_text(target_prompt=target_prompt)
     logger(
         "[RawServo] YOLOE prompt "
-        f"target={target_prompt!r} surface={config.surface_prompt!r} "
+        f"target={target_prompt!r} yaw_align_target={config.yaw_align_target_prompt!r} "
         f"tracker={prompt_artifact}"
     )
 
@@ -242,6 +320,8 @@ def detect_dual_camera_eligibility(
         snapshot = snapshots.get(stream_name)
         if snapshot is None:
             continue
+        target: TrackedInstance | None = None
+        yaw_align_target: TrackedInstance | None = None
         try:
             calibrations[stream_name].validate_snapshot(snapshot)
             # Head and chest are independent views, not consecutive video
@@ -250,6 +330,15 @@ def detect_dual_camera_eligibility(
             tracker.reset_tracking()
             instances = list(tracker.track(snapshot.rgb))
             target = _best_instance(instances, 0)
+            reuse_target = _prompts_match(
+                target_prompt,
+                config.yaw_align_target_prompt,
+            )
+            yaw_align_target = (
+                target
+                if reuse_target
+                else _best_instance(instances, 1)
+            )
             if target is None:
                 raise RuntimeError(
                     f"YOLOE text prompt {target_prompt!r} found no target"
@@ -260,7 +349,9 @@ def detect_dual_camera_eligibility(
                 f"track_id={target.track_id} confidence={target.confidence:.4f} "
                 f"bbox={target.bbox_xyxy} "
                 f"target_candidates={sum(item.class_index == 0 for item in instances)} "
-                f"surface_candidates={sum(item.class_index == 1 for item in instances)}"
+                "yaw_align_target_candidates="
+                f"{sum(item.class_index == (0 if reuse_target else 1) for item in instances)} "
+                f"yaw_align_target_reuses_target={reuse_target}"
             )
             eligible_streams.add(stream_name)
         except Exception as exc:
@@ -269,6 +360,11 @@ def detect_dual_camera_eligibility(
                 "[RawServo] YOLOE initial detection "
                 f"stream={stream_name} eligible=false error={exc}"
             )
+        finally:
+            if targets_out is not None:
+                targets_out[stream_name] = target
+            if yaw_align_targets_out is not None:
+                yaw_align_targets_out[stream_name] = yaw_align_target
     return eligible_streams, errors
 
 
@@ -284,23 +380,27 @@ def _select_tracked_instances(
     instances: Sequence[TrackedInstance],
     *,
     target_id: int | None,
-    surface_id: int | None,
+    yaw_align_target_id: int | None,
+    reuse_target_as_yaw_align_target: bool = False,
 ) -> tuple[TrackedInstance | None, TrackedInstance | None, bool, bool]:
     if target_id is None:
         target = _best_instance(instances, 0)
         target_reacquired = False
     else:
         target, target_reacquired, _ = _resolve_target(instances, target_id)
-    if surface_id is None:
-        surface = _best_instance(instances, 1)
-        surface_reacquired = False
+    if reuse_target_as_yaw_align_target:
+        yaw_align_target = target
+        yaw_align_target_reacquired = target_reacquired
+    elif yaw_align_target_id is None:
+        yaw_align_target = _best_instance(instances, 1)
+        yaw_align_target_reacquired = False
     else:
-        surface, surface_reacquired, _ = _resolve_target(
+        yaw_align_target, yaw_align_target_reacquired, _ = _resolve_target(
             instances,
-            surface_id,
+            yaw_align_target_id,
             class_index=1,
         )
-    return target, surface, target_reacquired, surface_reacquired
+    return target, yaw_align_target, target_reacquired, yaw_align_target_reacquired
 
 
 def _observe_tracked_snapshot(
@@ -309,9 +409,10 @@ def _observe_tracked_snapshot(
     calibration: RawServoCalibration,
     *,
     target_id: int | None,
-    surface_id: int | None,
-    require_table: bool,
-    include_table_geometry: bool = True,
+    yaw_align_target_id: int | None,
+    require_yaw_align_geometry: bool,
+    include_yaw_align_geometry: bool = True,
+    reuse_target_as_yaw_align_target: bool = False,
 ) -> tuple[
     TrackedInstance,
     TrackedInstance | None,
@@ -322,34 +423,36 @@ def _observe_tracked_snapshot(
     """Build one observation while keeping IDs local to one camera stream."""
     calibration.validate_snapshot(snapshot)
     instances = list(tracker.track(snapshot.rgb))
-    target, surface, target_reacquired, surface_reacquired = (
+    target, yaw_align_target, target_reacquired, yaw_align_target_reacquired = (
         _select_tracked_instances(
             instances,
             target_id=target_id,
-            surface_id=surface_id,
+            yaw_align_target_id=yaw_align_target_id,
+            reuse_target_as_yaw_align_target=reuse_target_as_yaw_align_target,
         )
     )
     if target is None:
         raise ValueError("missing tracked target")
-    if surface is None and require_table:
-        raise ValueError("missing tracked table")
+    if yaw_align_target is None and require_yaw_align_geometry:
+        raise ValueError("missing tracked yaw-align target")
     observation = _observation(
         snapshot,
         target,
-        surface,
+        yaw_align_target,
         calibration,
-        include_table_geometry=include_table_geometry,
+        include_yaw_align_geometry=include_yaw_align_geometry,
+        exclude_target_from_yaw_align_edge=not reuse_target_as_yaw_align_target,
     )
-    if observation.table is None and require_table:
+    if observation.yaw_align_geometry is None and require_yaw_align_geometry:
         raise ValueError(
-            observation.table_geometry_error or "missing table geometry"
+            observation.yaw_align_geometry_error or "missing yaw-align geometry"
         )
     return (
         target,
-        surface,
+        yaw_align_target,
         observation,
         target_reacquired,
-        surface_reacquired,
+        yaw_align_target_reacquired,
     )
 
 
@@ -367,47 +470,60 @@ def _observe_head_yaw_snapshot(
     calibration: RawServoCalibration,
     *,
     target_id: int | None,
-    surface_id: int | None,
+    yaw_align_target_id: int | None,
+    reuse_target_as_yaw_align_target: bool = False,
 ) -> tuple[
     TrackedInstance | None,
     TrackedInstance | None,
-    TableGeometry | None,
+    YawAlignGeometry | None,
     np.ndarray | None,
     np.ndarray | None,
     str | None,
 ]:
-    """Measure live head-camera desk yaw without requiring a head basket."""
+    """Measure yaw from the live head-camera yaw-align target."""
     calibration.validate_snapshot(snapshot)
     instances = list(tracker.track(snapshot.rgb))
-    target, surface, _, _ = (
+    target, yaw_align_target, _, _ = (
         _select_tracked_instances(
             instances,
             target_id=target_id,
-            surface_id=surface_id,
+            yaw_align_target_id=yaw_align_target_id,
+            reuse_target_as_yaw_align_target=reuse_target_as_yaw_align_target,
         )
     )
-    if surface is None:
+    if yaw_align_target is None:
         return (
             target,
             None,
             None,
             None,
             None,
-            "missing tracked desk for live head yaw",
+            "missing tracked yaw-align target for live head yaw",
         )
-    table, table_error, desk_mask, table_rgb_edges = _surface_geometry_components(
+    (
+        yaw_align_geometry,
+        yaw_align_geometry_error,
+        completed_yaw_align_target_mask,
+        yaw_align_target_rgb_edges,
+    ) = _yaw_align_target_geometry_components(
         snapshot,
-        surface,
+        yaw_align_target,
         calibration,
-        target_mask=None if target is None else target.mask,
+        target_mask=(
+            None
+            if target is None or reuse_target_as_yaw_align_target
+            else target.mask
+        ),
     )
     return (
         target,
-        surface,
-        table,
-        desk_mask,
-        table_rgb_edges,
-        None if table is not None else table_error or "missing live head desk geometry",
+        yaw_align_target,
+        yaw_align_geometry,
+        completed_yaw_align_target_mask,
+        yaw_align_target_rgb_edges,
+        None
+        if yaw_align_geometry is not None
+        else yaw_align_geometry_error or "missing live head yaw-align geometry",
     )
 
 
@@ -417,7 +533,7 @@ class HeadCameraMonitorResult:
 
     triggered: bool
     target: TrackedInstance | None
-    surface: TrackedInstance | None
+    yaw_align_target: TrackedInstance | None
 
 
 class HeadCameraTextMonitor:
@@ -430,6 +546,7 @@ class HeadCameraTextMonitor:
         *,
         required_target_frames: int = 1,
         release_missing_frames: int = 3,
+        reuse_target_as_yaw_align_target: bool = False,
     ):
         required = int(required_target_frames)
         release_missing = int(release_missing_frames)
@@ -444,6 +561,7 @@ class HeadCameraTextMonitor:
         self.tracker = tracker
         self.required_target_frames = required
         self.release_missing_frames = release_missing
+        self.reuse_target_as_yaw_align_target = bool(reuse_target_as_yaw_align_target)
         self.target_streak = 0
         self.missing_streak = 0
         self.hold_active = False
@@ -471,7 +589,11 @@ class HeadCameraTextMonitor:
     ) -> HeadCameraMonitorResult:
         instances = list(self.tracker.track(snapshot.rgb))
         target = _best_instance(instances, 0)
-        surface = _best_instance(instances, 1)
+        yaw_align_target = (
+            target
+            if self.reuse_target_as_yaw_align_target
+            else _best_instance(instances, 1)
+        )
         if target is None:
             self.note_missing_frame()
         else:
@@ -484,7 +606,7 @@ class HeadCameraTextMonitor:
                 and self.target_streak >= self.required_target_frames
             ),
             target=target,
-            surface=surface,
+            yaw_align_target=yaw_align_target,
         )
 
 
@@ -496,12 +618,13 @@ def _capture_head_yaw(
     tracker: Any,
     calibration: RawServoCalibration,
     target_id: int | None,
-    surface_id: int | None,
+    yaw_align_target_id: int | None,
+    reuse_target_as_yaw_align_target: bool = False,
 ) -> tuple[
     AlignedRGBDSnapshot | None,
     TrackedInstance | None,
     TrackedInstance | None,
-    TableGeometry | None,
+    YawAlignGeometry | None,
     np.ndarray | None,
     np.ndarray | None,
     str | None,
@@ -509,19 +632,20 @@ def _capture_head_yaw(
     snapshot: AlignedRGBDSnapshot | None = None
     try:
         snapshot = camera.capture_stream(stream_name, timeout_ms=timeout_ms)
-        target, surface, table, desk_mask, edges, error = (
+        target, yaw_align_target, yaw_align_geometry, completed_yaw_align_target_mask, edges, error = (
             _observe_head_yaw_snapshot(
                 snapshot,
                 tracker,
                 calibration,
                 target_id=target_id,
-                surface_id=surface_id,
+                yaw_align_target_id=yaw_align_target_id,
+                reuse_target_as_yaw_align_target=reuse_target_as_yaw_align_target,
             )
         )
     except Exception as exc:
-        target = surface = table = desk_mask = edges = None
+        target = yaw_align_target = yaw_align_geometry = completed_yaw_align_target_mask = edges = None
         error = str(exc)
-    return snapshot, target, surface, table, desk_mask, edges, error
+    return snapshot, target, yaw_align_target, yaw_align_geometry, completed_yaw_align_target_mask, edges, error
 
 
 def _claim_new_stream_snapshot(
@@ -602,7 +726,7 @@ def run_dual_raw_servo_worker(
     observation_events: queue.Queue[RawServoEvent] | None = None,
     diagnostics: AsyncFrameDiagnosticsWriter | None = None,
     camera_factory: Callable[[], Any],
-    table_required: Callable[[], bool],
+    yaw_alignment_required: Callable[[], bool],
     position_fallback_allowed: Callable[[], bool],
     tracker_factory: Callable[[], Any] | None = None,
     head_monitor_tracker_factory: Callable[[], Any] | None = None,
@@ -625,14 +749,18 @@ def run_dual_raw_servo_worker(
         str(config.dual_head_camera_stream),
         str(config.dual_chest_camera_stream),
     )
-    surface_prompt = ""
+    yaw_align_target_prompt = ""
     target_prompt = ""
+    reuse_target_as_yaw_align_target = False
     tolerance = config.dual_match_tolerance_frames
     head_reacquire_frames = config.dual_head_reacquire_frames
     head_release_missing_frames = config.dual_head_release_missing_frames
+    diagnostic_image_interval = int(
+        getattr(config, "raw_diagnostic_image_interval_frames", 5)
+    )
     camera: Any | None = None
     tracker: Any | None = None
-    tracker_surface_prompt = ""
+    tracker_yaw_align_target_prompt = ""
     perception_pool = ThreadPoolExecutor(
         max_workers=2,
         thread_name_prefix="dual-raw-servo-perception",
@@ -649,12 +777,16 @@ def run_dual_raw_servo_worker(
             output_dir: Path | None = None
             try:
                 target_prompt = str(config.target_prompt).strip()
-                surface_prompt = str(config.surface_prompt).strip()
-                if not target_prompt or not surface_prompt:
-                    raise RuntimeError("dynamic target and surface prompts are required")
+                yaw_align_target_prompt = str(config.yaw_align_target_prompt).strip()
+                if not target_prompt or not yaw_align_target_prompt:
+                    raise RuntimeError("dynamic target and yaw_align_target prompts are required")
+                reuse_target_as_yaw_align_target = _prompts_match(
+                    target_prompt,
+                    yaw_align_target_prompt,
+                )
                 if tracker is None or (
                     tracker_factory is None
-                    and surface_prompt != tracker_surface_prompt
+                    and yaw_align_target_prompt != tracker_yaw_align_target_prompt
                 ):
                     tracker = (
                         tracker_factory()
@@ -664,10 +796,10 @@ def run_dual_raw_servo_worker(
                             confidence=config.raw_yoloe_confidence,
                             imgsz=config.raw_yoloe_imgsz,
                             device=config.raw_yoloe_device,
-                            surface_prompt=surface_prompt,
+                            yaw_align_target_prompt=yaw_align_target_prompt,
                         )
                     )
-                    tracker_surface_prompt = surface_prompt
+                    tracker_yaw_align_target_prompt = yaw_align_target_prompt
                     # A monitor with the old text embedding must not survive
                     # into a new ALIGN skill.
                     head_monitor_tracker = None
@@ -680,12 +812,15 @@ def run_dual_raw_servo_worker(
                 if camera is None:
                     camera = camera_factory()
                 initial_capture = camera.capture()
+                latest_snapshot_by_stream = dict(initial_capture.snapshots)
                 stamp = time.strftime("%Y%m%d_%H%M%S")
                 output_dir = (
                     Path(config.output_root).resolve()
                     / f"dual_raw_yoloe_{stamp}_g{generation}"
                 )
                 output_dir.mkdir(parents=True, exist_ok=False)
+                initial_targets: dict[str, TrackedInstance | None] = {}
+                initial_yaw_align_targets: dict[str, TrackedInstance | None] = {}
                 if eligibility_factory is not None:
                     eligible_streams, grounding_errors = eligibility_factory(
                         config,
@@ -701,8 +836,66 @@ def run_dual_raw_servo_worker(
                             calibrations,
                             tracker=tracker,
                             logger=logger,
+                            targets_out=initial_targets,
+                            yaw_align_targets_out=initial_yaw_align_targets,
                         )
                     )
+                if diagnostics is not None and diagnostic_image_interval > 0:
+                    try:
+                        initial_images: list[CameraImageData] = []
+                        for stream_name in stream_names:
+                            initial_snapshot = initial_capture.snapshots.get(
+                                stream_name
+                            )
+                            if initial_snapshot is None:
+                                continue
+                            initial_target = initial_targets.get(stream_name)
+                            initial_edge_intersection = None
+                            initial_yaw_align_geometry = None
+                            if (
+                                stream_name == stream_names[0]
+                                and initial_yaw_align_targets.get(stream_name) is not None
+                            ):
+                                (
+                                    initial_yaw_align_geometry,
+                                    _,
+                                    _,
+                                    initial_edge_intersection,
+                                ) = _yaw_align_target_geometry_components(
+                                    initial_snapshot,
+                                    initial_yaw_align_targets[stream_name],
+                                    calibrations[stream_name],
+                                    target_mask=(
+                                        None
+                                        if (
+                                            initial_target is None
+                                            or reuse_target_as_yaw_align_target
+                                        )
+                                        else initial_target.mask
+                                    ),
+                                )
+                            initial_images.append(
+                                _camera_image_data(
+                                    stream_name,
+                                    initial_snapshot,
+                                    target=initial_target,
+                                    edge_intersection=(
+                                        initial_edge_intersection
+                                    ),
+                                    selected_yaw_align_geometry=initial_yaw_align_geometry,
+                                )
+                            )
+                        diagnostics.submit_camera_images(
+                            generation,
+                            output_dir,
+                            -1,
+                            tuple(initial_images),
+                        )
+                    except Exception as exc:
+                        logger(
+                            "[RawServo] WARNING initial diagnostic image "
+                            f"submit failed: {exc}"
+                        )
                 initial_errors = {
                     **dict(initial_capture.errors),
                     **grounding_errors,
@@ -755,7 +948,7 @@ def run_dual_raw_servo_worker(
                                     confidence=config.raw_yoloe_confidence,
                                     imgsz=config.raw_yoloe_imgsz,
                                     device=config.raw_yoloe_device,
-                                    surface_prompt=surface_prompt,
+                                    yaw_align_target_prompt=yaw_align_target_prompt,
                                 )
                         if attempt.live_stream == stream_names[1]:
                             if head_monitor_tracker is not None:
@@ -765,6 +958,9 @@ def run_dual_raw_servo_worker(
                                     required_target_frames=head_reacquire_frames,
                                     release_missing_frames=(
                                         head_release_missing_frames
+                                    ),
+                                    reuse_target_as_yaw_align_target=(
+                                        reuse_target_as_yaw_align_target
                                     ),
                                 )
                                 head_monitor.start()
@@ -810,9 +1006,9 @@ def run_dual_raw_servo_worker(
                     invalid_frames = 0
                     initialized = False
                     target_id: int | None = None
-                    surface_id: int | None = None
+                    yaw_align_target_id: int | None = None
                     fallback_target_id: int | None = None
-                    fallback_surface_id: int | None = None
+                    fallback_yaw_align_target_id: int | None = None
                     position_source_stream = attempt.live_stream
                     joint_chest_tracking_active = False
                     joint_chest_missing_frames = 0
@@ -827,30 +1023,31 @@ def run_dual_raw_servo_worker(
                     ):
                         snapshot: AlignedRGBDSnapshot | None = None
                         target: TrackedInstance | None = None
-                        surface: TrackedInstance | None = None
+                        yaw_align_target: TrackedInstance | None = None
                         observation = None
                         hard_failure = False
                         target_reacquired = False
-                        surface_reacquired = False
+                        yaw_align_target_reacquired = False
                         monitor_details: dict[str, Any] = {}
                         basket_source_details: dict[str, Any] = {}
                         yaw_source_details: dict[str, Any] = {}
                         head_snapshot: AlignedRGBDSnapshot | None = None
                         live_head_snapshot: AlignedRGBDSnapshot | None = None
                         live_head_target: TrackedInstance | None = None
-                        live_head_surface: TrackedInstance | None = None
-                        live_head_table: TableGeometry | None = None
-                        live_head_desk_mask: np.ndarray | None = None
-                        live_head_table_rgb_edges: np.ndarray | None = None
+                        live_head_yaw_align_target: TrackedInstance | None = None
+                        live_head_yaw_align_geometry: YawAlignGeometry | None = None
+                        live_head_completed_yaw_align_target_mask: np.ndarray | None = None
+                        live_head_yaw_align_target_rgb_edges: np.ndarray | None = None
                         live_head_yaw_error: str | None = None
                         monitor_result: HeadCameraMonitorResult | None = None
                         fallback_head_yaw_attempted = False
                         joint_chest_target_missing = False
+                        camera_images: tuple[CameraImageData, ...] = ()
                         chest_active = attempt.live_stream == stream_names[1]
-                        require_table = (
+                        require_yaw_align_geometry = (
                             False
                             if chest_active
-                            else bool(table_required())
+                            else bool(yaw_alignment_required())
                         )
                         fallback_allowed = (
                             attempt.live_stream == stream_names[0]
@@ -875,13 +1072,13 @@ def run_dual_raw_servo_worker(
                             if source_is_active
                             else fallback_target_id
                         )
-                        source_surface_id = (
-                            surface_id
+                        source_yaw_align_target_id = (
+                            yaw_align_target_id
                             if source_is_active
-                            else fallback_surface_id
+                            else fallback_yaw_align_target_id
                         )
                         previous_target_id = source_target_id
-                        previous_surface_id = source_surface_id
+                        previous_yaw_align_target_id = source_yaw_align_target_id
                         position_future: Any | None = None
                         parallel_started_at: float | None = None
                         head_branch_started_at: float | None = None
@@ -894,6 +1091,7 @@ def run_dual_raw_servo_worker(
                                     int(float(config.raw_camera_stale_s) * 1000.0),
                                 ),
                             )
+                            latest_snapshot_by_stream[control_source_stream] = snapshot
                             if not _claim_new_stream_snapshot(
                                 last_inference_timestamp_by_stream,
                                 control_source_stream,
@@ -919,9 +1117,12 @@ def run_dual_raw_servo_worker(
                                     source_tracker,
                                     calibrations[control_source_stream],
                                     target_id=source_target_id,
-                                    surface_id=source_surface_id,
-                                    require_table=False,
-                                    include_table_geometry=False,
+                                    yaw_align_target_id=source_yaw_align_target_id,
+                                    require_yaw_align_geometry=False,
+                                    include_yaw_align_geometry=False,
+                                    reuse_target_as_yaw_align_target=(
+                                        reuse_target_as_yaw_align_target
+                                    ),
                                 )
                             if (
                                 attempt.live_stream == stream_names[1]
@@ -937,6 +1138,9 @@ def run_dual_raw_servo_worker(
                                         raise BasePoseCameraError(
                                             "waiting for newer head-monitor RGB-D"
                                         )
+                                    latest_snapshot_by_stream[stream_names[0]] = (
+                                        head_snapshot
+                                    )
                                     calibrations[stream_names[0]].validate_snapshot(
                                         head_snapshot
                                     )
@@ -966,41 +1170,44 @@ def run_dual_raw_servo_worker(
                                         "error": str(exc),
                                     }
                                 else:
-                                    if monitor_result.surface is None:
+                                    if monitor_result.yaw_align_target is None:
                                         live_head_yaw_error = (
-                                            "missing tracked desk for live head yaw"
+                                            "missing tracked yaw-align target for live head yaw"
                                         )
                                     else:
                                         try:
                                             (
-                                                live_head_table,
+                                                live_head_yaw_align_geometry,
                                                 live_head_yaw_error,
-                                                live_head_desk_mask,
-                                                live_head_table_rgb_edges,
-                                            ) = _surface_geometry_components(
+                                                live_head_completed_yaw_align_target_mask,
+                                                live_head_yaw_align_target_rgb_edges,
+                                            ) = _yaw_align_target_geometry_components(
                                                 head_snapshot,
-                                                monitor_result.surface,
+                                                monitor_result.yaw_align_target,
                                                 calibrations[stream_names[0]],
                                                 target_mask=(
                                                     None
-                                                    if monitor_result.target is None
+                                                    if (
+                                                        monitor_result.target is None
+                                                        or reuse_target_as_yaw_align_target
+                                                    )
                                                     else monitor_result.target.mask
                                                 ),
                                             )
                                         except Exception as exc:
-                                            live_head_table = None
-                                            live_head_desk_mask = None
-                                            live_head_table_rgb_edges = None
+                                            live_head_yaw_align_geometry = None
+                                            live_head_completed_yaw_align_target_mask = None
+                                            live_head_yaw_align_target_rgb_edges = None
                                             live_head_yaw_error = str(exc)
                                     effective_hold = (
                                         head_monitor.hold_active
-                                        and live_head_table is None
+                                        and live_head_yaw_align_geometry is None
                                         and not joint_chest_tracking_active
                                     )
                                     monitor_state = {
                                         "status": (
                                             "joint_tracking"
-                                            if live_head_table is not None
+                                            if live_head_yaw_align_geometry is not None
                                             else "triggered"
                                             if monitor_result.triggered
                                             else "tracking"
@@ -1020,10 +1227,10 @@ def run_dual_raw_servo_worker(
                                         "hold_active": (
                                             effective_hold
                                         ),
-                                        "desk_detected": (
-                                            monitor_result.surface is not None
+                                        "yaw_align_target_detected": (
+                                            monitor_result.yaw_align_target is not None
                                         ),
-                                        "yaw_valid": live_head_table is not None,
+                                        "yaw_valid": live_head_yaw_align_geometry is not None,
                                         "yaw_error": live_head_yaw_error,
                                     }
                                 monitor_details["head_monitor"] = monitor_state
@@ -1055,7 +1262,7 @@ def run_dual_raw_servo_worker(
                                 if monitor_result is not None:
                                     if (
                                         monitor_result.triggered
-                                        and live_head_table is None
+                                        and live_head_yaw_align_geometry is None
                                         and not joint_chest_tracking_active
                                     ):
                                         preempt_attempt = (
@@ -1072,7 +1279,7 @@ def run_dual_raw_servo_worker(
                                             frame_index,
                                             head_snapshot,
                                             monitor_result.target,
-                                            monitor_result.surface,
+                                            monitor_result.yaw_align_target,
                                             None,
                                             kind="switching",
                                             error=failure_reason,
@@ -1098,10 +1305,10 @@ def run_dual_raw_servo_worker(
                                 (
                                     live_head_snapshot,
                                     live_head_target,
-                                    live_head_surface,
-                                    live_head_table,
-                                    live_head_desk_mask,
-                                    live_head_table_rgb_edges,
+                                    live_head_yaw_align_target,
+                                    live_head_yaw_align_geometry,
+                                    live_head_completed_yaw_align_target_mask,
+                                    live_head_yaw_align_target_rgb_edges,
                                     live_head_yaw_error,
                                 ) = _capture_head_yaw(
                                     camera,
@@ -1113,8 +1320,15 @@ def run_dual_raw_servo_worker(
                                     tracker=tracker,
                                     calibration=calibrations[stream_names[0]],
                                     target_id=target_id,
-                                    surface_id=surface_id,
+                                    yaw_align_target_id=yaw_align_target_id,
+                                    reuse_target_as_yaw_align_target=(
+                                        reuse_target_as_yaw_align_target
+                                    ),
                                 )
+                                if live_head_snapshot is not None:
+                                    latest_snapshot_by_stream[stream_names[0]] = (
+                                        live_head_snapshot
+                                    )
                                 head_branch_elapsed_ms = 1000.0 * (
                                     time.perf_counter() - head_branch_started_at
                                 )
@@ -1124,12 +1338,15 @@ def run_dual_raw_servo_worker(
                                     source_tracker,
                                     calibrations[control_source_stream],
                                     target_id=source_target_id,
-                                    surface_id=source_surface_id,
-                                    require_table=(
-                                        require_table if source_is_active else False
+                                    yaw_align_target_id=source_yaw_align_target_id,
+                                    require_yaw_align_geometry=(
+                                        require_yaw_align_geometry if source_is_active else False
                                     ),
-                                    include_table_geometry=(
+                                    include_yaw_align_geometry=(
                                         control_source_stream != stream_names[1]
+                                    ),
+                                    reuse_target_as_yaw_align_target=(
+                                        reuse_target_as_yaw_align_target
                                     ),
                                 )
                             else:
@@ -1151,14 +1368,14 @@ def run_dual_raw_servo_worker(
                                         time.perf_counter()
                                         - parallel_started_at
                                     ),
-                                    "chest_table_geometry_skipped": True,
+                                    "chest_yaw_align_geometry_skipped": True,
                                 }
                             (
                                 target,
-                                surface,
+                                yaw_align_target,
                                 observation,
                                 target_reacquired,
-                                surface_reacquired,
+                                yaw_align_target_reacquired,
                             ) = position_result
                             if attempt.live_stream == stream_names[0]:
                                 basket_source_details = {
@@ -1212,10 +1429,10 @@ def run_dual_raw_servo_worker(
                                     if alternate_is_active
                                     else fallback_target_id
                                 )
-                                alternate_surface_id = (
-                                    surface_id
+                                alternate_yaw_align_target_id = (
+                                    yaw_align_target_id
                                     if alternate_is_active
-                                    else fallback_surface_id
+                                    else fallback_yaw_align_target_id
                                 )
                                 try:
                                     fallback_snapshot = camera.capture_stream(
@@ -1228,21 +1445,27 @@ def run_dual_raw_servo_worker(
                                             ),
                                         ),
                                     )
+                                    latest_snapshot_by_stream[alternate_stream] = (
+                                        fallback_snapshot
+                                    )
                                     (
                                         fallback_target,
-                                        fallback_surface,
+                                        fallback_yaw_align_target,
                                         fallback_observation,
                                         fallback_target_reacquired,
-                                        fallback_surface_reacquired,
+                                        fallback_yaw_align_target_reacquired,
                                     ) = _observe_tracked_snapshot(
                                         fallback_snapshot,
                                         alternate_tracker,
                                         calibrations[alternate_stream],
                                         target_id=alternate_target_id,
-                                        surface_id=alternate_surface_id,
-                                        require_table=False,
-                                        include_table_geometry=(
+                                        yaw_align_target_id=alternate_yaw_align_target_id,
+                                        require_yaw_align_geometry=False,
+                                        include_yaw_align_geometry=(
                                             alternate_stream != stream_names[1]
+                                        ),
+                                        reuse_target_as_yaw_align_target=(
+                                            reuse_target_as_yaw_align_target
                                         ),
                                     )
                                 except Exception as fallback_exc:
@@ -1281,16 +1504,16 @@ def run_dual_raw_servo_worker(
                                         frame_index += 1
                                     snapshot = fallback_snapshot
                                     target = fallback_target
-                                    surface = fallback_surface
+                                    yaw_align_target = fallback_yaw_align_target
                                     observation = fallback_observation
                                     target_reacquired = (
                                         fallback_target_reacquired
                                     )
-                                    surface_reacquired = (
-                                        fallback_surface_reacquired
+                                    yaw_align_target_reacquired = (
+                                        fallback_yaw_align_target_reacquired
                                     )
                                     previous_target_id = alternate_target_id
-                                    previous_surface_id = alternate_surface_id
+                                    previous_yaw_align_target_id = alternate_yaw_align_target_id
                                     previous_source_stream = (
                                         control_source_stream
                                     )
@@ -1330,27 +1553,27 @@ def run_dual_raw_servo_worker(
                             not perception_error
                             and observation is not None
                             and attempt.live_stream == stream_names[1]
-                            and live_head_table is not None
+                            and live_head_yaw_align_geometry is not None
                             and head_snapshot is not None
                         ):
                             observation = replace(
                                 observation,
-                                table=live_head_table,
-                                table_geometry_error=None,
-                                desk_mask=live_head_desk_mask,
-                                table_rgb_edges=None,
-                                table_camera_stream=stream_names[0],
+                                yaw_align_geometry=live_head_yaw_align_geometry,
+                                yaw_align_geometry_error=None,
+                                completed_yaw_align_target_mask=live_head_completed_yaw_align_target_mask,
+                                yaw_align_target_rgb_edges=None,
+                                yaw_align_geometry_camera_stream=stream_names[0],
                             )
                             yaw_source_details = {
                                 "stream": stream_names[0],
                                 "realtime": True,
                                 "valid": True,
                                 "camera_timestamp": head_snapshot.timestamp,
-                                "surface_track_id": (
+                                "yaw_align_target_track_id": (
                                     None
                                     if monitor_result is None
-                                    or monitor_result.surface is None
-                                    else monitor_result.surface.track_id
+                                    or monitor_result.yaw_align_target is None
+                                    else monitor_result.yaw_align_target.track_id
                                 ),
                             }
                         elif (
@@ -1377,10 +1600,10 @@ def run_dual_raw_servo_worker(
                                 (
                                     live_head_snapshot,
                                     live_head_target,
-                                    live_head_surface,
-                                    live_head_table,
-                                    live_head_desk_mask,
-                                    live_head_table_rgb_edges,
+                                    live_head_yaw_align_target,
+                                    live_head_yaw_align_geometry,
+                                    live_head_completed_yaw_align_target_mask,
+                                    live_head_yaw_align_target_rgb_edges,
                                     live_head_yaw_error,
                                 ) = _capture_head_yaw(
                                     camera,
@@ -1392,13 +1615,20 @@ def run_dual_raw_servo_worker(
                                     tracker=tracker,
                                     calibration=calibrations[stream_names[0]],
                                     target_id=target_id,
-                                    surface_id=surface_id,
+                                    yaw_align_target_id=yaw_align_target_id,
+                                    reuse_target_as_yaw_align_target=(
+                                        reuse_target_as_yaw_align_target
+                                    ),
                                 )
+                                if live_head_snapshot is not None:
+                                    latest_snapshot_by_stream[stream_names[0]] = (
+                                        live_head_snapshot
+                                    )
                             if (
                                 live_head_yaw_error is not None
                                 or live_head_snapshot is None
-                                or live_head_surface is None
-                                or live_head_table is None
+                                or live_head_yaw_align_target is None
+                                or live_head_yaw_align_geometry is None
                             ):
                                 error = (
                                     live_head_yaw_error
@@ -1418,14 +1648,14 @@ def run_dual_raw_servo_worker(
                             else:
                                 if live_head_target is not None:
                                     target_id = live_head_target.track_id
-                                surface_id = live_head_surface.track_id
+                                yaw_align_target_id = live_head_yaw_align_target.track_id
                                 observation = replace(
                                     observation,
-                                    table=live_head_table,
-                                    table_geometry_error=None,
-                                    desk_mask=live_head_desk_mask,
-                                    table_rgb_edges=None,
-                                    table_camera_stream=stream_names[0],
+                                    yaw_align_geometry=live_head_yaw_align_geometry,
+                                    yaw_align_geometry_error=None,
+                                    completed_yaw_align_target_mask=live_head_completed_yaw_align_target_mask,
+                                    yaw_align_target_rgb_edges=None,
+                                    yaw_align_geometry_camera_stream=stream_names[0],
                                 )
                                 yaw_source_details = {
                                     "stream": stream_names[0],
@@ -1434,8 +1664,8 @@ def run_dual_raw_servo_worker(
                                     "camera_timestamp": (
                                         live_head_snapshot.timestamp
                                     ),
-                                    "surface_track_id": (
-                                        live_head_surface.track_id
+                                    "yaw_align_target_track_id": (
+                                        live_head_yaw_align_target.track_id
                                     ),
                                 }
                         elif (
@@ -1446,15 +1676,103 @@ def run_dual_raw_servo_worker(
                             yaw_source_details = {
                                 "stream": stream_names[0],
                                 "realtime": True,
-                                "valid": observation.table is not None,
+                                "valid": observation.yaw_align_geometry is not None,
                                 "camera_timestamp": snapshot.timestamp,
-                                "surface_track_id": (
+                                "yaw_align_target_track_id": (
                                     None
-                                    if surface is None
-                                    else surface.track_id
+                                    if yaw_align_target is None
+                                    else yaw_align_target.track_id
                                 ),
-                                "error": observation.table_geometry_error,
+                                "error": observation.yaw_align_geometry_error,
                             }
+
+                        if (
+                            diagnostics is not None
+                            and diagnostic_image_interval > 0
+                            and frame_index >= 0
+                            and frame_index % diagnostic_image_interval == 0
+                        ):
+                            _peek_diagnostic_snapshots(
+                                camera,
+                                stream_names,
+                                latest_snapshot_by_stream,
+                            )
+                            target_by_stream: dict[
+                                str, TrackedInstance | None
+                            ] = {}
+                            if snapshot is not None:
+                                latest_snapshot_by_stream[
+                                    control_source_stream
+                                ] = snapshot
+                                target_by_stream[control_source_stream] = target
+
+                            head_edge_intersection = None
+                            head_selected_yaw_align_geometry = None
+                            if head_snapshot is not None:
+                                latest_snapshot_by_stream[stream_names[0]] = (
+                                    head_snapshot
+                                )
+                                target_by_stream[stream_names[0]] = (
+                                    None
+                                    if monitor_result is None
+                                    else monitor_result.target
+                                )
+                                head_edge_intersection = (
+                                    live_head_yaw_align_target_rgb_edges
+                                )
+                                head_selected_yaw_align_geometry = live_head_yaw_align_geometry
+                            elif live_head_snapshot is not None:
+                                latest_snapshot_by_stream[stream_names[0]] = (
+                                    live_head_snapshot
+                                )
+                                target_by_stream[stream_names[0]] = (
+                                    live_head_target
+                                )
+                                head_edge_intersection = (
+                                    live_head_yaw_align_target_rgb_edges
+                                )
+                                head_selected_yaw_align_geometry = live_head_yaw_align_geometry
+                            elif (
+                                snapshot is not None
+                                and control_source_stream == stream_names[0]
+                            ):
+                                head_edge_intersection = (
+                                    None
+                                    if observation is None
+                                    else observation.yaw_align_target_rgb_edges
+                                )
+                                head_selected_yaw_align_geometry = (
+                                    None
+                                    if observation is None
+                                    else observation.yaw_align_geometry
+                                )
+
+                            sampled_images: list[CameraImageData] = []
+                            for stream_name in stream_names:
+                                camera_snapshot = (
+                                    latest_snapshot_by_stream.get(stream_name)
+                                )
+                                if camera_snapshot is None:
+                                    continue
+                                is_head = stream_name == stream_names[0]
+                                sampled_images.append(
+                                    _camera_image_data(
+                                        stream_name,
+                                        camera_snapshot,
+                                        target=target_by_stream.get(stream_name),
+                                        edge_intersection=(
+                                            head_edge_intersection
+                                            if is_head
+                                            else None
+                                        ),
+                                        selected_yaw_align_geometry=(
+                                            head_selected_yaw_align_geometry
+                                            if is_head
+                                            else None
+                                        ),
+                                    )
+                                )
+                            camera_images = tuple(sampled_images)
 
                         head_yaw_loss: dict[str, Any] | None = None
                         if (
@@ -1479,18 +1797,23 @@ def run_dual_raw_servo_worker(
                                     switch_details = {
                                         "head_yaw_loss": head_yaw_loss,
                                     }
-                                    failure_frame = _diagnostic_frame(
-                                        frame_index,
-                                        snapshot,
-                                        target,
-                                        surface,
-                                        observation,
-                                        kind="switching",
-                                        error=failure_reason,
-                                        **_attempt_frame_details(
-                                            attempt,
-                                            camera_stream=control_source_stream,
+                                    failure_frame = replace(
+                                        _diagnostic_frame(
+                                            frame_index,
+                                            snapshot,
+                                            target,
+                                            yaw_align_target,
+                                            observation,
+                                            kind="switching",
+                                            error=failure_reason,
+                                            **_attempt_frame_details(
+                                                attempt,
+                                                camera_stream=(
+                                                    control_source_stream
+                                                ),
+                                            ),
                                         ),
+                                        camera_images=camera_images,
                                     )
                                     break
                         elif control_source_stream != stream_names[1]:
@@ -1500,18 +1823,23 @@ def run_dual_raw_servo_worker(
                             diagnostic_frame = (
                                 None
                                 if snapshot is None
-                                else _diagnostic_frame(
-                                    frame_index,
-                                    snapshot,
-                                    target,
-                                    surface,
-                                    None,
-                                    kind="invalid",
-                                    error=perception_error,
-                                    **_attempt_frame_details(
-                                        attempt,
-                                        camera_stream=control_source_stream,
+                                else replace(
+                                    _diagnostic_frame(
+                                        frame_index,
+                                        snapshot,
+                                        target,
+                                        yaw_align_target,
+                                        None,
+                                        kind="invalid",
+                                        error=perception_error,
+                                        **_attempt_frame_details(
+                                            attempt,
+                                            camera_stream=(
+                                                control_source_stream
+                                            ),
+                                        ),
                                     ),
+                                    camera_images=camera_images,
                                 )
                             )
                             if hard_failure:
@@ -1607,12 +1935,12 @@ def run_dual_raw_servo_worker(
                             event_kind = "observation"
                         if control_source_stream == attempt.live_stream:
                             target_id = target.track_id
-                            if surface is not None:
-                                surface_id = surface.track_id
+                            if yaw_align_target is not None:
+                                yaw_align_target_id = yaw_align_target.track_id
                         else:
                             fallback_target_id = target.track_id
-                            fallback_surface_id = (
-                                None if surface is None else surface.track_id
+                            fallback_yaw_align_target_id = (
+                                None if yaw_align_target is None else yaw_align_target.track_id
                             )
                         details = _attempt_details(
                             attempt,
@@ -1623,8 +1951,8 @@ def run_dual_raw_servo_worker(
                             yaw_source=yaw_source_details,
                             head_yaw_loss=head_yaw_loss,
                             target_track_id=target.track_id,
-                            surface_track_id=(
-                                None if surface is None else surface.track_id
+                            yaw_align_target_track_id=(
+                                None if yaw_align_target is None else yaw_align_target.track_id
                             ),
                             **monitor_details,
                         )
@@ -1635,11 +1963,11 @@ def run_dual_raw_servo_worker(
                                     "previous_target_id": previous_target_id,
                                 }
                             )
-                        if surface_reacquired:
+                        if yaw_align_target_reacquired:
                             details.update(
                                 {
-                                    "surface_reacquired": True,
-                                    "previous_surface_id": previous_surface_id,
+                                    "yaw_align_target_reacquired": True,
+                                    "previous_yaw_align_target_id": previous_yaw_align_target_id,
                                 }
                             )
                         _publish_worker_event(
@@ -1652,17 +1980,22 @@ def run_dual_raw_servo_worker(
                                 observation=observation,
                                 output_dir=str(output_dir),
                                 details=details,
-                                frame=_diagnostic_frame(
-                                    frame_index,
-                                    snapshot,
-                                    target,
-                                    surface,
-                                    observation,
-                                    kind=event_kind,
-                                    **_attempt_frame_details(
-                                        attempt,
-                                        camera_stream=control_source_stream,
+                                frame=replace(
+                                    _diagnostic_frame(
+                                        frame_index,
+                                        snapshot,
+                                        target,
+                                        yaw_align_target,
+                                        observation,
+                                        kind=event_kind,
+                                        **_attempt_frame_details(
+                                            attempt,
+                                            camera_stream=(
+                                                control_source_stream
+                                            ),
+                                        ),
                                     ),
+                                    camera_images=camera_images,
                                 ),
                             ),
                         )

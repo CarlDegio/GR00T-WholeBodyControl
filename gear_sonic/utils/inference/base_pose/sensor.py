@@ -247,6 +247,12 @@ class _AsyncRGBDStreamBuffer:
                 return None
             return latest
 
+    def latest(self) -> tuple[int, AlignedRGBDSnapshot] | None:
+        """Return the newest buffered frame without advancing a consumer."""
+
+        with self._condition:
+            return None if not self._frames else self._frames[-1]
+
     def wait_after(
         self,
         timestamp_ns: int | None,
@@ -416,6 +422,14 @@ class SensorGatewayDualBasePoseCamera:
         timestamp_ns, snapshot = buffered
         self._last_timestamp_ns[stream_name] = timestamp_ns
         return snapshot
+
+    def peek_stream(self, stream_name: str) -> AlignedRGBDSnapshot | None:
+        """Return the latest buffered frame without advancing its cursor."""
+
+        if stream_name not in self._buffers:
+            raise BasePoseCameraError(f"unknown BasePose camera stream {stream_name!r}")
+        buffered = self._buffers[stream_name].latest()
+        return None if buffered is None else buffered[1]
 
     def close(self) -> None:
         for stream_buffer in self._buffers.values():

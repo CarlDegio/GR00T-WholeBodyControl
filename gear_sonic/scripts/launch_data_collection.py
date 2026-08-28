@@ -423,14 +423,12 @@ def build_sensor_gateway_command(
     config: DataCollectionLaunchConfig,
     repo_root: Path,
 ) -> str:
-    """Build the data-collection SensorGateway command with local RGB preview."""
+    """Build SensorGateway using endpoints from the unified runtime profile."""
     return (
         f"cd {shlex.quote(str(repo_root))} && "
         "source .venv_teleop/bin/activate && "
         "python -m gear_sonic.runtime.gateway.services.sensor "
         f"--profile {shlex.quote(config.runtime_profile)} "
-        f"--camera-host {shlex.quote(config.camera_host)} "
-        f"--camera-port {config.camera_port} "
         "--no-enable-depth-anything --no-enable-ros "
         "--no-enable-visualization --no-enable-vla-timing"
     )

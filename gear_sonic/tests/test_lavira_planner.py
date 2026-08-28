@@ -35,14 +35,22 @@ def task_result(generation: int) -> LaViRATaskResult:
 def runtime_with_intents():
     intents: list[tuple[str, dict]] = []
     runtime = LaviraPlannerRuntime(
-        LaviraPlannerConfig("find chair", "chair"),
+        LaviraPlannerConfig(
+            mission="find chair",
+            alignment_prompt="align to chair",
+            global_target="chair",
+        ),
         submit_intent=lambda name, parameters: intents.append((name, dict(parameters))),
     )
     return runtime, intents
 
 
 def test_lavira_config_exposes_dual_cloud_agent_roles() -> None:
-    config = LaviraPlannerConfig("find chair", "chair")
+    config = LaviraPlannerConfig(
+        mission="find chair",
+        alignment_prompt="align to chair",
+        global_target="chair",
+    )
 
     assert config.navigation_mode == "object_nav"
     assert config.manipulation_prompt == "find chair"
@@ -71,19 +79,31 @@ def test_lavira_config_exposes_dual_cloud_agent_roles() -> None:
     assert not hasattr(config, "debug")
     assert not hasattr(config, "output_root")
 
+    with pytest.raises(ValueError, match="alignment_prompt is required"):
+        LaviraPlannerConfig(
+            mission="find chair",
+            alignment_prompt=" ",
+            global_target="chair",
+        )
+
     with pytest.raises(TypeError):
-        LaviraPlannerConfig("find chair", "chair", task_type="eqa")
+        LaviraPlannerConfig(
+            "find chair", "align to chair", "chair", task_type="eqa"
+        )
     with pytest.raises(TypeError):
-        LaviraPlannerConfig("find chair", "chair", question="what color?")
+        LaviraPlannerConfig(
+            "find chair", "align to chair", "chair", question="what color?"
+        )
     with pytest.raises(ValueError, match="depth range"):
         LaviraPlannerConfig(
-            "find chair", "chair",
+            "find chair", "align to chair", "chair",
             nav_handoff_min_depth_m=3.0,
             nav_handoff_max_depth_m=2.0,
         )
     with pytest.raises(ValueError, match="limits"):
         LaviraPlannerConfig(
-            "find chair", "chair", heading_settle_seconds=-0.1,
+            "find chair", "align to chair", "chair",
+            heading_settle_seconds=-0.1,
         )
 
 
@@ -160,6 +180,25 @@ def test_vla_active_status_is_available_as_start_ack() -> None:
     assert runtime.phase == "nav"
 
 
+def test_navdp_world_goal_survives_status_mailbox_handoff() -> None:
+    runtime, _ = runtime_with_intents()
+    runtime.start_navigation(1)
+    payload = {
+        "type": "sonic_navigation_status",
+        "version": 1,
+        "generation": 1,
+        "skill_id": 2,
+        "segment_id": 7,
+        "state": "reached",
+        "reason": "goal_within_2m",
+        "goal_world": {"x": 1.25, "y": -3.5},
+    }
+
+    assert runtime.accept_status(payload, channel="navigation_status")
+
+    assert runtime.wait_status(1, 2, 7, 0.1) == payload
+
+
 def test_space_wakes_segment_wait_and_invalidates_late_status() -> None:
     runtime, _ = runtime_with_intents()
     runtime.start_navigation(1)
@@ -221,7 +260,11 @@ def test_warning_and_error_logs_are_promoted_to_structured_runtime_events() -> N
 def test_runtime_reports_todo_as_structured_event() -> None:
     events = []
     runtime = LaviraPlannerRuntime(
-        LaviraPlannerConfig("find chair", "chair"),
+        LaviraPlannerConfig(
+            mission="find chair",
+            alignment_prompt="align to chair",
+            global_target="chair",
+        ),
         submit_intent=lambda _name, _parameters: None,
         report_event=lambda level, code, message, **fields: events.append(
             (level, code, message, fields)

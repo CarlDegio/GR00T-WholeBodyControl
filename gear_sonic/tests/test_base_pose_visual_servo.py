@@ -13,10 +13,10 @@ from gear_sonic.utils.inference.base_pose.servo import (
     RawServoCalibration,
     RawServoObservation,
     ServoPhase,
-    TableGeometry,
+    YawAlignGeometry,
     TargetGeometry,
     VisualServoController,
-    estimate_table_geometry,
+    estimate_yaw_align_geometry,
 )
 
 
@@ -29,19 +29,19 @@ from gear_sonic.utils.inference.base_pose.servo import (
         ),
         (
             {
-                "viewer_table_edge_endpoints_px": (
+                "viewer_yaw_align_edge_endpoints_px": (
                     (0.0, 35.0),
                     (50.0, 35.0),
                 )
             },
-            "table_edge_endpoints_px",
+            "yaw_align_edge_endpoints_px",
         ),
         (
             {
-                "viewer_desk_mask_row_spans": ((35, 0, 50),),
+                "viewer_completed_yaw_align_target_mask_row_spans": ((35, 0, 50),),
                 "viewer_image_size": (64, 48),
             },
-            "desk_mask_row_spans",
+            "completed_yaw_align_target_mask_row_spans",
         ),
     ),
 )
@@ -59,7 +59,7 @@ def test_velocity_message_publishes_each_viewer_overlay_independently(
     assert expected_key in payload["viewer_overlay"]
 
 
-def test_yoloe_tracker_uses_configured_surface_text() -> None:
+def test_yoloe_tracker_uses_configured_yaw_align_target_text() -> None:
     class Embedding:
         ndim = 3
 
@@ -94,8 +94,8 @@ def test_yoloe_tracker_uses_configured_surface_text() -> None:
     tracker = object.__new__(raw_servo.YoloePersistentTracker)
     tracker.model = Model()
     tracker.class_names = None
-    tracker._initial_surface_embedding = None
-    tracker.surface_prompt = "workbench"
+    tracker._initial_yaw_align_target_embedding = None
+    tracker.yaw_align_target_prompt = "workbench"
     tracker._model_updated = lambda: None
 
     artifact = tracker.start_all_text(target_prompt="blue basket")
@@ -103,7 +103,43 @@ def test_yoloe_tracker_uses_configured_surface_text() -> None:
     assert tracker.model.requested_texts == ["blue basket", "workbench"]
     assert tracker.model.classes == ["blue basket", "workbench"]
     assert tracker.class_names == ("blue basket", "workbench")
-    assert artifact["prompt_mode"] == "target_text_surface_text"
+    assert artifact["prompt_mode"] == "target_text_yaw_align_target_text"
+
+
+def test_yoloe_tracker_uses_one_class_when_yaw_align_target_matches_target() -> None:
+    class Embedding:
+        ndim = 3
+
+        def __init__(self, class_count: int) -> None:
+            self.shape = (1, class_count, 8)
+
+    class Model:
+        predictor = object()
+
+        def __init__(self) -> None:
+            self.requested_texts: list[str] = []
+            self.classes: list[str] = []
+
+        def get_text_pe(self, texts):
+            self.requested_texts = list(texts)
+            return Embedding(len(texts))
+
+        def set_classes(self, classes, *, embeddings):
+            self.classes = list(classes)
+
+    tracker = object.__new__(raw_servo.YoloePersistentTracker)
+    tracker.model = Model()
+    tracker.class_names = None
+    tracker.yaw_align_target_prompt = "  RUBBISH   bin "
+    tracker._model_updated = lambda: None
+
+    artifact = tracker.start_all_text(target_prompt="rubbish bin")
+
+    assert tracker.model.requested_texts == ["rubbish bin"]
+    assert tracker.model.classes == ["rubbish bin"]
+    assert tracker.class_names == ("rubbish bin",)
+    assert artifact["prompt_mode"] == "target_text_as_yaw_align_target"
+    assert artifact["yaw_align_target_reuses_target"] is True
 
 
 def _observation(
@@ -121,7 +157,7 @@ def _observation(
             1.2,
             lateral_anchor_px=(320.0, 200.0),
         ),
-        table=TableGeometry(
+        yaw_align_geometry=YawAlignGeometry(
             yaw_error_rad=yaw,
             line_length_px=100.0,
             valid_depth_samples=20,
@@ -129,7 +165,7 @@ def _observation(
         ),
         camera_timestamp=1.0,
         target_track_id=1,
-        surface_track_id=2,
+        yaw_align_target_track_id=2,
         target_bbox_xyxy=bbox,
         image_width=640,
         image_height=480,
@@ -150,11 +186,11 @@ def test_table_mask_cleanup_keeps_largest_component_and_fills_holes() -> None:
     assert np.all(cleaned[1:4, 35:38] == 0)
 
 
-def test_table_edge_mask_dilation_expands_by_three_pixels() -> None:
+def test_yaw_align_edge_mask_dilation_expands_by_three_pixels() -> None:
     mask = np.zeros((20, 20), dtype=np.uint8)
     mask[8:12, 8:12] = 1
 
-    dilated = raw_servo._dilate_table_edge_mask(mask)
+    dilated = raw_servo._dilate_yaw_align_edge_mask(mask)
 
     assert dilated.dtype == np.uint8
     assert np.all(dilated[8:12, 8:12] == 1)
@@ -163,7 +199,7 @@ def test_table_edge_mask_dilation_expands_by_three_pixels() -> None:
     assert dilated[9, 15] == 0
 
 
-def test_desk_mask_row_spans_round_trip_binary_regions() -> None:
+def test_completed_yaw_align_target_mask_row_spans_round_trip_binary_regions() -> None:
     mask = np.zeros((4, 7), dtype=np.uint8)
     mask[1, 1:4] = 1
     mask[2, 0:2] = 1
@@ -199,6 +235,28 @@ def _snapshot(
 
 def _calibration() -> RawServoCalibration:
     return RawServoCalibration(240, 200, 200.0, 200.0, 120.0, 100.0)
+
+
+def test_target_forward_distance_uses_mean_of_retained_body_x() -> None:
+    depth_raw = np.full((200, 240), 2000, dtype=np.uint16)
+    depth_raw[:, :144] = 1000
+    geometry = raw_servo.estimate_target_geometry(
+        _snapshot(depth_raw=depth_raw),
+        np.ones((200, 240), dtype=np.uint8),
+        RawServoCalibration(
+            240,
+            200,
+            200.0,
+            200.0,
+            120.0,
+            100.0,
+            camera_pitch_deg=0.0,
+        ),
+    )
+
+    assert geometry.forward_m == pytest.approx(1.4)
+    assert geometry.body_xyz_m[0] == pytest.approx(1.4)
+    assert geometry.median_depth_m == pytest.approx(1.0)
 
 
 def _rgb_with_mask_contrast(mask: np.ndarray) -> np.ndarray:
@@ -334,12 +392,12 @@ def test_hough_candidates_are_strictly_longer_than_45_pixels() -> None:
 
     assert candidates
     assert all(
-        segment.length > raw_servo._TABLE_EDGE_MIN_LENGTH_PX
+        segment.length > raw_servo._YAW_ALIGN_EDGE_MIN_LENGTH_PX
         for segment in candidates
     )
 
 
-def test_table_geometry_uses_signed_pixel_angle_without_deprojection(
+def test_yaw_align_geometry_uses_signed_pixel_angle_without_deprojection(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     segment = raw_servo._PixelLineSegment(
@@ -358,12 +416,12 @@ def test_table_geometry_uses_signed_pixel_angle_without_deprojection(
         raw_servo,
         "_deproject",
         lambda *_args, **_kwargs: (_ for _ in ()).throw(
-            AssertionError("table yaw must not deproject pixels")
+            AssertionError("yaw_align_geometry yaw must not deproject pixels")
         ),
     )
     mask = np.ones((200, 240), dtype=np.uint8)
 
-    geometry = estimate_table_geometry(
+    geometry = estimate_yaw_align_geometry(
         _snapshot(),
         mask,
         _calibration(),
@@ -376,7 +434,7 @@ def test_table_geometry_uses_signed_pixel_angle_without_deprojection(
     assert geometry.line_center_px == pytest.approx((120.0, 100.0))
 
 
-def test_table_geometry_rejects_rgb_lines_not_longer_than_45_pixels(
+def test_yaw_align_geometry_rejects_rgb_lines_not_longer_than_45_pixels(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     short_segment = raw_servo._PixelLineSegment(
@@ -392,14 +450,14 @@ def test_table_geometry_rejects_rgb_lines_not_longer_than_45_pixels(
     mask = np.ones((200, 240), dtype=np.uint8)
 
     with pytest.raises(ValueError, match="longer than 45 px"):
-        estimate_table_geometry(
+        estimate_yaw_align_geometry(
             _snapshot(rgb=_rgb_with_mask_contrast(mask)),
             mask,
             _calibration(),
         )
 
 
-def test_table_geometry_dilates_target_exclusion_by_twenty_pixels(
+def test_yaw_align_geometry_dilates_target_exclusion_by_twenty_pixels(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     captured: dict[str, np.ndarray] = {}
@@ -415,13 +473,13 @@ def test_table_geometry_dilates_target_exclusion_by_twenty_pixels(
         return [segment]
 
     monkeypatch.setattr(raw_servo, "_rgb_mask_line_segments", capture_segments)
-    desk_mask = np.ones((200, 240), dtype=np.uint8)
-    target_mask = np.zeros_like(desk_mask)
+    completed_yaw_align_target_mask = np.ones((200, 240), dtype=np.uint8)
+    target_mask = np.zeros_like(completed_yaw_align_target_mask)
     target_mask[90:111, 110:131] = 1
 
-    estimate_table_geometry(
-        _snapshot(rgb=_rgb_with_mask_contrast(desk_mask)),
-        desk_mask,
+    estimate_yaw_align_geometry(
+        _snapshot(rgb=_rgb_with_mask_contrast(completed_yaw_align_target_mask)),
+        completed_yaw_align_target_mask,
         _calibration(),
         target_mask=target_mask,
     )
@@ -434,12 +492,12 @@ def test_table_geometry_dilates_target_exclusion_by_twenty_pixels(
     assert exclusion[100, 151] == 0
 
 
-def test_diagnostic_frame_carries_completed_desk_mask_by_value() -> None:
-    desk_mask = np.zeros((200, 240), dtype=np.uint8)
-    desk_mask[60:160, 20:220] = 1
+def test_diagnostic_frame_carries_completed_completed_yaw_align_target_mask_by_value() -> None:
+    completed_yaw_align_target_mask = np.zeros((200, 240), dtype=np.uint8)
+    completed_yaw_align_target_mask[60:160, 20:220] = 1
     observation = replace(
         _observation(bbox=(80.0, 40.0, 160.0, 140.0)),
-        desk_mask=desk_mask,
+        completed_yaw_align_target_mask=completed_yaw_align_target_mask,
     )
 
     frame = raw_servo._diagnostic_frame(
@@ -450,10 +508,10 @@ def test_diagnostic_frame_carries_completed_desk_mask_by_value() -> None:
         observation,
         kind="observation",
     )
-    desk_mask[:] = 0
+    completed_yaw_align_target_mask[:] = 0
 
-    assert frame.completed_surface_mask is not None
-    assert np.count_nonzero(frame.completed_surface_mask) == 20_000
+    assert frame.completed_yaw_align_target_mask is not None
+    assert np.count_nonzero(frame.completed_yaw_align_target_mask) == 20_000
 
 
 def test_chest_approach_mode_recenters_at_horizontal_guard() -> None:
@@ -497,6 +555,76 @@ def test_chest_approach_mode_recenters_at_horizontal_guard() -> None:
     assert command.wz == 0.0
 
 
+def test_head_far_approach_reuses_forward_logic_until_cutoff() -> None:
+    controller = VisualServoController(
+        target_distance_m=1.1,
+        far_approach_cutoff_m=1.3,
+        min_linear_speed_m_s=0.35,
+    )
+    controller.reset(0.0, initial_phase=ServoPhase.FORWARD_APPROACH)
+    far = _observation(
+        bbox=(240.0, 120.0, 400.0, 360.0),
+        yaw=0.6,
+    )
+    far = replace(
+        far,
+        target=replace(
+            far.target,
+            forward_m=1.6,
+            body_xyz_m=(1.6, 0.0, 0.5),
+            median_depth_m=1.6,
+        ),
+    )
+    orientation = {
+        "actual_heading_rad": 0.4,
+        "heading_setpoint_rad": 0.4,
+        "state_age_s": 0.0,
+    }
+
+    command = controller.update(far, now=0.1, orientation=orientation)
+
+    assert controller.phase is ServoPhase.FORWARD_APPROACH
+    assert command.vx > 0.35
+    assert command.vy == 0.0
+    assert command.wz == 0.0
+    assert controller.desired_heading_rad is None
+    assert controller.yaw_error_source == "distance_gated_approach"
+
+    guarded = replace(
+        far,
+        target_bbox_xyxy=(0.0, 120.0, 100.0, 360.0),
+    )
+    command = controller.update(guarded, now=0.2, orientation=orientation)
+
+    assert controller.phase is ServoPhase.FORWARD_RECENTER
+    assert command.vx > 0.35
+    assert command.vy == 0.0
+    assert command.wz > 0.0
+    assert controller.desired_heading_rad is None
+
+    at_cutoff = replace(
+        far,
+        target=replace(
+            far.target,
+            forward_m=1.3,
+            body_xyz_m=(1.3, 0.0, 0.5),
+            median_depth_m=1.3,
+        ),
+    )
+    command = controller.update(
+        at_cutoff,
+        now=0.3,
+        orientation=orientation,
+    )
+
+    assert controller.phase is ServoPhase.YAW_ALIGN
+    assert command.vx == 0.0
+    assert command.vy == 0.0
+    assert command.wz > 0.0
+    assert controller.desired_heading_rad == pytest.approx(1.0)
+    assert controller.yaw_error_source == "visual_calibrated_heading"
+
+
 def test_forward_recenter_can_only_be_entered_from_forward_approach() -> None:
     controller = VisualServoController()
     controller.phase = ServoPhase.YAW_ALIGN
@@ -527,7 +655,7 @@ def test_position_errors_bypass_ema_while_yaw_remains_filtered() -> None:
     second = replace(
         first,
         target=replace(first.target, forward_m=2.0, right_m=0.5),
-        table=replace(first.table, yaw_error_rad=0.3),
+        yaw_align_geometry=replace(first.yaw_align_geometry, yaw_error_rad=0.3),
     )
 
     controller._update_filter(first)
@@ -546,7 +674,7 @@ def test_yaw_filter_bypasses_ema_above_ten_degree_raw_jump() -> None:
     )
     second = replace(
         first,
-        table=replace(first.table, yaw_error_rad=math.radians(11.0)),
+        yaw_align_geometry=replace(first.yaw_align_geometry, yaw_error_rad=math.radians(11.0)),
     )
 
     controller._update_filter(first)
@@ -568,7 +696,7 @@ def test_yaw_filter_keeps_ema_at_exactly_ten_degree_raw_jump() -> None:
     )
     second = replace(
         first,
-        table=replace(first.table, yaw_error_rad=second_yaw),
+        yaw_align_geometry=replace(first.yaw_align_geometry, yaw_error_rad=second_yaw),
     )
 
     controller._update_filter(first)
@@ -585,11 +713,11 @@ def test_yaw_filter_compares_consecutive_valid_raw_samples_across_gap() -> None:
         bbox=(240.0, 120.0, 400.0, 360.0),
         yaw=0.0,
     )
-    missing = replace(first, table=None)
+    missing = replace(first, yaw_align_geometry=None)
     resumed_yaw = math.radians(11.0)
     resumed = replace(
         first,
-        table=replace(first.table, yaw_error_rad=resumed_yaw),
+        yaw_align_geometry=replace(first.yaw_align_geometry, yaw_error_rad=resumed_yaw),
     )
 
     controller._update_filter(first)
@@ -667,7 +795,7 @@ def test_missing_table_yaw_falls_back_to_virtual_setpoint_error() -> None:
     )
 
     command = controller.update(
-        replace(visible, table=None),
+        replace(visible, yaw_align_geometry=None),
         now=0.2,
         orientation=orientation,
         joint_completion=True,
@@ -735,7 +863,7 @@ def test_joint_completion_stops_chest_approach_at_chest_standoff() -> None:
             body_xyz_m=(0.7, -0.02, 0.5),
             median_depth_m=0.7,
         ),
-        table_camera_stream="ego_view",
+        yaw_align_geometry_camera_stream="ego_view",
     )
 
     first = controller.update(
@@ -773,7 +901,7 @@ def test_joint_completion_defaults_to_three_stable_frames() -> None:
             body_xyz_m=(0.7, -0.02, 0.5),
             median_depth_m=0.7,
         ),
-        table_camera_stream="ego_view",
+        yaw_align_geometry_camera_stream="ego_view",
     )
 
     for frame_index in range(2):

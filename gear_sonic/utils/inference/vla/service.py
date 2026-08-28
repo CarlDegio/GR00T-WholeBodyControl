@@ -59,6 +59,7 @@ from gear_sonic.utils.inference.vla.poses import (
 )
 from gear_sonic.utils.inference.vla.safety import VlaSafetyGate
 from gear_sonic.utils.inference.vla.runtime import (
+    _activate_pending_pose_task,
     _VlaCommandHandler,
     _VlaRuntimeState,
     _consume_task_failure,
@@ -796,6 +797,7 @@ def main(config: InferenceConfig):
         state.inference_generation += 1
         state.cached_action_chunk = None
         state.action_chunk_index = 0
+        state.pending_action_ready_ms = 0.0
         state.last_inference_request_time = 0.0
         queued = _drain_queue(inference_queue)
         results = _drain_queue(result_queue)
@@ -818,6 +820,8 @@ def main(config: InferenceConfig):
 
     def fail_active_task(reason: str, message: str) -> None:
         state.task_active = False
+        state.task_pose_entry_pending = False
+        state.pending_action_ready_ms = 0.0
         state.task_stream_hold_active = False
         state.pause_loop = True
         invalidate_inference(reason)
@@ -918,6 +922,17 @@ def main(config: InferenceConfig):
                 config=config,
                 language_prompt=language_prompt_ref[0],
                 record_event=record_event,
+            )
+            _activate_pending_pose_task(
+                state,
+                vla_safety_gate=vla_safety_gate,
+                vla_safety_monitor=vla_safety_monitor,
+                send_cpp_control_command=send_cpp_control_command,
+                activate_vla_metrics=activate_vla_metrics,
+                publish_task_status=publish_task_status,
+                fail_active_task=fail_active_task,
+                record_event=record_event,
+                language_prompt=language_prompt_ref[0],
             )
             _schedule_vla_inference(
                 state,

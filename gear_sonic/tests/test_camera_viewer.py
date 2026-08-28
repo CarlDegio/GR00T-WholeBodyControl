@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import shlex
 import sys
 import types
 from pathlib import Path
@@ -14,6 +15,7 @@ sys.modules.setdefault("tyro", types.ModuleType("tyro"))
 
 from gear_sonic.camera.sensor_server import ImageMessageSchema
 from gear_sonic.runtime.gateway.sensor_client import SensorGatewayClientError
+from gear_sonic.runtime.gateway.services.sensor import build_argument_parser
 import gear_sonic.scripts.launch_data_collection as data_collection_launcher
 from gear_sonic.utils.operator.camera_viewer import (
     GatewayCameraClient,
@@ -202,10 +204,18 @@ def test_data_collection_launcher_uses_sensor_gateway_without_builtin_preview() 
         "source .venv_teleop/bin/activate && "
         "python -m gear_sonic.runtime.gateway.services.sensor "
         "--profile '/tmp/runtime profile.yaml' "
-        "--camera-host 192.168.123.164 --camera-port 5555 "
         "--no-enable-depth-anything --no-enable-ros "
         "--no-enable-visualization --no-enable-vla-timing"
     )
+    assert "--camera-host" not in command
+    assert "--camera-port" not in command
+
+    argv = shlex.split(command)
+    module_index = argv.index("gear_sonic.runtime.gateway.services.sensor")
+    parsed = build_argument_parser().parse_args(argv[module_index + 1 :])
+    assert parsed.profile == "/tmp/runtime profile.yaml"
+    assert parsed.enable_camera is True
+    assert parsed.enable_ros is False
 
 
 def test_data_collection_launcher_keeps_pico_video_running_by_default() -> None:

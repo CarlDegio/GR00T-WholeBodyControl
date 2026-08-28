@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import math
+import threading
+import time
 from types import SimpleNamespace
 
 import msgpack
@@ -180,6 +182,51 @@ def test_sensor_monitor_decodes_latest_g1_debug_base_quaternion() -> None:
         [1.0, 0.0, 0.0, 0.0],
     )
     monitor.close()
+
+
+def test_safety_monitor_lidar_refresh_isolated_from_blocked_depth_reader() -> None:
+    lidar_refreshed = threading.Event()
+    release_depth = threading.Event()
+    depth_entered = threading.Event()
+
+    class LidarClient:
+        calls = 0
+
+        def request_snapshot(self, _request):
+            self.calls += 1
+            if self.calls >= 3:
+                lidar_refreshed.set()
+            frame = SimpleNamespace(
+                metadata=SimpleNamespace(timestamp_ns=time.monotonic_ns())
+            )
+            return SimpleNamespace(
+                complete=True,
+                frames={PlannerSafetySensorMonitor.LIDAR_STREAM: frame},
+            )
+
+    class BlockingAuxiliaryClient:
+        def read_snapshot(self, _request, *, retries):
+            assert retries == 0
+            depth_entered.set()
+            release_depth.wait(timeout=1.0)
+            raise RuntimeError("depth reader released")
+
+    monitor = PlannerSafetySensorMonitor(
+        "inproc://unused",
+        poll_hz=100.0,
+        request_timeout_ms=100,
+        max_age_ms=1000.0,
+        lidar_client=LidarClient(),
+        auxiliary_client=BlockingAuxiliaryClient(),
+    )
+    monitor.start()
+    try:
+        assert depth_entered.wait(timeout=0.5)
+        assert lidar_refreshed.wait(timeout=0.5)
+        assert monitor.snapshot().radar_timestamp_s > 0.0
+    finally:
+        release_depth.set()
+        monitor.close()
 
 
 def test_wasd_and_base_pose_share_the_same_manual_execution_path() -> None:

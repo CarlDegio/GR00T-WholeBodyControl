@@ -117,8 +117,8 @@ def parse_base_pose_viewer_overlay(
         _camera_stream_name(raw_overlay.get("target_camera_stream"))
         or default_stream
     )
-    table_camera_stream = (
-        _camera_stream_name(raw_overlay.get("table_camera_stream"))
+    yaw_align_geometry_camera_stream = (
+        _camera_stream_name(raw_overlay.get("yaw_align_geometry_camera_stream"))
         or default_stream
     )
 
@@ -147,20 +147,20 @@ def parse_base_pose_viewer_overlay(
         )
         target_lateral_anchor = (anchor[0], anchor[1])
 
-    table_edge = None
-    raw_edge = raw_overlay.get("table_edge_endpoints_px")
+    yaw_align_edge = None
+    raw_edge = raw_overlay.get("yaw_align_edge_endpoints_px")
     if raw_edge is not None:
         if not isinstance(raw_edge, (list, tuple)) or len(raw_edge) != 2:
             raise ValueError(
-                "Base Pose viewer table edge must contain two endpoints"
+                "Base Pose viewer yaw-align edge must contain two endpoints"
             )
         start = _finite_tuple(
-            raw_edge[0], length=2, description="viewer table edge start"
+            raw_edge[0], length=2, description="viewer yaw-align edge start"
         )
         end = _finite_tuple(
-            raw_edge[1], length=2, description="viewer table edge end"
+            raw_edge[1], length=2, description="viewer yaw-align edge end"
         )
-        table_edge = ((start[0], start[1]), (end[0], end[1]))
+        yaw_align_edge = ((start[0], start[1]), (end[0], end[1]))
 
     image_size = None
     raw_size = raw_overlay.get("image_size")
@@ -175,43 +175,43 @@ def parse_base_pose_viewer_overlay(
             )
         image_size = (width, height)
 
-    desk_mask_row_spans = None
-    raw_spans = raw_overlay.get("desk_mask_row_spans")
+    completed_yaw_align_target_mask_row_spans = None
+    raw_spans = raw_overlay.get("completed_yaw_align_target_mask_row_spans")
     if raw_spans is not None:
         if image_size is None:
             raise ValueError(
-                "Base Pose viewer desk mask requires an image size"
+                "Base Pose viewer yaw-align target mask requires an image size"
             )
         if not isinstance(raw_spans, (list, tuple)):
-            raise ValueError("Base Pose viewer desk mask spans must be a list")
+            raise ValueError("Base Pose viewer yaw-align target mask spans must be a list")
         parsed_spans: list[tuple[int, int, int]] = []
         for raw_span in raw_spans:
             values = _finite_tuple(
                 raw_span,
                 length=3,
-                description="viewer desk mask row span",
+                description="viewer yaw-align target mask row span",
             )
             row, start, end = (int(value) for value in values)
             if (row, start, end) != values:
                 raise ValueError(
-                    "Base Pose viewer desk mask spans must contain integers"
+                    "Base Pose viewer yaw-align target mask spans must contain integers"
                 )
             width, height = image_size
             if not (0 <= row < height and 0 <= start < end <= width):
                 raise ValueError(
-                    "Base Pose viewer desk mask span is outside the image"
+                    "Base Pose viewer yaw-align target mask span is outside the image"
                 )
             parsed_spans.append((row, start, end))
-        desk_mask_row_spans = tuple(parsed_spans)
+        completed_yaw_align_target_mask_row_spans = tuple(parsed_spans)
 
     return (
         target_bbox,
         target_lateral_anchor,
-        table_edge,
-        desk_mask_row_spans,
+        yaw_align_edge,
+        completed_yaw_align_target_mask_row_spans,
         image_size,
         target_camera_stream,
-        table_camera_stream,
+        yaw_align_geometry_camera_stream,
     )
 
 
@@ -224,32 +224,32 @@ class NavigationViewerState:
     camera_stream: str | None = None
     target_bbox_xyxy: tuple[float, float, float, float] | None = None
     target_lateral_anchor_px: tuple[float, float] | None = None
-    table_edge_endpoints_px: (
+    yaw_align_edge_endpoints_px: (
         tuple[tuple[float, float], tuple[float, float]] | None
     ) = None
-    desk_mask_row_spans: tuple[tuple[int, int, int], ...] | None = None
+    completed_yaw_align_target_mask_row_spans: tuple[tuple[int, int, int], ...] | None = None
     overlay_image_size: tuple[int, int] | None = None
     target_camera_stream: str | None = None
-    table_camera_stream: str | None = None
+    yaw_align_geometry_camera_stream: str | None = None
 
     def clear_base_pose_overlay(self) -> None:
         self.target_bbox_xyxy = None
         self.target_lateral_anchor_px = None
-        self.table_edge_endpoints_px = None
-        self.desk_mask_row_spans = None
+        self.yaw_align_edge_endpoints_px = None
+        self.completed_yaw_align_target_mask_row_spans = None
         self.overlay_image_size = None
         self.target_camera_stream = None
-        self.table_camera_stream = None
+        self.yaw_align_geometry_camera_stream = None
 
     def set_base_pose_overlay(self, parameters: Mapping[str, Any]) -> None:
         (
             self.target_bbox_xyxy,
             self.target_lateral_anchor_px,
-            self.table_edge_endpoints_px,
-            self.desk_mask_row_spans,
+            self.yaw_align_edge_endpoints_px,
+            self.completed_yaw_align_target_mask_row_spans,
             self.overlay_image_size,
             self.target_camera_stream,
-            self.table_camera_stream,
+            self.yaw_align_geometry_camera_stream,
         ) = parse_base_pose_viewer_overlay(parameters)
 
     def accept_control(
@@ -436,25 +436,25 @@ def draw_base_pose_overlays(
     camera_stream: str,
     state: NavigationViewerState,
 ) -> np.ndarray:
-    """Draw the exact target and desk geometry consumed by BasePose."""
+    """Draw the exact target and yaw-align geometry consumed by BasePose."""
 
     draw_target = camera_stream == (
         state.target_camera_stream or state.camera_stream
     )
-    draw_table = camera_stream == (
-        state.table_camera_stream or state.camera_stream
+    draw_yaw_align_target = camera_stream == (
+        state.yaw_align_geometry_camera_stream or state.camera_stream
     )
     if (
         image_bgr.ndim != 3
         or image_bgr.shape[2] != 3
         or not state.active
-        or not (draw_target or draw_table)
+        or not (draw_target or draw_yaw_align_target)
         or not any(
             (
                 state.target_bbox_xyxy is not None,
                 state.target_lateral_anchor_px is not None,
-                state.table_edge_endpoints_px is not None,
-                bool(state.desk_mask_row_spans),
+                state.yaw_align_edge_endpoints_px is not None,
+                bool(state.completed_yaw_align_target_mask_row_spans),
             )
         )
     ):
@@ -470,9 +470,9 @@ def draw_base_pose_overlays(
             min(height - 1, max(0, int(round(y * scale_y)))),
         )
 
-    if draw_table and state.desk_mask_row_spans:
+    if draw_yaw_align_target and state.completed_yaw_align_target_mask_row_spans:
         source_mask = np.zeros((source_height, source_width), dtype=np.uint8)
-        for row, start, end in state.desk_mask_row_spans:
+        for row, start, end in state.completed_yaw_align_target_mask_row_spans:
             source_mask[row, start:end] = 255
         display_mask = (
             source_mask
@@ -483,9 +483,9 @@ def draw_base_pose_overlays(
                 interpolation=cv2.INTER_NEAREST,
             )
         )
-        desk_color = (255, 128, 0)
+        yaw_align_target_color = (255, 128, 0)
         color_layer = np.empty_like(image_bgr)
-        color_layer[:] = desk_color
+        color_layer[:] = yaw_align_target_color
         blended = cv2.addWeighted(image_bgr, 0.72, color_layer, 0.28, 0.0)
         np.copyto(image_bgr, blended, where=(display_mask > 0)[..., None])
         contours, _ = cv2.findContours(
@@ -497,7 +497,7 @@ def draw_base_pose_overlays(
             image_bgr,
             contours,
             -1,
-            desk_color,
+            yaw_align_target_color,
             2,
             cv2.LINE_AA,
         )
@@ -531,9 +531,9 @@ def draw_base_pose_overlays(
             2,
             cv2.LINE_AA,
         )
-    if draw_table and state.table_edge_endpoints_px is not None:
-        edge_start = point(*state.table_edge_endpoints_px[0])
-        edge_end = point(*state.table_edge_endpoints_px[1])
+    if draw_yaw_align_target and state.yaw_align_edge_endpoints_px is not None:
+        edge_start = point(*state.yaw_align_edge_endpoints_px[0])
+        edge_end = point(*state.yaw_align_edge_endpoints_px[1])
         edge_color = (0, 0, 255)
         cv2.line(
             image_bgr,
@@ -558,7 +558,7 @@ def draw_base_pose_overlays(
         )
         _outlined_text(
             image_bgr,
-            "TABLE EDGE (YAW)",
+            "YAW-ALIGN EDGE",
             (max(0, edge_center[0] - 75), max(18, edge_center[1] - 8)),
             edge_color,
         )

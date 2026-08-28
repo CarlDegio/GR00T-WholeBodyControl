@@ -4,8 +4,9 @@ The Language Agent owns task decomposition and selects one skill per agent step.
 The Vision Agent only grounds a requested target or checks a requested visual
 postcondition. Navigation handoff OR-combines fresh target grounding and bbox
 depth from chest and head RGB-D views; alignment handoff requires every
-operation object in one fresh chest or head view. MOVE_TO and ALIGN may repeat,
-while MANIPULATE is terminal.
+operation object in one fresh chest or head view. A failed BasePose attempt
+returns to ALIGN so the next VA request grounds the new image. MOVE_TO and ALIGN
+may repeat, while MANIPULATE is terminal.
 """
 
 from __future__ import annotations
@@ -58,6 +59,21 @@ def _same_target(left: str, right: str) -> bool:
     return _normalized_target(left) == _normalized_target(right)
 
 
+def _detector_name(value: Any) -> str:
+    """Validate one short English detector label without scene semantics."""
+
+    name = str(value).strip() if isinstance(value, str) else ""
+    if (
+        not name
+        or not name.isascii()
+        or not any(character.isalpha() for character in name)
+    ):
+        raise LaViRAAgentError(
+            "VA ALIGN_GROUNDING names must be non-empty English detector labels"
+        )
+    return name
+
+
 SKILLS = {"MOVE_TO", "ALIGN", "MANIPULATE"}
 DIRECTIONS = {"front", "front_left", "left", "front_right", "right"}
 DECISIONS = {"EXECUTE", "FAIL"}
@@ -73,17 +89,13 @@ GROUNDING_KEYS = {
     "mode", "status", "bbox_2d", "point_2d", "target_description", "confidence",
 }
 ALIGN_GROUNDING_RESPONSE_KEYS = {
-    "mode", "status", "objects", "visual_evidence",
+    "mode", "status", "target", "yaw_align_target", "visual_evidence",
 }
-ALIGN_GROUNDING_CANONICAL_KEYS = ALIGN_GROUNDING_RESPONSE_KEYS | {
-    "target", "surface", "bbox_2d", "confidence",
+ALIGN_DISTANCE_TARGET_KEYS = {
+    "name", "visible", "bbox_2d", "confidence",
 }
-ALIGN_OPERATION_OBJECT_KEYS = {
-    "name", "surface", "visible", "bbox_2d", "confidence",
-}
-ABSTRACT_ALIGNMENT_SURFACES = {
-    "surface", "tabletop", "desktop", "desktop surface", "table surface",
-    "desk surface", "countertop", "top", "edge", "plane", "floor area",
+ALIGN_YAW_TARGET_KEYS = {
+    "name", "visible", "confidence",
 }
 MIN_ALIGNMENT_TARGET_BBOX_AREA = 10_000.0
 POSTCHECK_KEYS = {
@@ -113,12 +125,59 @@ class LaViRAAgentCancelled(LaViRAAgentError):
     """Raised after Space invalidates the active task generation."""
 
 
+class _MoveToFacingUnavailable(LaViRAAgentError):
+    """Raised when MOVE_TO facing geometry cannot be computed safely."""
+
+
+class _HeadingTerminalError(LaViRAAgentError):
+    """Raised only after a heading controller reports a terminal failure."""
+
+    def __init__(self, status: Mapping[str, Any]) -> None:
+        self.status = dict(status)
+        super().__init__(
+            f"heading_{status.get('state', 'failed')}:"
+            f"{status.get('reason', 'unknown')}"
+        )
+
+
 def _finite(value: Any) -> bool:
     return (
         not isinstance(value, bool)
         and isinstance(value, (int, float))
         and math.isfinite(float(value))
     )
+
+
+def _move_to_facing_geometry(
+    goal_world: Sequence[float],
+    fastlio_pose: Sequence[float],
+) -> dict[str, float]:
+    """Compute the Fast-LIO-relative turn that faces a fixed world goal."""
+
+    if len(goal_world) != 2 or not all(_finite(value) for value in goal_world):
+        raise _MoveToFacingUnavailable("move_to_goal_world_invalid")
+    if len(fastlio_pose) != 3 or not all(
+        _finite(value) for value in fastlio_pose
+    ):
+        raise _MoveToFacingUnavailable("move_to_fastlio_pose_invalid")
+    goal_x, goal_y = map(float, goal_world)
+    pose_x, pose_y, pose_yaw = map(float, fastlio_pose)
+    delta_x, delta_y = goal_x - pose_x, goal_y - pose_y
+    target_distance = math.hypot(delta_x, delta_y)
+    if target_distance <= 1.0e-6:
+        raise _MoveToFacingUnavailable("move_to_target_direction_undefined")
+    target_yaw = math.atan2(delta_y, delta_x)
+    heading_delta = math.remainder(target_yaw - pose_yaw, 2.0 * math.pi)
+    return {
+        "goal_world_x": goal_x,
+        "goal_world_y": goal_y,
+        "fastlio_x": pose_x,
+        "fastlio_y": pose_y,
+        "fastlio_yaw_rad": pose_yaw,
+        "target_distance_m": target_distance,
+        "target_yaw_rad": target_yaw,
+        "heading_delta_rad": heading_delta,
+    }
 
 
 def _strict_json_object(text: Any, *, role: str) -> dict[str, Any]:
@@ -285,10 +344,7 @@ def validate_postcheck(
 
 
 def validate_alignment_grounding(value: Any) -> dict[str, Any]:
-    if not isinstance(value, dict) or frozenset(value) not in {
-        frozenset(ALIGN_GROUNDING_RESPONSE_KEYS),
-        frozenset(ALIGN_GROUNDING_CANONICAL_KEYS),
-    }:
+    if not isinstance(value, dict) or set(value) != ALIGN_GROUNDING_RESPONSE_KEYS:
         raise LaViRAAgentError(
             "VA ALIGN_GROUNDING output has an invalid object schema"
         )
@@ -301,122 +357,91 @@ def validate_alignment_grounding(value: Any) -> dict[str, Any]:
         raise LaViRAAgentError(
             "VA ALIGN_GROUNDING visual_evidence must be a string"
         )
-    raw_objects = value["objects"]
-    if not isinstance(raw_objects, list) or not raw_objects:
+
+    raw_target = value["target"]
+    raw_yaw_target = value["yaw_align_target"]
+    if (
+        not isinstance(raw_target, dict)
+        or set(raw_target) != ALIGN_DISTANCE_TARGET_KEYS
+    ):
         raise LaViRAAgentError(
-            "VA ALIGN_GROUNDING must list every manipulation-task object"
+            "VA ALIGN_GROUNDING target has an invalid schema"
+        )
+    if (
+        not isinstance(raw_yaw_target, dict)
+        or set(raw_yaw_target) != ALIGN_YAW_TARGET_KEYS
+    ):
+        raise LaViRAAgentError(
+            "VA ALIGN_GROUNDING yaw_align_target has an invalid schema"
         )
 
-    objects: list[dict[str, Any]] = []
-    object_names: set[str] = set()
-    surface_names: set[str] = set()
-    eligible: list[tuple[float, float, dict[str, Any]]] = []
-    visible_areas: list[float] = []
-    for item in raw_objects:
-        if not isinstance(item, dict) or set(item) != ALIGN_OPERATION_OBJECT_KEYS:
-            raise LaViRAAgentError(
-                "VA ALIGN_GROUNDING operation object has an invalid schema"
-            )
-        name = str(item["name"]).strip() if isinstance(item["name"], str) else ""
-        surface = (
-            str(item["surface"]).strip()
-            if isinstance(item["surface"], str) else ""
+    target_name = _detector_name(raw_target["name"])
+    yaw_target_name = _detector_name(raw_yaw_target["name"])
+    if _same_target(target_name, yaw_target_name):
+        yaw_target_name = target_name
+
+    target_visible = raw_target["visible"]
+    yaw_target_visible = raw_yaw_target["visible"]
+    if not isinstance(target_visible, bool):
+        raise LaViRAAgentError(
+            "VA ALIGN_GROUNDING target visible must be boolean"
         )
-        if not name:
-            raise LaViRAAgentError(
-                "VA ALIGN_GROUNDING operation object name is required"
-            )
-        if not surface:
-            raise LaViRAAgentError(
-                "VA ALIGN_GROUNDING operation object surface is required"
-            )
-        normalized_name = _normalized_target(name)
-        normalized_surface = _normalized_target(surface)
-        if normalized_name in object_names:
-            raise LaViRAAgentError(
-                "VA ALIGN_GROUNDING operation object names must be unique"
-            )
-        if (
-            normalized_surface in ABSTRACT_ALIGNMENT_SURFACES
-            or normalized_surface.endswith(" surface")
-        ):
-            raise LaViRAAgentError(
-                "VA ALIGN_GROUNDING surface must name a complete physical object"
-            )
-        visible = item["visible"]
-        if not isinstance(visible, bool):
-            raise LaViRAAgentError(
-                "VA ALIGN_GROUNDING operation object visible must be boolean"
-            )
-        confidence = item["confidence"]
+    if not isinstance(yaw_target_visible, bool):
+        raise LaViRAAgentError(
+            "VA ALIGN_GROUNDING yaw_align_target visible must be boolean"
+        )
+
+    target_confidence = raw_target["confidence"]
+    yaw_target_confidence = raw_yaw_target["confidence"]
+    for confidence, role in (
+        (target_confidence, "target"),
+        (yaw_target_confidence, "yaw_align_target"),
+    ):
         if not _finite(confidence) or not 0.0 <= float(confidence) <= 1.0:
-            raise LaViRAAgentError("VA confidence is invalid")
-        bbox = _validate_bbox(item["bbox_2d"], required=visible)
-        if not visible and bbox is not None:
             raise LaViRAAgentError(
-                "VA ALIGN_GROUNDING invisible object cannot include a bbox"
+                f"VA ALIGN_GROUNDING {role} confidence is invalid"
             )
-        canonical_object = {
-            "name": name,
-            "surface": surface,
-            "visible": visible,
-            "bbox_2d": bbox,
-            "confidence": float(confidence),
-        }
-        objects.append(canonical_object)
-        object_names.add(normalized_name)
-        surface_names.add(normalized_surface)
-        if bbox is not None:
-            bbox_area = (bbox[2] - bbox[0]) * (bbox[3] - bbox[1])
-            visible_areas.append(bbox_area)
-            if bbox_area >= MIN_ALIGNMENT_TARGET_BBOX_AREA:
-                eligible.append((bbox_area, float(confidence), canonical_object))
 
-    overlap = object_names & surface_names
-    if overlap:
+    bbox = _validate_bbox(raw_target["bbox_2d"], required=target_visible)
+    if not target_visible and bbox is not None:
         raise LaViRAAgentError(
-            "VA ALIGN_GROUNDING surface objects must not appear in the "
-            "manipulation-task object list: " + ", ".join(sorted(overlap))
+            "VA ALIGN_GROUNDING invisible target cannot include a bbox"
         )
-
+    bbox_area = (
+        0.0
+        if bbox is None
+        else (bbox[2] - bbox[0]) * (bbox[3] - bbox[1])
+    )
+    eligible = bool(
+        target_visible
+        and yaw_target_visible
+        and bbox is not None
+        and bbox_area >= MIN_ALIGNMENT_TARGET_BBOX_AREA
+    )
     found = value["status"] == "FOUND"
     if found and not eligible:
-        largest_percent = max(visible_areas, default=0.0) / 10_000.0
         raise LaViRAAgentError(
-            "VA ALIGN_GROUNDING found no operation object large enough for "
-            f"stable BasePose alignment (largest={largest_percent:.2f}% of "
-            "image); include every manipulation-task object and return its bbox"
+            "VA ALIGN_GROUNDING FOUND requires both roles visible and a stable "
+            f"target bbox (area={bbox_area / 10_000.0:.2f}% of image)"
         )
-    if not found and eligible:
-        raise LaViRAAgentError(
-            "VA ALIGN_GROUNDING status is NOT_FOUND despite an eligible "
-            "visible manipulation-task object"
-        )
-
-    if eligible:
-        _area, _confidence, selected = max(
-            eligible, key=lambda candidate: (candidate[0], candidate[1]),
-        )
-        target = str(selected["name"])
-        surface = str(selected["surface"])
-        bbox = selected["bbox_2d"]
-        confidence = float(selected["confidence"])
-    else:
-        selected = objects[0]
-        target = str(selected["name"])
-        surface = str(selected["surface"])
-        bbox = None
-        confidence = max(float(item["confidence"]) for item in objects)
-
     return {
         "mode": "ALIGN_GROUNDING",
         "status": value["status"],
-        "objects": objects,
-        "target": target,
-        "surface": surface,
-        "bbox_2d": bbox,
+        "target": {
+            "name": target_name,
+            "visible": target_visible,
+            "bbox_2d": bbox,
+            "confidence": float(target_confidence),
+        },
+        "yaw_align_target": {
+            "name": yaw_target_name,
+            "visible": yaw_target_visible,
+            "confidence": float(yaw_target_confidence),
+        },
         "visual_evidence": value["visual_evidence"],
-        "confidence": confidence,
+        "confidence": min(
+            float(target_confidence), float(yaw_target_confidence),
+        ),
     }
 
 
@@ -510,8 +535,8 @@ generic checklist to guide your actions.
      is provided.
    - ALIGN skill_args must be {{}}. Alignment always uses the front view. Once
      navigation to the frozen GLOBAL TARGET is complete, VA independently
-     selects the largest, clearest, least-occluded operation object as the
-     BasePose alignment target and derives its concrete supporting object.
+   reads only the alignment prompt and current image to select the BasePose
+   distance/centering target and yaw-alignment target.
    - MANIPULATE skill_args must be {{}} and is terminal.
    - The runtime applies fixed NAV and ALIGN handoff contracts. Your
      expected_postcondition describes intended progress but cannot override
@@ -672,45 +697,35 @@ Coordinates are normalized [0,1000]. Return exactly:
 
 
 def alignment_grounding_prompt(
-    *, mission: str, global_target: str, strategic_goal: str,
-    strategic_stop: bool, direction: str,
+    *, alignment_prompt: str, direction: str,
 ) -> str:
-    return f"""**ROLE**: You are a humanoid robot agent's TACTICAL EYES in
-ALIGN_GROUNDING mode.
-{_va_context(mission, global_target, strategic_goal, strategic_stop)}
+    return f"""**ROLE**: You are a humanoid robot BasePose alignment visual
+grounding model in ALIGN_GROUNDING mode.
+
+**ALIGN PROMPT**: {json.dumps(alignment_prompt, ensure_ascii=False)}
 
 **INPUT**: You are looking at the CURRENT VIEW after turning to the fixed
 {direction} panorama direction.
 
 **TASK**:
-1. **Manipulation-Task Objects**: Using only MISSION (the manipulation task in
-   this request), enumerate every physical operation object required by that
-   task: each object to grasp/move/place, each destination or container, and
-   each physical control object the robot must operate. Include every such
-   object even when it is not visible in the current image.
-2. **Strict Exclusions**: Do not include any surface/support object as an item
-   in `objects`. Also exclude the frozen navigation GLOBAL TARGET as such,
-   navigation landmarks, rooms, people, robot body parts, and unrelated scene
-   objects. For the task "grasp the medicine bottle and place it into the blue
-   basket", `objects` must contain `medicine bottle` and `blue basket`; `desk`
-   belongs only in their `surface` fields and must not be a separate item.
-3. **Per-Object Grounding**: For every task object, return a short English
-   detector-friendly `name`, its complete concrete supporting `surface`,
-   whether it is visible, and its tight bbox and confidence. Invisible objects
-   use `bbox_2d:null`. Use a whole-object surface name such as `desk`, `table`,
-   or `shelf`; never use a part, region, material, or geometry such as
-   `tabletop`, `desktop surface`, `top`, `edge`, `plane`, or `floor area`.
-4. **Grounding Decision**: Return FOUND when at least one visible operation
-   object occupies at least 1% of the full image. Otherwise return NOT_FOUND.
-   Do not choose the final BasePose target yourself: the runtime compares all
-   returned visible bboxes and deterministically selects the largest eligible
-   operation object.
+1. Use only ALIGN PROMPT and the current image.
+2. Select exactly one `target` for distance approach and image centering. Give
+   it a tight bbox.
+3. Select exactly one `yaw_align_target` whose visible straight edge controls
+   yaw. Do not return a bbox for this role.
+4. Both roles may name the same physical object and must then use identical
+   short, detector-friendly English text.
+5. Do not infer supporting surfaces, floor relations, navigation targets,
+   current strategy, manipulation tasks, or prior state.
+6. FOUND requires the target to have a valid bbox and both roles to be visibly
+   identifiable with sufficient confidence. Otherwise return NOT_FOUND; if the
+   target is not visible, use `bbox_2d:null`.
 
-Use short English noun phrases. Coordinates are normalized [0,1000]. Return
-exactly:
-{{"mode":"ALIGN_GROUNDING","status":"FOUND|NOT_FOUND","objects":[
-{{"name":"...","surface":"...","visible":true,
-"bbox_2d":[0,0,1000,1000],"confidence":0.0}}],
+Coordinates are normalized [0,1000]. Return exactly:
+{{"mode":"ALIGN_GROUNDING","status":"FOUND|NOT_FOUND",
+"target":{{"name":"...","visible":true,
+"bbox_2d":[0,0,1000,1000],"confidence":0.0}},
+"yaw_align_target":{{"name":"...","visible":true,"confidence":0.0}},
 "visual_evidence":"..."}}"""
 
 
@@ -755,12 +770,12 @@ def alignment_handoff_postcondition(camera_label: str) -> str:
 
     return (
         f"This is the fresh {camera_label} camera image. Derive all concrete "
-        "operation objects required by the manipulation task, including "
-        "the manipulated object and its destination, container, support, or "
-        "control object. SATISFIED requires every operation object to be "
+        "alignment targets explicitly required by the alignment task in "
+        "MISSION. Do not infer downstream manipulation objects that are not "
+        "written in MISSION. SATISFIED requires every alignment target to be "
         "simultaneously visible in this single image. Do not use or infer "
-        "visibility from another camera, and do not count navigation landmarks "
-        "or rooms that are not operated on."
+        "visibility from another camera, and do not count navigation landmarks, "
+        "supporting surfaces, or unrelated scene objects."
     )
 
 
@@ -1067,8 +1082,8 @@ class LaViRAClient:
         )
 
     def alignment_grounding(
-        self, *, mission: str, global_target: str, strategic_goal: str,
-        strategic_stop: bool, direction: str, image_bgr: np.ndarray,
+        self, *, alignment_prompt: str, direction: str,
+        image_bgr: np.ndarray,
     ) -> dict[str, Any]:
         return self._create(
             self.va_client, request_kind="va_align_grounding", model=self.va_model,
@@ -1084,9 +1099,7 @@ class LaViRAClient:
                     "image_url": {"url": _image_data_url(image_bgr)},
                 },
                 {"type": "text", "text": alignment_grounding_prompt(
-                    mission=mission, global_target=global_target,
-                    strategic_goal=strategic_goal,
-                    strategic_stop=strategic_stop, direction=direction,
+                    alignment_prompt=alignment_prompt, direction=direction,
                 )},
             ], enable_thinking=self.va_enable_thinking),
             max_tokens=768, temperature=0, timeout=self.va_timeout_seconds,
@@ -1170,6 +1183,7 @@ class LaViRAAgent:
     def __init__(
         self, *, navigation_mode: Literal["vln", "object_nav"], mission: str,
         global_target: str = "", manipulation_prompt: str | None = None,
+        alignment_prompt: str,
         max_steps: int, history_size: int,
         min_confidence: float, segment_timeout_seconds: float, camera: Any,
         client: Any,
@@ -1186,7 +1200,7 @@ class LaViRAAgent:
         manipulation_window_seconds: float = 5.0,
         manipulation_max_windows: int = 12,
         manipulation_timeout_seconds: float = 180.0,
-        vla_start_timeout_seconds: float = 6.0,
+        vla_start_timeout_seconds: float = 25.0,
         heading_settle_seconds: float = 1.0,
         heading_settle_samples: int = 30,
         heading_settle_bad_sample_threshold: int = 12,
@@ -1202,6 +1216,8 @@ class LaViRAAgent:
             raise ValueError("navigation_mode must be vln or object_nav")
         if not mission.strip():
             raise ValueError("mission is required")
+        if not alignment_prompt.strip():
+            raise ValueError("alignment_prompt is required")
         if max_steps <= 0 or history_size <= 0:
             raise ValueError("max_steps and history_size must be positive")
         if (
@@ -1238,6 +1254,7 @@ class LaViRAAgent:
         self._configured_global_target = str(global_target).strip()
         self.global_target = self._configured_global_target
         self.manipulation_prompt = str(manipulation_prompt or mission).strip()
+        self.alignment_prompt = str(alignment_prompt).strip()
         self.max_steps = int(max_steps)
         self.history_size = min(5, int(history_size))
         self.min_confidence = float(min_confidence)
@@ -1349,6 +1366,8 @@ class LaViRAAgent:
             raise LaViRAAgentError("stale controller status")
         if int(status.get("skill_id", skill_id)) != skill_id:
             raise LaViRAAgentError("stale skill status")
+        if int(status.get("segment_id", segment_id)) != segment_id:
+            raise LaViRAAgentError("stale segment status")
         return status
 
     def _pose(self) -> tuple[float, float, float]:
@@ -1366,6 +1385,40 @@ class LaViRAAgent:
             if len(values) == 3 and all(_finite(item) for item in values):
                 return tuple(round(float(item), 2) for item in values)  # type: ignore[return-value]
         return 0.0, 0.0, 0.0
+
+    def _fastlio_pose(self) -> tuple[float, float, float]:
+        """Return the latest unrounded Fast-LIO pose for motion geometry."""
+
+        if not hasattr(self.camera, "current_pose"):
+            raise _MoveToFacingUnavailable("move_to_fastlio_pose_unavailable")
+        try:
+            raw = self.camera.current_pose()
+            values = (
+                (raw.get("x"), raw.get("y"), raw.get("yaw"))
+                if isinstance(raw, Mapping)
+                else tuple(raw)
+            )
+        except Exception as exc:
+            raise _MoveToFacingUnavailable(
+                "move_to_fastlio_pose_unavailable"
+            ) from exc
+        if len(values) != 3 or not all(_finite(item) for item in values):
+            raise _MoveToFacingUnavailable("move_to_fastlio_pose_invalid")
+        return tuple(float(item) for item in values)  # type: ignore[return-value]
+
+    @staticmethod
+    def _move_to_goal_world(
+        status: Mapping[str, Any],
+    ) -> tuple[float, float]:
+        """Decode the fixed Fast-LIO world goal returned by NavDP."""
+
+        value = status.get("goal_world")
+        if not isinstance(value, Mapping):
+            raise _MoveToFacingUnavailable("move_to_goal_world_unavailable")
+        coordinates = (value.get("x"), value.get("y"))
+        if not all(_finite(item) for item in coordinates):
+            raise _MoveToFacingUnavailable("move_to_goal_world_invalid")
+        return float(coordinates[0]), float(coordinates[1])
 
     def _sonic_yaw(self) -> float:
         """Return fresh measured SONIC yaw and fail closed if unavailable."""
@@ -1456,10 +1509,7 @@ class LaViRAAgent:
             # settle correction must use the shortest path back to the target.
             commanded_turn_direction = None
             if status.get("state") != "reached":
-                raise LaViRAAgentError(
-                    f"heading_{status.get('state', 'failed')}:"
-                    f"{status.get('reason', 'unknown')}"
-                )
+                raise _HeadingTerminalError(status)
             if status.get("reason") == "heading_adjustment_time_limit":
                 # The terminal NavDP packet carries zero velocity. Hold it for
                 # the normal settle interval, but do not start another
@@ -1659,6 +1709,72 @@ class LaViRAAgent:
             turn_direction=turn_direction,
         )
 
+    def _face_move_to_goal(
+        self,
+        generation: int,
+        skill_id: int,
+        navigation_status: Mapping[str, Any],
+    ) -> Mapping[str, Any]:
+        """Face NavDP's fixed world goal using a Fast-LIO-relative turn."""
+
+        try:
+            facing = _move_to_facing_geometry(
+                self._move_to_goal_world(navigation_status),
+                self._fastlio_pose(),
+            )
+        except _MoveToFacingUnavailable as exc:
+            self._event(
+                logging.WARNING,
+                "MOVE_TO_TARGET_FACING_FAILED",
+                "MOVE_TO target-facing geometry is unavailable; continuing",
+                generation=generation,
+                skill_id=skill_id,
+                segment_id=max(0, self._segment_id),
+                error=str(exc),
+            )
+            raise
+        self._event(
+            logging.INFO,
+            "MOVE_TO_TARGET_FACING_STARTED",
+            "Turning to face the fixed Fast-LIO navigation target",
+            generation=generation,
+            skill_id=skill_id,
+            segment_id=max(0, self._segment_id),
+            **facing,
+        )
+        try:
+            status = self._heading(
+                generation,
+                skill_id,
+                facing["heading_delta_rad"],
+            )
+        except _HeadingTerminalError as exc:
+            self._event(
+                logging.WARNING,
+                "MOVE_TO_TARGET_FACING_FAILED",
+                "MOVE_TO target-facing controller failed; continuing",
+                generation=generation,
+                skill_id=skill_id,
+                segment_id=max(0, self._segment_id),
+                controller_state=exc.status.get("state"),
+                controller_reason=exc.status.get("reason"),
+                error=str(exc),
+                **facing,
+            )
+            raise
+        self._event(
+            logging.INFO,
+            "MOVE_TO_TARGET_FACING_COMPLETED",
+            "Robot is facing the fixed Fast-LIO navigation target",
+            generation=generation,
+            skill_id=skill_id,
+            segment_id=int(status.get("segment_id", self._segment_id)),
+            controller_state=status.get("state"),
+            controller_reason=status.get("reason"),
+            **facing,
+        )
+        return status
+
     def _capture_panorama(
         self, generation: int, skill_id: int,
     ) -> list[ScanView]:
@@ -1785,25 +1901,18 @@ class LaViRAAgent:
 
     def _alignment_ground(
         self, *, generation: int, skill_id: int, image: np.ndarray,
-        strategic_goal: str,
     ) -> dict[str, Any]:
-        result = validate_alignment_grounding(self.client.alignment_grounding(
-            mission=self.manipulation_prompt,
-            global_target=self.global_target,
-            strategic_goal=strategic_goal,
-            strategic_stop=False,
+        result = self.client.alignment_grounding(
+            alignment_prompt=self.alignment_prompt,
             direction="front",
             image_bgr=image,
-        ))
-        result = dict(result)
-        result["target"] = str(result["target"]).strip()
-        result["surface"] = str(result["surface"]).strip()
+        )
         if (
             result["status"] == "FOUND"
             and float(result["confidence"]) < self.min_confidence
         ):
             result = dict(result)
-            result.update(status="NOT_FOUND", bbox_2d=None)
+            result["status"] = "NOT_FOUND"
         self._event(
             logging.INFO if result["status"] == "FOUND" else logging.WARNING,
             "VA_ALIGN_GROUNDING",
@@ -1811,13 +1920,16 @@ class LaViRAAgent:
             generation=generation,
             skill_id=skill_id,
             segment_id=max(0, self._segment_id),
-            target=result["target"],
-            surface=result["surface"],
+            target=result["target"]["name"],
+            yaw_align_target=result["yaw_align_target"]["name"],
             view_direction="front",
             status=result["status"],
             confidence=result["confidence"],
-            bbox_2d=result["bbox_2d"],
-            operation_objects=result["objects"],
+            target_confidence=result["target"]["confidence"],
+            yaw_align_target_confidence=(
+                result["yaw_align_target"]["confidence"]
+            ),
+            bbox_2d=result["target"]["bbox_2d"],
             visual_evidence=result["visual_evidence"],
         )
         return result
@@ -2053,7 +2165,7 @@ class LaViRAAgent:
         """Reuse the existing VA POSTCHECK interface for one camera view."""
 
         result = validate_postcheck(self.client.postcheck(
-            mission=self.manipulation_prompt,
+            mission=self.alignment_prompt,
             global_target=self.global_target,
             strategic_goal=strategic_goal,
             strategic_stop=False,
@@ -2243,13 +2355,22 @@ class LaViRAAgent:
         })
         status = self._wait(generation, skill_id, segment)
         move_succeeded = status.get("state") == "reached"
+        if move_succeeded:
+            try:
+                self._face_move_to_goal(generation, skill_id, status)
+            except (_MoveToFacingUnavailable, _HeadingTerminalError):
+                # The navigation segment has already reached a terminal state,
+                # so the selected warn-and-continue policy is safe here.  Wait
+                # timeouts, cancellation, and stale identities are not caught.
+                pass
+        post_segment = self._segment_id
         result_snapshots: dict[str, RGBDSnapshot] = {}
         camera_errors: dict[str, str] = {}
         for label in ("chest", "head"):
             try:
                 if label == "chest":
                     snapshot = self._capture_va_snapshot(
-                        generation, skill_id, segment,
+                        generation, skill_id, post_segment,
                     )
                 else:
                     snapshot = self.camera.capture_camera_aligned_rgbd(
@@ -2264,7 +2385,7 @@ class LaViRAAgent:
                     "NAV handoff camera view is unavailable",
                     generation=generation,
                     skill_id=skill_id,
-                    segment_id=segment,
+                    segment_id=post_segment,
                     camera=label,
                     camera_stream=(
                         "chest_view"
@@ -2298,7 +2419,7 @@ class LaViRAAgent:
                     "NAV handoff VA grounding failed",
                     generation=generation,
                     skill_id=skill_id,
-                    segment_id=segment,
+                    segment_id=post_segment,
                     camera=label,
                     error=str(exc),
                 )
@@ -2337,10 +2458,9 @@ class LaViRAAgent:
             generation=generation,
             skill_id=skill_id,
             image=alignment_image,
-            strategic_goal=strategic_goal,
         )
-        target = str(grounding["target"])
-        surface = str(grounding["surface"])
+        target = str(grounding["target"]["name"])
+        yaw_align_target = str(grounding["yaw_align_target"]["name"])
         if grounding["status"] != "FOUND":
             post = self._align_handoff(
                 generation=generation,
@@ -2355,10 +2475,12 @@ class LaViRAAgent:
             )
         segment = self._next_segment()
         self.submit_intent("start_base_pose", {
-            "generation": generation, "skill_id": skill_id,
-            "segment_id": segment, "target": target,
-            "surface": surface,
-            "reference_bbox": grounding["bbox_2d"],
+            "generation": generation,
+            "skill_id": skill_id,
+            "segment_id": segment,
+            "target": target,
+            "yaw_align_target": yaw_align_target,
+            "reference_bbox": grounding["target"]["bbox_2d"],
         })
         status = self._wait(generation, skill_id, segment)
         aligned = (

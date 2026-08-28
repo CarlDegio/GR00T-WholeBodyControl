@@ -20,7 +20,7 @@ from gear_sonic.utils.inference.base_pose.servo import (
     RawServoObservation,
     ServoCommand,
     ServoPhase,
-    TableGeometry,
+    YawAlignGeometry,
     TargetGeometry,
     VisualServoController,
 )
@@ -36,8 +36,8 @@ def _servo_observation(
 ) -> RawServoObservation:
     return RawServoObservation(
         target=TargetGeometry(1.2, 0.0, (1.2, 0.0, 0.5), 100, 0.9, 1.2),
-        table=(
-            TableGeometry(
+        yaw_align_geometry=(
+            YawAlignGeometry(
                 yaw_error_rad=yaw_rad,
                 line_length_px=100.0,
                 valid_depth_samples=20,
@@ -48,7 +48,7 @@ def _servo_observation(
         ),
         camera_timestamp=1.0,
         target_track_id=1,
-        surface_track_id=2 if include_table else None,
+        yaw_align_target_track_id=2 if include_table else None,
         target_bbox_xyxy=(240.0, 120.0, 400.0, 360.0),
     )
 
@@ -101,12 +101,12 @@ def test_yolo_adapter_accepts_dynamic_align_identity_and_prompts(tmp_path) -> No
         skill_id=3,
         segment_id=9,
         target="blue basket",
-        surface="workbench",
+        yaw_align_target="workbench",
         reference_bbox=[100, 100, 900, 900],
         now=1.0,
     )
     assert config.target_prompt == "blue basket"
-    assert config.surface_prompt == "workbench"
+    assert config.yaw_align_target_prompt == "workbench"
     assert intents[-1][1]["generation"] == 7
     assert intents[-1][1]["skill_id"] == 3
     assert intents[-1][1]["segment_id"] == 9
@@ -128,7 +128,7 @@ def test_yolo_adapter_accepts_dynamic_align_identity_and_prompts(tmp_path) -> No
         skill_id=4,
         segment_id=10,
         target="blue basket",
-        surface="workbench",
+        yaw_align_target="workbench",
         now=1.2,
     )
     assert intents[-1][1]["motion_profile"] == "yoloe_servo"
@@ -150,7 +150,7 @@ def test_yolo_adapter_skill_cancel_allows_later_standalone_start(tmp_path) -> No
         skill_id=3,
         segment_id=17,
         target="blue basket",
-        surface="desk",
+        yaw_align_target="yaw_align_target",
         now=1.0,
     )
     assert adapter.runtime.generation == 1_000_003
@@ -333,8 +333,8 @@ def test_yolo_adapter_forwards_viewer_overlay_without_touching_velocity(
     overlay = {
         "target_bbox_xyxy": [10.0, 20.0, 30.0, 40.0],
         "target_lateral_anchor_px": [20.0, 30.0],
-        "table_edge_endpoints_px": [[0.0, 35.0], [50.0, 35.0]],
-        "desk_mask_row_spans": [[35, 0, 50]],
+        "yaw_align_edge_endpoints_px": [[0.0, 35.0], [50.0, 35.0]],
+        "completed_yaw_align_target_mask_row_spans": [[35, 0, 50]],
         "image_size": [64, 48],
     }
 
@@ -367,18 +367,18 @@ def test_mixed_camera_overlay_keeps_mode_border_and_routes_geometry(
     runtime = adapter.runtime
     runtime.active_camera_stream = "ego_view"
     runtime.control_source_stream = "chest_view"
-    desk_mask = np.zeros((48, 64), dtype=np.uint8)
-    desk_mask[32:34, 4:60] = 1
+    completed_yaw_align_target_mask = np.zeros((48, 64), dtype=np.uint8)
+    completed_yaw_align_target_mask[32:34, 4:60] = 1
     observation = replace(
         _servo_observation(),
         image_width=64,
         image_height=48,
-        desk_mask=desk_mask,
-        table=replace(
-            _servo_observation().table,
+        completed_yaw_align_target_mask=completed_yaw_align_target_mask,
+        yaw_align_geometry=replace(
+            _servo_observation().yaw_align_geometry,
             line_endpoints_px=((5.0, 35.0), (55.0, 35.0)),
         ),
-        table_camera_stream="ego_view",
+        yaw_align_geometry_camera_stream="ego_view",
     )
 
     runtime._set_viewer_overlay(
@@ -391,12 +391,12 @@ def test_mixed_camera_overlay_keeps_mode_border_and_routes_geometry(
     assert parameters["camera_stream"] == "ego_view"
     overlay = parameters["viewer_overlay"]
     assert overlay["target_camera_stream"] == "chest_view"
-    assert overlay["table_camera_stream"] == "ego_view"
-    assert overlay["table_edge_endpoints_px"] == [
+    assert overlay["yaw_align_geometry_camera_stream"] == "ego_view"
+    assert overlay["yaw_align_edge_endpoints_px"] == [
         [5.0, 35.0],
         [55.0, 35.0],
     ]
-    assert overlay["desk_mask_row_spans"]
+    assert overlay["completed_yaw_align_target_mask_row_spans"]
 
 
 @pytest.mark.parametrize(
@@ -409,21 +409,21 @@ def test_mixed_camera_overlay_keeps_mode_border_and_routes_geometry(
         ),
         (
             {
-                "surface_mask": np.pad(
+                "yaw_align_target_mask": np.pad(
                     np.ones((1, 4), dtype=np.uint8),
                     ((3, 44), (5, 55)),
                 )
             },
-            "viewer_desk_mask_row_spans",
+            "viewer_completed_yaw_align_target_mask_row_spans",
             ((3, 5, 9),),
         ),
         (
             {
-                "table_geometry": {
+                "yaw_align_geometry": {
                     "line_endpoints_px": ((2.0, 30.0), (60.0, 31.0))
                 }
             },
-            "viewer_table_edge_endpoints_px",
+            "viewer_yaw_align_edge_endpoints_px",
             ((2.0, 30.0), (60.0, 31.0)),
         ),
     ),
@@ -562,7 +562,7 @@ def test_yolo_servo_outputs_only_bounded_yaw_during_initial_alignment() -> None:
     controller = VisualServoController()
     observation = RawServoObservation(
         target=TargetGeometry(1.2, 0.0, (1.2, 0.0, 0.5), 100, 0.9, 1.2),
-        table=TableGeometry(
+        yaw_align_geometry=YawAlignGeometry(
             yaw_error_rad=0.5,
             line_length_px=100.0,
             valid_depth_samples=20,
@@ -570,7 +570,7 @@ def test_yolo_servo_outputs_only_bounded_yaw_during_initial_alignment() -> None:
         ),
         camera_timestamp=1.0,
         target_track_id=1,
-        surface_track_id=2,
+        yaw_align_target_track_id=2,
         target_bbox_xyxy=(240.0, 120.0, 400.0, 360.0),
     )
 

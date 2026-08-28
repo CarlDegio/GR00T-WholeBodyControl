@@ -484,20 +484,26 @@ def test_yaml_contains_every_launch_parameter() -> None:
     profile = load_runtime_profile()
 
     assert profile.component("deploy")["policy_variant"] == "sonic_v1_1"
-    assert vla.prompt.startswith("Move in front of the desk with the blue basket")
-    assert lavira.navigation_mode == "vln"
+    assert vla.prompt.startswith("Grasp the empty cardboard box")
+    assert lavira.navigation_mode == "object_nav"
     assert lavira.mission == (
-        "Walk forward to the trash can, then turn right and walk to a position "
-        "near the desk with the blue basket on it."
+        "Search the workspace for a cardboard box on a handcart and approach it."
     )
-    assert lavira.global_target == ""
+    assert lavira.global_target == "a cardboard box on a handcart"
     assert lavira.manipulation_prompt == vla.prompt
+    assert lavira.alignment_prompt == (
+        "Use the cardboard box as the distance-and-centering target.\n"
+        "Use the cardboard box as the yaw-alignment target;\n"
+        "align yaw to one visible straight edge of that same cardboard box."
+    )
     assert lavira.la_model == "qwen3.8-max"
     assert lavira.va_model == "qwen3.5-27b"
     assert loaded.base_pose_enabled is True
-    assert base_pose.task == "align to the blue basket"
-    assert base_pose.target_prompt == "bluebasket"
-    assert base_pose.surface_prompt == "desk"
+    assert base_pose.task == (
+        "align distance, centering, and yaw to the cardboard box"
+    )
+    assert base_pose.target_prompt == "cardboard box"
+    assert base_pose.yaw_align_target_prompt == "cardboard box"
     assert base_pose.dual_chest_depth_stream == "camera/chest_view_depth"
     assert base_pose.raw_min_linear_speed_m_s == pytest.approx(0.35)
     assert base_pose.raw_max_lateral_speed_m_s == pytest.approx(0.4)
@@ -761,7 +767,7 @@ def test_base_pose_agent_uses_gateway_arbitration_and_fixed_task() -> None:
     assert "-m gear_sonic.utils.inference.base_pose.agent" in command
     assert "--task" not in command
     assert "--target-prompt" not in command
-    assert "--surface-prompt" not in command
+    assert "--yaw-align-target-prompt" not in command
     assert "--mode" not in command
     assert "--dual-head-camera-stream" not in command
     assert worker.dual_head_depth_stream == "camera/ego_view_depth"
@@ -780,8 +786,10 @@ def test_base_pose_agent_uses_gateway_arbitration_and_fixed_task() -> None:
     assert "--raw-chest-fallback-forward-tolerance-m" not in command
     assert "--raw-chest-fallback-lateral-tolerance-m" not in command
     assert "--raw-head-target-distance-m" not in command
-    assert worker.raw_head_target_distance_m == pytest.approx(0.9)
-    assert worker.raw_chest_target_distance_m == pytest.approx(0.7)
+    assert worker.raw_head_target_distance_m == pytest.approx(1.3)
+    assert worker.raw_head_approach_cutoff_m == pytest.approx(1.5)
+    assert worker.raw_chest_target_distance_m == pytest.approx(1.1)
+    assert worker.raw_chest_approach_cutoff_m == pytest.approx(1.3)
     assert worker.raw_post_stop_sample_frames == 30
     assert "--vision-backend" not in command
     assert "codex" not in command.lower()

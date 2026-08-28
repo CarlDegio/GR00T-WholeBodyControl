@@ -69,15 +69,16 @@ def _pose_policy_is_active(cpp_loop_running: bool, cpp_mode: str, pause_loop: bo
 def _should_schedule_vla_inference(
     *,
     cpp_mode: str,
+    prepose_warmup: bool = False,
     worker_is_busy: bool,
     request_queue_is_empty: bool,
     time_since_request: float,
     inference_interval: float,
 ) -> bool:
-    """Capture POSE observations even when action publication is paused."""
+    """Capture POSE observations or the first action before POSE entry."""
 
     return (
-        cpp_mode == "POSE"
+        (cpp_mode == "POSE" or prepose_warmup)
         and not worker_is_busy
         and request_queue_is_empty
         and time_since_request >= inference_interval
@@ -101,6 +102,11 @@ class _VlaRuntimeState:
     task_skill_id: int = 0
     task_window_id: int = 0
     task_active: bool = False
+    # A task started from PLANNER remains there until its first policy action
+    # and a fresh safety snapshot are both available.  This prevents a cold
+    # PolicyServer call from opening an actionless POSE interval.
+    task_pose_entry_pending: bool = False
+    pending_action_ready_ms: float = 0.0
     # A LaViRA visual postcheck pauses fresh policy actions, but the C++ POSE
     # input still requires a continuous stream.  While this flag is set the
     # service republishes the terminal action from the current policy chunk.
@@ -223,6 +229,8 @@ class _VlaCommandHandler:
         self.state.task_skill_id = 0
         self.state.task_window_id = 0
         self.state.task_active = False
+        self.state.task_pose_entry_pending = False
+        self.state.pending_action_ready_ms = 0.0
         self.state.task_stream_hold_active = False
         self.state.pause_loop = True
         self.invalidate_inference("navigation cancelled")
@@ -276,6 +284,8 @@ class _VlaCommandHandler:
         self.state.task_generation, self.state.task_skill_id = identity
         self.state.task_window_id = 0
         self.state.task_active = True
+        self.state.task_pose_entry_pending = False
+        self.state.pending_action_ready_ms = 0.0
         self.state.task_stream_hold_active = False
         while not self.inference_failures.empty():
             try:
@@ -292,29 +302,29 @@ class _VlaCommandHandler:
         self.language_prompt_ref[0] = prompt
         self.state.zmq_frame_counter = 0
         self.invalidate_inference("VLA task started")
-        if self.state.cpp_mode == "PLANNER":
-            if not self.publish_initial_pose():
+        if self.state.cpp_mode != "PLANNER":
+            if not self.send_cpp_control_command(start=True, planner=True):
                 self.fail_active_task(
-                    "vla_initial_pose_failed",
-                    "VLA could not publish its initial pose",
+                    "vla_planner_hold_failed",
+                    "VLA could not enter PLANNER hold before policy warmup",
                 )
                 return
-            if not self.send_cpp_control_command(start=True, planner=False):
-                self.fail_active_task(
-                    "vla_pose_mode_failed",
-                    "VLA could not enter POSE mode",
-                )
-                return
-        elif self.state.cpp_mode == "OFF":
-            if not self.send_cpp_control_command(start=True, planner=False):
-                self.fail_active_task(
-                    "vla_pose_mode_failed",
-                    "VLA could not start POSE mode",
-                )
-                return
-        self.state.pause_loop = False
+        if not self.publish_initial_pose():
+            self.fail_active_task(
+                "vla_initial_pose_failed",
+                "VLA could not publish its initial pose",
+            )
+            return
+        self.state.pause_loop = True
+        self.state.task_pose_entry_pending = True
         self.activate_vla_metrics()
-        self.publish_task_status("active", "started", window_id=0)
+        self.record_event(
+            logging.INFO,
+            "VLA_FIRST_ACTION_WAITING",
+            "VLA is holding PLANNER until the first policy action is ready",
+            generation=generation,
+            skill_id=skill_id,
+        )
 
     def _update_active_task(
         self,
@@ -368,6 +378,8 @@ class _VlaCommandHandler:
             self.activate_vla_metrics()
             return
         self.state.task_active = False
+        self.state.task_pose_entry_pending = False
+        self.state.pending_action_ready_ms = 0.0
         self.state.task_stream_hold_active = False
         self.state.pause_loop = True
         self.invalidate_inference(f"VLA task stopped at window {window_id}")
@@ -510,6 +522,8 @@ def _enforce_active_task_safety(
     if safety_reason == "clear":
         return
     state.task_active = False
+    state.task_pose_entry_pending = False
+    state.pending_action_ready_ms = 0.0
     state.task_stream_hold_active = False
     state.pause_loop = True
     invalidate_inference(f"VLA safety blocked: {safety_reason}")
@@ -554,22 +568,43 @@ def _consume_vla_result(
         return
     inference_delay = time.monotonic() - inference_start_time
     timing_ms["action_ready"] = inference_delay * 1000.0
-    if result_generation != state.inference_generation or not _pose_policy_is_active(
-        state.cpp_loop_running,
-        state.cpp_mode,
-        state.pause_loop,
+    if result_generation != state.inference_generation:
+        return
+    prepose_result = (
+        state.task_active
+        and state.task_pose_entry_pending
+        and state.cpp_mode == "PLANNER"
+    )
+    if not prepose_result and not _pose_policy_is_active(
+        state.cpp_loop_running, state.cpp_mode, state.pause_loop,
     ):
         return
     service.publish_metrics(
         timing_ms,
         allowed_names=VLA_TIMING_SEGMENTS,
     )
-    state.action_chunk_index = calculate_latency_compensated_index(
-        inference_delay,
-        config.action_publish_rate,
-        config.action_horizon,
-    )
+    if prepose_result:
+        # The robot was held stationary while this observation was processed,
+        # so inference latency must not skip to the end of the first chunk.
+        state.action_chunk_index = 0
+        state.pending_action_ready_ms = timing_ms["action_ready"]
+    else:
+        state.action_chunk_index = calculate_latency_compensated_index(
+            inference_delay,
+            config.action_publish_rate,
+            config.action_horizon,
+        )
     state.cached_action_chunk = processed_action
+    if prepose_result:
+        record_event(
+            logging.INFO,
+            "INFERENCE_READY",
+            "Remote VLA inference returned the action required for POSE entry",
+            generation=state.inference_generation,
+            prompt=language_prompt,
+            action_ready_ms=timing_ms["action_ready"],
+        )
+        return
     if state.active_generation == state.inference_generation:
         return
     record_event(
@@ -581,6 +616,64 @@ def _consume_vla_result(
         action_ready_ms=timing_ms["action_ready"],
     )
     state.active_generation = state.inference_generation
+
+
+def _activate_pending_pose_task(
+    state: _VlaRuntimeState,
+    *,
+    vla_safety_gate,
+    vla_safety_monitor,
+    send_cpp_control_command,
+    activate_vla_metrics,
+    publish_task_status,
+    fail_active_task,
+    record_event,
+    language_prompt: str,
+) -> bool:
+    """Enter POSE only after both the first action and safety are ready."""
+
+    if (
+        not state.task_active
+        or not state.task_pose_entry_pending
+        or state.cached_action_chunk is None
+    ):
+        return False
+    safety_reason = _current_vla_safety_reason(
+        vla_safety_gate,
+        vla_safety_monitor,
+    )
+    if safety_reason != "clear":
+        record_event(
+            logging.WARNING,
+            "VLA_POSE_ENTRY_WAITING",
+            "First policy action is ready; waiting for fresh safety sensors",
+            repeat_s=2.0,
+            reason=safety_reason,
+            generation=state.task_generation,
+            skill_id=state.task_skill_id,
+        )
+        return False
+    if not send_cpp_control_command(start=True, planner=False):
+        fail_active_task(
+            "vla_pose_mode_failed",
+            "VLA could not enter POSE mode after first-action warmup",
+        )
+        return False
+    state.task_pose_entry_pending = False
+    state.pause_loop = False
+    activate_vla_metrics()
+    publish_task_status("active", "started", window_id=0)
+    record_event(
+        logging.INFO,
+        "INFERENCE_ACTIVE",
+        "Remote VLA inference is active after safe POSE entry",
+        generation=state.inference_generation,
+        prompt=language_prompt,
+        action_ready_ms=state.pending_action_ready_ms,
+    )
+    state.pending_action_ready_ms = 0.0
+    state.active_generation = state.inference_generation
+    return True
 
 
 def _schedule_vla_inference(
@@ -596,6 +689,9 @@ def _schedule_vla_inference(
         not inference_failed_event.is_set()
         and _should_schedule_vla_inference(
             cpp_mode=state.cpp_mode,
+            prepose_warmup=(
+                state.task_active and state.task_pose_entry_pending
+            ),
             worker_is_busy=inference_busy_event.is_set(),
             request_queue_is_empty=inference_queue.empty(),
             time_since_request=(now - state.last_inference_request_time),

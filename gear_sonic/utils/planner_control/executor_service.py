@@ -86,6 +86,8 @@ class PlannerSafetySensorMonitor:
         max_age_ms: float,
         include_robot_state: bool = False,
         client: SensorGatewayClient | None = None,
+        lidar_client: SensorGatewayClient | None = None,
+        auxiliary_client: SensorGatewayClient | None = None,
         monotonic: Callable[[], float] = time.monotonic,
     ) -> None:
         if poll_hz <= 0.0:
@@ -93,16 +95,45 @@ class PlannerSafetySensorMonitor:
         self.poll_hz = float(poll_hz)
         self.max_age_ms = float(max_age_ms)
         self.include_robot_state = bool(include_robot_state)
-        self.client = client or SensorGatewayClient(
-            endpoint, request_timeout_ms=int(request_timeout_ms)
-        )
-        self._owns_client = client is None
+        if client is not None and (
+            lidar_client is not None or auxiliary_client is not None
+        ):
+            raise ValueError(
+                "client cannot be combined with dedicated safety clients"
+            )
+        self._owned_clients: list[SensorGatewayClient] = []
+        if client is not None:
+            # Preserve the injectable single-client path used by synchronous
+            # tests. Production uses independent sockets so a slow RGB-D/state
+            # materialization cannot delay the safety-critical LiDAR refresh.
+            self._lidar_client = client
+            self._auxiliary_client = client
+        else:
+            if lidar_client is None:
+                lidar_client = SensorGatewayClient(
+                    endpoint, request_timeout_ms=int(request_timeout_ms)
+                )
+                self._owned_clients.append(lidar_client)
+            if auxiliary_client is None:
+                auxiliary_client = SensorGatewayClient(
+                    endpoint, request_timeout_ms=int(request_timeout_ms)
+                )
+                self._owned_clients.append(auxiliary_client)
+            self._lidar_client = lidar_client
+            self._auxiliary_client = auxiliary_client
+        # Keep the historical attribute for callers that inspect the monitor.
+        self.client = self._auxiliary_client
         self._monotonic = monotonic
         self._lock = threading.Lock()
         self._stop = threading.Event()
-        self._thread = threading.Thread(
-            target=self._run,
-            name="planner-safety-sensors",
+        self._lidar_thread = threading.Thread(
+            target=self._run_lidar,
+            name="planner-safety-lidar",
+            daemon=True,
+        )
+        self._auxiliary_thread = threading.Thread(
+            target=self._run_auxiliary,
+            name="planner-safety-depth-state",
             daemon=True,
         )
         self._snapshot = SafetySnapshot()
@@ -111,7 +142,7 @@ class PlannerSafetySensorMonitor:
         self._last_error_time = 0.0
 
     def _request(self, stream: str):
-        return self.client.read_snapshot(
+        return self._auxiliary_client.read_snapshot(
             SnapshotRequest(
                 streams=(stream,),
                 max_age_ms=self.max_age_ms,
@@ -121,7 +152,7 @@ class PlannerSafetySensorMonitor:
         )
 
     def _poll_lidar(self) -> None:
-        lidar = self.client.request_snapshot(
+        lidar = self._lidar_client.request_snapshot(
             SnapshotRequest(
                 streams=(self.LIDAR_STREAM,),
                 max_age_ms=self.max_age_ms,
@@ -188,11 +219,8 @@ class PlannerSafetySensorMonitor:
             self._last_error = message
             self._last_error_time = now
 
-    def _run(self) -> None:
+    def _run_pollers(self, pollers) -> None:
         period = 1.0 / self.poll_hz
-        pollers = [self._poll_lidar, self._poll_depth]
-        if self.include_robot_state:
-            pollers.append(self._poll_robot_state)
         while not self._stop.is_set():
             started = self._monotonic()
             for poll in pollers:
@@ -204,8 +232,18 @@ class PlannerSafetySensorMonitor:
                     self._report(exc)
             self._stop.wait(max(0.0, period - (self._monotonic() - started)))
 
+    def _run_lidar(self) -> None:
+        self._run_pollers((self._poll_lidar,))
+
+    def _run_auxiliary(self) -> None:
+        pollers = [self._poll_depth]
+        if self.include_robot_state:
+            pollers.append(self._poll_robot_state)
+        self._run_pollers(pollers)
+
     def start(self) -> None:
-        self._thread.start()
+        self._lidar_thread.start()
+        self._auxiliary_thread.start()
 
     def snapshot(self) -> SafetySnapshot:
         with self._lock:
@@ -229,10 +267,11 @@ class PlannerSafetySensorMonitor:
 
     def close(self) -> None:
         self._stop.set()
-        if self._thread.is_alive():
-            self._thread.join(timeout=1.0)
-        if self._owns_client:
-            self.client.close()
+        for thread in (self._lidar_thread, self._auxiliary_thread):
+            if thread.is_alive():
+                thread.join(timeout=1.0)
+        for owned_client in self._owned_clients:
+            owned_client.close()
 
 
 def main(

@@ -1,11 +1,10 @@
 #!/usr/bin/env python3
 """Feed a VA ALIGN result through YOLOE and RGB edge-line filtering.
 
-The script mirrors BasePose's non-depth surface-edge stages. It deliberately
+The script mirrors BasePose's non-depth yaw-align edge stages. It deliberately
 omits depth sampling/ranking and chooses the longest surviving Hough segment
-for visualization. When target and surface text are identical (the explicit
-floor fallback), one YOLOE instance/mask is reused and self-exclusion is
-disabled; otherwise the normal target-mask exclusion is applied.
+for visualization. When both roles use identical text, one YOLOE instance and
+mask is reused and self-exclusion is disabled.
 """
 
 from __future__ import annotations
@@ -30,7 +29,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("image", type=Path)
     parser.add_argument("--target", required=True)
-    parser.add_argument("--surface", required=True)
+    parser.add_argument("--yaw-align-target", required=True)
     parser.add_argument(
         "--target-bbox",
         type=float,
@@ -39,7 +38,6 @@ def parse_args() -> argparse.Namespace:
         required=True,
         help="VA target bbox in normalized [0,1000] coordinates.",
     )
-    parser.add_argument("--surface-bbox", type=float, nargs=4)
     parser.add_argument("--model", type=Path, default=DEFAULT_MODEL)
     parser.add_argument("--device", default="0")
     parser.add_argument("--imgsz", type=int, default=640)
@@ -201,11 +199,11 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     from ultralytics import YOLOE
 
     from gear_sonic.utils.inference.base_pose.servo import (
-        _dilate_table_edge_mask,
+        _dilate_yaw_align_edge_mask,
         _largest_filled_component,
         _rgb_edge_line_segments,
         _rgb_mask_edge_intersection,
-        _table_edge_target_exclusion,
+        _yaw_align_edge_target_exclusion,
     )
 
     image_path = args.image.expanduser().resolve()
@@ -229,15 +227,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         width=width,
         height=height,
     )
-    surface_reference = (
-        None
-        if args.surface_bbox is None
-        else normalized_bbox_to_pixels(
-            args.surface_bbox,
-            width=width,
-            height=height,
-        )
-    )
+    yaw_align_target_reference = None
 
     reference_overlay = image_bgr.copy()
     draw_bbox(
@@ -246,19 +236,12 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         color=(255, 255, 0),
         label=f"VA TARGET: {args.target}",
     )
-    if surface_reference is not None and surface_reference != target_reference:
-        draw_bbox(
-            reference_overlay,
-            surface_reference,
-            color=(255, 0, 255),
-            label=f"VA SURFACE: {args.surface}",
-        )
     write_image(output_dir / "01_input_va_bbox.jpg", reference_overlay)
 
     same_prompt = " ".join(args.target.casefold().split()) == " ".join(
-        args.surface.casefold().split()
+        args.yaw_align_target.casefold().split()
     )
-    class_names = [args.target] if same_prompt else [args.target, args.surface]
+    class_names = [args.target] if same_prompt else [args.target, args.yaw_align_target]
     os.environ.setdefault(
         "YOLO_CONFIG_DIR",
         str(model_path.parents[1] / "config"),
@@ -316,7 +299,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             "status": "NO_TARGET_DETECTION",
             "image": str(image_path),
             "target": args.target,
-            "surface": args.surface,
+            "yaw_align_target": args.yaw_align_target,
             "class_names": class_names,
             "detections": [],
             "depth_filter_applied": False,
@@ -328,21 +311,21 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         return result
 
     if same_prompt:
-        surface_detection = target_detection
-        surface_mode = "floor_fallback_reuse_target_instance"
+        yaw_align_target_detection = target_detection
+        yaw_align_target_mode = "reuse_target_instance"
     else:
-        surface_detection = select_detection(
+        yaw_align_target_detection = select_detection(
             detections,
             class_index=1,
-            reference_bbox=surface_reference,
+            reference_bbox=yaw_align_target_reference,
         )
-        surface_mode = "independent_surface_instance"
-    if surface_detection is None:
+        yaw_align_target_mode = "independent_yaw_align_target_instance"
+    if yaw_align_target_detection is None:
         result = {
-            "status": "NO_SURFACE_DETECTION",
+            "status": "NO_YAW_ALIGN_TARGET_DETECTION",
             "image": str(image_path),
             "target": args.target,
-            "surface": args.surface,
+            "yaw_align_target": args.yaw_align_target,
             "class_names": class_names,
             "detections": [
                 serialize_detection(
@@ -361,17 +344,17 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         return result
 
     target_mask = np.asarray(target_detection["mask"], dtype=np.uint8)
-    raw_surface_mask = np.asarray(surface_detection["mask"], dtype=np.uint8)
-    filled_surface_mask = _largest_filled_component(raw_surface_mask)
-    dilated_surface_mask = _dilate_table_edge_mask(filled_surface_mask)
+    raw_yaw_align_target_mask = np.asarray(yaw_align_target_detection["mask"], dtype=np.uint8)
+    filled_yaw_align_target_mask = _largest_filled_component(raw_yaw_align_target_mask)
+    dilated_yaw_align_target_mask = _dilate_yaw_align_edge_mask(filled_yaw_align_target_mask)
     exclusion_mask = (
         None
         if same_prompt
-        else _table_edge_target_exclusion(target_mask, dilated_surface_mask.shape)
+        else _yaw_align_edge_target_exclusion(target_mask, dilated_yaw_align_target_mask.shape)
     )
     edge_intersection = _rgb_mask_edge_intersection(
         image_rgb,
-        dilated_surface_mask,
+        dilated_yaw_align_target_mask,
         exclusion_mask=exclusion_mask,
     )
     segments = _rgb_edge_line_segments(edge_intersection)
@@ -382,16 +365,16 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         colorize_mask(target_mask, color=(255, 255, 255)),
     )
     write_image(
-        output_dir / "04_surface_mask_raw.png",
-        colorize_mask(raw_surface_mask, color=(255, 255, 255)),
+        output_dir / "04_yaw_align_target_mask_raw.png",
+        colorize_mask(raw_yaw_align_target_mask, color=(255, 255, 255)),
     )
     write_image(
-        output_dir / "05_surface_mask_filled.png",
-        colorize_mask(filled_surface_mask, color=(255, 255, 255)),
+        output_dir / "05_yaw_align_target_mask_filled.png",
+        colorize_mask(filled_yaw_align_target_mask, color=(255, 255, 255)),
     )
     write_image(
-        output_dir / "06_surface_mask_dilated.png",
-        colorize_mask(dilated_surface_mask, color=(255, 255, 255)),
+        output_dir / "06_yaw_align_target_mask_dilated.png",
+        colorize_mask(dilated_yaw_align_target_mask, color=(255, 255, 255)),
     )
     if exclusion_mask is not None:
         write_image(
@@ -479,23 +462,15 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 "bbox_2d_normalized": list(map(float, args.target_bbox)),
                 "bbox_xyxy_pixels": list(target_reference),
             },
-            "surface": {
-                "text": args.surface,
-                "bbox_2d_normalized": (
-                    None
-                    if args.surface_bbox is None
-                    else list(map(float, args.surface_bbox))
-                ),
-                "bbox_xyxy_pixels": (
-                    None
-                    if surface_reference is None
-                    else list(surface_reference)
-                ),
+            "yaw_align_target": {
+                "text": args.yaw_align_target,
+                "bbox_2d_normalized": None,
+                "bbox_xyxy_pixels": None,
             },
         },
         "class_names": class_names,
-        "same_target_surface_prompt": same_prompt,
-        "surface_mode": surface_mode,
+        "same_target_yaw_align_target_prompt": same_prompt,
+        "yaw_align_target_mode": yaw_align_target_mode,
         "target_exclusion_applied": exclusion_mask is not None,
         "depth_filter_applied": False,
         "selection_without_depth": "longest_hough_segment",
@@ -506,7 +481,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 reference_bbox=(
                     target_reference
                     if int(item["class_index"]) == 0
-                    else surface_reference
+                    else yaw_align_target_reference
                 ),
             )
             for item in detections
@@ -516,14 +491,14 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             class_names=class_names,
             reference_bbox=target_reference,
         ),
-        "selected_surface_detection": serialize_detection(
-            surface_detection,
+        "selected_yaw_align_target_detection": serialize_detection(
+            yaw_align_target_detection,
             class_names=class_names,
-            reference_bbox=(target_reference if same_prompt else surface_reference),
+            reference_bbox=(target_reference if same_prompt else yaw_align_target_reference),
         ),
         "non_depth_filtering": {
-            "largest_filled_surface_component": True,
-            "surface_mask_dilation_radius_px": 3,
+            "largest_filled_yaw_align_target_component": True,
+            "yaw_align_target_mask_dilation_radius_px": 3,
             "target_exclusion_radius_px": None if same_prompt else 20,
             "gaussian_kernel": 5,
             "canny_low": 50,

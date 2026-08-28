@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 from dataclasses import replace
+import inspect
 from pathlib import Path
 import queue
 import threading
+import time
 from types import SimpleNamespace
 
 import numpy as np
@@ -14,6 +16,7 @@ from gear_sonic.runtime.gateway.snapshot import TimestampBasis
 from gear_sonic.utils.inference.base_pose.agent import (
     BasePoseAgentConfig,
     GatewayRawServoAdapter,
+    _dual_worker_kwargs,
 )
 import gear_sonic.utils.inference.base_pose.dual_servo as dual_servo
 from gear_sonic.utils.inference.base_pose.dual_servo import (
@@ -38,7 +41,7 @@ from gear_sonic.utils.inference.base_pose.servo import (
     RawServoObservation,
     RawServoRuntime,
     ServoPhase,
-    TableGeometry,
+    YawAlignGeometry,
     TargetGeometry,
     TrackedInstance,
 )
@@ -84,7 +87,7 @@ def test_base_pose_config_exposes_only_dual_camera_mode() -> None:
     assert not hasattr(config, "qwenvl_model")
     assert not hasattr(config, "dual_qwenvl_fallback_model")
     assert config.target_prompt == "bluebasket"
-    assert config.surface_prompt == "desk"
+    assert config.yaw_align_target_prompt == "cardboard box"
     assert config.dual_head_camera_stream == HEAD
     assert config.dual_head_depth_stream == "camera/ego_view_depth"
     assert config.dual_chest_camera_stream == CHEST
@@ -97,13 +100,40 @@ def test_base_pose_config_exposes_only_dual_camera_mode() -> None:
     assert config.dual_rgbd_poll_hz == pytest.approx(60.0)
     assert not hasattr(config, "raw_chest_handoff_distance_m")
     assert config.raw_head_target_distance_m == pytest.approx(1.0)
+    assert config.raw_head_approach_cutoff_m == pytest.approx(1.3)
     assert config.raw_chest_target_distance_m == pytest.approx(0.8)
+    assert config.raw_chest_approach_cutoff_m == pytest.approx(1.3)
     assert config.raw_forward_tolerance_m == pytest.approx(0.10)
     assert config.raw_lateral_tolerance_m == pytest.approx(0.10)
     assert config.raw_post_stop_sample_frames == 30
     assert config.raw_post_stop_deviation_frames == 10
+    assert config.raw_diagnostic_image_interval_frames == 5
     assert config.raw_min_linear_speed_m_s == pytest.approx(0.4)
     assert config.raw_max_lateral_speed_m_s == pytest.approx(0.4)
+
+
+def test_base_pose_service_worker_callbacks_match_worker_signature() -> None:
+    controller = SimpleNamespace(
+        yaw_alignment_required=True,
+        position_fallback_allowed=False,
+    )
+    runtime = SimpleNamespace(
+        observation_events=object(),
+        diagnostics=object(),
+        controller=controller,
+    )
+    camera = object()
+    worker_kwargs = _dual_worker_kwargs(
+        SimpleNamespace(runtime=runtime), camera,
+    )
+
+    inspect.signature(run_dual_raw_servo_worker).bind(
+        None, None, None, None, None, **worker_kwargs,
+    )
+    assert worker_kwargs["camera_factory"]() is camera
+    assert worker_kwargs["yaw_alignment_required"]() is True
+    assert worker_kwargs["position_fallback_allowed"]() is False
+    assert "table_required" not in worker_kwargs
 
 
 def test_dual_failover_matches_agent_near_camera_order() -> None:
@@ -155,7 +185,7 @@ def test_initial_reference_resets_tracker_for_each_camera() -> None:
         (1.0, 0.0, 5.0, 3.0),
         np.ones((4, 6), dtype=np.uint8),
     )
-    desk = TrackedInstance(
+    yaw_align_target = TrackedInstance(
         12,
         1,
         0.88,
@@ -173,8 +203,8 @@ def test_initial_reference_resets_tracker_for_each_camera() -> None:
         def start_all_text(self, *, target_prompt: str):
             self.prompts.append(target_prompt)
             return {
-                "class_names": [target_prompt, "desk"],
-                "prompt_mode": "target_text_surface_text",
+                "class_names": [target_prompt, "yaw_align_target"],
+                "prompt_mode": "target_text_yaw_align_target_text",
             }
 
         def reset_tracking(self) -> None:
@@ -185,7 +215,7 @@ def test_initial_reference_resets_tracker_for_each_camera() -> None:
             marker = int(rgb[0, 0, 0])
             self.markers.append(marker)
             self.frames_since_reset += 1
-            return [target, desk] if self.frames_since_reset == 1 else [desk]
+            return [target, yaw_align_target] if self.frames_since_reset == 1 else [yaw_align_target]
 
     tracker = TextTracker()
     config = BasePoseAgentConfig(task="approach the blue basket")
@@ -199,6 +229,8 @@ def test_initial_reference_resets_tracker_for_each_camera() -> None:
         camera_pitch_deg=-3.0,
     )
     logs: list[str] = []
+    initial_targets: dict[str, TrackedInstance | None] = {}
+    initial_yaw_align_targets: dict[str, TrackedInstance | None] = {}
     eligible_streams, errors = detect_dual_camera_eligibility(
         config,
         {
@@ -208,6 +240,8 @@ def test_initial_reference_resets_tracker_for_each_camera() -> None:
         {HEAD: calibration, CHEST: calibration},
         tracker=tracker,
         logger=logs.append,
+        targets_out=initial_targets,
+        yaw_align_targets_out=initial_yaw_align_targets,
     )
 
     assert tracker.prompts == ["bluebasket"]
@@ -215,9 +249,56 @@ def test_initial_reference_resets_tracker_for_each_camera() -> None:
     assert tracker.reset_count == 2
     assert eligible_streams == {HEAD, CHEST}
     assert errors == {}
+    assert initial_targets == {HEAD: target, CHEST: target}
+    assert initial_yaw_align_targets == {HEAD: yaw_align_target, CHEST: yaw_align_target}
     assert "YOLOE prompt" in logs[0]
     assert any(f"stream={HEAD} eligible=true" in line for line in logs)
     assert any(f"stream={CHEST} eligible=true" in line for line in logs)
+
+
+def test_same_target_yaw_align_target_reuses_instance_and_disables_edge_exclusion(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    target = TrackedInstance(
+        11,
+        0,
+        0.91,
+        (1.0, 0.0, 5.0, 3.0),
+        np.ones((4, 6), dtype=np.uint8),
+    )
+
+    class Tracker:
+        def track(self, _rgb):
+            return [target]
+
+    captured: dict[str, object] = {}
+
+    def capture_observation(_snapshot, target_value, yaw_align_target_value, _calibration, **kwargs):
+        captured["target"] = target_value
+        captured["yaw_align_target"] = yaw_align_target_value
+        captured.update(kwargs)
+        return SimpleNamespace(yaw_align_geometry=object(), yaw_align_geometry_error=None)
+
+    monkeypatch.setattr(dual_servo, "_observation", capture_observation)
+    calibration = RawServoCalibration(6, 4, 100.0, 101.0, 2.5, 1.5)
+
+    selected_target, selected_yaw_align_target, _observation, _, _ = (
+        dual_servo._observe_tracked_snapshot(
+            _worker_snapshot(HEAD, 1),
+            Tracker(),
+            calibration,
+            target_id=None,
+            yaw_align_target_id=None,
+            require_yaw_align_geometry=True,
+            reuse_target_as_yaw_align_target=True,
+        )
+    )
+
+    assert selected_target is target
+    assert selected_yaw_align_target is target
+    assert captured["target"] is target
+    assert captured["yaw_align_target"] is target
+    assert captured["exclude_target_from_yaw_align_edge"] is False
 
 
 def test_head_monitor_reacquires_head_stream_directly() -> None:
@@ -240,7 +321,7 @@ def test_head_monitor_reuses_initialized_dynamic_target_prompt() -> None:
         (1.0, 0.0, 4.0, 3.0),
         np.ones((4, 6), dtype=np.uint8),
     )
-    desk = TrackedInstance(
+    yaw_align_target = TrackedInstance(
         2,
         1,
         0.8,
@@ -256,7 +337,7 @@ def test_head_monitor_reuses_initialized_dynamic_target_prompt() -> None:
             self.prompts.append(target_prompt)
 
         def track(self, _rgb):
-            return [target, desk]
+            return [target, yaw_align_target]
 
     tracker = Tracker()
     monitor = HeadCameraTextMonitor(
@@ -271,6 +352,34 @@ def test_head_monitor_reuses_initialized_dynamic_target_prompt() -> None:
     assert tracker.prompts == ["red tote"]
     assert not first.triggered
     assert second.triggered
+
+
+def test_head_monitor_reuses_target_detection_as_yaw_align_target() -> None:
+    target = TrackedInstance(
+        1,
+        0,
+        0.9,
+        (1.0, 0.0, 4.0, 3.0),
+        np.ones((4, 6), dtype=np.uint8),
+    )
+
+    class Tracker:
+        def start_all_text(self, **_kwargs):
+            return None
+
+        def track(self, _rgb):
+            return [target]
+
+    monitor = HeadCameraTextMonitor(
+        Tracker(),
+        "rubbish bin",
+        reuse_target_as_yaw_align_target=True,
+    )
+    monitor.start()
+    result = monitor.inspect(_worker_snapshot(HEAD, 1))
+
+    assert result.target is target
+    assert result.yaw_align_target is target
 
 
 def test_head_monitor_holds_through_two_misses_and_releases_on_third() -> None:
@@ -440,8 +549,16 @@ def test_dual_gateway_does_not_let_one_camera_block_the_other() -> None:
     clients[CHEST].publish(2_000_000_000)
     clients[HEAD].publish(3_000_000_000)
     head = camera.capture_stream(HEAD)
+    chest_peek = None
+    deadline = time.monotonic() + 0.1
+    while chest_peek is None and time.monotonic() < deadline:
+        chest_peek = camera.peek_stream(CHEST)
+        time.sleep(0.002)
     chest = camera.capture_stream(CHEST)
     assert head.timestamp == pytest.approx(3.0)
+    assert chest_peek is not None
+    assert chest_peek.timestamp == pytest.approx(2.0)
+    # Peeking for diagnostics must not consume the inference frame.
     assert chest.timestamp == pytest.approx(2.0)
     assert chest.depth_aligned_to == CHEST
 
@@ -490,12 +607,14 @@ def test_dual_runtime_uses_chest_approach_mode_and_head_standoff(tmp_path) -> No
     adapter.runtime.active_camera_stream = HEAD
     adapter.runtime._reset_controller(1.0)
     assert adapter.runtime.controller.target_distance_m == pytest.approx(1.0)
+    assert adapter.runtime.controller.far_approach_cutoff_m == pytest.approx(1.3)
     assert not adapter.runtime.controller.chest_approach_only
-    assert adapter.runtime.controller.phase is ServoPhase.YAW_ALIGN
+    assert adapter.runtime.controller.phase is ServoPhase.FORWARD_APPROACH
 
     adapter.runtime.active_camera_stream = CHEST
     adapter.runtime._reset_controller(2.0)
     assert adapter.runtime.controller.target_distance_m == pytest.approx(0.8)
+    assert adapter.runtime.controller.far_approach_cutoff_m == pytest.approx(1.3)
     assert adapter.runtime.controller.chest_approach_only
     assert adapter.runtime.controller.phase is ServoPhase.FORWARD_APPROACH
 
@@ -514,6 +633,8 @@ def test_head_stage_control_source_uses_shared_tolerances_without_reset(
         output_root=str(tmp_path),
         raw_forward_tolerance_m=0.03,
         raw_lateral_tolerance_m=0.04,
+        raw_head_approach_cutoff_m=1.4,
+        raw_chest_approach_cutoff_m=1.1,
     )
     runtime = RawServoRuntime(
         config,
@@ -533,6 +654,7 @@ def test_head_stage_control_source_uses_shared_tolerances_without_reset(
     assert runtime.active_camera_stream == HEAD
     assert runtime.control_source_stream == CHEST
     assert runtime.controller.target_distance_m == pytest.approx(0.8)
+    assert runtime.controller.far_approach_cutoff_m == pytest.approx(1.1)
     assert runtime.controller.phase is ServoPhase.TRANSLATE_TARGET
     assert runtime.controller.forward_tolerance_m == pytest.approx(0.03)
     assert runtime.controller.lateral_tolerance_m == pytest.approx(0.04)
@@ -545,6 +667,7 @@ def test_head_stage_control_source_uses_shared_tolerances_without_reset(
     assert runtime.active_camera_stream == HEAD
     assert runtime.control_source_stream == HEAD
     assert runtime.controller.target_distance_m == pytest.approx(1.0)
+    assert runtime.controller.far_approach_cutoff_m == pytest.approx(1.4)
     assert runtime.controller.phase is ServoPhase.TRANSLATE_TARGET
     assert runtime.controller.forward_tolerance_m == pytest.approx(0.03)
     assert runtime.controller.lateral_tolerance_m == pytest.approx(0.04)
@@ -642,6 +765,52 @@ def _worker_snapshot(stream_name: str, marker: int) -> object:
     )
 
 
+def test_sampled_camera_image_copies_rgb_mask_and_head_lines(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    snapshot = _worker_snapshot(HEAD, 7)
+    mask = np.zeros((4, 6), dtype=np.uint8)
+    mask[1:3, 2:5] = 1
+    target = TrackedInstance(
+        1,
+        0,
+        0.9,
+        (2.0, 1.0, 5.0, 3.0),
+        mask,
+    )
+    segment = SimpleNamespace(
+        endpoint_a=np.array([0.0, 1.0]),
+        endpoint_b=np.array([5.0, 1.0]),
+    )
+    monkeypatch.setattr(
+        dual_servo,
+        "_rgb_edge_line_segments",
+        lambda _edges: [segment],
+    )
+    yaw_align_geometry = YawAlignGeometry(
+        yaw_error_rad=0.0,
+        line_length_px=5.0,
+        valid_depth_samples=20,
+        line_center_px=(2.5, 2.0),
+        line_endpoints_px=((0.0, 2.0), (5.0, 2.0)),
+    )
+
+    image = dual_servo._camera_image_data(
+        HEAD,
+        snapshot,
+        target=target,
+        edge_intersection=np.ones((4, 6), dtype=np.uint8),
+        selected_yaw_align_geometry=yaw_align_geometry,
+    )
+    snapshot.rgb[:] = 0
+    mask[:] = 0
+
+    assert np.all(image.rgb == 7)
+    assert np.count_nonzero(image.target_mask) == 6
+    assert image.candidate_lines_px == (((0.0, 1.0), (5.0, 1.0)),)
+    assert image.selected_line_px == ((0.0, 2.0), (5.0, 2.0))
+
+
 class _FakeWorkerCamera:
     def __init__(self) -> None:
         self.count = 0
@@ -707,7 +876,7 @@ def test_dual_worker_exhausts_the_agent_near_failover_sequence(
         gate,
         threading.Event(),
         camera_factory=lambda: camera,
-        table_required=lambda: True,
+        yaw_alignment_required=lambda: True,
         position_fallback_allowed=lambda: True,
         tracker_factory=MissingTracker,
         calibration_factory=lambda _config: calibrations,
@@ -725,7 +894,7 @@ def test_dual_worker_exhausts_the_agent_near_failover_sequence(
     detecting = [event for event in emitted if event.kind == "detecting"]
     assert started_text_prompts
     assert set(started_text_prompts) == {"bluebasket"}
-    assert detecting[0].details["prompt_mode"] == "target_text_surface_text"
+    assert detecting[0].details["prompt_mode"] == "target_text_yaw_align_target_text"
     assert detecting[0].details["target_prompt"] == "bluebasket"
     assert switching, [(event.kind, event.error) for event in emitted]
     assert [event.details["live_stream"] for event in switching] == [
@@ -750,10 +919,10 @@ def _handoff_observation(forward_m: float) -> RawServoObservation:
             0.9,
             forward_m,
         ),
-        table=None,
+        yaw_align_geometry=None,
         camera_timestamp=1.0,
         target_track_id=1,
-        surface_track_id=None,
+        yaw_align_target_track_id=None,
     )
 
 
@@ -773,13 +942,13 @@ def _joint_observation(
             0.9,
             forward_m,
         ),
-        table=TableGeometry(
+        yaw_align_geometry=YawAlignGeometry(
             yaw_error_rad=yaw_rad,
             line_length_px=100.0,
             valid_depth_samples=20,
             line_center_px=(320.0, 200.0),
         ),
-        table_camera_stream=HEAD,
+        yaw_align_geometry_camera_stream=HEAD,
     )
 
 
@@ -969,7 +1138,7 @@ def test_runtime_keeps_bidirectional_chest_control_for_nine_head_yaw_misses(
                         "stream": HEAD,
                         "valid": False,
                         "realtime": True,
-                        "error": "missing tracked desk for live head yaw",
+                        "error": "missing tracked yaw_align_target for live head yaw",
                     },
                     "head_yaw_loss": loss,
                 },
@@ -1241,7 +1410,7 @@ def test_close_chest_distance_does_not_trigger_head_handoff(
         (60.0, 20.0, 100.0, 50.0),
         target_mask,
     )
-    desk = TrackedInstance(
+    yaw_align_target = TrackedInstance(
         2,
         1,
         0.9,
@@ -1307,7 +1476,7 @@ def test_close_chest_distance_does_not_trigger_head_handoff(
                 {CHEST},
                 {HEAD: "head unavailable during initial grounding"},
             ),
-            "table_required": lambda: False,
+            "yaw_alignment_required": lambda: False,
             "position_fallback_allowed": lambda: True,
         },
         daemon=True,
@@ -1339,7 +1508,7 @@ def test_close_chest_distance_does_not_trigger_head_handoff(
         for event in applied
     )
     assert all(event.observation is not None for event in applied)
-    assert all(event.observation.table is None for event in applied)
+    assert all(event.observation.yaw_align_geometry is None for event in applied)
     assert switching == []
     assert terminal == []
     assert tracker.start_calls == 1
@@ -1416,7 +1585,7 @@ def test_head_monitor_keeps_chest_position_when_live_head_yaw_is_valid(
         (60.0, 20.0, 100.0, 50.0),
         target_mask,
     )
-    desk = TrackedInstance(
+    yaw_align_target = TrackedInstance(
         2,
         1,
         0.9,
@@ -1425,21 +1594,21 @@ def test_head_monitor_keeps_chest_position_when_live_head_yaw_is_valid(
     )
     tracking_barrier = threading.Barrier(2)
     geometry_streams: list[str] = []
-    original_surface_geometry = visual_servo._surface_geometry_components
+    original_yaw_align_target_geometry = visual_servo._yaw_align_target_geometry_components
 
-    def counting_surface_geometry(snapshot_value, *args, **kwargs):
+    def counting_yaw_align_target_geometry(snapshot_value, *args, **kwargs):
         geometry_streams.append(snapshot_value.depth_aligned_to)
-        return original_surface_geometry(snapshot_value, *args, **kwargs)
+        return original_yaw_align_target_geometry(snapshot_value, *args, **kwargs)
 
     monkeypatch.setattr(
         dual_servo,
-        "_surface_geometry_components",
-        counting_surface_geometry,
+        "_yaw_align_target_geometry_components",
+        counting_yaw_align_target_geometry,
     )
     monkeypatch.setattr(
         visual_servo,
-        "_surface_geometry_components",
-        counting_surface_geometry,
+        "_yaw_align_target_geometry_components",
+        counting_yaw_align_target_geometry,
     )
 
     class Tracker:
@@ -1448,7 +1617,7 @@ def test_head_monitor_keeps_chest_position_when_live_head_yaw_is_valid(
 
         def track(self, _rgb):
             tracking_barrier.wait(timeout=1.0)
-            return [target, desk]
+            return [target, yaw_align_target]
 
     class MonitorTracker:
         def start_all_text(self, **_kwargs):
@@ -1456,7 +1625,7 @@ def test_head_monitor_keeps_chest_position_when_live_head_yaw_is_valid(
 
         def track(self, _rgb):
             tracking_barrier.wait(timeout=1.0)
-            return [target, desk]
+            return [target, yaw_align_target]
 
     config = BasePoseAgentConfig(
         task="approach the blue basket",
@@ -1486,7 +1655,7 @@ def test_head_monitor_keeps_chest_position_when_live_head_yaw_is_valid(
                 {CHEST},
                 {HEAD: "initial head grounding unavailable"},
             ),
-            "table_required": lambda: False,
+            "yaw_alignment_required": lambda: False,
             "position_fallback_allowed": lambda: True,
         },
         daemon=True,
@@ -1513,9 +1682,9 @@ def test_head_monitor_keeps_chest_position_when_live_head_yaw_is_valid(
         for event in observations
     )
     assert all(event.observation is not None for event in observations)
-    assert all(event.observation.table is not None for event in observations)
+    assert all(event.observation.yaw_align_geometry is not None for event in observations)
     assert all(
-        event.observation.table_camera_stream == HEAD
+        event.observation.yaw_align_geometry_camera_stream == HEAD
         for event in observations
         if event.observation is not None
     )
@@ -1526,7 +1695,7 @@ def test_head_monitor_keeps_chest_position_when_live_head_yaw_is_valid(
         for event in observations
     )
     assert all(
-        event.details["parallel_perception"]["chest_table_geometry_skipped"]
+        event.details["parallel_perception"]["chest_yaw_align_geometry_skipped"]
         for event in observations
     )
     assert geometry_streams
@@ -1564,14 +1733,14 @@ def test_worker_switches_state_after_twenty_joint_head_yaw_misses(
         (1.0, 0.0, 5.0, 3.0),
         np.ones((4, 6), dtype=np.uint8),
     )
-    desk = TrackedInstance(
+    yaw_align_target = TrackedInstance(
         2,
         1,
         0.9,
         (0.0, 1.0, 6.0, 4.0),
         np.ones((4, 6), dtype=np.uint8),
     )
-    table = TableGeometry(
+    yaw_align_geometry = YawAlignGeometry(
         yaw_error_rad=0.0,
         line_length_px=100.0,
         valid_depth_samples=20,
@@ -1595,9 +1764,9 @@ def test_worker_switches_state_after_twenty_joint_head_yaw_misses(
     )
     monkeypatch.setattr(
         dual_servo,
-        "_surface_geometry_components",
+        "_yaw_align_target_geometry_components",
         lambda *_args, **_kwargs: (
-            table,
+            yaw_align_geometry,
             None,
             np.ones((4, 6), dtype=np.uint8),
             None,
@@ -1642,7 +1811,7 @@ def test_worker_switches_state_after_twenty_joint_head_yaw_misses(
 
         def track(self, _rgb):
             self.calls += 1
-            return [target, desk] if self.calls == 1 else [target]
+            return [target, yaw_align_target] if self.calls == 1 else [target]
 
     config = BasePoseAgentConfig(
         task="align to the blue basket",
@@ -1670,7 +1839,7 @@ def test_worker_switches_state_after_twenty_joint_head_yaw_misses(
                 {CHEST},
                 {HEAD: "initial head grounding unavailable"},
             ),
-            "table_required": lambda: False,
+            "yaw_alignment_required": lambda: False,
             "position_fallback_allowed": lambda: True,
         },
         daemon=True,
@@ -1778,14 +1947,14 @@ def test_head_stage_keeps_chest_basket_until_it_becomes_invalid(
         target_mask,
     )
     head_target = replace(chest_target, track_id=8)
-    surface_mask = np.zeros((height, width), dtype=np.uint8)
-    surface_mask[85:115, 5:155] = 1
-    head_surface = TrackedInstance(
+    yaw_align_target_mask = np.zeros((height, width), dtype=np.uint8)
+    yaw_align_target_mask[85:115, 5:155] = 1
+    head_yaw_align_target = TrackedInstance(
         9,
         1,
         0.95,
         (5.0, 85.0, 155.0, 115.0),
-        surface_mask,
+        yaw_align_target_mask,
     )
 
     class HeadTracker:
@@ -1798,9 +1967,9 @@ def test_head_stage_keeps_chest_basket_until_it_becomes_invalid(
         def track(self, _rgb):
             self.calls += 1
             return (
-                [head_surface]
+                [head_yaw_align_target]
                 if self.calls == 1
-                else [head_target, head_surface]
+                else [head_target, head_yaw_align_target]
             )
 
     class ChestFallbackTracker:
@@ -1850,7 +2019,7 @@ def test_head_stage_keeps_chest_basket_until_it_becomes_invalid(
                 {HEAD, CHEST},
                 {},
             ),
-            "table_required": lambda: False,
+            "yaw_alignment_required": lambda: False,
             "position_fallback_allowed": lambda: True,
         },
         daemon=True,
@@ -1896,15 +2065,15 @@ def test_head_stage_keeps_chest_basket_until_it_becomes_invalid(
     assert observations[1].details["yaw_source"]["realtime"]
     assert observations[1].details["yaw_source"]["valid"]
     assert observations[0].observation is not None
-    assert observations[0].observation.table is not None
-    assert observations[0].observation.table.line_endpoints_px is not None
-    assert observations[0].observation.desk_mask is not None
-    assert observations[0].observation.table_camera_stream == HEAD
+    assert observations[0].observation.yaw_align_geometry is not None
+    assert observations[0].observation.yaw_align_geometry.line_endpoints_px is not None
+    assert observations[0].observation.completed_yaw_align_target_mask is not None
+    assert observations[0].observation.yaw_align_geometry_camera_stream == HEAD
     assert observations[1].observation is not None
-    assert observations[1].observation.table is not None
-    assert observations[1].observation.table.line_endpoints_px is not None
-    assert observations[1].observation.desk_mask is not None
-    assert observations[1].observation.table_camera_stream == HEAD
+    assert observations[1].observation.yaw_align_geometry is not None
+    assert observations[1].observation.yaw_align_geometry.line_endpoints_px is not None
+    assert observations[1].observation.completed_yaw_align_target_mask is not None
+    assert observations[1].observation.yaw_align_geometry_camera_stream == HEAD
     loss_events = [
         event
         for event in emitted

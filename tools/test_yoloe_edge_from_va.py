@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run YOLOE target/surface segmentation and RGB edge filtering from VA output.
+"""Run YOLOE target/yaw-target segmentation and RGB edge filtering from VA output.
 
 The image-only test intentionally stops before the production depth-based line
 selection. It saves every intermediate mask and all Hough line candidates that
@@ -23,11 +23,11 @@ import numpy as np
 from gear_sonic.utils.inference.base_pose.servo import (
     TrackedInstance,
     YoloePersistentTracker,
-    _dilate_table_edge_mask,
+    _dilate_yaw_align_edge_mask,
     _largest_filled_component,
     _rgb_edge_line_segments,
     _rgb_mask_edge_intersection,
-    _table_edge_target_exclusion,
+    _yaw_align_edge_target_exclusion,
 )
 
 
@@ -59,8 +59,8 @@ def parse_args() -> argparse.Namespace:
         help="Optional YOLOE target prompt override; VA bbox remains unchanged.",
     )
     parser.add_argument(
-        "--surface-text",
-        help="Optional YOLOE surface prompt override.",
+        "--yaw-align-target-text",
+        help="Optional YOLOE yaw-align target prompt override.",
     )
     parser.add_argument(
         "--output-dir",
@@ -73,17 +73,17 @@ def parse_args() -> argparse.Namespace:
 def load_va_selection(path: Path) -> tuple[str, str, list[float]]:
     source = path.expanduser().resolve()
     value = json.loads(source.read_text(encoding="utf-8"))
-    if not isinstance(value, dict) or set(value) != {"target", "surface"}:
-        raise ValueError("VA selection must contain only target and surface")
+    if not isinstance(value, dict):
+        raise ValueError("VA result must be an object")
     target = value["target"]
-    surface = value["surface"]
-    if not isinstance(target, dict) or not isinstance(surface, dict):
-        raise ValueError("VA target and surface must be objects")
-    target_text = str(target.get("text", "")).strip()
-    surface_text = str(surface.get("text", "")).strip()
+    yaw_align_target = value["yaw_align_target"]
+    if not isinstance(target, dict) or not isinstance(yaw_align_target, dict):
+        raise ValueError("VA target and yaw_align_target must be objects")
+    target_text = str(target.get("name", "")).strip()
+    yaw_align_target_text = str(yaw_align_target.get("name", "")).strip()
     bbox = target.get("bbox_2d")
-    if not target_text or not surface_text:
-        raise ValueError("VA target and surface text must be non-empty")
+    if not target_text or not yaw_align_target_text:
+        raise ValueError("VA target and yaw_align_target text must be non-empty")
     if (
         not isinstance(bbox, list)
         or len(bbox) != 4
@@ -99,7 +99,7 @@ def load_va_selection(path: Path) -> tuple[str, str, list[float]]:
     x1, y1, x2, y2 = map(float, bbox)
     if x1 >= x2 or y1 >= y2:
         raise ValueError("VA target bbox_2d has invalid corner order")
-    return target_text, surface_text, [x1, y1, x2, y2]
+    return target_text, yaw_align_target_text, [x1, y1, x2, y2]
 
 
 def new_output_dir(requested: Path | None, target_text: str) -> Path:
@@ -325,14 +325,16 @@ def run(args: argparse.Namespace) -> int:
     if args.imgsz <= 0:
         raise ValueError("--imgsz must be positive")
 
-    va_target_text, va_surface_text, va_bbox = load_va_selection(args.va_result)
+    va_target_text, va_yaw_align_target_text, va_bbox = load_va_selection(args.va_result)
     target_text = (
         args.target_text.strip() if args.target_text is not None else va_target_text
     )
-    surface_text = (
-        args.surface_text.strip() if args.surface_text is not None else va_surface_text
+    yaw_align_target_text = (
+        args.yaw_align_target_text.strip()
+        if args.yaw_align_target_text is not None
+        else va_yaw_align_target_text
     )
-    if not target_text or not surface_text:
+    if not target_text or not yaw_align_target_text:
         raise ValueError("YOLOE prompt overrides must be non-empty")
     output_dir = new_output_dir(args.output_dir, target_text)
     bgr = cv2.imread(str(image_path), cv2.IMREAD_COLOR)
@@ -352,7 +354,7 @@ def run(args: argparse.Namespace) -> int:
         confidence=args.confidence,
         imgsz=args.imgsz,
         device=args.device,
-        surface_prompt=surface_text,
+        yaw_align_target_prompt=yaw_align_target_text,
     )
     prompt_artifact = tracker.start_all_text(target_prompt=target_text)
     instances = list(tracker.track(rgb))
@@ -360,9 +362,10 @@ def run(args: argparse.Namespace) -> int:
     if not instances:
         instances = predict_without_tracking(tracker, rgb)
         detection_mode = "predict_fallback_after_empty_track"
-    class_names = (target_text, surface_text)
+    class_names = tuple(prompt_artifact["class_names"])
+    reuse_target = bool(prompt_artifact["yaw_align_target_reuses_target"])
     target = best_instance(instances, 0)
-    surface = best_instance(instances, 1)
+    yaw_align_target = target if reuse_target else best_instance(instances, 1)
 
     detection_records = [
         instance_record(
@@ -382,12 +385,12 @@ def run(args: argparse.Namespace) -> int:
         "va_result": str(args.va_result.expanduser().resolve()),
         "image_size": {"width": width, "height": height},
         "target_prompt": target_text,
-        "surface_prompt": surface_text,
+        "yaw_align_target_prompt": yaw_align_target_text,
         "va_target_text": va_target_text,
-        "va_surface_text": va_surface_text,
+        "va_yaw_align_target_text": va_yaw_align_target_text,
         "prompt_overrides_applied": {
             "target": target_text != va_target_text,
-            "surface": surface_text != va_surface_text,
+            "yaw_align_target": yaw_align_target_text != va_yaw_align_target_text,
         },
         "va_target_bbox_normalized": va_bbox,
         "va_target_bbox_pixels": list(va_bbox_px),
@@ -397,16 +400,18 @@ def run(args: argparse.Namespace) -> int:
         "yoloe_imgsz": args.imgsz,
         "detections": detection_records,
         "selected_target_track_id": None if target is None else target.track_id,
-        "selected_surface_track_id": None if surface is None else surface.track_id,
+        "selected_yaw_align_target_track_id": (
+            None if yaw_align_target is None else yaw_align_target.track_id
+        ),
         "depth_filter_applied": False,
     }
 
-    if target is None or surface is None:
+    if target is None or yaw_align_target is None:
         missing = []
         if target is None:
             missing.append("target")
-        if surface is None:
-            missing.append("surface")
+        if yaw_align_target is None:
+            missing.append("yaw_align_target")
         base_result.update(
             status="missing_yoloe_" + "_and_".join(missing),
             filtered_line_count=0,
@@ -421,33 +426,62 @@ def run(args: argparse.Namespace) -> int:
         return 1
 
     write_mask(output_dir / "02_target_mask.png", target.mask)
-    write_mask(output_dir / "03_surface_mask_raw.png", surface.mask)
-    surface_component = _largest_filled_component(surface.mask)
-    write_mask(output_dir / "04_surface_mask_largest_filled.png", surface_component)
-    surface_mask = _dilate_table_edge_mask(surface_component)
-    write_mask(output_dir / "05_surface_mask_dilated.png", surface_mask)
-    target_exclusion = _table_edge_target_exclusion(target.mask, surface_mask.shape)
-    write_mask(output_dir / "06_target_exclusion_mask.png", target_exclusion)
-    effective_surface_mask = (surface_mask > 0) & ~(target_exclusion > 0)
-    write_mask(output_dir / "07_effective_surface_mask.png", effective_surface_mask)
+    write_mask(
+        output_dir / "03_yaw_align_target_mask_raw.png",
+        yaw_align_target.mask,
+    )
+    yaw_align_target_component = _largest_filled_component(yaw_align_target.mask)
+    write_mask(
+        output_dir / "04_yaw_align_target_mask_largest_filled.png",
+        yaw_align_target_component,
+    )
+    yaw_align_target_mask = _dilate_yaw_align_edge_mask(yaw_align_target_component)
+    write_mask(
+        output_dir / "05_yaw_align_target_mask_dilated.png",
+        yaw_align_target_mask,
+    )
+    target_exclusion = (
+        None
+        if reuse_target
+        else _yaw_align_edge_target_exclusion(
+            target.mask,
+            yaw_align_target_mask.shape,
+        )
+    )
+    if target_exclusion is not None:
+        write_mask(output_dir / "06_target_exclusion_mask.png", target_exclusion)
+    effective_yaw_align_target_mask = yaw_align_target_mask > 0
+    if target_exclusion is not None:
+        effective_yaw_align_target_mask &= ~(target_exclusion > 0)
+    write_mask(
+        output_dir / "07_effective_yaw_align_target_mask.png",
+        effective_yaw_align_target_mask,
+    )
 
     edge_intersection = _rgb_mask_edge_intersection(
         rgb,
-        surface_mask,
+        yaw_align_target_mask,
         exclusion_mask=target_exclusion,
     )
-    save_image(output_dir / "08_surface_rgb_edge_intersection.png", edge_intersection)
+    save_image(
+        output_dir / "08_yaw_align_target_rgb_edge_intersection.png",
+        edge_intersection,
+    )
     edge_overlay = bgr.copy()
     edge_overlay[edge_intersection > 0] = (0, 0, 255)
-    save_image(output_dir / "09_surface_rgb_edges_overlay.jpg", edge_overlay)
+    save_image(output_dir / "09_yaw_align_target_rgb_edges_overlay.jpg", edge_overlay)
 
-    combined_mask_overlay = overlay_mask(bgr, surface_mask, (255, 0, 0))
+    combined_mask_overlay = overlay_mask(
+        bgr,
+        yaw_align_target_mask,
+        (255, 0, 0),
+    )
     combined_mask_overlay = overlay_mask(
         combined_mask_overlay,
         target.mask,
         (0, 255, 0),
     )
-    save_image(output_dir / "10_target_surface_masks_overlay.jpg", combined_mask_overlay)
+    save_image(output_dir / "10_target_yaw_align_target_masks_overlay.jpg", combined_mask_overlay)
 
     segments = _rgb_edge_line_segments(edge_intersection)
     save_image(
@@ -489,21 +523,25 @@ def run(args: argparse.Namespace) -> int:
     base_result.update(
         status="ok" if segments else "no_filtered_hough_line",
         target_selection="highest_confidence_class_0_matching_production",
-        surface_selection="highest_confidence_class_1_matching_production",
+        yaw_align_target_selection=(
+            "reused_target_instance"
+            if reuse_target
+            else "highest_confidence_class_1_matching_production"
+        ),
         selected_target=instance_record(
             target,
             class_names=class_names,
             va_bbox_px=va_bbox_px,
         ),
-        selected_surface=instance_record(
-            surface,
+        selected_yaw_align_target=instance_record(
+            yaw_align_target,
             class_names=class_names,
             va_bbox_px=va_bbox_px,
         ),
         edge_filters={
-            "largest_surface_component_and_hole_fill": True,
-            "surface_mask_dilation_px": 3,
-            "target_exclusion_radius_px": 20,
+            "largest_yaw_align_target_component_and_hole_fill": True,
+            "yaw_align_target_mask_dilation_px": 3,
+            "target_exclusion_radius_px": None if reuse_target else 20,
             "gaussian_kernel": 5,
             "canny_low": 50,
             "canny_high": 150,

@@ -23,6 +23,8 @@ from gear_sonic.utils.inference.lavira.agent import (
     LaViRAClient,
     MoveToView,
     ScanView,
+    _move_to_facing_geometry,
+    alignment_grounding_prompt,
     language_action_prompt,
     mean_bbox_depth_m,
     validate_alignment_grounding,
@@ -76,23 +78,37 @@ def grounding(status="FOUND", description="basket"):
 
 
 def alignment_grounding(
-    status="FOUND", target="basket", surface="desk",
-    evidence="basket is on desk", objects=None,
+    status="FOUND",
+    target="basket",
+    yaw_align_target="desk",
+    evidence="basket and yaw-align target are visible",
+    *,
+    bbox=None,
+    target_confidence=0.9,
+    yaw_align_target_confidence=0.9,
+    target_visible=None,
+    yaw_align_target_visible=None,
 ):
-    if objects is None:
-        objects = [{
-            "name": target,
-            "surface": surface,
-            "visible": status == "FOUND",
-            "bbox_2d": (
-                [200, 200, 800, 800] if status == "FOUND" else None
-            ),
-            "confidence": 0.9,
-        }]
+    if target_visible is None:
+        target_visible = status == "FOUND"
+    if yaw_align_target_visible is None:
+        yaw_align_target_visible = status == "FOUND"
+    if bbox is None and target_visible:
+        bbox = [200, 200, 800, 800]
     return {
         "mode": "ALIGN_GROUNDING",
         "status": status,
-        "objects": objects,
+        "target": {
+            "name": target,
+            "visible": target_visible,
+            "bbox_2d": bbox,
+            "confidence": target_confidence,
+        },
+        "yaw_align_target": {
+            "name": yaw_align_target,
+            "visible": yaw_align_target_visible,
+            "confidence": yaw_align_target_confidence,
+        },
         "visual_evidence": evidence,
     }
 
@@ -189,7 +205,8 @@ class FakeCamera:
 
 class FakeClient:
     def __init__(
-        self, decisions, groundings=(), alignment_groundings=(), postchecks=(),
+        self, decisions, groundings=(), alignment_groundings=(),
+        postchecks=(),
     ):
         self.decisions = iter(decisions)
         self.groundings = iter(groundings)
@@ -210,7 +227,7 @@ class FakeClient:
 
     def alignment_grounding(self, **kwargs):
         self.alignment_grounding_calls.append(kwargs)
-        return next(self.alignment_groundings)
+        return validate_alignment_grounding(next(self.alignment_groundings))
 
     def postcheck(self, **kwargs):
         self.postcheck_calls.append(kwargs)
@@ -258,6 +275,59 @@ def test_lavira_client_rejects_missing_api_keys(
             la_base_url="https://example.invalid/la",
             va_base_url="https://example.invalid/va",
         )
+
+
+def test_align_grounding_retries_after_legacy_surface_schema(
+    tmp_path,
+) -> None:
+    calls = []
+    invalid = alignment_grounding(
+        target="cardboard box",
+        yaw_align_target="cardboard box",
+    )
+    invalid["surface"] = "floor"
+    responses = iter([
+        json.dumps(invalid),
+        json.dumps(alignment_grounding(
+            target="cardboard box",
+            yaw_align_target="cardboard box",
+        )),
+    ])
+
+    class Completions:
+        def create(self, **kwargs):
+            calls.append(kwargs)
+            return SimpleNamespace(choices=[SimpleNamespace(
+                message=SimpleNamespace(content=next(responses)),
+            )])
+
+    cloud_client = SimpleNamespace(
+        chat=SimpleNamespace(completions=Completions()),
+    )
+    lavira = LaViRAClient(
+        la_base_url="https://example.invalid/v1",
+        va_base_url="https://example.invalid/v1",
+        la_client=cloud_client,
+        va_client=cloud_client,
+        request_context_dir=tmp_path / "lavira_requests",
+    )
+
+    result = lavira.alignment_grounding(
+        alignment_prompt=(
+            "Use the cardboard box as both the distance-and-centering and "
+            "yaw-alignment target."
+        ),
+        direction="front",
+        image_bgr=np.zeros((8, 8, 3), np.uint8),
+    )
+
+    assert result["target"]["name"] == "cardboard box"
+    assert result["yaw_align_target"]["name"] == "cardboard box"
+    assert len(calls) == 2
+    assert "previous response failed validation" in (
+        calls[1]["messages"][0]["content"].lower()
+    )
+    assert "invalid object schema" in calls[1]["messages"][0]["content"]
 
 
 def test_lavira_cloud_calls_preserve_role_specific_thinking_mode(tmp_path) -> None:
@@ -322,10 +392,9 @@ def test_lavira_cloud_calls_preserve_role_specific_thinking_mode(tmp_path) -> No
         image_bgr=image,
     )
     lavira.alignment_grounding(
-        mission="find basket",
-        global_target="basket",
-        strategic_goal="Prepare the basket for the final task",
-        strategic_stop=False,
+        alignment_prompt=(
+            "Use the basket for distance, centering, and yaw alignment."
+        ),
         direction="front",
         image_bgr=image,
     )
@@ -402,7 +471,7 @@ def test_lavira_cloud_calls_preserve_role_specific_thinking_mode(tmp_path) -> No
     assert "rear/behind direction" in la_prompt
     assert "successful MOVE_TO to the exact GLOBAL TARGET" in la_prompt
     assert "VA independently" in la_prompt
-    for index in (1, 2, 3):
+    for index in (1, 3):
         va_content = calls[index]["messages"][1]["content"]
         assert sum(item["type"] == "image_url" for item in va_content) == 1
         va_prompt = va_content[-1]["text"]
@@ -410,22 +479,24 @@ def test_lavira_cloud_calls_preserve_role_specific_thinking_mode(tmp_path) -> No
         assert '**GLOBAL TARGET**: "basket"' in va_prompt
         assert "**CURRENT STRATEGY**" in va_prompt
         assert "**STRATEGIC STOP SIGNAL**: false" in va_prompt
+    alignment_content = calls[2]["messages"][1]["content"]
+    assert sum(
+        item["type"] == "image_url" for item in alignment_content
+    ) == 1
+    alignment_prompt_text = alignment_content[-1]["text"]
+    assert "**ALIGN PROMPT**" in alignment_prompt_text
+    assert "find basket" not in alignment_prompt_text
+    assert "GLOBAL TARGET" not in alignment_prompt_text
+    assert "CURRENT STRATEGY" not in alignment_prompt_text
+    assert "STRATEGIC STOP" not in alignment_prompt_text
     postcheck_prompt_text = calls[3]["messages"][1]["content"][-1]["text"]
     assert "latest controller\naction" in postcheck_prompt_text
     assert "after ALIGN" not in postcheck_prompt_text
     assert "skill" not in postcheck_prompt_text.lower()
-    alignment_prompt_text = calls[2]["messages"][1]["content"][-1]["text"]
-    assert "enumerate every physical operation object" in alignment_prompt_text
-    assert "Include every such\n   object even when it is not visible" in (
-        alignment_prompt_text
-    )
-    assert "desk`\n   belongs only in their `surface` fields" in (
-        alignment_prompt_text
-    )
-    assert "Do not choose the final BasePose target yourself" in (
-        alignment_prompt_text
-    )
-    assert "at least 1%" in alignment_prompt_text
+    assert "Select exactly one `target`" in alignment_prompt_text
+    assert "Select exactly one `yaw_align_target`" in alignment_prompt_text
+    assert "Both roles may name the same physical object" in alignment_prompt_text
+    assert "Do not infer supporting surfaces" in alignment_prompt_text
     saved = [
         json.loads(path.read_text(encoding="utf-8"))
         for path in sorted((tmp_path / "lavira_requests").glob("*.json"))
@@ -556,17 +627,20 @@ def test_lavira_stops_only_after_three_invalid_json_responses(tmp_path) -> None:
 
 
 def build_agent(
-    decisions, *, groundings=(), alignment_groundings=(), postchecks=(),
+    decisions, *, groundings=(), alignment_groundings=(),
+    postchecks=(),
     max_steps=20, poll_failure=None, events=None, todos=None, depth_mm=2000.0,
     handoff_depth_mm=None, manipulation_prompt=None, sleeps=None,
     mission="find the basket and put the bottle in it",
     global_target="basket",
+    alignment_prompt="Use the basket as both alignment targets.",
 ):
     camera = FakeCamera(
         depth_mm=depth_mm, handoff_depth_mm=handoff_depth_mm,
     )
     client = FakeClient(
-        decisions, groundings, alignment_groundings, postchecks,
+        decisions, groundings, alignment_groundings,
+        postchecks,
     )
     intents = []
     waited = []
@@ -583,25 +657,40 @@ def build_agent(
                 "reason": "started",
             }
         if name == "navigation_heading_goal":
+            heading_delta = float(intents[-1][1]["heading_delta_rad"])
             camera.sonic_yaw = math.remainder(
-                camera.sonic_yaw
-                + float(intents[-1][1]["heading_delta_rad"]),
-                2 * math.pi,
+                camera.sonic_yaw + heading_delta, 2 * math.pi,
+            )
+            pose_x, pose_y, pose_yaw = camera.pose
+            camera.pose = (
+                pose_x,
+                pose_y,
+                math.remainder(pose_yaw + heading_delta, 2 * math.pi),
             )
         reason = "aligned" if name == "start_base_pose" else "reached"
-        return {
+        result = {
             "generation": generation,
             "skill_id": skill_id,
             "segment_id": segment_id,
             "state": "reached",
             "reason": reason,
         }
+        if name == "navigation_goal":
+            goal_x, goal_y = map(float, intents[-1][1]["goal_base"])
+            pose_x, pose_y, pose_yaw = camera.pose
+            cosine, sine = math.cos(pose_yaw), math.sin(pose_yaw)
+            result["goal_world"] = {
+                "x": pose_x + cosine * goal_x - sine * goal_y,
+                "y": pose_y + sine * goal_x + cosine * goal_y,
+            }
+        return result
 
     agent = LaViRAAgent(
         navigation_mode="object_nav",
         mission=mission,
         global_target=global_target,
         manipulation_prompt=manipulation_prompt,
+        alignment_prompt=alignment_prompt,
         max_steps=max_steps,
         history_size=5,
         min_confidence=0.6,
@@ -744,7 +833,7 @@ def test_each_la_step_gets_panorama_and_consecutive_move_to_are_supported():
     assert len(client.la_calls[0]["scan_views"]) == 5
     names = [name for name, _ in intents]
     assert names.count("navigation_goal") == 3
-    assert names.count("navigation_heading_goal") == 5 * 3 + 3
+    assert names.count("navigation_heading_goal") == 5 * 3 + 3 + 3
     heading_deltas = [
         args["heading_delta_rad"]
         for name, args in intents if name == "navigation_heading_goal"
@@ -775,6 +864,240 @@ def test_each_la_step_gets_panorama_and_consecutive_move_to_are_supported():
     assert camera.depth_count == 21
     skill_ids = [args["skill_id"] for name, args in intents if name.startswith("navigation_")]
     assert skill_ids == sorted(skill_ids)
+
+
+def test_move_to_facing_geometry_uses_unrounded_fastlio_pose() -> None:
+    facing = _move_to_facing_geometry(
+        (2.12349, -1.45678),
+        (1.02341, -1.05672, math.pi / 2.0),
+    )
+
+    expected_yaw = math.atan2(-0.40006, 1.10008)
+    assert facing["fastlio_x"] == pytest.approx(1.02341)
+    assert facing["fastlio_y"] == pytest.approx(-1.05672)
+    assert facing["target_yaw_rad"] == pytest.approx(expected_yaw)
+    assert facing["heading_delta_rad"] == pytest.approx(
+        math.remainder(expected_yaw - math.pi / 2.0, 2.0 * math.pi)
+    )
+
+
+def test_move_to_facing_geometry_uses_shortest_turn_across_wraparound() -> None:
+    target_yaw = math.pi - 0.1
+    facing = _move_to_facing_geometry(
+        (math.cos(target_yaw), math.sin(target_yaw)),
+        (0.0, 0.0, -math.pi + 0.1),
+    )
+
+    assert facing["target_yaw_rad"] == pytest.approx(target_yaw)
+    assert facing["heading_delta_rad"] == pytest.approx(-0.2)
+
+
+def test_move_to_facing_geometry_rejects_zero_length_target_direction() -> None:
+    with pytest.raises(
+        LaViRAAgentError, match="move_to_target_direction_undefined"
+    ):
+        _move_to_facing_geometry(
+            (1.25, -3.5),
+            (1.25, -3.5, 0.7),
+        )
+
+
+def test_move_to_faces_exact_world_goal_before_post_navigation_capture():
+    events = []
+    agent, camera, _client, intents, _waited = build_agent(
+        [move(), decision(None, result="FAIL")],
+        groundings=[grounding() for _ in range(3)],
+        events=events,
+    )
+    camera.pose = (1.1234, -2.5678, 2.9)
+    camera.sonic_yaw = -0.7
+    normal_wait = agent.wait_status
+    nav_fastlio_yaw = None
+    nav_sonic_yaw = None
+    desired_yaw = -3.0
+
+    def return_exact_world_goal(generation, skill_id, segment_id, timeout):
+        nonlocal nav_fastlio_yaw, nav_sonic_yaw
+        if intents[-1][0] == "navigation_goal":
+            pose_x, pose_y, nav_fastlio_yaw = camera.pose
+            nav_sonic_yaw = camera.sonic_yaw
+            return {
+                "generation": generation,
+                "skill_id": skill_id,
+                "segment_id": segment_id,
+                "state": "reached",
+                "reason": "goal_within_2m",
+                "goal_world": {
+                    "x": pose_x + math.cos(desired_yaw),
+                    "y": pose_y + math.sin(desired_yaw),
+                },
+            }
+        return normal_wait(generation, skill_id, segment_id, timeout)
+
+    agent.wait_status = return_exact_world_goal
+    result = agent.run(72)
+
+    assert result.reason.startswith("la_fail:")
+    assert nav_fastlio_yaw is not None and nav_sonic_yaw is not None
+    expected_delta = math.remainder(
+        desired_yaw - nav_fastlio_yaw, 2.0 * math.pi,
+    )
+    names = [name for name, _args in intents]
+    nav_index = names.index("navigation_goal")
+    facing_index = names.index("navigation_heading_goal", nav_index + 1)
+    capture_index = names.index("lavira_depth_request", nav_index + 1)
+    assert nav_index < facing_index < capture_index
+    facing_intent = intents[facing_index][1]
+    assert facing_intent["heading_delta_rad"] == pytest.approx(expected_delta)
+    assert camera.sonic_yaw == pytest.approx(
+        math.remainder(nav_sonic_yaw + expected_delta, 2.0 * math.pi)
+    )
+    assert camera.leases[-1] == (
+        72, facing_intent["skill_id"], facing_intent["segment_id"],
+    )
+    assert any(
+        event["code"] == "MOVE_TO_TARGET_FACING_COMPLETED"
+        for event in events
+    )
+
+
+def test_move_to_terminal_facing_failure_warns_and_continues_handoff():
+    events = []
+    agent, _camera, _client, intents, _waited = build_agent(
+        [move(), decision(None, result="FAIL")],
+        groundings=[grounding() for _ in range(3)],
+        events=events,
+    )
+    normal_wait = agent.wait_status
+    fail_next_heading = False
+
+    def fail_facing(generation, skill_id, segment_id, timeout):
+        nonlocal fail_next_heading
+        if intents[-1][0] == "navigation_goal":
+            fail_next_heading = True
+            return normal_wait(generation, skill_id, segment_id, timeout)
+        if intents[-1][0] == "navigation_heading_goal" and fail_next_heading:
+            fail_next_heading = False
+            return {
+                "generation": generation,
+                "skill_id": skill_id,
+                "segment_id": segment_id,
+                "state": "failed",
+                "reason": "sonic_orientation_timeout",
+            }
+        return normal_wait(generation, skill_id, segment_id, timeout)
+
+    agent.wait_status = fail_facing
+    result = agent.run(73)
+
+    assert result.reason.startswith("la_fail:")
+    assert agent._history[0].controller_state == "reached"
+    failure = next(
+        event for event in events
+        if event["code"] == "MOVE_TO_TARGET_FACING_FAILED"
+    )
+    assert failure["fields"]["controller_reason"] == (
+        "sonic_orientation_timeout"
+    )
+    names = [name for name, _args in intents]
+    nav_index = names.index("navigation_goal")
+    failed_heading_index = names.index("navigation_heading_goal", nav_index + 1)
+    capture_index = names.index("lavira_depth_request", nav_index + 1)
+    assert failed_heading_index < capture_index
+    assert intents[capture_index][1]["segment_id"] == (
+        intents[failed_heading_index][1]["segment_id"]
+    )
+
+
+def test_move_to_missing_world_goal_warns_and_continues_without_facing():
+    events = []
+    agent, _camera, _client, intents, _waited = build_agent(
+        [move(), decision(None, result="FAIL")],
+        groundings=[grounding() for _ in range(3)],
+        events=events,
+    )
+    normal_wait = agent.wait_status
+
+    def omit_world_goal(generation, skill_id, segment_id, timeout):
+        status = dict(normal_wait(generation, skill_id, segment_id, timeout))
+        if intents[-1][0] == "navigation_goal":
+            status.pop("goal_world", None)
+        return status
+
+    agent.wait_status = omit_world_goal
+    result = agent.run(74)
+
+    assert result.reason.startswith("la_fail:")
+    failure = next(
+        event for event in events
+        if event["code"] == "MOVE_TO_TARGET_FACING_FAILED"
+    )
+    assert failure["fields"]["error"] == "move_to_goal_world_unavailable"
+    names = [name for name, _args in intents]
+    nav_index = names.index("navigation_goal")
+    assert names[nav_index + 1] == "lavira_depth_request"
+
+
+def test_move_to_facing_wait_timeout_still_terminates_task():
+    agent, _camera, _client, intents, _waited = build_agent(
+        [move()],
+        groundings=[grounding()],
+    )
+    normal_wait = agent.wait_status
+    timeout_next_heading = False
+
+    def timeout_facing(generation, skill_id, segment_id, timeout):
+        nonlocal timeout_next_heading
+        if intents[-1][0] == "navigation_goal":
+            timeout_next_heading = True
+            return normal_wait(generation, skill_id, segment_id, timeout)
+        if intents[-1][0] == "navigation_heading_goal" and timeout_next_heading:
+            raise TimeoutError("move_to_facing_timeout")
+        return normal_wait(generation, skill_id, segment_id, timeout)
+
+    agent.wait_status = timeout_facing
+    result = agent.run(75)
+
+    assert result.state == "failed"
+    assert result.reason == "move_to_facing_timeout"
+    names = [name for name, _args in intents]
+    nav_index = names.index("navigation_goal")
+    facing_index = names.index("navigation_heading_goal", nav_index + 1)
+    assert "lavira_depth_request" not in names[facing_index + 1:]
+
+
+def test_move_to_facing_stale_segment_status_still_terminates_task():
+    agent, _camera, _client, intents, _waited = build_agent(
+        [move()],
+        groundings=[grounding()],
+    )
+    normal_wait = agent.wait_status
+    stale_next_heading = False
+
+    def stale_facing(generation, skill_id, segment_id, timeout):
+        nonlocal stale_next_heading
+        if intents[-1][0] == "navigation_goal":
+            stale_next_heading = True
+            return normal_wait(generation, skill_id, segment_id, timeout)
+        if intents[-1][0] == "navigation_heading_goal" and stale_next_heading:
+            return {
+                "generation": generation,
+                "skill_id": skill_id,
+                "segment_id": segment_id + 1,
+                "state": "reached",
+                "reason": "heading_sonic_yaw_reached",
+            }
+        return normal_wait(generation, skill_id, segment_id, timeout)
+
+    agent.wait_status = stale_facing
+    result = agent.run(76)
+
+    assert result.state == "failed"
+    assert result.reason == "stale segment status"
+    names = [name for name, _args in intents]
+    nav_index = names.index("navigation_goal")
+    facing_index = names.index("navigation_heading_goal", nav_index + 1)
+    assert "lavira_depth_request" not in names[facing_index + 1:]
 
 
 def test_panorama_uses_sonic_measured_yaw_not_fastlio_yaw():
@@ -934,7 +1257,7 @@ def test_la_context_keeps_fresh_panorama_and_last_five_completed_moves():
     )
 
 
-def test_va_context_contains_mission_strategy_and_terminal_stop_flag():
+def test_va_context_excludes_alignment_grounding_but_keeps_postcheck_context():
     agent, _camera, client, _intents, _waited = build_agent(
         [move(), align(), decision("MANIPULATE")],
         groundings=[grounding(), grounding(), grounding()],
@@ -949,18 +1272,25 @@ def test_va_context_contains_mission_strategy_and_terminal_stop_flag():
     assert result.state == "reached"
     assert result.steps == 3
     assert len(client.la_calls) == 3
-    calls = [
-        *client.grounding_calls,
-        *client.alignment_grounding_calls,
-        *client.postcheck_calls,
-    ]
+    calls = [*client.grounding_calls, *client.postcheck_calls]
     assert all(
-        call["mission"] == "find the basket and put the bottle in it"
-        and call["global_target"] == "basket"
+        call["global_target"] == "basket"
         and call["strategic_goal"]
         for call in calls
     )
+    assert all(
+        call["mission"] == "find the basket and put the bottle in it"
+        for call in client.grounding_calls
+    )
+    assert all(
+        call["mission"] == "Use the basket as both alignment targets."
+        for call in client.postcheck_calls[:2]
+    )
     assert all(not call["strategic_stop"] for call in client.grounding_calls)
+    assert len(client.alignment_grounding_calls) == 1
+    assert set(client.alignment_grounding_calls[0]) == {
+        "alignment_prompt", "direction", "image_bgr",
+    }
     assert [call["strategic_stop"] for call in client.postcheck_calls] == [
         False, False, True,
     ]
@@ -1058,7 +1388,7 @@ def test_align_retry_and_align_can_return_to_move_to():
     assert [name for name, _ in intents].count("start_base_pose") == 1
     base_pose = next(args for name, args in intents if name == "start_base_pose")
     assert base_pose["target"] == "basket"
-    assert base_pose["surface"] == "desk"
+    assert base_pose["yaw_align_target"] == "desk"
     assert base_pose["reference_bbox"] == [200, 200, 800, 800]
     assert agent._history[1].controller_state == "target_not_found"
 
@@ -1158,7 +1488,7 @@ def test_align_grounding_can_select_operation_target_independent_of_global_targe
         ],
         groundings=[grounding() for _ in range(3)],
         alignment_groundings=[alignment_grounding(
-            target="medicine bottle", surface="desk",
+            target="medicine bottle", yaw_align_target="desk",
         )],
         postchecks=[ready_to_manipulate(), ready_to_manipulate()],
         global_target="desk with blue basket",
@@ -1171,7 +1501,7 @@ def test_align_grounding_can_select_operation_target_independent_of_global_targe
         args for name, args in intents if name == "start_base_pose"
     )
     assert base_pose["target"] == "medicine bottle"
-    assert base_pose["surface"] == "desk"
+    assert base_pose["yaw_align_target"] == "desk"
 
 
 def test_base_pose_target_comes_from_align_va_grounding():
@@ -1190,7 +1520,7 @@ def test_base_pose_target_comes_from_align_va_grounding():
         ],
         groundings=[grounding() for _ in range(3)],
         alignment_groundings=[alignment_grounding(
-            target="  blue basket  ", surface="  desk  ",
+            target="  blue basket  ", yaw_align_target="  desk  ",
         )],
         postchecks=[ready_to_manipulate(), ready_to_manipulate()],
         global_target="desk with blue basket",
@@ -1203,9 +1533,55 @@ def test_base_pose_target_comes_from_align_va_grounding():
         args for name, args in intents if name == "start_base_pose"
     )
     assert base_pose["target"] == "blue basket"
-    assert base_pose["surface"] == "desk"
-    assert client.alignment_grounding_calls[0]["global_target"] == (
-        "desk with blue basket"
+    assert base_pose["yaw_align_target"] == "desk"
+    assert set(client.alignment_grounding_calls[0]) == {
+        "alignment_prompt", "direction", "image_bgr",
+    }
+
+
+def test_failed_base_pose_does_not_run_an_intra_align_fallback():
+    events = []
+    agent, _camera, _client, intents, _waited = build_agent(
+        [move(), align(), decision(None, result="FAIL")],
+        groundings=[grounding() for _ in range(3)],
+        alignment_groundings=[alignment_grounding(
+            target="cardboard box",
+            yaw_align_target="cardboard box",
+        )],
+        postchecks=[ready_to_manipulate(), ready_to_manipulate()],
+        events=events,
+    )
+    normal_wait = agent.wait_status
+
+    def fail_base_pose(generation, skill_id, segment_id, timeout):
+        if intents[-1][0] == "start_base_pose":
+            return {
+                "generation": generation,
+                "skill_id": skill_id,
+                "segment_id": segment_id,
+                "state": "failed",
+                "reason": "YOLOE text prompt found no target",
+            }
+        return normal_wait(generation, skill_id, segment_id, timeout)
+
+    agent.wait_status = fail_base_pose
+
+    result = agent.run(44)
+
+    assert result.reason.startswith("la_fail:")
+    attempts = [
+        args for name, args in intents if name == "start_base_pose"
+    ]
+    assert attempts == [{
+        "generation": 44,
+        "skill_id": 2,
+        "segment_id": attempts[0]["segment_id"],
+        "target": "cardboard box",
+        "yaw_align_target": "cardboard box",
+        "reference_bbox": [200.0, 200.0, 800.0, 800.0],
+    }]
+    assert not any(
+        event["code"] == "BASE_POSE_TARGET_FALLBACK" for event in events
     )
 
 
@@ -1348,9 +1724,16 @@ def test_manipulation_recovers_in_vla_then_system_completes_after_va_success():
         call["manipulation_prompt"] == static_prompt
         for call in client.la_calls
     )
+    assert set(client.alignment_grounding_calls[0]) == {
+        "alignment_prompt", "direction", "image_bgr",
+    }
+    assert all(
+        call["mission"] == "Use the basket as both alignment targets."
+        for call in client.postcheck_calls[:2]
+    )
     assert all(
         call["mission"] == static_prompt
-        for call in client.alignment_grounding_calls + client.postcheck_calls
+        for call in client.postcheck_calls[2:]
     )
     assert not any(name.startswith("navigation_") for name in names[names.index("start_vla_task") + 1:])
 
@@ -1458,30 +1841,83 @@ def test_vla_rejected_start_ends_agent_without_retrying():
     assert not any(name == "hold_vla_task" for name, _parameters in intents)
 
 
-def test_align_grounding_lists_task_objects_and_runtime_selects_largest() -> None:
-    result = validate_alignment_grounding(alignment_grounding(objects=[
-        {
-            "name": "medicine bottle",
-            "surface": "desk",
-            "visible": True,
-            "bbox_2d": [925, 406, 971, 513],
-            "confidence": 0.95,
-        },
-        {
-            "name": "blue basket",
-            "surface": "desk",
-            "visible": True,
-            "bbox_2d": [640, 310, 870, 500],
-            "confidence": 0.9,
-        },
-    ]))
+def test_align_grounding_same_object_canonicalizes_detector_text() -> None:
+    result = validate_alignment_grounding(alignment_grounding(
+        target="Cardboard Box",
+        yaw_align_target="cardboard   box",
+    ))
 
-    assert [item["name"] for item in result["objects"]] == [
-        "medicine bottle", "blue basket",
-    ]
-    assert result["target"] == "blue basket"
-    assert result["surface"] == "desk"
-    assert result["bbox_2d"] == [640.0, 310.0, 870.0, 500.0]
+    assert result["target"]["name"] == "Cardboard Box"
+    assert result["yaw_align_target"]["name"] == "Cardboard Box"
+    assert result["target"]["bbox_2d"] == [200.0, 200.0, 800.0, 800.0]
+    assert result["confidence"] == pytest.approx(0.9)
+
+
+def test_align_grounding_accepts_different_target_roles() -> None:
+    result = validate_alignment_grounding(alignment_grounding(
+        target="medicine bottle",
+        yaw_align_target="desk",
+        target_confidence=0.95,
+        yaw_align_target_confidence=0.81,
+    ))
+
+    assert result["target"]["name"] == "medicine bottle"
+    assert result["yaw_align_target"]["name"] == "desk"
+    assert result["confidence"] == pytest.approx(0.81)
+
+
+def test_align_grounding_not_found_allows_visible_low_confidence_roles() -> None:
+    result = validate_alignment_grounding(alignment_grounding(
+        status="NOT_FOUND",
+        target="cardboard box",
+        yaw_align_target="cardboard box",
+        target_visible=True,
+        yaw_align_target_visible=True,
+        target_confidence=0.2,
+        yaw_align_target_confidence=0.1,
+    ))
+
+    assert result["status"] == "NOT_FOUND"
+    assert result["confidence"] == pytest.approx(0.1)
+
+
+def test_align_runtime_applies_minimum_role_confidence_gate() -> None:
+    agent, _camera, _client, _intents, _waited = build_agent(
+        [],
+        alignment_groundings=[alignment_grounding(
+            target="cardboard box",
+            yaw_align_target="cardboard box",
+            target_confidence=0.95,
+            yaw_align_target_confidence=0.59,
+        )],
+    )
+
+    result = agent._alignment_ground(
+        generation=7,
+        skill_id=1,
+        image=np.zeros((8, 8, 3), dtype=np.uint8),
+    )
+
+    assert result["status"] == "NOT_FOUND"
+    assert result["confidence"] == pytest.approx(0.59)
+
+
+def test_align_grounding_prompt_is_decoupled_from_navigation_context() -> None:
+    prompt = alignment_grounding_prompt(
+        alignment_prompt=(
+            "Use the cardboard box as the distance-and-centering target. "
+            "Use it as the yaw-alignment target."
+        ),
+        direction="front",
+    )
+
+    assert "Use only ALIGN PROMPT and the current image" in prompt
+    assert "Select exactly one `target`" in prompt
+    assert "Select exactly one `yaw_align_target`" in prompt
+    assert "Both roles may name the same physical object" in prompt
+    assert "GLOBAL TARGET" not in prompt
+    assert "CURRENT STRATEGY" not in prompt
+    assert "STRATEGIC STOP" not in prompt
 
 
 def test_strict_schemas_fail_closed():
@@ -1509,36 +1945,25 @@ def test_strict_schemas_fail_closed():
     assert normalized["transition"] == "CONTINUE_MANIPULATION"
     with pytest.raises(LaViRAAgentError, match="schema"):
         validate_alignment_grounding({**alignment_grounding(), "extra": True})
-    with pytest.raises(LaViRAAgentError, match="complete physical object"):
-        validate_alignment_grounding(alignment_grounding(surface="tabletop"))
-    with pytest.raises(LaViRAAgentError, match="must not appear"):
-        validate_alignment_grounding(alignment_grounding(objects=[
-            {
-                "name": "blue basket",
-                "surface": "desk",
-                "visible": True,
-                "bbox_2d": [100, 100, 500, 500],
-                "confidence": 0.9,
-            },
-            {
-                "name": "desk",
-                "surface": "floor",
-                "visible": True,
-                "bbox_2d": [50, 50, 900, 900],
-                "confidence": 0.9,
-            },
-        ]))
-    with pytest.raises(LaViRAAgentError, match="no operation object large enough"):
+    legacy = alignment_grounding()
+    legacy["surface"] = "desk"
+    with pytest.raises(LaViRAAgentError, match="schema"):
+        validate_alignment_grounding(legacy)
+    with pytest.raises(LaViRAAgentError, match="stable target bbox"):
         validate_alignment_grounding(alignment_grounding(
             target="medicine bottle",
-            surface="desk",
-            objects=[{
-                "name": "medicine bottle",
-                "surface": "desk",
-                "visible": True,
-                "bbox_2d": [925, 406, 971, 513],
-                "confidence": 0.95,
-            }],
+            yaw_align_target="desk",
+            bbox=[925, 406, 971, 513],
+        ))
+    with pytest.raises(LaViRAAgentError, match="corner ordering"):
+        validate_alignment_grounding(alignment_grounding(
+            bbox=[900, 100, 100, 900],
+        ))
+    with pytest.raises(LaViRAAgentError, match="English detector"):
+        validate_alignment_grounding(alignment_grounding(target="纸箱"))
+    with pytest.raises(LaViRAAgentError, match="confidence"):
+        validate_alignment_grounding(alignment_grounding(
+            yaw_align_target_confidence=math.inf,
         ))
     with pytest.raises(LaViRAAgentError, match="decision"):
         validate_language_action(decision(None, result="COMPLETE"))
@@ -1621,5 +2046,5 @@ def test_structured_events_cover_panorama_three_skills_and_completion():
     assert [event["fields"]["transition"] for event in postcheck_events] == [
         "TASK_COMPLETE",
     ]
-    assert [name for name, _args in intents].count("navigation_heading_goal") == 7
+    assert [name for name, _args in intents].count("navigation_heading_goal") == 8
     assert events[-1]["code"] == "TASK_COMPLETED"

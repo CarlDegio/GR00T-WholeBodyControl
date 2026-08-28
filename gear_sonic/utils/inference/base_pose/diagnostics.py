@@ -10,7 +10,23 @@ import queue
 import threading
 from typing import Any, Callable, Mapping
 
+import cv2
 import numpy as np
+
+
+LineEndpoints = tuple[tuple[float, float], tuple[float, float]]
+
+
+@dataclass(frozen=True)
+class CameraImageData:
+    """One sampled camera RGB frame and its same-frame annotations."""
+
+    camera_stream: str
+    camera_timestamp: float
+    rgb: np.ndarray = field(repr=False)
+    target_mask: np.ndarray | None = field(default=None, repr=False)
+    candidate_lines_px: tuple[LineEndpoints, ...] = ()
+    selected_line_px: LineEndpoints | None = None
 
 
 @dataclass(frozen=True)
@@ -26,16 +42,20 @@ class DetectionFrameData:
     target_mask: np.ndarray | None = field(default=None, repr=False)
     target_track_id: int | None = None
     target_confidence: float | None = None
-    surface_bbox_xyxy: tuple[float, float, float, float] | None = None
-    surface_mask: np.ndarray | None = field(default=None, repr=False)
-    completed_surface_mask: np.ndarray | None = field(default=None, repr=False)
-    surface_track_id: int | None = None
-    surface_confidence: float | None = None
+    yaw_align_target_bbox_xyxy: tuple[float, float, float, float] | None = None
+    yaw_align_target_mask: np.ndarray | None = field(default=None, repr=False)
+    completed_yaw_align_target_mask: np.ndarray | None = field(default=None, repr=False)
+    yaw_align_target_track_id: int | None = None
+    yaw_align_target_confidence: float | None = None
     target_geometry: Mapping[str, Any] | None = None
-    table_geometry: Mapping[str, Any] | None = None
-    table_geometry_error: str | None = None
+    yaw_align_geometry: Mapping[str, Any] | None = None
+    yaw_align_geometry_error: str | None = None
     perception_kind: str = "observation"
     perception_error: str | None = None
+    camera_images: tuple[CameraImageData, ...] = field(
+        default_factory=tuple,
+        repr=False,
+    )
 
 
 def _optional_float(value: Any) -> float | None:
@@ -69,11 +89,107 @@ def _phase_name(value: Any) -> str | None:
 
 
 class FrameDiagnosticsWriter:
-    """Append perception and control records without producing image artifacts."""
+    """Append JSONL records and sampled annotated camera images."""
 
     def __init__(self, output_dir: str | Path):
         self.output_dir = Path(output_dir).resolve()
         self.jsonl_path = self.output_dir / "raw_servo_frames.jsonl"
+        self.image_root = self.output_dir / "diagnostic_images"
+
+    @staticmethod
+    def _safe_stream_name(value: str) -> str:
+        normalized = "".join(
+            character
+            if character.isalnum() or character in {"-", "_", "."}
+            else "_"
+            for character in str(value)
+        )
+        return normalized or "unknown_stream"
+
+    def _image_relative_path(
+        self,
+        frame_index: int,
+        image: CameraImageData,
+    ) -> Path:
+        filename = (
+            "initial.jpg"
+            if int(frame_index) < 0
+            else f"frame_{int(frame_index):06d}.jpg"
+        )
+        return (
+            Path("diagnostic_images")
+            / self._safe_stream_name(image.camera_stream)
+            / filename
+        )
+
+    @staticmethod
+    def _line_points(line: LineEndpoints) -> tuple[tuple[int, int], tuple[int, int]]:
+        return tuple(
+            tuple(int(round(float(value))) for value in point)
+            for point in line
+        )
+
+    @classmethod
+    def _annotated_rgb(cls, image: CameraImageData) -> np.ndarray:
+        rgb = np.asarray(image.rgb)
+        if rgb.ndim != 3 or rgb.shape[2] != 3:
+            raise ValueError("diagnostic RGB image must have three channels")
+        if rgb.dtype != np.uint8:
+            raise ValueError("diagnostic RGB image must be uint8")
+        annotated = rgb.copy()
+
+        if image.target_mask is not None:
+            mask = np.asarray(image.target_mask) > 0
+            if mask.shape != annotated.shape[:2]:
+                raise ValueError("diagnostic target mask is not aligned to RGB")
+            if np.any(mask):
+                mask_color = np.array([255, 0, 255], dtype=np.float32)
+                annotated[mask] = np.clip(
+                    0.55 * annotated[mask].astype(np.float32)
+                    + 0.45 * mask_color,
+                    0,
+                    255,
+                ).astype(np.uint8)
+
+        for candidate in image.candidate_lines_px:
+            point_a, point_b = cls._line_points(candidate)
+            cv2.line(
+                annotated,
+                point_a,
+                point_b,
+                (255, 215, 0),
+                1,
+                cv2.LINE_AA,
+            )
+        if image.selected_line_px is not None:
+            point_a, point_b = cls._line_points(image.selected_line_px)
+            cv2.line(
+                annotated,
+                point_a,
+                point_b,
+                (0, 255, 0),
+                3,
+                cv2.LINE_AA,
+            )
+        return annotated
+
+    def write_camera_images(
+        self,
+        frame_index: int,
+        images: tuple[CameraImageData, ...],
+    ) -> None:
+        for image in images:
+            relative_path = self._image_relative_path(frame_index, image)
+            output_path = self.output_dir / relative_path
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            annotated_rgb = self._annotated_rgb(image)
+            encoded = cv2.cvtColor(annotated_rgb, cv2.COLOR_RGB2BGR)
+            if not cv2.imwrite(
+                str(output_path),
+                encoded,
+                [cv2.IMWRITE_JPEG_QUALITY, 95],
+            ):
+                raise OSError(f"failed to write diagnostic image {output_path}")
 
     @staticmethod
     def _detection(
@@ -169,11 +285,11 @@ class FrameDiagnosticsWriter:
                     frame.target_confidence,
                     frame.target_mask,
                 ),
-                "table": self._detection(
-                    frame.surface_bbox_xyxy,
-                    frame.surface_track_id,
-                    frame.surface_confidence,
-                    frame.surface_mask,
+                "yaw_align_target": self._detection(
+                    frame.yaw_align_target_bbox_xyxy,
+                    frame.yaw_align_target_track_id,
+                    frame.yaw_align_target_confidence,
+                    frame.yaw_align_target_mask,
                 ),
             },
             "geometry": {
@@ -182,18 +298,31 @@ class FrameDiagnosticsWriter:
                     if frame.target_geometry is None
                     else dict(frame.target_geometry)
                 ),
-                "table": (
+                "yaw_align_geometry": (
                     None
-                    if frame.table_geometry is None
-                    else dict(frame.table_geometry)
+                    if frame.yaw_align_geometry is None
+                    else dict(frame.yaw_align_geometry)
                 ),
-                "table_error": frame.table_geometry_error,
+                "yaw_align_geometry_error": frame.yaw_align_geometry_error,
             },
             "controller": (
                 None if not applied else self._controller(controller_state)
             ),
             "command": None if not applied else self._command(command),
             "orientation": None if orientation is None else dict(orientation),
+            "image_artifacts": [
+                {
+                    "camera_stream": image.camera_stream,
+                    "camera_timestamp": float(image.camera_timestamp),
+                    "path": str(
+                        self._image_relative_path(frame.frame_index, image)
+                    ),
+                    "target_mask": image.target_mask is not None,
+                    "candidate_line_count": len(image.candidate_lines_px),
+                    "selected_line": image.selected_line_px is not None,
+                }
+                for image in frame.camera_images
+            ],
         }
         with self.jsonl_path.open("a", encoding="utf-8") as handle:
             handle.write(
@@ -205,6 +334,7 @@ class FrameDiagnosticsWriter:
                 + "\n"
             )
             handle.flush()
+        self.write_camera_images(frame.frame_index, frame.camera_images)
 
 
 @dataclass(frozen=True)
@@ -222,6 +352,14 @@ class _ControlDecision:
     controller_state: Mapping[str, Any] | None
     command: Mapping[str, Any] | None
     orientation: Mapping[str, Any] | None
+
+
+@dataclass(frozen=True)
+class _ProducedImages:
+    generation: int
+    output_dir: Path
+    frame_index: int
+    images: tuple[CameraImageData, ...]
 
 
 @dataclass(frozen=True)
@@ -292,6 +430,26 @@ class AsyncFrameDiagnosticsWriter:
                 raise RuntimeError("diagnostic writer is closed")
             self._items.put_nowait(item)
 
+    def submit_camera_images(
+        self,
+        generation: int,
+        output_dir: str | Path,
+        frame_index: int,
+        images: tuple[CameraImageData, ...],
+    ) -> None:
+        if not images:
+            return
+        item = _ProducedImages(
+            int(generation),
+            Path(output_dir).resolve(),
+            int(frame_index),
+            tuple(images),
+        )
+        with self._submit_lock:
+            if self._closed:
+                raise RuntimeError("diagnostic writer is closed")
+            self._items.put_nowait(item)
+
     def close(self, *, drain: bool = True) -> None:
         with self._submit_lock:
             if self._closed:
@@ -331,6 +489,20 @@ class AsyncFrameDiagnosticsWriter:
         except Exception as exc:
             self._report_failure(generation, produced.output_dir, exc)
             return False
+
+    def _write_images(self, produced: _ProducedImages) -> None:
+        try:
+            writer = self._writers.get(produced.generation)
+            if writer is None:
+                writer = self.writer_factory(produced.output_dir)
+                self._writers[produced.generation] = writer
+            writer.write_camera_images(produced.frame_index, produced.images)
+        except Exception as exc:
+            self._report_failure(
+                produced.generation,
+                produced.output_dir,
+                exc,
+            )
 
     def _flush_ready(self, generation: int) -> None:
         next_index = self._next_index.setdefault(generation, 0)
@@ -378,3 +550,6 @@ class AsyncFrameDiagnosticsWriter:
                 key = (item.generation, item.frame_index)
                 self._decisions[key] = item
                 self._flush_ready(item.generation)
+                continue
+            if isinstance(item, _ProducedImages):
+                self._write_images(item)
