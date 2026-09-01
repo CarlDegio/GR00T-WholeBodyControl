@@ -100,6 +100,15 @@ def test_lavira_config_exposes_dual_cloud_agent_roles() -> None:
             nav_handoff_min_depth_m=3.0,
             nav_handoff_max_depth_m=2.0,
         )
+    assert LaviraPlannerConfig(
+        "find chair", "align to chair", "chair",
+        nav_handoff_max_depth_m=15.0,
+    ).nav_handoff_max_depth_m == 15.0
+    with pytest.raises(ValueError, match="depth range"):
+        LaviraPlannerConfig(
+            "find chair", "align to chair", "chair",
+            nav_handoff_max_depth_m=15.1,
+        )
     with pytest.raises(ValueError, match="limits"):
         LaviraPlannerConfig(
             "find chair", "align to chair", "chair",

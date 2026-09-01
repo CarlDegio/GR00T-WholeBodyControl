@@ -23,6 +23,8 @@ from gear_sonic.utils.inference.lavira.agent import (
     LaViRAClient,
     MoveToView,
     ScanView,
+    _complete_move_to_todo,
+    _first_incomplete_todo_line,
     _move_to_facing_geometry,
     alignment_grounding_prompt,
     language_action_prompt,
@@ -42,11 +44,12 @@ def decision(
     *,
     result="EXECUTE",
     global_target="basket",
+    todo_list="- [x] observed\n- [ ] continue",
 ):
     return {
         "global_target": global_target,
         "progress_analysis": "progress",
-        "updated_todo_list": "- [x] observed\n- [ ] continue",
+        "updated_todo_list": todo_list,
         "reasoning": "reason",
         "decision": result,
         "skill": skill,
@@ -55,11 +58,17 @@ def decision(
     }
 
 
-def move(target="basket", direction="front", *, global_target="basket"):
+def move(
+    target="basket",
+    direction="front",
+    *,
+    global_target="basket",
+    todo_list="- [x] observed\n- [ ] continue",
+):
     return decision("MOVE_TO", {
         "view_direction": direction,
         "target": target,
-    }, global_target=global_target)
+    }, global_target=global_target, todo_list=todo_list)
 
 
 def align(*, global_target="basket"):
@@ -139,6 +148,31 @@ def ready_to_manipulate(status="SATISFIED", evidence="ready to manipulate"):
 
 def task_complete(evidence="task complete"):
     return postcheck("SATISFIED", evidence, "TASK_COMPLETE")
+
+
+def test_runtime_move_to_todo_helper_completes_only_recorded_item():
+    todo = (
+        "- [x] pass the glass door\n"
+        "  - [ ] approach the black trash can\n"
+        "- [ ] approach the dark blue trash can"
+    )
+
+    active_line = _first_incomplete_todo_line(todo)
+    assert active_line == 1
+    assert _complete_move_to_todo(todo, active_line, "black trash can") == (
+        "- [x] pass the glass door\n"
+        "  - [x] approach the black trash can Result: Runtime VA confirmed "
+        'MOVE_TO target "black trash can" as SATISFIED.\n'
+        "- [ ] approach the dark blue trash can"
+    )
+
+
+def test_runtime_move_to_todo_helper_fails_closed_if_item_changed():
+    with pytest.raises(
+        LaViRAAgentError,
+        match="active MOVE_TO TODO item is no longer incomplete",
+    ):
+        _complete_move_to_todo("- [x] already complete", 0, "basket")
 
 
 class FakeCamera:
@@ -434,8 +468,7 @@ def test_lavira_cloud_calls_preserve_role_specific_thinking_mode(tmp_path) -> No
     assert "**JSON RESPONSE FORMAT**" in la_labels[0]
     assert '**MISSION**: "find basket"' in la_labels[1]
     assert la_labels[2] == 'Navigation Task: "find basket"\n\n- Current Step: 3'
-    assert la_labels[3] == "PLAN-1"
-    assert la_labels[4:9] == [
+    assert la_labels[3:8] == [
         "Image 1: The current FORWARD view (Step 3).",
         "Image 2: The view 45 deg to the RIGHT of the forward view (Step 3).",
         "Image 3: The view after turning 90 deg to the RIGHT (Step 3).",
@@ -443,6 +476,7 @@ def test_lavira_cloud_calls_preserve_role_specific_thinking_mode(tmp_path) -> No
         "(Step 3).",
         "Image 5: The view 45 deg to the LEFT of the forward view (Step 3).",
     ]
+    assert la_labels[8] == "PLAN-1"
     plan_image_index = next(
         index for index, item in enumerate(la_content)
         if item.get("text") == "PLAN-1"
@@ -452,7 +486,7 @@ def test_lavira_cloud_calls_preserve_role_specific_thinking_mode(tmp_path) -> No
         if item.get("text")
         == "Image 1: The current FORWARD view (Step 3)."
     ) - 1
-    assert plan_image_index < current_image_index
+    assert current_image_index < plan_image_index
     assert current_image_index > 1
     assert "absolute_yaw" not in json.dumps(la_content)
     assert "controller=" not in json.dumps(la_content)
@@ -470,6 +504,12 @@ def test_lavira_cloud_calls_preserve_role_specific_thinking_mode(tmp_path) -> No
     assert "45-degree intermediate views" in la_prompt
     assert "rear/behind direction" in la_prompt
     assert "successful MOVE_TO to the exact GLOBAL TARGET" in la_prompt
+    assert "runtime exclusively completes MOVE_TO TODO items" in la_prompt
+    assert "Never mark a MOVE_TO item complete yourself" in la_prompt
+    assert "exactly one target waypoint" in la_prompt
+    assert "never create a standalone turn" in la_prompt
+    assert "ALIGN TODO completion remains your responsibility" in la_prompt
+    assert "Never select the same completed waypoint again" in la_prompt
     assert "VA independently" in la_prompt
     for index in (1, 3):
         va_content = calls[index]["messages"][1]["content"]
@@ -631,6 +671,7 @@ def build_agent(
     postchecks=(),
     max_steps=20, poll_failure=None, events=None, todos=None, depth_mm=2000.0,
     handoff_depth_mm=None, manipulation_prompt=None, sleeps=None,
+    trace=None,
     mission="find the basket and put the bottle in it",
     global_target="basket",
     alignment_prompt="Use the basket as both alignment targets.",
@@ -685,6 +726,23 @@ def build_agent(
             }
         return result
 
+    def report_event(level, code, message, **fields):
+        if events is not None:
+            events.append({
+                "level": level,
+                "code": code,
+                "message": message,
+                "fields": fields,
+            })
+        if trace is not None:
+            trace.append(("event", code))
+
+    def report_todo(generation, step, todo):
+        if todos is not None:
+            todos.append((generation, step, todo))
+        if trace is not None:
+            trace.append(("todo", todo))
+
     agent = LaViRAAgent(
         navigation_mode="object_nav",
         mission=mission,
@@ -708,22 +766,13 @@ def build_agent(
         poll_failure=poll_failure,
         report_event=(
             None
-            if events is None
-            else lambda level, code, message, **fields: events.append(
-                {
-                    "level": level,
-                    "code": code,
-                    "message": message,
-                    "fields": fields,
-                }
-            )
+            if events is None and trace is None
+            else report_event
         ),
         report_todo=(
             None
-            if todos is None
-            else lambda generation, step, todo: todos.append(
-                (generation, step, todo)
-            )
+            if todos is None and trace is None
+            else report_todo
         ),
     )
     return agent, camera, client, intents, waited
@@ -1611,6 +1660,183 @@ def test_nav_handoff_accepts_head_when_chest_does_not_pass():
     assert handoff["fields"]["head_status"] == "SATISFIED"
     assert handoff["fields"]["ready_view"] == "head"
     assert handoff["fields"]["transition"] == "READY_TO_ALIGN"
+
+
+@pytest.mark.parametrize(
+    ("chest_grounding", "head_grounding", "ready_view"),
+    [
+        ("FOUND", "NOT_FOUND", "chest"),
+        ("NOT_FOUND", "FOUND", "head"),
+        ("FOUND", "FOUND", "both"),
+    ],
+)
+def test_runtime_completes_move_to_todo_when_either_nav_view_is_satisfied(
+    chest_grounding,
+    head_grounding,
+    ready_view,
+):
+    open_todo = "- [ ] approach the basket\n- [ ] align with the basket"
+    completed_todo = (
+        "- [x] approach the basket Result: Runtime VA confirmed MOVE_TO target "
+        '"basket" as SATISFIED.\n'
+        "- [ ] align with the basket"
+    )
+    todos = []
+    events = []
+    trace = []
+    agent, _camera, client, _intents, _waited = build_agent(
+        [
+            move(todo_list=open_todo),
+            decision(None, result="FAIL", todo_list=completed_todo),
+        ],
+        groundings=[
+            grounding("FOUND", "basket"),
+            grounding(chest_grounding, "basket"),
+            grounding(head_grounding, "basket"),
+        ],
+        todos=todos,
+        events=events,
+        trace=trace,
+    )
+
+    result = agent.run(50)
+
+    assert result.reason.startswith("la_fail:")
+    assert client.la_calls[1]["todo_list"] == completed_todo
+    assert [item[2] for item in todos] == [open_todo, completed_todo]
+    assert trace.count(("todo", completed_todo)) == 1
+    assert trace.index(("event", "SKILL_COMPLETED")) < trace.index(
+        ("todo", completed_todo)
+    )
+    handoff = next(
+        event for event in events
+        if event["code"] == "NAV_HANDOFF_EVALUATED"
+    )
+    assert handoff["fields"]["status"] == "SATISFIED"
+    assert handoff["fields"]["transition"] == "READY_TO_ALIGN"
+    assert handoff["fields"]["ready_view"] == ready_view
+
+
+@pytest.mark.parametrize("unknown", [False, True])
+def test_runtime_leaves_move_to_todo_open_without_satisfied_nav_view(unknown):
+    open_todo = "- [ ] approach the basket\n- [ ] align with the basket"
+    if unknown:
+        handoff_groundings = [
+            grounding("FOUND", "basket"),
+            grounding("FOUND", "basket"),
+        ]
+    else:
+        handoff_groundings = [
+            grounding("NOT_FOUND", "basket"),
+            grounding("NOT_FOUND", "basket"),
+        ]
+    todos = []
+    events = []
+    agent, _camera, client, _intents, _waited = build_agent(
+        [
+            move(todo_list=open_todo),
+            decision(None, result="FAIL", todo_list=open_todo),
+        ],
+        groundings=[grounding("FOUND", "basket"), *handoff_groundings],
+        handoff_depth_mm=0.0 if unknown else None,
+        todos=todos,
+        events=events,
+    )
+
+    result = agent.run(51)
+
+    assert result.reason.startswith("la_fail:")
+    assert client.la_calls[1]["todo_list"] == open_todo
+    assert [item[2] for item in todos] == [open_todo]
+    handoff = next(
+        event for event in events
+        if event["code"] == "NAV_HANDOFF_EVALUATED"
+    )
+    assert handoff["fields"]["status"] == (
+        "UNKNOWN" if unknown else "NOT_SATISFIED"
+    )
+
+
+def test_intermediate_move_to_completion_advances_black_to_dark_blue_trash_can():
+    global_target = "desk with blue basket"
+    initial_todo = (
+        "- [ ] approach the black trash can\n"
+        "- [ ] approach the dark blue trash can\n"
+        "- [ ] approach the desk with blue basket"
+    )
+    black_completed = (
+        "- [x] approach the black trash can Result: Runtime VA confirmed "
+        'MOVE_TO target "black trash can" as SATISFIED.\n'
+        "- [ ] approach the dark blue trash can\n"
+        "- [ ] approach the desk with blue basket"
+    )
+    dark_blue_completed = (
+        "- [x] approach the black trash can Result: Runtime VA confirmed "
+        'MOVE_TO target "black trash can" as SATISFIED.\n'
+        "- [x] approach the dark blue trash can Result: Runtime VA confirmed "
+        'MOVE_TO target "dark blue trash can" as SATISFIED.\n'
+        "- [ ] approach the desk with blue basket"
+    )
+    todos = []
+    events = []
+    agent, _camera, client, _intents, _waited = build_agent(
+        [
+            move(
+                "black trash can",
+                global_target=global_target,
+                todo_list=initial_todo,
+            ),
+            move(
+                "dark blue trash can",
+                global_target=global_target,
+                todo_list=black_completed,
+            ),
+            decision(
+                None,
+                result="FAIL",
+                global_target=global_target,
+                todo_list=dark_blue_completed,
+            ),
+        ],
+        groundings=[
+            grounding("FOUND", "black trash can"),
+            grounding("FOUND", "black trash can"),
+            grounding("NOT_FOUND", "black trash can"),
+            *[grounding("FOUND", "dark blue trash can") for _ in range(3)],
+        ],
+        global_target=global_target,
+        todos=todos,
+        events=events,
+    )
+
+    result = agent.run(52)
+
+    assert result.reason.startswith("la_fail:")
+    assert client.la_calls[1]["todo_list"] == black_completed
+    assert client.la_calls[2]["todo_list"] == dark_blue_completed
+    assert [call["target"] for call in client.grounding_calls] == [
+        "black trash can",
+        "black trash can",
+        "black trash can",
+        "dark blue trash can",
+        "dark blue trash can",
+        "dark blue trash can",
+    ]
+    assert [item[2] for item in todos] == [
+        initial_todo,
+        black_completed,
+        dark_blue_completed,
+    ]
+    handoffs = [
+        event for event in events
+        if event["code"] == "NAV_HANDOFF_EVALUATED"
+    ]
+    assert [event["fields"]["transition"] for event in handoffs] == [
+        "CONTINUE_NAVIGATION",
+        "CONTINUE_NAVIGATION",
+    ]
+    assert handoffs[0]["fields"]["chest_status"] == "SATISFIED"
+    assert handoffs[0]["fields"]["head_status"] == "NOT_SATISFIED"
 
 
 def test_align_handoff_accepts_one_complete_camera_view():

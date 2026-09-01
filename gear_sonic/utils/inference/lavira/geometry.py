@@ -8,7 +8,7 @@ from typing import Any, Mapping, Sequence
 import numpy as np
 
 
-MAX_DIRECT_TRAVEL = 8.0
+MAX_DIRECT_TRAVEL = 15.0
 DEPTH_WINDOW_RADIUS = 3
 MIN_VALID_DEPTH_MM = 100.0
 FRAME_COUNT = 5

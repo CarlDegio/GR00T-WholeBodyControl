@@ -101,8 +101,18 @@ def test_goal_preserves_full_measured_range() -> None:
     assert geometry["mean_range"] == 2.0
 
 
-def test_rejects_direct_travel_above_eight_metres() -> None:
-    frames = [(depth_frame(8100.0), 100.0, 50.0)] * 5
+def test_allows_direct_travel_below_fifteen_metres() -> None:
+    frames = [(depth_frame(10_000.0), 100.0, 50.0)] * 5
+
+    geometry = build_object_nav_geometry_from_frames(
+        navigate_policy([450, 450, 550, 550]), frames
+    )
+
+    assert geometry["mean_range"] == pytest.approx(10.0)
+
+
+def test_rejects_direct_travel_above_fifteen_metres() -> None:
+    frames = [(depth_frame(15_100.0), 100.0, 50.0)] * 5
 
     with pytest.raises(ObjectNavGeometryError, match="exceeds"):
         build_object_nav_geometry_from_frames(

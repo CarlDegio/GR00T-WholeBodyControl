@@ -100,7 +100,15 @@ last. There is no separate initial-TODO inference. The first LA request derives
 and returns `global_target`, creates the working Markdown checklist, and selects
 the first skill in one response. Later requests receive the frozen value and
 must return it unchanged while revising the checklist and selecting the next
-skill. MOVE_TO captures fresh chest and
+skill. Each navigation checklist item represents exactly one waypoint; turns
+and facing choices belong to that waypoint's MOVE_TO `view_direction` and are
+not separate TODO items. The runtime exclusively completes MOVE_TO items. LA
+must preserve runtime-completed navigation lines exactly, never reopen them,
+and proceed directly to the first remaining incomplete item. ALIGN checklist
+completion remains LA-owned from `READY_TO_MANIPULATE`; MANIPULATE and its
+final visual confirmation remain runtime-owned terminal behavior.
+
+MOVE_TO captures fresh chest and
 head RGB-D observations after its issued NavDP goal reaches. Both views are
 captured before either cloud check, and the view that makes the NAV handoff
 ready is retained for LA history.
@@ -170,9 +178,16 @@ The runtime owns the effective NAV/ALIGN transition:
   all three harness conditions: the navigation controller completed, the
   MOVE_TO target matches `global_target`, and either complete camera view
   passes. A passing intermediate landmark remains `CONTINUE_NAVIGATION` and
-  clears ALIGN readiness. Values over 8 m are discarded. If neither view
+  clears ALIGN readiness. Values over 15 m are discarded. If neither view
   passes, missing/unavailable depth or a camera/check error produces `UNKNOWN`;
   two available but missing/out-of-range results produce `CONTINUE_NAVIGATION`.
+  Whenever either complete view passes, the OR-combined NAV status is
+  `SATISFIED`. The runtime immediately marks the MOVE_TO's recorded first
+  incomplete TODO as `[x]`, appends
+  `Result: Runtime VA confirmed MOVE_TO target "<target>" as SATISFIED.`, and
+  emits `TODO_UPDATED`. This applies to both intermediate
+  `CONTINUE_NAVIGATION` and final `READY_TO_ALIGN` handoffs. `NOT_SATISFIED`,
+  `UNKNOWN`, and missing targets leave the item open.
 - ALIGN combines the two one-image POSTCHECK statuses with OR. It produces
   `READY_TO_MANIPULATE` only when one complete camera view contains all
   operation objects and BasePose is aligned. If neither view is complete it
@@ -231,7 +246,9 @@ and while the first combined LA plan/action request is running it shows a
 waiting hint. TODO updates are
 structured `TODO_UPDATED` runtime events that update the fixed area instead of
 being duplicated in the scrolling event list. Complete event history remains
-available in the component log files.
+available in the component log files. A satisfied MOVE_TO produces this update
+directly from the runtime before the next LA request, so the completed count and
+active waypoint advance without an LA visual recheck.
 
 Production validation should progress from observation-only logging, to a
 30-degree-limited turn, to a 0.5 m local goal, and finally a complete task.

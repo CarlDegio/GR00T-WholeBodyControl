@@ -89,7 +89,7 @@ class SonicDataExporterConfig:
     defer_video_encoding: bool = True
     """Keep encoded camera frames in memory and encode videos when saving the episode."""
 
-    video_encoder_threads: int = 16
+    video_encoder_threads: int = 32
     """Maximum encoder threads used while saving each deferred video."""
 
     text_to_speech: bool = True
@@ -133,6 +133,7 @@ class TimingThresholdMonitor:
                 f"Time delta exception: {self.failure_count} failures in "
                 f"{self.reset_timeout_sec} seconds, time delta: {time_delta}"
             )
+            self.failure_count = 0
             if self.raise_exception:
                 raise TimeDeltaException(self.failure_count, self.reset_timeout_sec)
 

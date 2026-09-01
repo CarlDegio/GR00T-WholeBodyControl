@@ -34,6 +34,7 @@ from gear_sonic.utils.inference.lavira.agent import (
     LaViRATaskResult,
 )
 from gear_sonic.utils.inference.lavira.camera import SensorGatewayRGBDCamera
+from gear_sonic.utils.inference.lavira.geometry import MAX_DIRECT_TRAVEL
 
 LOGGER = logging.getLogger("sonic.lavira")
 EventReporter = Callable[..., None]
@@ -125,7 +126,7 @@ class LaviraPlannerConfig:
             or not math.isfinite(float(self.nav_handoff_max_depth_m))
             or self.nav_handoff_min_depth_m <= 0.0
             or self.nav_handoff_max_depth_m <= self.nav_handoff_min_depth_m
-            or self.nav_handoff_max_depth_m > 8.0
+            or self.nav_handoff_max_depth_m > MAX_DIRECT_TRAVEL
         ):
             raise ValueError("LaViRA NAV handoff depth range is invalid")
         if not self.alignment_head_camera_stream.strip():

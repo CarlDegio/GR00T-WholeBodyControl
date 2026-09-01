@@ -75,8 +75,8 @@ from gear_sonic.utils.teleop.sonic_orientation_telemetry import (
 def test_navdp_goal_tolerance_matches_production_profile() -> None:
     config = load_navdp_planner_config()
     assert config.goal_tolerance_m == pytest.approx(2.0)
-    assert config.rgb_stream == "camera/chest_view"
-    assert config.depth_stream == "camera/chest_view_depth"
+    assert config.rgb_stream == "camera/ego_view"
+    assert config.depth_stream == "camera/ego_view_depth"
 
 
 def test_navdp_runs_unthrottled_inference_with_ten_hz_mpc() -> None:

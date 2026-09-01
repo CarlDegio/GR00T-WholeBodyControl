@@ -140,6 +140,39 @@ class _HeadingTerminalError(LaViRAAgentError):
         )
 
 
+def _first_incomplete_todo_line(todo_list: str) -> int | None:
+    """Return the line containing the active checklist item, if any."""
+
+    for line_index, line in enumerate(todo_list.splitlines()):
+        if line.strip().startswith("- [ ]"):
+            return line_index
+    return None
+
+
+def _complete_move_to_todo(
+    todo_list: str,
+    line_index: int,
+    target: str,
+) -> str:
+    """Complete the MOVE_TO item selected before its runtime execution."""
+
+    lines = todo_list.splitlines()
+    if not 0 <= line_index < len(lines):
+        raise LaViRAAgentError("active MOVE_TO TODO item is unavailable")
+    checkbox_index = lines[line_index].find("[ ]")
+    if checkbox_index < 0 or not lines[line_index].strip().startswith("- [ ]"):
+        raise LaViRAAgentError("active MOVE_TO TODO item is no longer incomplete")
+    lines[line_index] = (
+        lines[line_index][:checkbox_index]
+        + "[x]"
+        + lines[line_index][checkbox_index + 3:].rstrip()
+        + " Result: Runtime VA confirmed MOVE_TO target "
+        + json.dumps(str(target).strip(), ensure_ascii=False)
+        + " as SATISFIED."
+    )
+    return "\n".join(lines)
+
+
 def _finite(value: Any) -> bool:
     return (
         not isinstance(value, bool)
@@ -511,14 +544,29 @@ generic checklist to guide your actions.
    - On the first request, create the working checklist and choose the first
      action in this same response. There is no separate initial planning call.
    - On every later request, reconcile the checklist with the newest visual
-     evidence and VA transition result. Preserve useful unfinished items, mark
-     completed items as [x] with "Result: ...", and add, remove, reorder, or
-     rewrite items whenever execution reveals a better plan.
+     evidence and VA transition result. Preserve useful unfinished items and
+     mark completed non-MOVE_TO items as [x] with "Result: ...". You may add,
+     remove, reorder, or rewrite pending items when execution reveals a better
+     plan.
+   - The runtime exclusively completes MOVE_TO TODO items after fresh head or
+     chest VA evidence satisfies the requested target.
+   - Never mark a MOVE_TO item complete yourself. Preserve every
+     runtime-completed MOVE_TO line exactly as received: never reopen, delete,
+     reorder, or rewrite it.
+   - Every navigation TODO item must represent exactly one target waypoint.
+     Left turns, right turns, facing, and other orientation choices belong only
+     in the selected MOVE_TO view_direction; never create a standalone turn,
+     face, or orientation TODO item.
+   - ALIGN TODO completion remains your responsibility. When the latest
+     transition is READY_TO_MANIPULATE, mark the corresponding ALIGN item [x]
+     with its Result before choosing the next incomplete item.
    - Keep navigation, approach, alignment, manipulation, and final visual
      verification represented as needed. Return the complete current plan as a
      Markdown checklist in updated_todo_list.
 2. **Decide the next action**:
    - Base it on the first incomplete TODO item.
+   - When the runtime has completed a MOVE_TO item, immediately work on the
+     next incomplete item. Never select the same completed waypoint again.
    - Choose strictly from MOVE_TO, ALIGN, MANIPULATE, or FAIL.
    - Respect the latest VA transition discriminator. It describes which stage
      is visually ready, but only your skill call can request a mode change.
@@ -995,17 +1043,6 @@ class LaViRAClient:
                 f"- Current Step: {current_step}"
             )},
         ]
-        recent_move_views = move_to_views[-5:]
-        for index, view in enumerate(recent_move_views):
-            content.extend([
-                {"type": "image_url", "image_url": {
-                    "url": _image_data_url(view.image_bgr),
-                }},
-                {
-                    "type": "text",
-                    "text": f"PLAN-{len(recent_move_views) - index}",
-                },
-            ])
         for index, view in enumerate(scan_views[-5:], start=1):
             content.extend([
                 {"type": "image_url", "image_url": {
@@ -1016,6 +1053,17 @@ class LaViRAClient:
                     "text": _g1_view_label(
                         view.direction, current_step, index,
                     ),
+                },
+            ])
+        recent_move_views = move_to_views[-5:]
+        for index, view in enumerate(recent_move_views):
+            content.extend([
+                {"type": "image_url", "image_url": {
+                    "url": _image_data_url(view.image_bgr),
+                }},
+                {
+                    "type": "text",
+                    "text": f"PLAN-{len(recent_move_views) - index}",
                 },
             ])
         return self._create(
@@ -2785,6 +2833,14 @@ class LaViRAAgent:
                 if la["decision"] == "FAIL":
                     raise LaViRAAgentError(f"la_fail:{la['reasoning']}")
                 skill = str(la["skill"])
+                active_move_to_todo_line = (
+                    _first_incomplete_todo_line(todo)
+                    if skill == "MOVE_TO" else None
+                )
+                if skill == "MOVE_TO" and active_move_to_todo_line is None:
+                    raise LaViRAAgentError(
+                        "LA MOVE_TO requires an incomplete TODO waypoint"
+                    )
                 self._validate_transition_gate(skill)
                 args = la["skill_args"]
                 target_hint = str(args.get("target", ""))
@@ -2857,6 +2913,17 @@ class LaViRAAgent:
                     va_result=entry.va_result,
                     evidence=entry.evidence,
                 )
+                if skill == "MOVE_TO" and entry.va_result == "SATISFIED":
+                    if active_move_to_todo_line is None:
+                        raise LaViRAAgentError(
+                            "active MOVE_TO TODO item is unavailable"
+                        )
+                    todo = _complete_move_to_todo(
+                        todo,
+                        active_move_to_todo_line,
+                        target_hint,
+                    )
+                    self._todo(generation, step, todo)
                 if skill == "MANIPULATE":
                     result = LaViRATaskResult(
                         generation, "reached", "manipulation_completed", step,
