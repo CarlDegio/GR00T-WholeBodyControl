@@ -23,6 +23,8 @@ import numpy as np
 from gear_sonic.utils.inference.base_pose.servo import (
     TrackedInstance,
     YoloePersistentTracker,
+    _YAW_ALIGN_EDGE_MAX_HORIZONTAL_ANGLE_DEG,
+    _YAW_ALIGN_EDGE_MIN_LENGTH_PX,
     _dilate_yaw_align_edge_mask,
     _largest_filled_component,
     _rgb_edge_line_segments,
@@ -546,8 +548,11 @@ def run(args: argparse.Namespace) -> int:
             "canny_low": 50,
             "canny_high": 150,
             "hough_threshold": 25,
-            "hough_min_line_length_px": 75.0,
+            "hough_min_line_length_px": _YAW_ALIGN_EDGE_MIN_LENGTH_PX,
             "hough_max_line_gap_px": 12,
+            "max_angle_from_horizontal_deg": (
+                _YAW_ALIGN_EDGE_MAX_HORIZONTAL_ANGLE_DEG
+            ),
             "depth_candidate_selection": "skipped",
         },
         filtered_line_count=len(segments),

@@ -1,11 +1,5 @@
 #!/usr/bin/env python3
-"""Experimentally infer BasePose alignment targets from an overall task.
-
-This standalone tool deliberately owns its prompt and does not call or modify
-the production ``alignment_grounding_prompt``. It sends one image plus the
-overall manipulation task to VA, then validates the response with the
-production ALIGN_GROUNDING response schema.
-"""
+"""Test production BasePose target inference with one image and a VLA task."""
 
 from __future__ import annotations
 
@@ -26,6 +20,7 @@ for import_root in (REPO_ROOT, TOOLS_ROOT):
 
 from gear_sonic.utils.inference.lavira.agent import (  # noqa: E402
     LaViRAAgentError,
+    alignment_grounding_prompt,
     validate_alignment_grounding,
 )
 from test_va_align_grounding import (  # noqa: E402
@@ -44,53 +39,13 @@ from test_va_align_grounding import (  # noqa: E402
 DEFAULT_OUTPUT_ROOT = Path("outputs/va_align_target_inference_tests")
 
 
-def experimental_alignment_prompt(*, task_prompt: str, direction: str) -> str:
-    """Build the experiment-only VA prompt."""
+def build_alignment_prompt(*, task_prompt: str, direction: str) -> str:
+    """Build the same VA prompt used by production ALIGN."""
 
-    return f"""**ROLE**: You are a humanoid robot BasePose alignment visual
-grounding model in ALIGN_GROUNDING mode.
-
-**OVERALL MANIPULATION TASK**: {json.dumps(task_prompt, ensure_ascii=False)}
-
-**INPUT**: You are looking at the CURRENT VIEW after turning to the fixed
-{direction} panorama direction.
-
-**TASK**:
-1. Use only OVERALL MANIPULATION TASK and the current image.
-2. Infer the two alignment roles that best prepare the robot to perform the
-   manipulation behavior described by OVERALL MANIPULATION TASK.
-3. Select exactly one `target`. Define it as the object that the robot should
-   approach and center in order to make the manipulation behavior as convenient
-   as possible. Select it only from manipulation objects. Manipulation objects
-   include grasp targets, objects that will be moved or carried, destination
-   containers or receptacles, and physical control objects, among others; only
-   supporting surfaces are excluded from this category. Prefer the largest,
-   most regular manipulation object that is easiest to recognize and align
-   automatically. Give `target` a tight bbox.
-4. Select exactly one `yaw_align_target`. Define it as the object whose
-   front-facing straight edge should be parallel to the robot's heading to make
-   the manipulation behavior as convenient as possible. It may be a supporting
-   object for an operated object, or it may be `target` itself.
-   When a non-floor supporting surface is present, regular, and visually clear,
-   prefer that supporting surface over `target` itself.
-   Never select the floor as a supporting yaw target; when the relevant
-   supporting surface is the floor, select `target` itself.
-   Prefer a regular object with a clear straight edge that is easy to recognize
-   and align automatically. Do not return a bbox for this role.
-5. Both roles may name the same physical object and must then use identical
-   short, detector-friendly English text.
-6. Do not select navigation landmarks, unrelated scene objects, or objects
-   inferred only from prior state.
-7. FOUND requires the target to have a valid bbox and both roles to be visibly
-   identifiable with sufficient confidence. Otherwise return NOT_FOUND; if the
-   target is not visible, use `bbox_2d:null`.
-
-Coordinates are normalized [0,1000]. Return exactly:
-{{"mode":"ALIGN_GROUNDING","status":"FOUND|NOT_FOUND",
-"target":{{"name":"...","visible":true,
-"bbox_2d":[0,0,1000,1000],"confidence":0.0}},
-"yaw_align_target":{{"name":"...","visible":true,"confidence":0.0}},
-"visual_evidence":"..."}}"""
+    return alignment_grounding_prompt(
+        manipulation_prompt=task_prompt,
+        direction=direction,
+    )
 
 
 def parse_args() -> argparse.Namespace:
@@ -184,7 +139,7 @@ def run(args: argparse.Namespace) -> int:
     if args.retry_delay_seconds < 0.0:
         raise ValueError("--retry-delay-seconds must be non-negative")
 
-    prompt = experimental_alignment_prompt(
+    prompt = build_alignment_prompt(
         task_prompt=task_prompt,
         direction=args.direction,
     )
@@ -212,7 +167,7 @@ def run(args: argparse.Namespace) -> int:
         "response_format": args.response_format,
         "max_tokens": args.max_tokens,
         "timeout_seconds": args.timeout_seconds,
-        "prompt_source": "experiment_only",
+        "prompt_source": "production_alignment_grounding_prompt",
     }
     (output_dir / "context.json").write_text(
         json.dumps(context, ensure_ascii=False, indent=2),

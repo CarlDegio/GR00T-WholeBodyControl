@@ -1770,6 +1770,7 @@ def test_worker_switches_state_after_twenty_joint_head_yaw_misses(
             None,
             np.ones((4, 6), dtype=np.uint8),
             None,
+            (),
         ),
     )
 

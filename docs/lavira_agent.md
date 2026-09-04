@@ -137,25 +137,28 @@ grounding. No rear image is captured, and `behind` is rejected by the runtime
 schema on every step.
 
 ALIGN has empty skill arguments and always uses the front direction. Its VA
-`ALIGN_GROUNDING` request asks VA to enumerate every object required by the
-manipulation task, whether visible or not. Each entry contains its name,
-visibility, bbox, confidence, and complete concrete supporting object. Surface
-objects are not allowed as separate operation-object entries; navigation
-landmarks and the frozen navigation `global_target` are also excluded unless
-they independently appear as operated objects in the manipulation task.
-Abstract surfaces such as `tabletop`, `desk surface`, or `plane` fail
-validation and trigger the normal response retry. The runtime ignores model
-ordering, filters visible candidates below one percent of the image, and
-deterministically selects the remaining candidate with the largest bbox for
-BasePose. After BasePose returns, ALIGN reuses the existing
-VA `POSTCHECK` interface twice: once with a fresh chest RGB and once with a
-fresh head RGB. Each request independently asks whether every operation object
-required by the manipulation task is simultaneously visible in that single
-camera view. Partial visibility cannot be combined across cameras. ALIGN is
-ready only when BasePose reports `aligned` and either the chest or head result
-is `SATISFIED`. MANIPULATE has empty arguments and requests VLA execution only
-after that handoff. Sensor freshness and controller ownership remain
-independent safety gates.
+`ALIGN_GROUNDING` request receives the same overall `manipulation_prompt` used
+by VLA and infers two roles directly from that task and the current image. The
+distance-and-centering `target` must be a manipulation object (for example a
+grasped or carried object, destination container, or physical control), not a
+supporting surface. VA prefers a large, regular, readily detectable candidate.
+The `yaw_align_target` may be that target or a regular supporting object with a
+clear straight edge; a clear non-floor support is preferred, while the floor is
+never selected. The response contains the selected names, a tight target bbox,
+per-role visibility and confidence, and visual evidence. The runtime passes the
+two names and target bbox to BasePose without changing its controller API.
+
+After BasePose returns, ALIGN reuses the VA `POSTCHECK` interface twice: once
+with a fresh chest RGB and once with a fresh head RGB. Each request explicitly
+checks the two roles selected by that ALIGN_GROUNDING response; it does not
+derive another target list from the legacy static alignment prompt. Partial
+visibility cannot be combined across cameras. ALIGN is ready only when
+BasePose reports `aligned` and either the chest or head result is `SATISFIED`.
+MANIPULATE has empty arguments and requests VLA execution only after that
+handoff. Sensor freshness and controller ownership remain independent safety
+gates. The legacy `lavira.alignment_prompt` and standalone `base_pose` prompt
+fields remain in YAML for manual use or rollback, but do not drive LaViRA's
+dynamic ALIGN role selection.
 
 Each VA request still contains exactly one image and reuses the existing
 `GROUNDING`, `ALIGN_GROUNDING`, or `POSTCHECK` schema. Navigation and ordinary

@@ -60,6 +60,31 @@ def test_writer_creates_only_jsonl(tmp_path) -> None:
     assert "annotated_image" not in record
 
 
+def test_writer_serializes_each_yaw_align_candidate_depth_stat(tmp_path) -> None:
+    candidate = {
+        "camera_stream": "ego_view",
+        "line_endpoints_px": [[10.0, 20.0], [70.0, 22.0]],
+        "line_length_px": 60.03,
+        "valid_depth_samples": 4,
+        "median_depth_m": 1.25,
+        "passes_depth_filter": False,
+        "selected": False,
+    }
+    writer = FrameDiagnosticsWriter(tmp_path)
+    writer.write(
+        replace(
+            _frame(2),
+            yaw_align_candidate_lines=(candidate,),
+        ),
+        control_applied=False,
+        controller_state=None,
+        command=None,
+    )
+
+    record = json.loads((tmp_path / "raw_servo_frames.jsonl").read_text())
+    assert record["geometry"]["yaw_align_candidate_lines"] == [candidate]
+
+
 def test_writer_saves_sampled_camera_rgb_with_mask_and_head_lines(
     tmp_path,
 ) -> None:

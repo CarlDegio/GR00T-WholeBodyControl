@@ -53,7 +53,7 @@ components:
     #  place another paper ball into the same basket, and finally return both arms
     #  to the sides of the body.
     prompt: &vla_task_prompt >-
-       collect the bag and put it into box, then carry the box
+       collect the pill bottle
     # Current prompt:
     #prompt: &vla_task_prompt >-
     #  collect the bag and put it into box, then carry the box
@@ -70,6 +70,8 @@ components:
       Search the workspace for a cardboard box on a handcart and approach it.
     global_target: a cardboard box on a handcart
     manipulation_prompt: *vla_task_prompt
+    # Reserved legacy/manual alignment text. Production ALIGN target inference
+    # now uses manipulation_prompt; keep this for rollback or manual runs.
     alignment_prompt: |-
       Use the cardboard box as the distance-and-centering target.
       Use the cardboard box as the yaw-alignment target;
@@ -116,10 +118,12 @@ components:
     # POSE readiness. Include margin for policy ping and message scheduling.
     vla_start_timeout_seconds: 6.0
   base_pose:
+    # Standalone/manual BasePose defaults. LaViRA overrides these three values
+    # per ALIGN attempt with the two roles inferred by VA.
     task: >-
       align distance, centering to the cardboard box and yaw to the cardboard box
-    target_prompt: cardboard box
-    yaw_align_target_prompt: cardboard box
+    target_prompt: blue basket
+    yaw_align_target_prompt:  desk
     planner_hz: 20.0
     final_stop_count: 3
     sensor_gateway_request_timeout_ms: 100

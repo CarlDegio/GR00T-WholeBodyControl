@@ -89,7 +89,7 @@ class SonicDataExporterConfig:
     defer_video_encoding: bool = True
     """Keep encoded camera frames in memory and encode videos when saving the episode."""
 
-    video_encoder_threads: int = 32
+    video_encoder_threads: int = 16
     """Maximum encoder threads used while saving each deferred video."""
 
     text_to_speech: bool = True

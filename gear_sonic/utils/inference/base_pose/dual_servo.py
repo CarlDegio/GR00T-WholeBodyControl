@@ -34,7 +34,6 @@ from gear_sonic.utils.inference.base_pose.servo import (
     _prompts_match,
     _publish_worker_event,
     _rgb_edge_line_segments,
-    _select_nearest_pixel_segment,
     _resolve_target,
     _yaw_align_target_geometry_components,
 )
@@ -63,28 +62,14 @@ def _camera_image_data(
     candidate_lines: tuple[
         tuple[tuple[float, float], tuple[float, float]], ...
     ] = ()
-    if (
-        edge_intersection is not None
-        and snapshot.depth_raw is not None
-        and snapshot.depth_scale_m is not None
-    ):
-        depth_valid_segments = []
-        for segment in _rgb_edge_line_segments(edge_intersection):
-            try:
-                _select_nearest_pixel_segment(
-                    [segment],
-                    depth_raw=snapshot.depth_raw,
-                    depth_scale_m=snapshot.depth_scale_m,
-                )
-            except ValueError:
-                continue
-            depth_valid_segments.append(segment)
+    if edge_intersection is not None:
+        candidates = _rgb_edge_line_segments(edge_intersection)
         candidate_lines = tuple(
             (
                 tuple(float(value) for value in segment.endpoint_a),
                 tuple(float(value) for value in segment.endpoint_b),
             )
-            for segment in depth_valid_segments
+            for segment in candidates
         )
     selected_line = (
         None
@@ -505,6 +490,7 @@ def _observe_head_yaw_snapshot(
         yaw_align_geometry_error,
         completed_yaw_align_target_mask,
         yaw_align_target_rgb_edges,
+        _,
     ) = _yaw_align_target_geometry_components(
         snapshot,
         yaw_align_target,
@@ -861,6 +847,7 @@ def run_dual_raw_servo_worker(
                                     _,
                                     _,
                                     initial_edge_intersection,
+                                    _,
                                 ) = _yaw_align_target_geometry_components(
                                     initial_snapshot,
                                     initial_yaw_align_targets[stream_name],
@@ -1181,6 +1168,7 @@ def run_dual_raw_servo_worker(
                                                 live_head_yaw_error,
                                                 live_head_completed_yaw_align_target_mask,
                                                 live_head_yaw_align_target_rgb_edges,
+                                                _,
                                             ) = _yaw_align_target_geometry_components(
                                                 head_snapshot,
                                                 monitor_result.yaw_align_target,

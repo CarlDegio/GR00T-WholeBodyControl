@@ -745,27 +745,43 @@ Coordinates are normalized [0,1000]. Return exactly:
 
 
 def alignment_grounding_prompt(
-    *, alignment_prompt: str, direction: str,
+    *, manipulation_prompt: str, direction: str,
 ) -> str:
     return f"""**ROLE**: You are a humanoid robot BasePose alignment visual
 grounding model in ALIGN_GROUNDING mode.
 
-**ALIGN PROMPT**: {json.dumps(alignment_prompt, ensure_ascii=False)}
+**OVERALL MANIPULATION TASK**: {json.dumps(manipulation_prompt, ensure_ascii=False)}
 
 **INPUT**: You are looking at the CURRENT VIEW after turning to the fixed
 {direction} panorama direction.
 
 **TASK**:
-1. Use only ALIGN PROMPT and the current image.
-2. Select exactly one `target` for distance approach and image centering. Give
-   it a tight bbox.
-3. Select exactly one `yaw_align_target` whose visible straight edge controls
-   yaw. Do not return a bbox for this role.
-4. Both roles may name the same physical object and must then use identical
+1. Use only OVERALL MANIPULATION TASK and the current image.
+2. Infer the two alignment roles that best prepare the robot to perform the
+   manipulation behavior described by OVERALL MANIPULATION TASK.
+3. Select exactly one `target`. Define it as the object that the robot should
+   approach and center in order to make the manipulation behavior as convenient
+   as possible. Select it only from manipulation objects. Manipulation objects
+   include grasp targets, objects that will be moved or carried, destination
+   containers or receptacles, and physical control objects, among others; only
+   supporting surfaces are excluded from this category. Prefer the largest,
+   most regular manipulation object that is easiest to recognize and align
+   automatically. Give `target` a tight bbox.
+4. Select exactly one `yaw_align_target`. Define it as the object whose
+   front-facing straight edge should be parallel to the robot's heading to make
+   the manipulation behavior as convenient as possible. It may be a supporting
+   object for an operated object, or it may be `target` itself.
+   When a non-floor supporting surface is present, regular, and visually clear,
+   prefer that supporting surface over `target` itself.
+   Never select the floor as a supporting yaw target; when the relevant
+   supporting surface is the floor, select `target` itself.
+   Prefer a regular object with a clear straight edge that is easy to recognize
+   and align automatically. Do not return a bbox for this role.
+5. Both roles may name the same physical object and must then use identical
    short, detector-friendly English text.
-5. Do not infer supporting surfaces, floor relations, navigation targets,
-   current strategy, manipulation tasks, or prior state.
-6. FOUND requires the target to have a valid bbox and both roles to be visibly
+6. Do not select navigation landmarks, unrelated scene objects, or objects
+   inferred only from prior state.
+7. FOUND requires the target to have a valid bbox and both roles to be visibly
    identifiable with sufficient confidence. Otherwise return NOT_FOUND; if the
    target is not visible, use `bbox_2d:null`.
 
@@ -813,17 +829,23 @@ Return exactly:
 "transition":"...","visual_evidence":"...","confidence":0.0}}"""
 
 
-def alignment_handoff_postcondition(camera_label: str) -> str:
+def alignment_handoff_postcondition(
+    camera_label: str, *, target: str, yaw_align_target: str,
+) -> str:
     """Fixed verifier contract for one camera's ALIGN handoff view."""
 
     return (
-        f"This is the fresh {camera_label} camera image. Derive all concrete "
-        "alignment targets explicitly required by the alignment task in "
-        "MISSION. Do not infer downstream manipulation objects that are not "
-        "written in MISSION. SATISFIED requires every alignment target to be "
-        "simultaneously visible in this single image. Do not use or infer "
-        "visibility from another camera, and do not count navigation landmarks, "
-        "supporting surfaces, or unrelated scene objects."
+        f"This is the fresh {camera_label} camera image. Verify only the two "
+        "BasePose alignment roles chosen for this ALIGN attempt: the "
+        f"distance-and-centering target {json.dumps(target, ensure_ascii=False)} "
+        "and the yaw-alignment target "
+        f"{json.dumps(yaw_align_target, ensure_ascii=False)}. SATISFIED requires "
+        "both role targets to be simultaneously visible in this single image; "
+        "if both names refer to the same physical object, that one visible "
+        "object is sufficient. MISSION provides the overall manipulation task "
+        "only; do not infer additional objects to verify from it. Do not use or "
+        "infer visibility from another camera, and do not count navigation "
+        "landmarks or unrelated scene objects."
     )
 
 
@@ -1130,7 +1152,7 @@ class LaViRAClient:
         )
 
     def alignment_grounding(
-        self, *, alignment_prompt: str, direction: str,
+        self, *, manipulation_prompt: str, direction: str,
         image_bgr: np.ndarray,
     ) -> dict[str, Any]:
         return self._create(
@@ -1147,7 +1169,8 @@ class LaViRAClient:
                     "image_url": {"url": _image_data_url(image_bgr)},
                 },
                 {"type": "text", "text": alignment_grounding_prompt(
-                    alignment_prompt=alignment_prompt, direction=direction,
+                    manipulation_prompt=manipulation_prompt,
+                    direction=direction,
                 )},
             ], enable_thinking=self.va_enable_thinking),
             max_tokens=768, temperature=0, timeout=self.va_timeout_seconds,
@@ -1302,6 +1325,9 @@ class LaViRAAgent:
         self._configured_global_target = str(global_target).strip()
         self.global_target = self._configured_global_target
         self.manipulation_prompt = str(manipulation_prompt or mission).strip()
+        # Retained for configuration compatibility and manual rollback. The
+        # production ALIGN request and handoff use manipulation_prompt plus the
+        # roles inferred from it.
         self.alignment_prompt = str(alignment_prompt).strip()
         self.max_steps = int(max_steps)
         self.history_size = min(5, int(history_size))
@@ -1951,7 +1977,7 @@ class LaViRAAgent:
         self, *, generation: int, skill_id: int, image: np.ndarray,
     ) -> dict[str, Any]:
         result = self.client.alignment_grounding(
-            alignment_prompt=self.alignment_prompt,
+            manipulation_prompt=self.manipulation_prompt,
             direction="front",
             image_bgr=image,
         )
@@ -2208,16 +2234,20 @@ class LaViRAAgent:
 
     def _single_view_alignment_check(
         self, *, camera_label: str, image_bgr: np.ndarray,
-        strategic_goal: str,
+        strategic_goal: str, target: str, yaw_align_target: str,
     ) -> dict[str, Any]:
         """Reuse the existing VA POSTCHECK interface for one camera view."""
 
         result = validate_postcheck(self.client.postcheck(
-            mission=self.alignment_prompt,
+            mission=self.manipulation_prompt,
             global_target=self.global_target,
             strategic_goal=strategic_goal,
             strategic_stop=False,
-            expected_postcondition=alignment_handoff_postcondition(camera_label),
+            expected_postcondition=alignment_handoff_postcondition(
+                camera_label,
+                target=target,
+                yaw_align_target=yaw_align_target,
+            ),
             image_bgr=image_bgr,
         ))
         if (
@@ -2231,8 +2261,9 @@ class LaViRAAgent:
     def _align_handoff(
         self, *, generation: int, skill_id: int, strategic_goal: str,
         controller_aligned: bool, controller_state: str,
+        target: str, yaw_align_target: str,
     ) -> dict[str, Any]:
-        """Require all operation objects in one fresh chest or head view."""
+        """Require both inferred alignment targets in one fresh camera view."""
 
         camera_results: dict[str, dict[str, Any]] = {}
         camera_errors: dict[str, str] = {}
@@ -2264,6 +2295,8 @@ class LaViRAAgent:
                     camera_label=label,
                     image_bgr=image,
                     strategic_goal=strategic_goal,
+                    target=target,
+                    yaw_align_target=yaw_align_target,
                 )
             except Exception as exc:
                 camera_errors[label] = str(exc)
@@ -2516,6 +2549,8 @@ class LaViRAAgent:
                 strategic_goal=strategic_goal,
                 controller_aligned=False,
                 controller_state="target_not_found",
+                target=target,
+                yaw_align_target=yaw_align_target,
             )
             return AgentHistoryEntry(
                 skill_id, "ALIGN", target, "target_not_found", post["status"],
@@ -2544,6 +2579,8 @@ class LaViRAAgent:
             strategic_goal=strategic_goal,
             controller_aligned=aligned,
             controller_state=controller_state,
+            target=target,
+            yaw_align_target=yaw_align_target,
         )
         return AgentHistoryEntry(
             skill_id, "ALIGN", target,

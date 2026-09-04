@@ -49,6 +49,7 @@ class DetectionFrameData:
     yaw_align_target_confidence: float | None = None
     target_geometry: Mapping[str, Any] | None = None
     yaw_align_geometry: Mapping[str, Any] | None = None
+    yaw_align_candidate_lines: tuple[Mapping[str, Any], ...] = ()
     yaw_align_geometry_error: str | None = None
     perception_kind: str = "observation"
     perception_error: str | None = None
@@ -303,6 +304,10 @@ class FrameDiagnosticsWriter:
                     if frame.yaw_align_geometry is None
                     else dict(frame.yaw_align_geometry)
                 ),
+                "yaw_align_candidate_lines": [
+                    dict(candidate)
+                    for candidate in frame.yaw_align_candidate_lines
+                ],
                 "yaw_align_geometry_error": frame.yaw_align_geometry_error,
             },
             "controller": (

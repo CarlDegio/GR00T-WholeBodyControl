@@ -347,9 +347,9 @@ def test_align_grounding_retries_after_legacy_surface_schema(
     )
 
     result = lavira.alignment_grounding(
-        alignment_prompt=(
-            "Use the cardboard box as both the distance-and-centering and "
-            "yaw-alignment target."
+        manipulation_prompt=(
+            "Collect the bag and put it into the cardboard box, then carry "
+            "the cardboard box."
         ),
         direction="front",
         image_bgr=np.zeros((8, 8, 3), np.uint8),
@@ -426,9 +426,7 @@ def test_lavira_cloud_calls_preserve_role_specific_thinking_mode(tmp_path) -> No
         image_bgr=image,
     )
     lavira.alignment_grounding(
-        alignment_prompt=(
-            "Use the basket for distance, centering, and yaw alignment."
-        ),
+        manipulation_prompt="Put the medicine bottle into the basket.",
         direction="front",
         image_bgr=image,
     )
@@ -524,8 +522,8 @@ def test_lavira_cloud_calls_preserve_role_specific_thinking_mode(tmp_path) -> No
         item["type"] == "image_url" for item in alignment_content
     ) == 1
     alignment_prompt_text = alignment_content[-1]["text"]
-    assert "**ALIGN PROMPT**" in alignment_prompt_text
-    assert "find basket" not in alignment_prompt_text
+    assert "**OVERALL MANIPULATION TASK**" in alignment_prompt_text
+    assert "Put the medicine bottle into the basket." in alignment_prompt_text
     assert "GLOBAL TARGET" not in alignment_prompt_text
     assert "CURRENT STRATEGY" not in alignment_prompt_text
     assert "STRATEGIC STOP" not in alignment_prompt_text
@@ -536,7 +534,13 @@ def test_lavira_cloud_calls_preserve_role_specific_thinking_mode(tmp_path) -> No
     assert "Select exactly one `target`" in alignment_prompt_text
     assert "Select exactly one `yaw_align_target`" in alignment_prompt_text
     assert "Both roles may name the same physical object" in alignment_prompt_text
-    assert "Do not infer supporting surfaces" in alignment_prompt_text
+    assert "only\n   supporting surfaces are excluded" in alignment_prompt_text
+    assert "prefer that supporting surface over `target` itself" in (
+        alignment_prompt_text
+    )
+    assert "Never select the floor as a supporting yaw target" in (
+        alignment_prompt_text
+    )
     saved = [
         json.loads(path.read_text(encoding="utf-8"))
         for path in sorted((tmp_path / "lavira_requests").glob("*.json"))
@@ -1306,7 +1310,7 @@ def test_la_context_keeps_fresh_panorama_and_last_five_completed_moves():
     )
 
 
-def test_va_context_excludes_alignment_grounding_but_keeps_postcheck_context():
+def test_va_context_routes_manipulation_prompt_to_align_and_handoff():
     agent, _camera, client, _intents, _waited = build_agent(
         [move(), align(), decision("MANIPULATE")],
         groundings=[grounding(), grounding(), grounding()],
@@ -1332,14 +1336,17 @@ def test_va_context_excludes_alignment_grounding_but_keeps_postcheck_context():
         for call in client.grounding_calls
     )
     assert all(
-        call["mission"] == "Use the basket as both alignment targets."
+        call["mission"] == "find the basket and put the bottle in it"
         for call in client.postcheck_calls[:2]
     )
     assert all(not call["strategic_stop"] for call in client.grounding_calls)
     assert len(client.alignment_grounding_calls) == 1
     assert set(client.alignment_grounding_calls[0]) == {
-        "alignment_prompt", "direction", "image_bgr",
+        "manipulation_prompt", "direction", "image_bgr",
     }
+    assert client.alignment_grounding_calls[0]["manipulation_prompt"] == (
+        "find the basket and put the bottle in it"
+    )
     assert [call["strategic_stop"] for call in client.postcheck_calls] == [
         False, False, True,
     ]
@@ -1584,7 +1591,7 @@ def test_base_pose_target_comes_from_align_va_grounding():
     assert base_pose["target"] == "blue basket"
     assert base_pose["yaw_align_target"] == "desk"
     assert set(client.alignment_grounding_calls[0]) == {
-        "alignment_prompt", "direction", "image_bgr",
+        "manipulation_prompt", "direction", "image_bgr",
     }
 
 
@@ -1867,6 +1874,11 @@ def test_align_handoff_accepts_one_complete_camera_view():
         in call["expected_postcondition"]
         for call in align_checks
     )
+    assert all(
+        'distance-and-centering target "basket"' in call["expected_postcondition"]
+        and 'yaw-alignment target "desk"' in call["expected_postcondition"]
+        for call in align_checks
+    )
     assert [name for name, _args in intents].count("start_vla_task") == 1
 
 
@@ -1951,10 +1963,13 @@ def test_manipulation_recovers_in_vla_then_system_completes_after_va_success():
         for call in client.la_calls
     )
     assert set(client.alignment_grounding_calls[0]) == {
-        "alignment_prompt", "direction", "image_bgr",
+        "manipulation_prompt", "direction", "image_bgr",
     }
+    assert client.alignment_grounding_calls[0]["manipulation_prompt"] == (
+        static_prompt
+    )
     assert all(
-        call["mission"] == "Use the basket as both alignment targets."
+        call["mission"] == static_prompt
         for call in client.postcheck_calls[:2]
     )
     assert all(
@@ -2128,18 +2143,23 @@ def test_align_runtime_applies_minimum_role_confidence_gate() -> None:
     assert result["confidence"] == pytest.approx(0.59)
 
 
-def test_align_grounding_prompt_is_decoupled_from_navigation_context() -> None:
+def test_align_grounding_prompt_infers_roles_from_manipulation_task() -> None:
     prompt = alignment_grounding_prompt(
-        alignment_prompt=(
-            "Use the cardboard box as the distance-and-centering target. "
-            "Use it as the yaw-alignment target."
+        manipulation_prompt=(
+            "Collect the bag and put it into the cardboard box, then carry "
+            "the cardboard box."
         ),
         direction="front",
     )
 
-    assert "Use only ALIGN PROMPT and the current image" in prompt
+    assert "Use only OVERALL MANIPULATION TASK and the current image" in prompt
+    assert "Collect the bag and put it into the cardboard box" in prompt
     assert "Select exactly one `target`" in prompt
+    assert "destination\n   containers or receptacles" in prompt
+    assert "only\n   supporting surfaces are excluded" in prompt
     assert "Select exactly one `yaw_align_target`" in prompt
+    assert "prefer that supporting surface over `target` itself" in prompt
+    assert "Never select the floor as a supporting yaw target" in prompt
     assert "Both roles may name the same physical object" in prompt
     assert "GLOBAL TARGET" not in prompt
     assert "CURRENT STRATEGY" not in prompt

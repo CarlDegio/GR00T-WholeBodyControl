@@ -259,13 +259,35 @@ def test_target_forward_distance_uses_mean_of_retained_body_x() -> None:
     assert geometry.median_depth_m == pytest.approx(1.0)
 
 
+def test_target_forward_distance_excludes_depth_beyond_three_meters() -> None:
+    depth_raw = np.full((200, 240), 5500, dtype=np.uint16)
+    depth_raw[:, :144] = 1000
+    geometry = raw_servo.estimate_target_geometry(
+        _snapshot(depth_raw=depth_raw),
+        np.ones((200, 240), dtype=np.uint8),
+        RawServoCalibration(
+            240,
+            200,
+            200.0,
+            200.0,
+            120.0,
+            100.0,
+            camera_pitch_deg=0.0,
+        ),
+    )
+
+    assert geometry.valid_ratio == pytest.approx(0.6)
+    assert geometry.forward_m == pytest.approx(1.0)
+    assert geometry.median_depth_m == pytest.approx(1.0)
+
+
 def _rgb_with_mask_contrast(mask: np.ndarray) -> np.ndarray:
     rgb = np.zeros((*mask.shape, 3), dtype=np.uint8)
     rgb[np.asarray(mask) > 0] = 255
     return rgb
 
 
-def test_rgb_pixel_lines_select_minimum_mean_of_twenty_depths() -> None:
+def test_rgb_pixel_lines_select_minimum_median_of_all_valid_depths() -> None:
     midpoint_outlier = raw_servo._PixelLineSegment(
         endpoint_a=np.array([20.0, 50.0]),
         endpoint_b=np.array([220.0, 50.0]),
@@ -290,8 +312,9 @@ def test_rgb_pixel_lines_select_minimum_mean_of_twenty_depths() -> None:
     )
 
     assert selected is consistently_near
-    assert sampled_pixels.shape == (20, 2)
-    assert np.mean(sampled_depth_m) == pytest.approx(1.0)
+    assert sampled_pixels.shape == (201, 2)
+    assert sampled_depth_m.shape == (201,)
+    assert np.median(sampled_depth_m) == pytest.approx(1.0)
 
 
 def test_rgb_pixel_line_depth_tie_prefers_longer_segment() -> None:
@@ -315,19 +338,15 @@ def test_rgb_pixel_line_depth_tie_prefers_longer_segment() -> None:
     assert selected is long
 
 
-def test_rgb_pixel_line_accepts_twelve_valid_depths_and_averages_only_them(
+def test_rgb_pixel_line_accepts_five_valid_depths(
 ) -> None:
     segment = raw_servo._PixelLineSegment(
         endpoint_a=np.array([20.0, 100.0]),
         endpoint_b=np.array([220.0, 100.0]),
         length=200.0,
     )
-    depth_raw = np.full((200, 240), 1000, dtype=np.uint16)
-    sampled = np.rint(
-        np.linspace(segment.endpoint_a, segment.endpoint_b, 20)
-    ).astype(int)
-    for x, y in sampled[:8]:
-        depth_raw[y, x] = 0
+    depth_raw = np.zeros((200, 240), dtype=np.uint16)
+    depth_raw[100, 20:25] = 1000
 
     selected, valid_pixels, valid_depth_m = (
         raw_servo._select_nearest_pixel_segment(
@@ -338,30 +357,200 @@ def test_rgb_pixel_line_accepts_twelve_valid_depths_and_averages_only_them(
     )
 
     assert selected is segment
-    assert valid_pixels.shape == (12, 2)
-    assert valid_depth_m.shape == (12,)
-    assert np.mean(valid_depth_m) == pytest.approx(1.0)
+    assert valid_pixels.shape == (5, 2)
+    assert valid_depth_m.shape == (5,)
+    assert np.median(valid_depth_m) == pytest.approx(1.0)
 
 
-def test_rgb_pixel_line_rejects_fewer_than_twelve_valid_depths() -> None:
+def test_rgb_pixel_line_uses_every_rasterized_line_pixel() -> None:
+    segment = raw_servo._PixelLineSegment(
+        endpoint_a=np.array([20.0, 100.0]),
+        endpoint_b=np.array([220.0, 100.0]),
+        length=200.0,
+    )
+    depth_raw = np.zeros((200, 240), dtype=np.uint16)
+    depth_raw[100, 20:221] = 1000
+
+    _, valid_pixels, valid_depth_m = raw_servo._select_nearest_pixel_segment(
+        [segment],
+        depth_raw=depth_raw,
+        depth_scale_m=0.001,
+    )
+
+    assert valid_pixels.shape == (201, 2)
+    assert valid_depth_m.shape == (201,)
+
+
+def test_rgb_pixel_line_uses_valid_depth_median_for_selection() -> None:
+    lower_median = raw_servo._PixelLineSegment(
+        endpoint_a=np.array([20.0, 80.0]),
+        endpoint_b=np.array([220.0, 80.0]),
+        length=200.0,
+    )
+    lower_mean = raw_servo._PixelLineSegment(
+        endpoint_a=np.array([20.0, 120.0]),
+        endpoint_b=np.array([220.0, 120.0]),
+        length=200.0,
+    )
+    depth_raw = np.zeros((200, 240), dtype=np.uint16)
+    lower_median_pixels = np.rint(
+        np.linspace(lower_median.endpoint_a, lower_median.endpoint_b, 20)
+    ).astype(int)
+    lower_mean_pixels = np.rint(
+        np.linspace(lower_mean.endpoint_a, lower_mean.endpoint_b, 20)
+    ).astype(int)
+    depth_raw[
+        lower_median_pixels[:12, 1], lower_median_pixels[:12, 0]
+    ] = 1000
+    depth_raw[
+        lower_median_pixels[12:, 1], lower_median_pixels[12:, 0]
+    ] = 3000
+    depth_raw[lower_mean_pixels[:, 1], lower_mean_pixels[:, 0]] = 1500
+
+    selected, _, selected_depth_m = raw_servo._select_nearest_pixel_segment(
+        [lower_median, lower_mean],
+        depth_raw=depth_raw,
+        depth_scale_m=0.001,
+    )
+
+    assert selected is lower_median
+    assert np.median(selected_depth_m) == pytest.approx(1.0)
+    assert np.mean(selected_depth_m) == pytest.approx(1.8)
+
+
+def test_rgb_pixel_line_valid_depth_range_is_inclusive_point_one_to_three(
+) -> None:
+    segment = raw_servo._PixelLineSegment(
+        endpoint_a=np.array([20.0, 100.0]),
+        endpoint_b=np.array([220.0, 100.0]),
+        length=200.0,
+    )
+    depth_raw = np.zeros((200, 240), dtype=np.uint16)
+    sampled = np.rint(
+        np.linspace(segment.endpoint_a, segment.endpoint_b, 20)
+    ).astype(int)
+    depth_raw[sampled[:3, 1], sampled[:3, 0]] = 99
+    depth_raw[sampled[3:8, 1], sampled[3:8, 0]] = 100
+    depth_raw[sampled[8:13, 1], sampled[8:13, 0]] = 3000
+    depth_raw[sampled[13:, 1], sampled[13:, 0]] = 3001
+
+    _, valid_pixels, valid_depth_m = raw_servo._select_nearest_pixel_segment(
+        [segment],
+        depth_raw=depth_raw,
+        depth_scale_m=0.001,
+    )
+
+    assert valid_pixels.shape == (10, 2)
+    np.testing.assert_allclose(valid_depth_m, [0.1] * 5 + [3.0] * 5)
+    assert np.median(valid_depth_m) == pytest.approx(1.55)
+
+
+def test_rgb_pixel_line_rejects_fewer_than_five_valid_depths() -> None:
     segment = raw_servo._PixelLineSegment(
         endpoint_a=np.array([20.0, 100.0]),
         endpoint_b=np.array([220.0, 100.0]),
         length=200.0,
     )
     depth_raw = np.full((200, 240), 1000, dtype=np.uint16)
-    sampled = np.rint(
-        np.linspace(segment.endpoint_a, segment.endpoint_b, 20)
-    ).astype(int)
-    for x, y in sampled[:9]:
-        depth_raw[y, x] = 0
+    depth_raw[:] = 0
+    depth_raw[100, 20:24] = 1000
 
-    with pytest.raises(ValueError, match="at least 12 of 20"):
+    with pytest.raises(ValueError, match="at least 5 valid depth points"):
         raw_servo._select_nearest_pixel_segment(
             [segment],
             depth_raw=depth_raw,
             depth_scale_m=0.001,
         )
+
+
+def test_yaw_align_geometry_records_depth_stats_for_all_candidates(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    selected = raw_servo._PixelLineSegment(
+        endpoint_a=np.array([20.0, 80.0]),
+        endpoint_b=np.array([220.0, 80.0]),
+        length=200.0,
+    )
+    depth_rejected = raw_servo._PixelLineSegment(
+        endpoint_a=np.array([20.0, 120.0]),
+        endpoint_b=np.array([220.0, 120.0]),
+        length=200.0,
+    )
+    monkeypatch.setattr(
+        raw_servo,
+        "_rgb_mask_line_segments",
+        lambda *_args, **_kwargs: [selected, depth_rejected],
+    )
+    depth_raw = np.zeros((200, 240), dtype=np.uint16)
+    selected_pixels = np.rint(
+        np.linspace(selected.endpoint_a, selected.endpoint_b, 20)
+    ).astype(int)
+    rejected_pixels = np.rint(
+        np.linspace(depth_rejected.endpoint_a, depth_rejected.endpoint_b, 20)
+    ).astype(int)
+    depth_raw[selected_pixels[:5, 1], selected_pixels[:5, 0]] = 1000
+    depth_raw[rejected_pixels[:4, 1], rejected_pixels[:4, 0]] = 2000
+
+    geometry = estimate_yaw_align_geometry(
+        _snapshot(depth_raw=depth_raw),
+        np.ones((200, 240), dtype=np.uint8),
+        _calibration(),
+    )
+
+    assert len(geometry.candidate_depth_stats) == 2
+    selected_stats, rejected_stats = geometry.candidate_depth_stats
+    assert selected_stats.valid_depth_samples == 5
+    assert selected_stats.median_depth_m == pytest.approx(1.0)
+    assert selected_stats.passes_depth_filter
+    assert selected_stats.selected
+    assert rejected_stats.valid_depth_samples == 4
+    assert rejected_stats.median_depth_m == pytest.approx(2.0)
+    assert not rejected_stats.passes_depth_filter
+    assert not rejected_stats.selected
+
+
+def test_yaw_align_components_keep_stats_when_all_candidates_fail_depth(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    segment = raw_servo._PixelLineSegment(
+        endpoint_a=np.array([20.0, 100.0]),
+        endpoint_b=np.array([220.0, 100.0]),
+        length=200.0,
+    )
+    monkeypatch.setattr(
+        raw_servo,
+        "_rgb_edge_line_segments",
+        lambda *_args, **_kwargs: [segment],
+    )
+    depth_raw = np.zeros((200, 240), dtype=np.uint16)
+    sampled = np.rint(
+        np.linspace(segment.endpoint_a, segment.endpoint_b, 20)
+    ).astype(int)
+    depth_raw[sampled[:4, 1], sampled[:4, 0]] = 1000
+    yaw_align_target = raw_servo.TrackedInstance(
+        track_id=2,
+        class_index=1,
+        confidence=0.9,
+        bbox_xyxy=(0.0, 0.0, 240.0, 200.0),
+        mask=np.ones((200, 240), dtype=np.uint8),
+    )
+
+    geometry, error, _, _, candidate_stats = (
+        raw_servo._yaw_align_target_geometry_components(
+            _snapshot(depth_raw=depth_raw),
+            yaw_align_target,
+            _calibration(),
+            target_mask=None,
+        )
+    )
+
+    assert geometry is None
+    assert error is not None and "at least 5 valid depth points" in error
+    assert len(candidate_stats) == 1
+    assert candidate_stats[0].valid_depth_samples == 4
+    assert candidate_stats[0].median_depth_m == pytest.approx(1.0)
+    assert not candidate_stats[0].passes_depth_filter
+    assert not candidate_stats[0].selected
 
 
 def test_rgb_edges_are_intersected_with_mask_and_exclusion() -> None:
@@ -397,6 +586,117 @@ def test_hough_candidates_are_strictly_longer_than_45_pixels() -> None:
     )
 
 
+def test_hough_candidates_discard_lines_steeper_than_75_degrees(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        cv2,
+        "HoughLinesP",
+        lambda *_args, **_kwargs: np.array(
+            (
+                ((10, 50, 210, 50),),
+                ((100, 10, 110, 190),),
+            ),
+            dtype=np.int32,
+        ),
+    )
+
+    candidates = raw_servo._rgb_edge_line_segments(
+        np.zeros((200, 240), dtype=np.uint8)
+    )
+
+    assert len(candidates) == 1
+    np.testing.assert_array_equal(candidates[0].endpoint_a, (10.0, 50.0))
+    np.testing.assert_array_equal(candidates[0].endpoint_b, (210.0, 50.0))
+
+
+@pytest.mark.parametrize(
+    ("angle_deg", "reverse_endpoints", "expected"),
+    (
+        (0.0, False, True),
+        (75.0, False, True),
+        (76.0, False, False),
+        (-76.0, False, False),
+        (76.0, True, False),
+    ),
+)
+def test_yaw_align_edge_candidate_filters_by_unoriented_horizontal_angle(
+    angle_deg: float,
+    reverse_endpoints: bool,
+    expected: bool,
+) -> None:
+    angle_rad = math.radians(angle_deg)
+    endpoint_a = np.array([0.0, 0.0])
+    endpoint_b = 100.0 * np.array(
+        [math.cos(angle_rad), math.sin(angle_rad)]
+    )
+    if reverse_endpoints:
+        endpoint_a, endpoint_b = endpoint_b, endpoint_a
+    segment = raw_servo._PixelLineSegment(
+        endpoint_a=endpoint_a,
+        endpoint_b=endpoint_b,
+        length=100.0,
+    )
+
+    assert raw_servo._is_yaw_align_edge_candidate(segment) is expected
+
+
+def test_yaw_align_geometry_filters_steep_line_before_depth_selection(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    steep_near = raw_servo._PixelLineSegment(
+        endpoint_a=np.array([100.0, 20.0]),
+        endpoint_b=np.array([110.0, 180.0]),
+        length=math.hypot(10.0, 160.0),
+    )
+    horizontal_far = raw_servo._PixelLineSegment(
+        endpoint_a=np.array([20.0, 100.0]),
+        endpoint_b=np.array([220.0, 100.0]),
+        length=200.0,
+    )
+    monkeypatch.setattr(
+        raw_servo,
+        "_rgb_mask_line_segments",
+        lambda *_args, **_kwargs: [steep_near, horizontal_far],
+    )
+    depth_raw = np.full((200, 240), 1000, dtype=np.uint16)
+    steep_pixels = np.rint(
+        np.linspace(steep_near.endpoint_a, steep_near.endpoint_b, 20)
+    ).astype(int)
+    depth_raw[steep_pixels[:, 1], steep_pixels[:, 0]] = 500
+
+    geometry = estimate_yaw_align_geometry(
+        _snapshot(depth_raw=depth_raw),
+        np.ones((200, 240), dtype=np.uint8),
+        _calibration(),
+    )
+
+    assert geometry.line_endpoints_px == ((20.0, 100.0), (220.0, 100.0))
+    assert geometry.yaw_error_rad == pytest.approx(0.0)
+
+
+def test_yaw_align_geometry_reports_when_all_lines_are_too_steep(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    steep_segment = raw_servo._PixelLineSegment(
+        endpoint_a=np.array([100.0, 20.0]),
+        endpoint_b=np.array([110.0, 180.0]),
+        length=math.hypot(10.0, 160.0),
+    )
+    monkeypatch.setattr(
+        raw_servo,
+        "_rgb_mask_line_segments",
+        lambda *_args, **_kwargs: [steep_segment],
+    )
+
+    with pytest.raises(ValueError, match="within 75 degrees of horizontal"):
+        estimate_yaw_align_geometry(
+            _snapshot(),
+            np.ones((200, 240), dtype=np.uint8),
+            _calibration(),
+        )
+
+
 def test_yaw_align_geometry_uses_signed_pixel_angle_without_deprojection(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -430,7 +730,7 @@ def test_yaw_align_geometry_uses_signed_pixel_angle_without_deprojection(
     assert geometry.yaw_error_rad == pytest.approx(math.atan2(40.0, 200.0))
     assert geometry.line_endpoints_px == ((20.0, 120.0), (220.0, 80.0))
     assert geometry.line_length_px == pytest.approx(math.hypot(200.0, 40.0))
-    assert geometry.valid_depth_samples == 20
+    assert geometry.valid_depth_samples == 201
     assert geometry.line_center_px == pytest.approx((120.0, 100.0))
 
 
@@ -512,6 +812,43 @@ def test_diagnostic_frame_carries_completed_completed_yaw_align_target_mask_by_v
 
     assert frame.completed_yaw_align_target_mask is not None
     assert np.count_nonzero(frame.completed_yaw_align_target_mask) == 20_000
+
+
+def test_diagnostic_frame_carries_yaw_candidate_depth_stats() -> None:
+    candidate = raw_servo.YawAlignCandidateDepthStats(
+        line_endpoints_px=((20.0, 80.0), (220.0, 80.0)),
+        line_length_px=200.0,
+        valid_depth_samples=4,
+        median_depth_m=1.25,
+        passes_depth_filter=False,
+    )
+    observation = replace(
+        _observation(bbox=(80.0, 40.0, 160.0, 140.0)),
+        yaw_align_geometry=None,
+        yaw_align_candidate_depth_stats=(candidate,),
+    )
+
+    frame = raw_servo._diagnostic_frame(
+        0,
+        _snapshot(),
+        None,
+        None,
+        observation,
+        kind="observation",
+        camera_stream="ego_view",
+    )
+
+    assert frame.yaw_align_candidate_lines == (
+        {
+            "camera_stream": "ego_view",
+            "line_endpoints_px": [[20.0, 80.0], [220.0, 80.0]],
+            "line_length_px": 200.0,
+            "valid_depth_samples": 4,
+            "median_depth_m": 1.25,
+            "passes_depth_filter": False,
+            "selected": False,
+        },
+    )
 
 
 def test_chest_approach_mode_recenters_at_horizontal_guard() -> None:

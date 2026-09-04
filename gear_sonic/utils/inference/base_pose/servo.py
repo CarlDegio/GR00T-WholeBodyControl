@@ -33,6 +33,7 @@ from gear_sonic.utils.inference.base_pose.diagnostics import (
 HEAD_MONITOR_HOLD_EVENT = "head_monitor_hold"
 DEFAULT_YOLOE_MODEL = "tools/yoloe26m/weights/yoloe-26m-seg.pt"
 DEFAULT_YAW_ALIGN_TARGET_TEXT_PROMPT = "cardboard box"
+_TARGET_DEPTH_MAX_M = 3.0
 
 
 def _prompts_match(left: object, right: object) -> bool:
@@ -125,6 +126,16 @@ class TargetGeometry:
 
 
 @dataclass(frozen=True)
+class YawAlignCandidateDepthStats:
+    line_endpoints_px: tuple[tuple[float, float], tuple[float, float]]
+    line_length_px: float
+    valid_depth_samples: int
+    median_depth_m: float | None
+    passes_depth_filter: bool
+    selected: bool = False
+
+
+@dataclass(frozen=True)
 class YawAlignGeometry:
     yaw_error_rad: float
     line_length_px: float
@@ -133,6 +144,7 @@ class YawAlignGeometry:
     line_endpoints_px: (
         tuple[tuple[float, float], tuple[float, float]] | None
     ) = None
+    candidate_depth_stats: tuple[YawAlignCandidateDepthStats, ...] = ()
 
 
 class ServoPhase(str, Enum):
@@ -162,6 +174,9 @@ class RawServoObservation:
     completed_yaw_align_target_mask: np.ndarray | None = None
     yaw_align_target_rgb_edges: np.ndarray | None = None
     yaw_align_geometry_camera_stream: str | None = None
+    yaw_align_candidate_depth_stats: tuple[
+        YawAlignCandidateDepthStats, ...
+    ] = ()
 
 
 @dataclass(frozen=True)
@@ -392,7 +407,12 @@ def _depth_points(
     if total == 0:
         raise ValueError("segmentation mask is empty after erosion")
     depth_m = snapshot.depth_raw.astype(np.float64) * snapshot.depth_scale_m
-    valid_mask = (binary > 0) & np.isfinite(depth_m) & (depth_m >= 0.10) & (depth_m <= 10.0)
+    valid_mask = (
+        (binary > 0)
+        & np.isfinite(depth_m)
+        & (depth_m >= 0.10)
+        & (depth_m <= _TARGET_DEPTH_MAX_M)
+    )
     valid_count = int(np.count_nonzero(valid_mask))
     valid_ratio = valid_count / total
     if valid_count < min_pixels or valid_ratio < min_valid_ratio:
@@ -473,9 +493,11 @@ _YAW_ALIGN_EDGE_CANNY_LOW = 50
 _YAW_ALIGN_EDGE_CANNY_HIGH = 150
 _YAW_ALIGN_EDGE_HOUGH_THRESHOLD = 25
 _YAW_ALIGN_EDGE_MIN_LENGTH_PX = 45.0
+_YAW_ALIGN_EDGE_MAX_HORIZONTAL_ANGLE_DEG = 75.0
 _YAW_ALIGN_EDGE_HOUGH_MAX_LINE_GAP_PX = 12
-_YAW_ALIGN_EDGE_DEPTH_SAMPLES = 20
-_YAW_ALIGN_EDGE_MIN_VALID_DEPTH_SAMPLES = 12
+_YAW_ALIGN_EDGE_MIN_VALID_DEPTH_SAMPLES = 5
+_YAW_ALIGN_EDGE_DEPTH_MIN_M = 0.10
+_YAW_ALIGN_EDGE_DEPTH_MAX_M = 3.0
 _YAW_ALIGN_EDGE_MASK_DILATION_RADIUS_PX = 3
 _YAW_ALIGN_EDGE_TARGET_EXCLUSION_RADIUS_PX = 20
 _YAW_EMA_BYPASS_DELTA_RAD = math.radians(10.0)
@@ -486,6 +508,38 @@ class _PixelLineSegment:
     endpoint_a: np.ndarray
     endpoint_b: np.ndarray
     length: float
+
+
+@dataclass(frozen=True)
+class _PixelLineDepthAnalysis:
+    segment: _PixelLineSegment
+    valid_sampled_pixels: np.ndarray
+    valid_sampled_depth_m: np.ndarray
+
+
+class _YawAlignDepthSelectionError(ValueError):
+    def __init__(
+        self,
+        message: str,
+        candidate_depth_stats: tuple[YawAlignCandidateDepthStats, ...],
+    ) -> None:
+        super().__init__(message)
+        self.candidate_depth_stats = candidate_depth_stats
+
+
+def _is_yaw_align_edge_candidate(segment: _PixelLineSegment) -> bool:
+    pixel_delta = np.asarray(segment.endpoint_b) - np.asarray(segment.endpoint_a)
+    angle_from_horizontal_deg = math.degrees(
+        math.atan2(
+            abs(float(pixel_delta[1])),
+            abs(float(pixel_delta[0])),
+        )
+    )
+    return (
+        segment.length > _YAW_ALIGN_EDGE_MIN_LENGTH_PX
+        and angle_from_horizontal_deg
+        <= _YAW_ALIGN_EDGE_MAX_HORIZONTAL_ANGLE_DEG
+    )
 
 
 def _rgb_mask_edge_intersection(
@@ -571,15 +625,144 @@ def _rgb_edge_line_segments(
             endpoint_a = np.array([x1, y1], dtype=np.float64)
             endpoint_b = np.array([x2, y2], dtype=np.float64)
             length = float(np.linalg.norm(endpoint_b - endpoint_a))
-            if length > _YAW_ALIGN_EDGE_MIN_LENGTH_PX:
-                segments.append(
-                    _PixelLineSegment(
-                        endpoint_a=endpoint_a,
-                        endpoint_b=endpoint_b,
-                        length=length,
-                    )
-                )
+            segment = _PixelLineSegment(
+                endpoint_a=endpoint_a,
+                endpoint_b=endpoint_b,
+                length=length,
+            )
+            if _is_yaw_align_edge_candidate(segment):
+                segments.append(segment)
     return sorted(segments, key=lambda segment: segment.length, reverse=True)
+
+
+def _canonical_line_endpoints(
+    segment: _PixelLineSegment,
+) -> tuple[tuple[float, float], tuple[float, float]]:
+    endpoint_a = tuple(float(value) for value in segment.endpoint_a)
+    endpoint_b = tuple(float(value) for value in segment.endpoint_b)
+    if endpoint_b < endpoint_a:
+        endpoint_a, endpoint_b = endpoint_b, endpoint_a
+    return endpoint_a, endpoint_b
+
+
+def _analyze_pixel_segment_depths(
+    segments: Sequence[_PixelLineSegment],
+    *,
+    depth_raw: np.ndarray,
+    depth_scale_m: float,
+) -> tuple[_PixelLineDepthAnalysis, ...]:
+    if depth_raw.ndim != 2 or not math.isfinite(depth_scale_m):
+        raise ValueError("yaw-align edge depth source is invalid")
+    analyses: list[_PixelLineDepthAnalysis] = []
+    for segment in segments:
+        line_mask = np.zeros(depth_raw.shape, dtype=np.uint8)
+        endpoint_a = tuple(int(round(value)) for value in segment.endpoint_a)
+        endpoint_b = tuple(int(round(value)) for value in segment.endpoint_b)
+        cv2.line(
+            line_mask,
+            endpoint_a,
+            endpoint_b,
+            color=1,
+            thickness=1,
+            lineType=cv2.LINE_8,
+        )
+        sampled_v, sampled_u = np.nonzero(line_mask)
+        sampled_pixels = np.column_stack((sampled_u, sampled_v))
+        if sampled_pixels.size == 0:
+            analyses.append(
+                _PixelLineDepthAnalysis(
+                    segment=segment,
+                    valid_sampled_pixels=np.empty((0, 2), dtype=int),
+                    valid_sampled_depth_m=np.empty((0,), dtype=np.float64),
+                )
+            )
+            continue
+        sampled_depth_m = (
+            depth_raw[sampled_v, sampled_u].astype(np.float64)
+            * depth_scale_m
+        )
+        valid_depth = (
+            np.isfinite(sampled_depth_m)
+            & (sampled_depth_m >= _YAW_ALIGN_EDGE_DEPTH_MIN_M)
+            & (sampled_depth_m <= _YAW_ALIGN_EDGE_DEPTH_MAX_M)
+        )
+        analyses.append(
+            _PixelLineDepthAnalysis(
+                segment=segment,
+                valid_sampled_pixels=sampled_pixels[valid_depth],
+                valid_sampled_depth_m=sampled_depth_m[valid_depth],
+            )
+        )
+    return tuple(analyses)
+
+
+def _candidate_depth_stats(
+    analyses: Sequence[_PixelLineDepthAnalysis],
+    *,
+    selected: _PixelLineDepthAnalysis | None = None,
+) -> tuple[YawAlignCandidateDepthStats, ...]:
+    return tuple(
+        YawAlignCandidateDepthStats(
+            line_endpoints_px=_canonical_line_endpoints(analysis.segment),
+            line_length_px=float(analysis.segment.length),
+            valid_depth_samples=int(analysis.valid_sampled_depth_m.size),
+            median_depth_m=(
+                None
+                if analysis.valid_sampled_depth_m.size == 0
+                else float(np.median(analysis.valid_sampled_depth_m))
+            ),
+            passes_depth_filter=(
+                analysis.valid_sampled_depth_m.size
+                >= _YAW_ALIGN_EDGE_MIN_VALID_DEPTH_SAMPLES
+            ),
+            selected=analysis is selected,
+        )
+        for analysis in analyses
+    )
+
+
+def _select_nearest_pixel_segment_with_stats(
+    segments: Sequence[_PixelLineSegment],
+    *,
+    depth_raw: np.ndarray,
+    depth_scale_m: float,
+) -> tuple[
+    _PixelLineSegment,
+    np.ndarray,
+    np.ndarray,
+    tuple[YawAlignCandidateDepthStats, ...],
+]:
+    analyses = _analyze_pixel_segment_depths(
+        segments,
+        depth_raw=depth_raw,
+        depth_scale_m=depth_scale_m,
+    )
+    eligible = [
+        analysis
+        for analysis in analyses
+        if analysis.valid_sampled_depth_m.size
+        >= _YAW_ALIGN_EDGE_MIN_VALID_DEPTH_SAMPLES
+    ]
+    if not eligible:
+        stats = _candidate_depth_stats(analyses)
+        raise _YawAlignDepthSelectionError(
+            "no RGB-mask yaw-align edge has at least "
+            f"{_YAW_ALIGN_EDGE_MIN_VALID_DEPTH_SAMPLES} valid depth points",
+            stats,
+        )
+    selected = min(
+        eligible,
+        key=lambda analysis: (
+            float(np.median(analysis.valid_sampled_depth_m)),
+            -analysis.segment.length,
+        ),
+    )
+    return (
+        selected.segment,
+        selected.valid_sampled_pixels,
+        selected.valid_sampled_depth_m,
+        _candidate_depth_stats(analyses, selected=selected),
+    )
 
 
 def _select_nearest_pixel_segment(
@@ -588,64 +771,14 @@ def _select_nearest_pixel_segment(
     depth_raw: np.ndarray,
     depth_scale_m: float,
 ) -> tuple[_PixelLineSegment, np.ndarray, np.ndarray]:
-    if depth_raw.ndim != 2 or not math.isfinite(depth_scale_m):
-        raise ValueError("yaw-align edge depth source is invalid")
-    best: tuple[
-        float, _PixelLineSegment, np.ndarray, np.ndarray
-    ] | None = None
-    for segment in segments:
-        sampled_pixels = np.rint(
-            np.linspace(
-                segment.endpoint_a,
-                segment.endpoint_b,
-                _YAW_ALIGN_EDGE_DEPTH_SAMPLES,
-            )
-        ).astype(int)
-        sampled_u = sampled_pixels[:, 0]
-        sampled_v = sampled_pixels[:, 1]
-        if not (
-            np.all((0 <= sampled_v) & (sampled_v < depth_raw.shape[0]))
-            and np.all((0 <= sampled_u) & (sampled_u < depth_raw.shape[1]))
-        ):
-            continue
-        sampled_depth_m = (
-            depth_raw[sampled_v, sampled_u].astype(np.float64)
-            * depth_scale_m
+    selected, sampled_pixels, sampled_depth_m, _ = (
+        _select_nearest_pixel_segment_with_stats(
+            segments,
+            depth_raw=depth_raw,
+            depth_scale_m=depth_scale_m,
         )
-        valid_depth = (
-            np.isfinite(sampled_depth_m)
-            & (sampled_depth_m >= 0.15)
-            & (sampled_depth_m <= 4.0)
-        )
-        if (
-            int(np.count_nonzero(valid_depth))
-            < _YAW_ALIGN_EDGE_MIN_VALID_DEPTH_SAMPLES
-        ):
-            continue
-        valid_sampled_pixels = sampled_pixels[valid_depth]
-        valid_sampled_depth_m = sampled_depth_m[valid_depth]
-        mean_depth_m = float(np.mean(valid_sampled_depth_m))
-        if (
-            best is None
-            or mean_depth_m < best[0]
-            or (
-                mean_depth_m == best[0]
-                and segment.length > best[1].length
-            )
-        ):
-            best = (
-                mean_depth_m,
-                segment,
-                valid_sampled_pixels,
-                valid_sampled_depth_m,
-            )
-    if best is None:
-        raise ValueError(
-            "no RGB-mask yaw-align edge has at least "
-            f"{_YAW_ALIGN_EDGE_MIN_VALID_DEPTH_SAMPLES} of "
-            f"{_YAW_ALIGN_EDGE_DEPTH_SAMPLES} valid sampled depths"
-        )
-    return best[1], best[2], best[3]
+    )
+    return selected, sampled_pixels, sampled_depth_m
 
 
 def _largest_filled_component(mask: np.ndarray) -> np.ndarray:
@@ -738,24 +871,27 @@ def estimate_yaw_align_geometry(
     candidates = [
         segment
         for segment in segments
-        if segment.length > _YAW_ALIGN_EDGE_MIN_LENGTH_PX
+        if _is_yaw_align_edge_candidate(segment)
     ]
     if not candidates:
         raise ValueError(
-            "yaw-align target edge intersection has no line longer than 45 px"
+            "yaw-align target edge intersection has no line longer than "
+            f"{_YAW_ALIGN_EDGE_MIN_LENGTH_PX:g} px and within "
+            f"{_YAW_ALIGN_EDGE_MAX_HORIZONTAL_ANGLE_DEG:g} degrees of horizontal"
         )
-    selected, sampled_pixels, _ = _select_nearest_pixel_segment(
-        candidates,
-        depth_raw=snapshot.depth_raw,
-        depth_scale_m=snapshot.depth_scale_m,
+    selected, sampled_pixels, _, candidate_depth_stats = (
+        _select_nearest_pixel_segment_with_stats(
+            candidates,
+            depth_raw=snapshot.depth_raw,
+            depth_scale_m=snapshot.depth_scale_m,
+        )
     )
-    endpoint_a = np.asarray(selected.endpoint_a, dtype=np.float64)
-    endpoint_b = np.asarray(selected.endpoint_b, dtype=np.float64)
+    canonical_endpoints = _canonical_line_endpoints(selected)
+    endpoint_a = np.asarray(canonical_endpoints[0], dtype=np.float64)
+    endpoint_b = np.asarray(canonical_endpoints[1], dtype=np.float64)
     # A detected edge is unoriented. Canonicalize it from image-left to
     # image-right (and top-to-bottom for a vertical edge) so reversing the
     # Hough endpoints cannot change the yaw sign.
-    if tuple(endpoint_b) < tuple(endpoint_a):
-        endpoint_a, endpoint_b = endpoint_b, endpoint_a
     pixel_delta = endpoint_b - endpoint_a
     # Image v grows downward, while positive yaw turns left/counter-clockwise.
     # Negating dv therefore gives the signed angle from the camera's horizontal
@@ -772,6 +908,7 @@ def estimate_yaw_align_geometry(
         valid_depth_samples=int(len(sampled_pixels)),
         line_center_px=(float(center_px[0]), float(center_px[1])),
         line_endpoints_px=line_endpoints_px,
+        candidate_depth_stats=candidate_depth_stats,
     )
 
 
@@ -2085,12 +2222,19 @@ def _yaw_align_target_geometry_components(
     calibration: RawServoCalibration,
     *,
     target_mask: np.ndarray | None,
-) -> tuple[YawAlignGeometry | None, str | None, np.ndarray, np.ndarray | None]:
+) -> tuple[
+    YawAlignGeometry | None,
+    str | None,
+    np.ndarray,
+    np.ndarray | None,
+    tuple[YawAlignCandidateDepthStats, ...],
+]:
     """Extract yaw from a visible straight edge of the yaw-align target."""
     completed_yaw_align_target_mask = _dilate_yaw_align_edge_mask(
         _largest_filled_component(yaw_align_target.mask)
     )
     yaw_align_target_rgb_edges = None
+    candidate_depth_stats: tuple[YawAlignCandidateDepthStats, ...] = ()
     try:
         target_exclusion = (
             None
@@ -2110,8 +2254,22 @@ def _yaw_align_target_geometry_components(
             edge_intersection=yaw_align_target_rgb_edges,
         )
     except ValueError as exc:
-        return None, str(exc), completed_yaw_align_target_mask, yaw_align_target_rgb_edges
-    return yaw_align_geometry, None, completed_yaw_align_target_mask, yaw_align_target_rgb_edges
+        if isinstance(exc, _YawAlignDepthSelectionError):
+            candidate_depth_stats = exc.candidate_depth_stats
+        return (
+            None,
+            str(exc),
+            completed_yaw_align_target_mask,
+            yaw_align_target_rgb_edges,
+            candidate_depth_stats,
+        )
+    return (
+        yaw_align_geometry,
+        None,
+        completed_yaw_align_target_mask,
+        yaw_align_target_rgb_edges,
+        yaw_align_geometry.candidate_depth_stats,
+    )
 
 
 def _observation(
@@ -2127,16 +2285,23 @@ def _observation(
     yaw_align_geometry_error = None
     completed_yaw_align_target_mask = None
     yaw_align_target_rgb_edges = None
+    yaw_align_candidate_depth_stats: tuple[
+        YawAlignCandidateDepthStats, ...
+    ] = ()
     if yaw_align_target is not None and include_yaw_align_geometry:
-        yaw_align_geometry, yaw_align_geometry_error, completed_yaw_align_target_mask, yaw_align_target_rgb_edges = (
-            _yaw_align_target_geometry_components(
-                snapshot,
-                yaw_align_target,
-                calibration,
-                target_mask=(
-                    target.mask if exclude_target_from_yaw_align_edge else None
-                ),
-            )
+        (
+            yaw_align_geometry,
+            yaw_align_geometry_error,
+            completed_yaw_align_target_mask,
+            yaw_align_target_rgb_edges,
+            yaw_align_candidate_depth_stats,
+        ) = _yaw_align_target_geometry_components(
+            snapshot,
+            yaw_align_target,
+            calibration,
+            target_mask=(
+                target.mask if exclude_target_from_yaw_align_edge else None
+            ),
         )
     return RawServoObservation(
         target=estimate_target_geometry(
@@ -2155,6 +2320,7 @@ def _observation(
         yaw_align_geometry_error=yaw_align_geometry_error,
         completed_yaw_align_target_mask=completed_yaw_align_target_mask,
         yaw_align_target_rgb_edges=yaw_align_target_rgb_edges,
+        yaw_align_candidate_depth_stats=yaw_align_candidate_depth_stats,
     )
 
 
@@ -2175,6 +2341,7 @@ def _diagnostic_frame(
 ) -> DetectionFrameData:
     target_geometry = None
     yaw_align_geometry = None
+    yaw_align_candidate_lines: tuple[Mapping[str, Any], ...] = ()
     table_pixels_match_frame = True
     if observation is not None:
         table_pixels_match_frame = (
@@ -2196,6 +2363,10 @@ def _diagnostic_frame(
             ),
         }
         if observation.yaw_align_geometry is not None:
+            candidate_depth_stats = (
+                observation.yaw_align_geometry.candidate_depth_stats
+                or observation.yaw_align_candidate_depth_stats
+            )
             yaw_align_geometry = {
                 "yaw_error_rad": observation.yaw_align_geometry.yaw_error_rad,
                 "line_length_px": observation.yaw_align_geometry.line_length_px,
@@ -2212,6 +2383,25 @@ def _diagnostic_frame(
                     ]
                 ),
             }
+        else:
+            candidate_depth_stats = observation.yaw_align_candidate_depth_stats
+        candidate_camera_stream = (
+            observation.yaw_align_geometry_camera_stream or camera_stream
+        )
+        yaw_align_candidate_lines = tuple(
+            {
+                "camera_stream": candidate_camera_stream,
+                "line_endpoints_px": [
+                    list(point) for point in candidate.line_endpoints_px
+                ],
+                "line_length_px": candidate.line_length_px,
+                "valid_depth_samples": candidate.valid_depth_samples,
+                "median_depth_m": candidate.median_depth_m,
+                "passes_depth_filter": candidate.passes_depth_filter,
+                "selected": candidate.selected,
+            }
+            for candidate in candidate_depth_stats
+        )
     return DetectionFrameData(
         frame_index=frame_index,
         camera_timestamp=snapshot.timestamp,
@@ -2239,6 +2429,7 @@ def _diagnostic_frame(
         yaw_align_target_confidence=None if yaw_align_target is None else yaw_align_target.confidence,
         target_geometry=target_geometry,
         yaw_align_geometry=yaw_align_geometry,
+        yaw_align_candidate_lines=yaw_align_candidate_lines,
         yaw_align_geometry_error=(
             None if observation is None else observation.yaw_align_geometry_error
         ),
