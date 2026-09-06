@@ -90,6 +90,11 @@ class BasePoseAgentConfig:
     raw_chest_approach_cutoff_m: float = 1.30
     raw_forward_tolerance_m: float = 0.10
     raw_lateral_tolerance_m: float = 0.10
+    raw_lateral_pulse_enter_m: float = 0.10
+    raw_lateral_pulse_exit_m: float = 0.20
+    raw_lateral_pulse_max_s: float = 0.20
+    raw_lateral_pulse_settle_s: float = 0.50
+    raw_lateral_pulse_sample_frames: int = 3
     raw_min_linear_speed_m_s: float = 0.40
     raw_max_lateral_speed_m_s: float = 0.40
     raw_min_yaw_speed_rad_s: float = 0.10
@@ -137,6 +142,10 @@ class BasePoseAgentConfig:
             ),
             (self.raw_forward_tolerance_m, "raw_forward_tolerance_m"),
             (self.raw_lateral_tolerance_m, "raw_lateral_tolerance_m"),
+            (self.raw_lateral_pulse_enter_m, "raw_lateral_pulse_enter_m"),
+            (self.raw_lateral_pulse_exit_m, "raw_lateral_pulse_exit_m"),
+            (self.raw_lateral_pulse_max_s, "raw_lateral_pulse_max_s"),
+            (self.raw_lateral_pulse_settle_s, "raw_lateral_pulse_settle_s"),
         ):
             if not math.isfinite(value) or value <= 0.0:
                 raise ValueError(f"{name} must be finite and positive")
@@ -165,6 +174,22 @@ class BasePoseAgentConfig:
                 "raw_post_stop_deviation_frames must be in "
                 "[1, raw_post_stop_sample_frames]"
             )
+        try:
+            lateral_pulse_sample_value = float(
+                self.raw_lateral_pulse_sample_frames
+            )
+        except (TypeError, ValueError):
+            lateral_pulse_sample_value = math.nan
+        if (
+            isinstance(self.raw_lateral_pulse_sample_frames, bool)
+            or not math.isfinite(lateral_pulse_sample_value)
+            or lateral_pulse_sample_value <= 0.0
+            or not lateral_pulse_sample_value.is_integer()
+        ):
+            raise ValueError(
+                "raw_lateral_pulse_sample_frames must be a positive integer"
+            )
+        self.raw_lateral_pulse_sample_frames = int(lateral_pulse_sample_value)
 
 
 def load_base_pose_config(

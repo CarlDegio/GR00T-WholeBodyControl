@@ -1003,6 +1003,288 @@ def test_position_errors_bypass_ema_while_yaw_remains_filtered() -> None:
     assert yaw_error == pytest.approx(0.21)
 
 
+def _near_field_observation(
+    right_m: float,
+    *,
+    forward_m: float = 1.2,
+) -> RawServoObservation:
+    observation = _observation(bbox=(240.0, 120.0, 400.0, 360.0))
+    return replace(
+        observation,
+        target=replace(
+            observation.target,
+            forward_m=forward_m,
+            right_m=right_m,
+            body_xyz_m=(forward_m, -right_m, 0.5),
+            median_depth_m=forward_m,
+        ),
+    )
+
+
+def _near_field_controller() -> VisualServoController:
+    controller = VisualServoController(
+        target_distance_m=1.2,
+        forward_tolerance_m=0.05,
+        lateral_tolerance_m=0.05,
+        lateral_pulse_enter_m=0.10,
+        lateral_pulse_exit_m=0.20,
+        lateral_pulse_max_s=0.20,
+        lateral_pulse_settle_s=0.50,
+        lateral_pulse_sample_frames=3,
+    )
+    controller.phase = ServoPhase.TRANSLATE_TARGET
+    return controller
+
+
+def test_lateral_pulse_thresholds_can_be_equal() -> None:
+    controller = VisualServoController(
+        lateral_tolerance_m=0.05,
+        lateral_pulse_enter_m=0.10,
+        lateral_pulse_exit_m=0.10,
+    )
+
+    assert controller.lateral_pulse_enter_m == pytest.approx(0.10)
+    assert controller.lateral_pulse_exit_m == pytest.approx(0.10)
+
+
+def test_near_field_lateral_control_latches_until_average_exceeds_exit() -> None:
+    controller = _near_field_controller()
+
+    command = controller.update(_near_field_observation(0.09), now=0.0)
+
+    assert command.vy < 0.0
+    assert controller.lateral_pulse_mode_active
+    assert controller.lateral_pulse_state is raw_servo.LateralPulseState.PULSING
+
+    controller.stop_if_timed_out(now=0.20)
+    assert controller.current.velocity == (0.0, 0.0, 0.0)
+    assert controller.lateral_pulse_state is raw_servo.LateralPulseState.SETTLING
+
+    controller.update(_near_field_observation(0.14), now=0.30)
+    controller.update(_near_field_observation(0.15), now=0.50)
+    command = controller.update(_near_field_observation(0.16), now=0.70)
+
+    assert command.vy < 0.0
+    assert controller.lateral_pulse_mode_active
+    assert controller.lateral_pulse_state is raw_servo.LateralPulseState.PULSING
+    assert controller.lateral_decision_error_m == pytest.approx(0.15)
+
+    controller.stop_if_timed_out(now=0.90)
+    controller.update(_near_field_observation(0.21), now=1.00)
+    controller.update(_near_field_observation(0.22), now=1.20)
+    command = controller.update(_near_field_observation(0.23), now=1.40)
+
+    assert command.vy < 0.0
+    assert not controller.lateral_pulse_mode_active
+    assert controller.lateral_pulse_state is raw_servo.LateralPulseState.INACTIVE
+    assert controller.lateral_decision_error_m == pytest.approx(0.22)
+
+
+def test_lateral_pulse_entry_threshold_is_strict() -> None:
+    controller = _near_field_controller()
+
+    command = controller.update(_near_field_observation(0.10), now=0.0)
+
+    assert command.vy < 0.0
+    assert not controller.lateral_pulse_mode_active
+    assert controller.lateral_pulse_state is raw_servo.LateralPulseState.INACTIVE
+
+
+def test_lateral_pulse_exit_threshold_is_strict() -> None:
+    controller = _near_field_controller()
+    controller.update(_near_field_observation(0.09), now=0.0)
+    controller.stop_if_timed_out(now=0.20)
+    controller.update(_near_field_observation(0.20), now=0.30)
+    controller.update(_near_field_observation(0.20), now=0.50)
+
+    command = controller.update(_near_field_observation(0.20), now=0.70)
+
+    assert command.vy < 0.0
+    assert controller.lateral_pulse_mode_active
+    assert controller.lateral_pulse_state is raw_servo.LateralPulseState.PULSING
+
+
+@pytest.mark.parametrize(
+    "phase",
+    (ServoPhase.TRANSLATE_TARGET, ServoPhase.RECENTER),
+)
+def test_all_lateral_control_paths_use_near_field_pulses(
+    phase: ServoPhase,
+) -> None:
+    controller = _near_field_controller()
+    controller.phase = phase
+
+    command = controller.update(
+        _near_field_observation(0.09),
+        now=0.0,
+    )
+
+    assert command.vy < 0.0
+    assert controller.lateral_pulse_state is raw_servo.LateralPulseState.PULSING
+
+
+def test_lateral_pulse_stops_on_deadline_without_an_observation() -> None:
+    controller = _near_field_controller()
+    controller.update(_near_field_observation(0.09), now=1.0)
+
+    assert controller.current.vy < 0.0
+    assert not controller.stop_if_timed_out(now=1.199)
+    assert controller.current.vy < 0.0
+
+    assert not controller.stop_if_timed_out(now=1.20)
+    assert controller.current.velocity == (0.0, 0.0, 0.0)
+    assert controller.lateral_pulse_state is raw_servo.LateralPulseState.SETTLING
+    assert controller.lateral_pulse_last_elapsed_s == pytest.approx(0.20)
+
+
+@pytest.mark.parametrize(
+    ("right_m", "reason_fragment"),
+    ((0.04, "entered tolerance"), (-0.06, "crossed zero")),
+)
+def test_lateral_pulse_stops_early_on_tolerance_or_zero_crossing(
+    right_m: float,
+    reason_fragment: str,
+) -> None:
+    controller = _near_field_controller()
+    controller.update(_near_field_observation(0.09), now=0.0)
+
+    command = controller.update(_near_field_observation(right_m), now=0.05)
+
+    assert command.velocity == (0.0, 0.0, 0.0)
+    assert controller.lateral_pulse_state is raw_servo.LateralPulseState.SETTLING
+    assert reason_fragment in (controller.lateral_pulse_last_stop_reason or "")
+    assert controller.lateral_settle_deadline == pytest.approx(0.55)
+
+
+def test_lateral_settle_uses_only_last_three_post_stop_frames() -> None:
+    controller = _near_field_controller()
+    controller.update(_near_field_observation(0.09), now=0.0)
+    controller.update(_near_field_observation(-0.08), now=0.05)
+
+    assert tuple(controller.lateral_settle_samples) == ()
+    assert controller.lateral_settle_deadline == pytest.approx(0.55)
+
+    for timestamp, right_m in (
+        (0.10, 0.10),
+        (0.20, 0.11),
+        (0.30, 0.12),
+        (0.40, 0.13),
+    ):
+        command = controller.update(
+            _near_field_observation(right_m), now=timestamp
+        )
+        assert command.velocity == (0.0, 0.0, 0.0)
+
+    assert tuple(controller.lateral_settle_samples) == pytest.approx(
+        (0.11, 0.12, 0.13)
+    )
+    command = controller.update(_near_field_observation(0.14), now=0.55)
+
+    assert command.vy < 0.0
+    assert controller.lateral_decision_error_m == pytest.approx(0.13)
+    assert controller.lateral_last_decision_samples == pytest.approx(
+        (0.12, 0.13, 0.14)
+    )
+
+
+def test_lateral_settle_waits_past_deadline_until_three_valid_frames() -> None:
+    controller = _near_field_controller()
+    controller.update(_near_field_observation(0.09), now=0.0)
+    controller.stop_if_timed_out(now=0.20)
+    controller.update(_near_field_observation(0.12), now=0.40)
+    command = controller.update(_near_field_observation(0.13), now=0.80)
+
+    assert command.velocity == (0.0, 0.0, 0.0)
+    assert controller.lateral_pulse_state is raw_servo.LateralPulseState.SETTLING
+    assert len(controller.lateral_settle_samples) == 2
+
+    command = controller.update(_near_field_observation(0.14), now=1.00)
+
+    assert command.vy < 0.0
+    assert controller.lateral_decision_error_m == pytest.approx(0.13)
+
+
+def test_lateral_settle_average_in_tolerance_resumes_forward_control() -> None:
+    controller = _near_field_controller()
+    controller.update(_near_field_observation(0.09), now=0.0)
+    controller.stop_if_timed_out(now=0.20)
+    controller.update(
+        _near_field_observation(0.04, forward_m=1.4), now=0.30
+    )
+    controller.update(
+        _near_field_observation(0.03, forward_m=1.4), now=0.50
+    )
+    command = controller.update(
+        _near_field_observation(0.02, forward_m=1.4), now=0.70
+    )
+
+    assert command.vx > 0.0
+    assert command.vy == 0.0
+    assert command.wz == 0.0
+    assert controller.lateral_decision_error_m == pytest.approx(0.03)
+
+    command = controller.update(
+        _near_field_observation(0.25, forward_m=1.4), now=0.80
+    )
+
+    assert command.vy < 0.0
+    assert controller.lateral_pulse_mode_active
+    assert controller.lateral_pulse_state is raw_servo.LateralPulseState.PULSING
+
+
+def test_transient_invalid_frame_stops_lateral_pulse_without_sampling_it() -> None:
+    controller = _near_field_controller()
+    controller.update(_near_field_observation(0.09), now=0.0)
+
+    command = controller.note_transient_invalid(now=0.05)
+
+    assert command.velocity == (0.0, 0.0, 0.0)
+    assert controller.lateral_pulse_state is raw_servo.LateralPulseState.SETTLING
+    assert tuple(controller.lateral_settle_samples) == ()
+    assert controller.lateral_settle_deadline == pytest.approx(0.55)
+
+
+def test_hard_invalid_clears_lateral_pulse_state() -> None:
+    controller = _near_field_controller()
+    controller.update(_near_field_observation(0.09), now=0.0)
+
+    command = controller.note_invalid(
+        "camera failure",
+        hard=True,
+        now=0.05,
+    )
+
+    assert command.velocity == (0.0, 0.0, 0.0)
+    assert controller.terminal_reason == "camera failure"
+    assert not controller.lateral_pulse_mode_active
+    assert controller.lateral_pulse_state is raw_servo.LateralPulseState.INACTIVE
+
+
+def test_post_stop_entry_clears_completed_lateral_pulse_mode() -> None:
+    controller = VisualServoController(
+        target_distance_m=1.2,
+        forward_tolerance_m=0.05,
+        lateral_tolerance_m=0.05,
+        lateral_pulse_enter_m=0.10,
+        lateral_pulse_exit_m=0.20,
+        stable_frames=1,
+        post_stop_sample_frames=3,
+        post_stop_deviation_frames=1,
+    )
+    controller.phase = ServoPhase.TRANSLATE_TARGET
+    controller.update(_near_field_observation(0.09), now=0.0)
+    controller.stop_if_timed_out(now=0.20)
+    controller.update(_near_field_observation(0.04), now=0.30)
+    controller.update(_near_field_observation(0.03), now=0.50)
+
+    command = controller.update(_near_field_observation(0.02), now=0.70)
+
+    assert command.velocity == (0.0, 0.0, 0.0)
+    assert controller.phase is ServoPhase.POST_STOP_SAMPLING
+    assert not controller.lateral_pulse_mode_active
+    assert controller.lateral_pulse_state is raw_servo.LateralPulseState.INACTIVE
+
+
 def test_yaw_filter_bypasses_ema_above_ten_degree_raw_jump() -> None:
     controller = VisualServoController(ema_alpha=0.1)
     first = _observation(
@@ -1167,6 +1449,7 @@ def test_completion_ignores_virtual_heading_setpoint_error() -> None:
         "state_age_s": 0.01,
         "telemetry_age_s": 0.01,
     }
+    controller.phase = ServoPhase.TRANSLATE_TARGET
 
     command = controller.update(
         observation,
@@ -1181,41 +1464,131 @@ def test_completion_ignores_virtual_heading_setpoint_error() -> None:
     assert controller.terminal_reason == "aligned"
 
 
-def test_joint_completion_stops_chest_approach_at_chest_standoff() -> None:
+def test_joint_completion_uses_the_standard_phase_order() -> None:
     controller = VisualServoController(
         target_distance_m=0.7,
-        forward_tolerance_m=0.07,
-        lateral_tolerance_m=0.07,
-        stable_frames=2,
+        far_approach_cutoff_m=1.0,
+        forward_tolerance_m=0.05,
+        lateral_tolerance_m=0.05,
+        stable_frames=1,
+        ema_alpha=1.0,
+        lateral_pulse_enter_m=0.01,
         chest_approach_only=True,
     )
     controller.reset(0.0, initial_phase=ServoPhase.FORWARD_APPROACH)
-    observation = _observation(bbox=(240.0, 120.0, 400.0, 360.0))
-    observation = replace(
-        observation,
-        target=replace(
-            observation.target,
-            forward_m=0.7,
-            right_m=0.02,
-            body_xyz_m=(0.7, -0.02, 0.5),
-            median_depth_m=0.7,
-        ),
-        yaw_align_geometry_camera_stream="ego_view",
-    )
 
-    first = controller.update(
-        observation,
+    def observation(
+        forward_m: float,
+        right_m: float,
+        yaw_rad: float,
+    ) -> RawServoObservation:
+        value = _observation(
+            bbox=(240.0, 120.0, 400.0, 360.0),
+            yaw=yaw_rad,
+        )
+        return replace(
+            value,
+            target=replace(
+                value.target,
+                forward_m=forward_m,
+                right_m=right_m,
+                body_xyz_m=(forward_m, -right_m, 0.5),
+                median_depth_m=forward_m,
+            ),
+            yaw_align_geometry_camera_stream="ego_view",
+        )
+
+    far_command = controller.update(
+        observation(1.2, 0.20, math.radians(20.0)),
         now=0.1,
         joint_completion=True,
     )
-    second = controller.update(
-        observation,
+    assert controller.joint_completion_active
+    assert controller.phase is ServoPhase.FORWARD_APPROACH
+    assert far_command.vx > 0.0
+    assert far_command.vy == 0.0
+    assert far_command.wz == 0.0
+
+    coarse_command = controller.update(
+        observation(0.9, 0.20, math.radians(20.0)),
         now=0.2,
         joint_completion=True,
     )
+    assert controller.phase is ServoPhase.YAW_ALIGN
+    assert coarse_command.vx == 0.0
+    assert coarse_command.vy == 0.0
+    assert coarse_command.wz > 0.0
 
-    assert first.velocity == (0.0, 0.0, 0.0)
-    assert second.velocity == (0.0, 0.0, 0.0)
+    trim_entry = controller.update(
+        observation(0.9, 0.20, math.radians(5.0)),
+        now=0.3,
+        joint_completion=True,
+    )
+    assert controller.phase is ServoPhase.YAW_TRIM
+    assert trim_entry.velocity == (0.0, 0.0, 0.0)
+
+    trim_command = controller.update(
+        observation(0.9, 0.20, math.radians(10.5)),
+        now=0.4,
+        joint_completion=True,
+    )
+    assert controller.phase is ServoPhase.YAW_TRIM
+    assert trim_command.vx == 0.0
+    assert trim_command.vy == 0.0
+    assert 0.0 < trim_command.wz <= controller.yaw_trim_speed_rad_s
+
+    for frame_index in range(controller.yaw_lock_frames_required):
+        command = controller.update(
+            observation(0.9, 0.20, 0.0),
+            now=0.5 + 0.1 * frame_index,
+            joint_completion=True,
+        )
+        assert command.vy == 0.0
+    assert controller.phase is ServoPhase.TRANSLATE_TARGET
+
+    lateral_command = controller.update(
+        observation(0.9, 0.20, 0.0),
+        now=0.8,
+        joint_completion=True,
+    )
+    assert lateral_command.vx == 0.0
+    assert lateral_command.vy < 0.0
+    assert lateral_command.wz == 0.0
+
+    distance_command = controller.update(
+        observation(0.9, 0.0, 0.0),
+        now=0.9,
+        joint_completion=True,
+    )
+    assert distance_command.vx > 0.0
+    assert distance_command.vy == 0.0
+    assert distance_command.wz == 0.0
+
+    final_yaw_command = controller.update(
+        observation(0.7, 0.0, math.radians(15.0)),
+        now=1.0,
+        joint_completion=True,
+    )
+    assert controller.phase is ServoPhase.GLOBAL_YAW_ALIGN
+    assert final_yaw_command.vx == 0.0
+    assert final_yaw_command.vy == 0.0
+    assert final_yaw_command.wz > 0.0
+
+    for frame_index in range(controller.yaw_lock_frames_required):
+        controller.update(
+            observation(0.7, 0.0, 0.0),
+            now=1.1 + 0.1 * frame_index,
+            joint_completion=True,
+        )
+    assert controller.phase is ServoPhase.TRANSLATE_TARGET
+
+    final_command = controller.update(
+        observation(0.7, 0.0, 0.0),
+        now=1.4,
+        joint_completion=True,
+    )
+
+    assert final_command.velocity == (0.0, 0.0, 0.0)
     assert controller.phase is ServoPhase.DONE
     assert controller.terminal_reason == "aligned"
 
@@ -1228,6 +1601,7 @@ def test_joint_completion_defaults_to_three_stable_frames() -> None:
         chest_approach_only=True,
     )
     controller.reset(0.0, initial_phase=ServoPhase.FORWARD_APPROACH)
+    controller.phase = ServoPhase.TRANSLATE_TARGET
     observation = _observation(bbox=(240.0, 120.0, 400.0, 360.0))
     observation = replace(
         observation,
@@ -1248,7 +1622,7 @@ def test_joint_completion_defaults_to_three_stable_frames() -> None:
             joint_completion=True,
         )
         assert command.velocity == (0.0, 0.0, 0.0)
-        assert controller.phase is ServoPhase.FORWARD_APPROACH
+        assert controller.phase is ServoPhase.TRANSLATE_TARGET
         assert controller.stable_frames == frame_index + 1
 
     command = controller.update(

@@ -17,6 +17,7 @@ from gear_sonic.utils.inference.base_pose.agent import (
     BasePoseAgentConfig,
     GatewayRawServoAdapter,
     _dual_worker_kwargs,
+    load_base_pose_config,
 )
 import gear_sonic.utils.inference.base_pose.dual_servo as dual_servo
 from gear_sonic.utils.inference.base_pose.dual_servo import (
@@ -105,11 +106,44 @@ def test_base_pose_config_exposes_only_dual_camera_mode() -> None:
     assert config.raw_chest_approach_cutoff_m == pytest.approx(1.3)
     assert config.raw_forward_tolerance_m == pytest.approx(0.10)
     assert config.raw_lateral_tolerance_m == pytest.approx(0.10)
+    assert config.raw_lateral_pulse_enter_m == pytest.approx(0.10)
+    assert config.raw_lateral_pulse_exit_m == pytest.approx(0.20)
+    assert config.raw_lateral_pulse_max_s == pytest.approx(0.20)
+    assert config.raw_lateral_pulse_settle_s == pytest.approx(0.50)
+    assert config.raw_lateral_pulse_sample_frames == 3
     assert config.raw_post_stop_sample_frames == 30
     assert config.raw_post_stop_deviation_frames == 10
     assert config.raw_diagnostic_image_interval_frames == 5
     assert config.raw_min_linear_speed_m_s == pytest.approx(0.4)
     assert config.raw_max_lateral_speed_m_s == pytest.approx(0.4)
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    (
+        {"raw_lateral_pulse_enter_m": 0.0},
+        {"raw_lateral_pulse_exit_m": float("inf")},
+        {"raw_lateral_pulse_sample_frames": 0},
+        {"raw_lateral_pulse_sample_frames": 2.5},
+        {"raw_lateral_pulse_sample_frames": True},
+    ),
+)
+def test_base_pose_config_rejects_invalid_lateral_pulse_values(
+    overrides: dict[str, object],
+) -> None:
+    with pytest.raises(ValueError, match=r"lateral[ _]pulse"):
+        BasePoseAgentConfig(task="align", **overrides)
+
+
+def test_launch_profile_configures_near_field_lateral_pulses() -> None:
+    config = load_base_pose_config()
+
+    assert config.raw_lateral_tolerance_m == pytest.approx(0.06)
+    assert config.raw_lateral_pulse_enter_m == pytest.approx(0.10)
+    assert config.raw_lateral_pulse_exit_m == pytest.approx(0.10)
+    assert config.raw_lateral_pulse_max_s == pytest.approx(0.40)
+    assert config.raw_lateral_pulse_settle_s == pytest.approx(0.50)
+    assert config.raw_lateral_pulse_sample_frames == 3
 
 
 def test_base_pose_service_worker_callbacks_match_worker_signature() -> None:
@@ -952,6 +986,227 @@ def _joint_observation(
     )
 
 
+def _pulse_runtime(
+    tmp_path: Path,
+    published: list[dict[str, object]],
+) -> RawServoRuntime:
+    runtime = RawServoRuntime(
+        BasePoseAgentConfig(
+            task="align",
+            output_root=str(tmp_path),
+            raw_lateral_tolerance_m=0.05,
+        ),
+        publish=published.append,
+        logger=lambda _message: None,
+    )
+    runtime.generation = 1
+    runtime.phase = "aligning"
+    runtime.current_attempt_id = 1
+    runtime.active_camera_stream = HEAD
+    runtime.control_source_stream = HEAD
+    runtime.navigation_started_at = 0.0
+    runtime.last_observation_at = 0.0
+    runtime.controller.phase = ServoPhase.TRANSLATE_TARGET
+    return runtime
+
+
+def test_publish_due_sends_zero_at_lateral_pulse_deadline_without_frames(
+    tmp_path: Path,
+) -> None:
+    published: list[dict[str, object]] = []
+    runtime = _pulse_runtime(tmp_path, published)
+    runtime.controller.update(
+        _joint_observation(1.0, right_m=0.09), now=0.0
+    )
+    runtime.next_publish_at = 10.0
+
+    command = runtime.publish_due(0.20)
+
+    assert command is not None
+    assert command.velocity == (0.0, 0.0, 0.0)
+    assert runtime.controller.lateral_pulse_state is (
+        visual_servo.LateralPulseState.SETTLING
+    )
+    assert published[-1]["action"] == "visual_servo"
+    assert published[-1]["velocity"] == {"vx": 0.0, "vy": 0.0, "wz": 0.0}
+
+
+def test_control_source_change_clears_samples_and_restarts_settle(
+    tmp_path: Path,
+) -> None:
+    runtime = _pulse_runtime(tmp_path, [])
+    runtime.controller.update(
+        _joint_observation(1.0, right_m=0.09), now=0.0
+    )
+    runtime.controller.stop_if_timed_out(now=0.20)
+    runtime.controller.update(
+        _joint_observation(1.0, right_m=0.11), now=0.30
+    )
+    assert tuple(runtime.controller.lateral_settle_samples) == (0.11,)
+
+    assert not runtime.accept_event(
+        RawServoEvent(
+            0,
+            "observation",
+            observation=_joint_observation(1.0, right_m=-0.40),
+            details={"attempt_id": 1, "control_source_stream": HEAD},
+        ),
+        now=0.35,
+    )
+    assert not runtime.accept_event(
+        RawServoEvent(
+            1,
+            "observation",
+            observation=_joint_observation(1.0, right_m=-0.40),
+            details={"attempt_id": 0, "control_source_stream": HEAD},
+        ),
+        now=0.36,
+    )
+    assert tuple(runtime.controller.lateral_settle_samples) == (0.11,)
+
+    runtime._prepare_control_source(
+        {"control_source_stream": CHEST},
+        _joint_observation(0.8, right_m=0.12),
+        now=0.40,
+    )
+
+    assert runtime.controller.current.velocity == (0.0, 0.0, 0.0)
+    assert runtime.controller.lateral_pulse_state is (
+        visual_servo.LateralPulseState.SETTLING
+    )
+    assert tuple(runtime.controller.lateral_settle_samples) == ()
+    assert runtime.controller.lateral_settle_deadline == pytest.approx(0.90)
+
+
+def test_camera_stale_and_recovery_restart_lateral_settle(
+    tmp_path: Path,
+) -> None:
+    published: list[dict[str, object]] = []
+    runtime = _pulse_runtime(tmp_path, published)
+    runtime.controller.update(
+        _joint_observation(1.0, right_m=0.09), now=0.0
+    )
+    runtime.controller.stop_if_timed_out(now=0.20)
+    runtime.controller.update(
+        _joint_observation(1.0, right_m=0.11), now=0.30
+    )
+    runtime.next_publish_at = 0.40
+
+    command = runtime.publish_due(0.41)
+
+    assert command is not None
+    assert command.velocity == (0.0, 0.0, 0.0)
+    assert runtime.soft_stale
+    assert tuple(runtime.controller.lateral_settle_samples) == ()
+    assert runtime.controller.lateral_settle_deadline == pytest.approx(0.91)
+
+    assert runtime.accept_event(
+        RawServoEvent(
+            1,
+            "observation",
+            observation=_joint_observation(1.0, right_m=0.12),
+            details={
+                "attempt_id": 1,
+                "live_stream": HEAD,
+                "control_source_stream": HEAD,
+            },
+        ),
+        now=0.50,
+    )
+
+    assert not runtime.soft_stale
+    assert runtime.controller.current.velocity == (0.0, 0.0, 0.0)
+    assert tuple(runtime.controller.lateral_settle_samples) == ()
+    assert runtime.controller.lateral_settle_deadline == pytest.approx(1.0)
+
+
+def test_camera_switch_keeps_zero_and_restarts_settle_on_initialization(
+    tmp_path: Path,
+) -> None:
+    published: list[dict[str, object]] = []
+    runtime = _pulse_runtime(tmp_path, published)
+    runtime.active_camera_stream = CHEST
+    runtime.control_source_stream = CHEST
+    runtime.controller.update(
+        _joint_observation(1.0, right_m=0.09), now=0.0
+    )
+
+    assert runtime.accept_event(
+        RawServoEvent(
+            1,
+            "switching",
+            details={"attempt_id": 2, "live_stream": HEAD},
+        ),
+        now=0.10,
+    )
+    assert runtime.camera_switch_lateral_settle_active
+    assert runtime.controller.current.velocity == (0.0, 0.0, 0.0)
+    assert runtime.controller.lateral_settle_deadline == pytest.approx(0.60)
+    assert published[-1]["action"] == "visual_servo"
+
+    command = runtime.publish_due(0.15)
+    assert command is not None
+    assert command.velocity == (0.0, 0.0, 0.0)
+    assert published[-1]["action"] == "visual_servo"
+
+    assert runtime.accept_event(
+        RawServoEvent(
+            1,
+            "initialized",
+            observation=_joint_observation(1.0, right_m=0.12),
+            details={
+                "attempt_id": 2,
+                "live_stream": HEAD,
+                "control_source_stream": HEAD,
+            },
+        ),
+        now=0.20,
+    )
+
+    assert not runtime.camera_switch_lateral_settle_active
+    assert runtime.controller.phase is ServoPhase.VERTICAL_RECENTER
+    assert runtime.controller.current.velocity == (0.0, 0.0, 0.0)
+    assert runtime.controller.lateral_pulse_state is (
+        visual_servo.LateralPulseState.SETTLING
+    )
+    assert tuple(runtime.controller.lateral_settle_samples) == ()
+    assert runtime.controller.lateral_settle_deadline == pytest.approx(0.70)
+
+    assert runtime.accept_event(
+        RawServoEvent(
+            1,
+            "invalid",
+            error="new camera frame invalid",
+            details={"attempt_id": 2, "live_stream": HEAD},
+        ),
+        now=0.25,
+    )
+    assert runtime.controller.current.velocity == (0.0, 0.0, 0.0)
+    assert tuple(runtime.controller.lateral_settle_samples) == ()
+
+
+def test_cancel_during_lateral_pulse_publishes_only_stop_commands(
+    tmp_path: Path,
+) -> None:
+    published: list[dict[str, object]] = []
+    runtime = _pulse_runtime(tmp_path, published)
+    runtime.controller.update(
+        _joint_observation(1.0, right_m=0.09), now=0.0
+    )
+
+    runtime.cancel("operator cancel", 0.05, generation=2)
+
+    assert runtime.phase == "idle"
+    assert runtime.controller.current.velocity == (0.0, 0.0, 0.0)
+    assert not runtime.controller.lateral_pulse_mode_active
+    assert len(published) == runtime.config.final_stop_count
+    assert all(message["action"] == "stop" for message in published)
+    assert all(
+        message["velocity"] == {"vx": 0.0, "vy": 0.0, "wz": 0.0}
+        for message in published
+    )
+
+
 def test_runtime_allows_joint_completion_regardless_of_live_stream(
     tmp_path: Path,
 ) -> None:
@@ -979,7 +1234,8 @@ def test_runtime_allows_joint_completion_regardless_of_live_stream(
         RawServoEvent(1, "detecting", details=details),
         now=0.01,
     )
-    for index in range(5):
+    # Three frames lock yaw, then five frames confirm the final pose.
+    for index in range(8):
         assert runtime.accept_event(
             RawServoEvent(
                 1,
@@ -1027,7 +1283,8 @@ def test_runtime_reuses_yoloe_after_ten_post_stop_deviation_frames(
         RawServoEvent(1, "detecting", details=details),
         now=0.01,
     )
-    for index in range(5):
+    # Three frames lock yaw, then five frames confirm the final pose.
+    for index in range(8):
         assert runtime.accept_event(
             RawServoEvent(
                 1,
@@ -1086,7 +1343,7 @@ def test_joint_head_yaw_loss_policy_boundaries(
     }
 
 
-def test_runtime_keeps_bidirectional_chest_control_for_nine_head_yaw_misses(
+def test_runtime_pauses_chest_translation_during_head_yaw_loss_and_resumes(
     tmp_path: Path,
 ) -> None:
     runtime = RawServoRuntime(
@@ -1114,14 +1371,26 @@ def test_runtime_keeps_bidirectional_chest_control_for_nine_head_yaw_misses(
         RawServoEvent(1, "detecting", details=common),
         now=0.01,
     )
+    for index in range(3):
+        assert runtime.accept_event(
+            RawServoEvent(
+                1,
+                "initialized" if index == 0 else "observation",
+                observation=_joint_observation(0.7),
+                details=live_yaw,
+            ),
+            now=0.02 + 0.01 * index,
+        )
+    assert runtime.controller.phase is ServoPhase.TRANSLATE_TARGET
+
     assert runtime.accept_event(
         RawServoEvent(
             1,
-            "initialized",
+            "observation",
             observation=_joint_observation(0.5),
             details=live_yaw,
         ),
-        now=0.02,
+        now=0.05,
     )
     assert runtime.controller.current.vx < 0.0
 
@@ -1143,9 +1412,10 @@ def test_runtime_keeps_bidirectional_chest_control_for_nine_head_yaw_misses(
                     "head_yaw_loss": loss,
                 },
             ),
-            now=0.02 + 0.01 * missing_frames,
+            now=0.05 + 0.01 * missing_frames,
         )
-        assert runtime.controller.current.vx < 0.0
+        assert runtime.controller.current.velocity == (0.0, 0.0, 0.0)
+        assert runtime.controller.joint_completion_active
 
     for missing_frames in range(10, 20):
         loss = dual_servo._joint_head_yaw_loss_details(missing_frames)
@@ -1164,19 +1434,20 @@ def test_runtime_keeps_bidirectional_chest_control_for_nine_head_yaw_misses(
                     "head_yaw_loss": loss,
                 },
             ),
-            now=0.02 + 0.01 * missing_frames,
+            now=0.05 + 0.01 * missing_frames,
         )
         assert runtime.controller.current.velocity == (0.0, 0.0, 0.0)
 
-    assert runtime.accept_event(
-        RawServoEvent(
-            1,
-            "observation",
-            observation=_joint_observation(0.5),
-            details=live_yaw,
-        ),
-        now=0.22,
-    )
+    for index in range(4):
+        assert runtime.accept_event(
+            RawServoEvent(
+                1,
+                "observation",
+                observation=_joint_observation(0.5),
+                details=live_yaw,
+            ),
+            now=0.25 + 0.01 * index,
+        )
     assert runtime.controller.current.vx < 0.0
 
 

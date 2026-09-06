@@ -507,6 +507,11 @@ def test_yaml_contains_every_launch_parameter() -> None:
     assert base_pose.dual_chest_depth_stream == "camera/chest_view_depth"
     assert base_pose.raw_min_linear_speed_m_s == pytest.approx(0.35)
     assert base_pose.raw_max_lateral_speed_m_s == pytest.approx(0.4)
+    assert base_pose.raw_lateral_pulse_enter_m == pytest.approx(0.10)
+    assert base_pose.raw_lateral_pulse_exit_m == pytest.approx(0.10)
+    assert base_pose.raw_lateral_pulse_max_s == pytest.approx(0.35)
+    assert base_pose.raw_lateral_pulse_settle_s == pytest.approx(0.50)
+    assert base_pose.raw_lateral_pulse_sample_frames == 3
     assert not hasattr(loaded, "base_pose_mode")
     assert not hasattr(loaded, "base_pose_vision_backend")
     assert not hasattr(loaded, "base_pose_model")

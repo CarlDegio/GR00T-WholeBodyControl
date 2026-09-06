@@ -218,6 +218,30 @@ class FrameDiagnosticsWriter:
             "heading_setpoint_error_rad": value.get("heading_setpoint_error_rad"),
             "yaw_error_source": value.get("yaw_error_source"),
             "yaw_error_trusted": value.get("yaw_error_trusted"),
+            "lateral_pulse_state": _phase_name(
+                value.get("lateral_pulse_state")
+            ),
+            "lateral_pulse_mode_active": value.get(
+                "lateral_pulse_mode_active"
+            ),
+            "lateral_pulse_elapsed_s": value.get(
+                "lateral_pulse_elapsed_s"
+            ),
+            "lateral_settle_elapsed_s": value.get(
+                "lateral_settle_elapsed_s"
+            ),
+            "lateral_pulse_sample_count": value.get(
+                "lateral_pulse_sample_count"
+            ),
+            "lateral_pulse_samples_m": value.get(
+                "lateral_pulse_samples_m"
+            ),
+            "lateral_pulse_decision_error_m": value.get(
+                "lateral_pulse_decision_error_m"
+            ),
+            "lateral_pulse_last_stop_reason": value.get(
+                "lateral_pulse_last_stop_reason"
+            ),
             "post_stop_sample_frames": value.get("post_stop_sample_frames"),
             "post_stop_deviation_frames": value.get("post_stop_deviation_frames"),
             "post_stop_sample_count": value.get("post_stop_sample_count"),

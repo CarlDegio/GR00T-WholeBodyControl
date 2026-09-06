@@ -34,6 +34,14 @@ def test_writer_serializes_nonfinite_controller_values_as_null(tmp_path) -> None
             "filtered_errors": [float("nan"), float("inf"), 0.0],
             "vertical_recenter_armed": True,
             "vertical_recenter_elapsed_s": float("nan"),
+            "lateral_pulse_state": "settling",
+            "lateral_pulse_mode_active": True,
+            "lateral_pulse_elapsed_s": 0.2,
+            "lateral_settle_elapsed_s": 0.3,
+            "lateral_pulse_sample_count": 3,
+            "lateral_pulse_samples_m": [0.08, 0.07, 0.06],
+            "lateral_pulse_decision_error_m": 0.07,
+            "lateral_pulse_last_stop_reason": "200 ms timeout",
         },
         command={"vx": float("inf"), "vy": 0.0, "wz": 0.0},
     )
@@ -41,6 +49,21 @@ def test_writer_serializes_nonfinite_controller_values_as_null(tmp_path) -> None
     record = json.loads((tmp_path / "raw_servo_frames.jsonl").read_text())
     assert record["controller"]["filtered_errors"] == [None, None, 0.0]
     assert record["controller"]["vertical_recenter_elapsed_s"] is None
+    assert record["controller"]["lateral_pulse_state"] == "settling"
+    assert record["controller"]["lateral_pulse_mode_active"] is True
+    assert record["controller"]["lateral_pulse_elapsed_s"] == 0.2
+    assert record["controller"]["lateral_settle_elapsed_s"] == 0.3
+    assert record["controller"]["lateral_pulse_sample_count"] == 3
+    assert record["controller"]["lateral_pulse_samples_m"] == [
+        0.08,
+        0.07,
+        0.06,
+    ]
+    assert record["controller"]["lateral_pulse_decision_error_m"] == 0.07
+    assert (
+        record["controller"]["lateral_pulse_last_stop_reason"]
+        == "200 ms timeout"
+    )
     assert record["command"]["vx"] is None
 
 

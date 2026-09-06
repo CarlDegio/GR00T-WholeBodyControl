@@ -7,6 +7,7 @@ persistent track IDs and aligned RealSense depth.
 
 from __future__ import annotations
 
+from collections import deque
 from dataclasses import dataclass, replace
 from enum import Enum
 import math
@@ -158,6 +159,12 @@ class ServoPhase(str, Enum):
     TRANSLATE_TARGET = "translate_target"
     POST_STOP_SAMPLING = "post_stop_sampling"
     DONE = "done"
+
+
+class LateralPulseState(str, Enum):
+    INACTIVE = "inactive"
+    PULSING = "pulsing"
+    SETTLING = "settling"
 
 
 @dataclass(frozen=True)
@@ -927,6 +934,11 @@ class VisualServoController:
         max_run_s: float = 180.0,
         min_linear_speed_m_s: float = 0.30,
         max_lateral_speed_m_s: float = 0.40,
+        lateral_pulse_enter_m: float = 0.10,
+        lateral_pulse_exit_m: float = 0.20,
+        lateral_pulse_max_s: float = 0.20,
+        lateral_pulse_settle_s: float = 0.50,
+        lateral_pulse_sample_frames: int = 3,
         min_yaw_speed_rad_s: float = 0.10,
         yaw_tolerance_deg: float = 8.0,
         yaw_coarse_speed_rad_s: float = 0.30,
@@ -938,6 +950,7 @@ class VisualServoController:
         far_approach_cutoff_m: float | None = None,
         horizontal_guard_fraction: float = 0.25,
         horizontal_recovery_fraction: float = 0.30,
+        event_logger: Callable[[str], None] | None = None,
     ):
         self.target_distance_m = float(target_distance_m)
         self.forward_tolerance_m = float(forward_tolerance_m)
@@ -966,6 +979,32 @@ class VisualServoController:
         lateral_speed_limit = float(max_lateral_speed_m_s)
         if not math.isfinite(lateral_speed_limit) or lateral_speed_limit <= 0.0:
             raise ValueError("maximum lateral speed must be finite and positive")
+        lateral_pulse_enter = float(lateral_pulse_enter_m)
+        lateral_pulse_exit = float(lateral_pulse_exit_m)
+        lateral_pulse_max = float(lateral_pulse_max_s)
+        lateral_pulse_settle = float(lateral_pulse_settle_s)
+        if not all(
+            math.isfinite(value) and value > 0.0
+            for value in (
+                lateral_pulse_enter,
+                lateral_pulse_exit,
+                lateral_pulse_max,
+                lateral_pulse_settle,
+            )
+        ):
+            raise ValueError("lateral pulse values must be finite and positive")
+        try:
+            lateral_pulse_sample_value = float(lateral_pulse_sample_frames)
+        except (TypeError, ValueError):
+            lateral_pulse_sample_value = math.nan
+        if (
+            isinstance(lateral_pulse_sample_frames, bool)
+            or not math.isfinite(lateral_pulse_sample_value)
+            or lateral_pulse_sample_value <= 0.0
+            or not lateral_pulse_sample_value.is_integer()
+        ):
+            raise ValueError("lateral pulse sample frames must be a positive integer")
+        lateral_pulse_samples = int(lateral_pulse_sample_value)
         min_linear_speed = float(min_linear_speed_m_s)
         if not math.isfinite(min_linear_speed) or min_linear_speed <= 0.0:
             raise ValueError("minimum linear speed must be finite and positive")
@@ -1012,6 +1051,12 @@ class VisualServoController:
             )
         self.min_linear_speed_m_s = min_linear_speed
         self.max_lateral_speed_m_s = lateral_speed_limit
+        self.lateral_pulse_enter_m = lateral_pulse_enter
+        self.lateral_pulse_exit_m = lateral_pulse_exit
+        self.lateral_pulse_max_s = lateral_pulse_max
+        self.lateral_pulse_settle_s = lateral_pulse_settle
+        self.lateral_pulse_sample_frames = lateral_pulse_samples
+        self.event_logger = event_logger
         self.min_yaw_speed_rad_s = min_yaw_speed
         self.yaw_tolerance_deg = yaw_tolerance
         self.yaw_tolerance_rad = math.radians(yaw_tolerance)
@@ -1064,7 +1109,27 @@ class VisualServoController:
         self.last_update_time = float(now)
         self.filtered: np.ndarray | None = None
         self.current = ServoCommand(0.0, 0.0, 0.0)
+        self.lateral_pulse_mode_active = False
+        self.lateral_pulse_state = LateralPulseState.INACTIVE
+        self.lateral_pulse_started_at: float | None = None
+        self.lateral_pulse_deadline: float | None = None
+        self.lateral_pulse_error_sign = 0
+        self.lateral_settle_started_at: float | None = None
+        self.lateral_settle_deadline: float | None = None
+        self.lateral_settle_samples: deque[float] = deque(
+            maxlen=self.lateral_pulse_sample_frames
+        )
+        self.lateral_last_decision_samples: tuple[float, ...] = ()
+        self.lateral_decision_error_m: float | None = None
+        self.lateral_pulse_last_stop_reason: str | None = None
+        self.lateral_pulse_last_elapsed_s: float | None = None
+        self.lateral_settle_last_elapsed_s: float | None = None
         self.phase = initial_phase
+        # Once chest position and head yaw have been observed together, keep
+        # using the normal multi-phase alignment sequence for the rest of this
+        # controller attempt.  A brief head-yaw miss must not drop the chest
+        # path back to its legacy forward-only behavior.
+        self.joint_completion_active = False
         self.resume_phase: ServoPhase | None = None
         self.yaw_resume_phase: ServoPhase | None = None
         self.yaw_correction_context: str | None = None
@@ -1103,7 +1168,7 @@ class VisualServoController:
 
     @property
     def yaw_alignment_required(self) -> bool:
-        if self.chest_approach_only:
+        if self.chest_approach_only and not self.joint_completion_active:
             return False
         if self.phase is ServoPhase.POST_STOP_SAMPLING:
             return True
@@ -1139,11 +1204,15 @@ class VisualServoController:
             raise RuntimeError(
                 "forward recenter can only be entered from forward_approach"
             )
-        if self.chest_approach_only and phase not in {
-            ServoPhase.FORWARD_APPROACH,
-            ServoPhase.FORWARD_RECENTER,
-            ServoPhase.POST_STOP_SAMPLING,
-        }:
+        if (
+            self.chest_approach_only
+            and not self.joint_completion_active
+            and phase not in {
+                ServoPhase.FORWARD_APPROACH,
+                ServoPhase.FORWARD_RECENTER,
+                ServoPhase.POST_STOP_SAMPLING,
+            }
+        ):
             raise RuntimeError(
                 f"chest approach controller cannot enter {phase.value}"
             )
@@ -1171,6 +1240,7 @@ class VisualServoController:
         self.last_update_time = timestamp
 
     def _stop(self, reason: str) -> ServoCommand:
+        self._clear_lateral_pulse_mode()
         self.terminal_reason = reason
         if reason == "aligned":
             self.phase = ServoPhase.DONE
@@ -1179,6 +1249,7 @@ class VisualServoController:
         return self.current
 
     def _begin_post_stop_sampling(self) -> ServoCommand:
+        self._clear_lateral_pulse_mode()
         if self.post_stop_sample_frames == 0:
             return self._stop("aligned")
         self.post_stop_sample_count = 0
@@ -1242,7 +1313,7 @@ class VisualServoController:
         self.invalid_frames = 0
         resume_phase = (
             ServoPhase.FORWARD_APPROACH
-            if self.chest_approach_only
+            if self.chest_approach_only and not self.joint_completion_active
             else ServoPhase.TRANSLATE_TARGET
         )
         self._transition(
@@ -1435,10 +1506,214 @@ class VisualServoController:
             )
         return vx, vy
 
+    def _log_lateral_pulse(self, message: str) -> None:
+        if self.event_logger is not None:
+            self.event_logger(f"[RawServo] LATERAL_PULSE {message}")
+
+    def _clear_lateral_pulse_mode(self) -> None:
+        self.lateral_pulse_mode_active = False
+        self.lateral_pulse_state = LateralPulseState.INACTIVE
+        self.lateral_pulse_started_at = None
+        self.lateral_pulse_deadline = None
+        self.lateral_pulse_error_sign = 0
+        self.lateral_settle_started_at = None
+        self.lateral_settle_deadline = None
+        self.lateral_settle_samples.clear()
+        self.lateral_last_decision_samples = ()
+        self.lateral_decision_error_m = None
+        self.lateral_settle_last_elapsed_s = None
+
+    @property
+    def lateral_pulse_elapsed_s(self) -> float | None:
+        if self.lateral_pulse_started_at is None:
+            return self.lateral_pulse_last_elapsed_s
+        return max(0.0, self.last_update_time - self.lateral_pulse_started_at)
+
+    @property
+    def lateral_settle_elapsed_s(self) -> float | None:
+        if self.lateral_settle_started_at is None:
+            return self.lateral_settle_last_elapsed_s
+        return max(0.0, self.last_update_time - self.lateral_settle_started_at)
+
+    @property
+    def lateral_diagnostic_samples(self) -> tuple[float, ...]:
+        if self.lateral_pulse_state is LateralPulseState.SETTLING:
+            return tuple(self.lateral_settle_samples)
+        return self.lateral_last_decision_samples
+
+    def _continuous_lateral_command(self, right_error: float) -> ServoCommand:
+        desired_vy = self._clip(
+            -0.6 * float(right_error), self.max_lateral_speed_m_s
+        )
+        _, vy = self._enforce_min_linear_speed(0.0, desired_vy)
+        self.current = ServoCommand(0.0, vy, 0.0)
+        return self.current
+
+    def _begin_lateral_pulse(
+        self, right_error: float, *, now: float
+    ) -> ServoCommand:
+        timestamp = float(now)
+        self.lateral_pulse_mode_active = True
+        self.lateral_pulse_state = LateralPulseState.PULSING
+        self.lateral_pulse_started_at = timestamp
+        self.lateral_pulse_deadline = timestamp + self.lateral_pulse_max_s
+        self.lateral_pulse_error_sign = 1 if right_error > 0.0 else -1
+        self.lateral_settle_started_at = None
+        self.lateral_settle_deadline = None
+        self.lateral_settle_samples.clear()
+        self.lateral_pulse_last_stop_reason = None
+        self.lateral_pulse_last_elapsed_s = None
+        self.stable_frames = 0
+        self.recenter_stable_frames = 0
+        command = self._continuous_lateral_command(right_error)
+        self._log_lateral_pulse(
+            "START "
+            f"error_m={right_error:.4f} vy={command.vy:.4f} "
+            f"max_s={self.lateral_pulse_max_s:.3f}"
+        )
+        return command
+
+    def _begin_lateral_settle(self, *, now: float, reason: str) -> ServoCommand:
+        timestamp = float(now)
+        pulse_elapsed_s = (
+            None
+            if self.lateral_pulse_started_at is None
+            else max(0.0, timestamp - self.lateral_pulse_started_at)
+        )
+        self.lateral_pulse_state = LateralPulseState.SETTLING
+        self.lateral_pulse_started_at = None
+        self.lateral_pulse_deadline = None
+        self.lateral_pulse_error_sign = 0
+        self.lateral_settle_started_at = timestamp
+        self.lateral_settle_deadline = timestamp + self.lateral_pulse_settle_s
+        self.lateral_settle_samples.clear()
+        self.lateral_pulse_last_stop_reason = str(reason)
+        if pulse_elapsed_s is not None:
+            self.lateral_pulse_last_elapsed_s = pulse_elapsed_s
+        self.lateral_settle_last_elapsed_s = None
+        self.current = self._zero()
+        elapsed = "n/a" if pulse_elapsed_s is None else f"{pulse_elapsed_s:.3f}"
+        self._log_lateral_pulse(
+            f"STOP reason={reason} pulse_elapsed_s={elapsed} "
+            f"settle_s={self.lateral_pulse_settle_s:.3f}"
+        )
+        return self.current
+
+    def restart_lateral_settle(self, *, now: float, reason: str) -> bool:
+        """Stop near-field lateral motion and restart its fresh-frame wait."""
+
+        if (
+            not self.lateral_pulse_mode_active
+            or self.lateral_pulse_state is LateralPulseState.INACTIVE
+        ):
+            return False
+        self._integrate(now)
+        self._begin_lateral_settle(now=now, reason=reason)
+        return True
+
+    def _expire_lateral_pulse(self, now: float) -> bool:
+        deadline = self.lateral_pulse_deadline
+        if (
+            self.lateral_pulse_state is not LateralPulseState.PULSING
+            or deadline is None
+            or float(now) + 1.0e-12 < deadline
+        ):
+            return False
+        self._begin_lateral_settle(
+            now=now,
+            reason=f"{self.lateral_pulse_max_s * 1000.0:g} ms timeout",
+        )
+        return True
+
+    def _process_lateral_pulse_observation(
+        self, right_error: float, *, now: float
+    ) -> tuple[bool, float]:
+        """Return whether pulse control owns this update and its decision error."""
+
+        raw_error = float(right_error)
+        if self.lateral_pulse_state is LateralPulseState.PULSING:
+            pulse_sign = self.lateral_pulse_error_sign
+            raw_sign = 1 if raw_error > 0.0 else -1 if raw_error < 0.0 else 0
+            if abs(raw_error) <= self.lateral_tolerance_m + 1.0e-12:
+                self._begin_lateral_settle(
+                    now=now, reason="raw lateral error entered tolerance"
+                )
+            elif pulse_sign and raw_sign != pulse_sign:
+                self._begin_lateral_settle(
+                    now=now, reason="raw lateral error crossed zero"
+                )
+            elif self._expire_lateral_pulse(now):
+                pass
+            return True, raw_error
+
+        if self.lateral_pulse_state is LateralPulseState.SETTLING:
+            self.current = self._zero()
+            settle_started_at = self.lateral_settle_started_at
+            if (
+                settle_started_at is not None
+                and float(now) <= settle_started_at + 1.0e-12
+            ):
+                return True, raw_error
+            self.lateral_settle_samples.append(raw_error)
+            deadline = self.lateral_settle_deadline
+            if deadline is None or float(now) + 1.0e-12 < deadline:
+                return True, raw_error
+            if len(self.lateral_settle_samples) < self.lateral_pulse_sample_frames:
+                return True, raw_error
+
+            decision_error = float(
+                sum(self.lateral_settle_samples)
+                / len(self.lateral_settle_samples)
+            )
+            samples = tuple(self.lateral_settle_samples)
+            self.lateral_last_decision_samples = samples
+            self.lateral_settle_last_elapsed_s = (
+                None
+                if self.lateral_settle_started_at is None
+                else max(0.0, float(now) - self.lateral_settle_started_at)
+            )
+            self.lateral_pulse_state = LateralPulseState.INACTIVE
+            self.lateral_settle_started_at = None
+            self.lateral_settle_deadline = None
+            self.lateral_decision_error_m = decision_error
+            self._log_lateral_pulse(
+                f"DECIDE samples_m={samples!r} average_m={decision_error:.4f}"
+            )
+            if (
+                abs(decision_error)
+                > self.lateral_pulse_exit_m + 1.0e-12
+            ):
+                self.lateral_pulse_mode_active = False
+                self._log_lateral_pulse(
+                    "EXIT_CONTINUOUS "
+                    f"average_m={decision_error:.4f} "
+                    f"threshold_m={self.lateral_pulse_exit_m:.4f}"
+                )
+            return False, decision_error
+
+        magnitude = abs(raw_error)
+        if not self.lateral_pulse_mode_active and magnitude < self.lateral_pulse_enter_m:
+            self.lateral_pulse_mode_active = True
+            self._log_lateral_pulse(
+                "ENTER "
+                f"error_m={raw_error:.4f} "
+                f"threshold_m={self.lateral_pulse_enter_m:.4f}"
+            )
+        return False, raw_error
+
+    def _lateral_command(self, right_error: float, *, now: float) -> ServoCommand:
+        if abs(right_error) <= self.lateral_tolerance_m + 1.0e-12:
+            self.current = self._zero()
+            return self.current
+        if self.lateral_pulse_mode_active:
+            return self._begin_lateral_pulse(right_error, now=now)
+        return self._continuous_lateral_command(right_error)
+
     def stop_if_timed_out(self, *, now: float) -> bool:
         if self.terminal:
             return True
         self._integrate(now)
+        self._expire_lateral_pulse(now)
         if self.phase is ServoPhase.POST_STOP_SAMPLING:
             self._post_stop_sampling_complete()
             return self.terminal
@@ -1562,7 +1837,7 @@ class VisualServoController:
         return self.current
 
     def _forward_approach_vx(self, forward_error: float) -> float:
-        if self.chest_approach_only:
+        if self.chest_approach_only and not self.joint_completion_active:
             return math.nextafter(self.min_linear_speed_m_s, math.inf)
         if forward_error <= self.forward_tolerance_m + 1.0e-12:
             return 0.0
@@ -1676,48 +1951,6 @@ class VisualServoController:
         self.last_errors = errors
         return errors
 
-    def _update_joint_completion(
-        self,
-        *,
-        forward_error: float,
-        right_error: float,
-        yaw_error: float,
-    ) -> ServoCommand | None:
-        """Apply the chest-position/head-yaw completion gate in any phase."""
-
-        forward_stable = (
-            abs(forward_error) <= self.forward_tolerance_m + 1.0e-12
-        )
-        lateral_stable = (
-            abs(right_error) <= self.lateral_tolerance_m + 1.0e-12
-        )
-        if not forward_stable:
-            self.stable_frames = 0
-            if forward_error < -self.forward_tolerance_m:
-                desired_vx = self._clip(0.5 * forward_error, 0.20)
-                vx, _ = self._enforce_min_linear_speed(desired_vx, 0.0)
-                self.current = ServoCommand(vx, 0.0, 0.0)
-                return self.current
-            return None
-        if not lateral_stable:
-            self.stable_frames = 0
-            desired_vy = self._clip(
-                -0.6 * right_error, self.max_lateral_speed_m_s
-            )
-            _, vy = self._enforce_min_linear_speed(0.0, desired_vy)
-            self.current = ServoCommand(0.0, vy, 0.0)
-            return self.current
-
-        yaw_stable = self._yaw_is_stable(yaw_error)
-        self.stable_frames = self.stable_frames + 1 if yaw_stable else 0
-        if not yaw_stable:
-            return self._yaw_command(speed_limit=self.yaw_trim_speed_rad_s)
-
-        self.current = self._zero()
-        if self.stable_frames < self.stable_frames_required:
-            return self.current
-        return self._begin_post_stop_sampling()
-
     def update(
         self,
         observation: RawServoObservation,
@@ -1733,7 +1966,26 @@ class VisualServoController:
         limited = self._check_limits(now)
         if limited is not None:
             return limited
-        if self.phase is ServoPhase.VERTICAL_RECENTER and not joint_completion:
+        if joint_completion:
+            self.joint_completion_active = True
+            if self.phase is ServoPhase.VERTICAL_RECENTER:
+                self._transition(
+                    ServoPhase.FORWARD_APPROACH,
+                    "joint completion sequence activated",
+                )
+        if self.phase is ServoPhase.VERTICAL_RECENTER:
+            if self.lateral_pulse_state in {
+                LateralPulseState.PULSING,
+                LateralPulseState.SETTLING,
+            }:
+                pulse_owns_update, _ = (
+                    self._process_lateral_pulse_observation(
+                        observation.target.right_m,
+                        now=now,
+                    )
+                )
+                if pulse_owns_update:
+                    return self.current
             return self._update_vertical_recenter(observation, now=now)
         distance_gated_approach = self._distance_gated_forward_approach(
             observation
@@ -1763,7 +2015,10 @@ class VisualServoController:
             self.last_errors = (forward_error, right_error, yaw_error)
         else:
             if (
-                not self.chest_approach_only
+                (
+                    not self.chest_approach_only
+                    or self.joint_completion_active
+                )
                 and self.far_approach_cutoff_m is not None
                 and self.phase
                 in {ServoPhase.FORWARD_APPROACH, ServoPhase.FORWARD_RECENTER}
@@ -1791,14 +2046,11 @@ class VisualServoController:
             else:
                 self._post_stop_sampling_complete()
                 return self.current
-        if joint_completion:
-            joint_command = self._update_joint_completion(
-                forward_error=forward_error,
-                right_error=right_error,
-                yaw_error=yaw_error,
-            )
-            if joint_command is not None:
-                return joint_command
+        pulse_owns_update, right_error = (
+            self._process_lateral_pulse_observation(right_error, now=now)
+        )
+        if pulse_owns_update:
+            return self.current
         if self.phase is ServoPhase.VERTICAL_RECENTER:
             return self._update_vertical_recenter(observation, now=now)
         if self.phase is ServoPhase.GLOBAL_YAW_ALIGN:
@@ -1842,7 +2094,7 @@ class VisualServoController:
                 )
                 return self._update_forward_recenter(observation, now=now)
             self.invalid_frames = 0
-            if self.chest_approach_only:
+            if self.chest_approach_only and not self.joint_completion_active:
                 self.forward_approach_stable_frames = 0
                 self.current = ServoCommand(
                     self._forward_approach_vx(forward_error),
@@ -1927,12 +2179,7 @@ class VisualServoController:
                 self.resume_phase = None
                 return self._transition(resume, "target recentered")
             controlled_right = 0.0 if abs(right_error) <= 0.03 else right_error
-            desired_vy = self._clip(
-                -0.6 * controlled_right, self.max_lateral_speed_m_s
-            )
-            vx, vy = self._enforce_min_linear_speed(0.0, desired_vy)
-            self.current = ServoCommand(vx, vy, 0.0)
-            return self.current
+            return self._lateral_command(controlled_right, now=now)
 
         if self.phase is ServoPhase.YAW_TRIM:
             stable_yaw = self._yaw_is_stable(yaw_error)
@@ -1988,15 +2235,10 @@ class VisualServoController:
             # changing standoff distance. Sending vx and vy together produces
             # poor diagonal steps on the physical robot.
             if not lateral_stable:
-                desired_vx = 0.0
-                desired_vy = self._clip(
-                    -0.6 * right_error, self.max_lateral_speed_m_s
-                )
-            else:
-                desired_vx = self._clip(0.5 * forward_error, 0.20)
-                desired_vy = 0.0
-            vx, vy = self._enforce_min_linear_speed(desired_vx, desired_vy)
-            self.current = ServoCommand(vx, vy, 0.0)
+                return self._lateral_command(right_error, now=now)
+            desired_vx = self._clip(0.5 * forward_error, 0.20)
+            vx, _ = self._enforce_min_linear_speed(desired_vx, 0.0)
+            self.current = ServoCommand(vx, 0.0, 0.0)
             return self.current
 
         return self.current
@@ -2015,6 +2257,12 @@ class VisualServoController:
         if not integrated:
             self._integrate(now)
         self._propagate_yaw_error(orientation)
+        if self.lateral_pulse_state is LateralPulseState.PULSING:
+            self._begin_lateral_settle(
+                now=now, reason=f"invalid observation: {reason}"
+            )
+        elif self.lateral_pulse_state is LateralPulseState.SETTLING:
+            self.current = self._zero()
         if self.phase is ServoPhase.POST_STOP_SAMPLING:
             self.current = self._zero()
             self.invalid_frames += 1
@@ -2029,6 +2277,11 @@ class VisualServoController:
         if self.phase is ServoPhase.VERTICAL_RECENTER:
             self.vertical_recenter_stable_frames = 0
             self.invalid_frames = 0
+            if self.lateral_pulse_state is LateralPulseState.SETTLING:
+                self.current = self._zero()
+                if hard:
+                    return self._stop(reason)
+                return self.current
             if self._vertical_recenter_timed_out(now):
                 return self.current
             self.current = self._vertical_recenter_command()
@@ -2057,6 +2310,12 @@ class VisualServoController:
             return self.current
         self._integrate(now)
         self._propagate_yaw_error(orientation)
+        if self.lateral_pulse_state is LateralPulseState.PULSING:
+            self._begin_lateral_settle(
+                now=now, reason="transient invalid observation"
+            )
+        elif self.lateral_pulse_state is LateralPulseState.SETTLING:
+            self.current = self._zero()
         limited = self._check_limits(now)
         if limited is not None:
             return limited
@@ -2477,6 +2736,13 @@ class RawServoRuntime:
             max_run_s=config.raw_max_run_s,
             min_linear_speed_m_s=config.raw_min_linear_speed_m_s,
             max_lateral_speed_m_s=config.raw_max_lateral_speed_m_s,
+            lateral_pulse_enter_m=config.raw_lateral_pulse_enter_m,
+            lateral_pulse_exit_m=config.raw_lateral_pulse_exit_m,
+            lateral_pulse_max_s=config.raw_lateral_pulse_max_s,
+            lateral_pulse_settle_s=config.raw_lateral_pulse_settle_s,
+            lateral_pulse_sample_frames=(
+                config.raw_lateral_pulse_sample_frames
+            ),
             min_yaw_speed_rad_s=config.raw_min_yaw_speed_rad_s,
             yaw_tolerance_deg=config.raw_yaw_tolerance_deg,
             yaw_coarse_speed_rad_s=config.raw_yaw_coarse_speed_rad_s,
@@ -2489,6 +2755,7 @@ class RawServoRuntime:
             far_approach_cutoff_m=config.raw_head_approach_cutoff_m,
             horizontal_guard_fraction=config.raw_horizontal_guard_fraction,
             horizontal_recovery_fraction=config.raw_horizontal_recovery_fraction,
+            event_logger=self.logger,
         )
         self.generation = 0
         self.phase = "idle"
@@ -2501,7 +2768,9 @@ class RawServoRuntime:
         self.active_camera_stream: str | None = None
         self.control_source_stream: str | None = None
         self.head_monitor_hold_active = False
+        self.head_yaw_loss_hold_active = False
         self.vertical_recenter_armed = False
+        self.camera_switch_lateral_settle_active = False
         self.viewer_target_bbox_xyxy: (
             tuple[float, float, float, float] | None
         ) = None
@@ -2545,6 +2814,8 @@ class RawServoRuntime:
         self,
         details: Mapping[str, Any],
         observation: RawServoObservation,
+        *,
+        now: float | None = None,
     ) -> None:
         selected = (
             self._event_control_source_stream(details)
@@ -2560,6 +2831,14 @@ class RawServoRuntime:
         )
         if selected == previous:
             return
+        self.controller.restart_lateral_settle(
+            now=(
+                self.controller.last_update_time
+                if now is None
+                else float(now)
+            ),
+            reason=f"control source changed from {previous} to {selected}",
+        )
         if self.controller.filtered is not None:
             self.controller.filtered[0] = observation.target.forward_m
             self.controller.filtered[1] = observation.target.right_m
@@ -2626,6 +2905,8 @@ class RawServoRuntime:
         self,
         command: ServoCommand,
         details: Mapping[str, Any],
+        *,
+        now: float,
     ) -> ServoCommand:
         """Stop chest motion while the head target confirmation gate is active."""
 
@@ -2644,6 +2925,10 @@ class RawServoRuntime:
         was_active = self.head_monitor_hold_active
         self.head_monitor_hold_active = requested
         if requested:
+            if not was_active:
+                self.controller.restart_lateral_settle(
+                    now=now, reason="head monitor hold"
+                )
             command = self._zero()
             self.controller.current = command
         elif was_active:
@@ -2658,6 +2943,8 @@ class RawServoRuntime:
         self,
         command: ServoCommand,
         details: Mapping[str, Any],
+        *,
+        now: float,
     ) -> ServoCommand:
         """Hold zero during the second ten-frame head-yaw loss window."""
 
@@ -2667,17 +2954,29 @@ class RawServoRuntime:
             or self.control_source_stream
         )
         head_yaw_loss = details.get("head_yaw_loss")
-        if (
-            target_stream != chest_stream
-            or not isinstance(head_yaw_loss, Mapping)
-            or head_yaw_loss.get("stage") not in {"zero_hold", "switch_state"}
-        ):
+        hold_requested = (
+            target_stream == chest_stream
+            and isinstance(head_yaw_loss, Mapping)
+            and head_yaw_loss.get("stage") in {"zero_hold", "switch_state"}
+        )
+        if not hold_requested:
+            self.head_yaw_loss_hold_active = False
             return command
+        if not self.head_yaw_loss_hold_active:
+            self.controller.restart_lateral_settle(
+                now=now, reason="head yaw loss hold"
+            )
+        self.head_yaw_loss_hold_active = True
         command = self._zero()
         self.controller.current = command
         return command
 
-    def _reset_controller(self, now: float) -> None:
+    def _reset_controller(
+        self,
+        now: float,
+        *,
+        lateral_settle_reason: str | None = None,
+    ) -> None:
         chest_stream = self.config.dual_chest_camera_stream
         active_stream = self.active_camera_stream
         chest_camera_active = active_stream == chest_stream
@@ -2698,6 +2997,12 @@ class RawServoRuntime:
                 else ServoPhase.FORWARD_APPROACH
             ),
         )
+        if lateral_settle_reason is not None:
+            self.controller.lateral_pulse_mode_active = True
+            self.controller._begin_lateral_settle(
+                now=now,
+                reason=lateral_settle_reason,
+            )
 
     def _clear_viewer_overlay(self) -> None:
         self.viewer_target_bbox_xyxy = None
@@ -2908,7 +3213,32 @@ class RawServoRuntime:
             "control_source_stream": self.control_source_stream,
             "forward_tolerance_m": self.controller.forward_tolerance_m,
             "lateral_tolerance_m": self.controller.lateral_tolerance_m,
+            "lateral_pulse_state": self.controller.lateral_pulse_state,
+            "lateral_pulse_mode_active": (
+                self.controller.lateral_pulse_mode_active
+            ),
+            "lateral_pulse_elapsed_s": (
+                self.controller.lateral_pulse_elapsed_s
+            ),
+            "lateral_settle_elapsed_s": (
+                self.controller.lateral_settle_elapsed_s
+            ),
+            "lateral_pulse_sample_count": len(
+                self.controller.lateral_diagnostic_samples
+            ),
+            "lateral_pulse_samples_m": list(
+                self.controller.lateral_diagnostic_samples
+            ),
+            "lateral_pulse_decision_error_m": (
+                self.controller.lateral_decision_error_m
+            ),
+            "lateral_pulse_last_stop_reason": (
+                self.controller.lateral_pulse_last_stop_reason
+            ),
             "chest_approach_only": self.controller.chest_approach_only,
+            "joint_completion_active": (
+                self.controller.joint_completion_active
+            ),
             "head_monitor_hold_active": self.head_monitor_hold_active,
             "filtered_errors": list(self.controller.last_errors),
             "visual_yaw_error_rad": self.controller.last_visual_yaw_error_rad,
@@ -2971,6 +3301,8 @@ class RawServoRuntime:
         self._clear_viewer_overlay()
         self.vertical_recenter_armed = False
         self.head_monitor_hold_active = False
+        self.head_yaw_loss_hold_active = False
+        self.camera_switch_lateral_settle_active = False
         self.active_camera_stream = None
         self.control_source_stream = None
         self.last_observation_at = None
@@ -2980,6 +3312,9 @@ class RawServoRuntime:
     def _finish(self, reason: str, now: float) -> None:
         if self.phase == "idle":
             return
+        self.controller._integrate(now)
+        self.controller._clear_lateral_pulse_mode()
+        self.controller.current = self._zero()
         self.gate.cancel(self.generation)
         self.phase = "idle"
         self._clear_session_state()
@@ -3026,6 +3361,9 @@ class RawServoRuntime:
     ) -> None:
         self.gate.cancel()
         self._drain_waiting_observations()
+        self.controller._integrate(now)
+        self.controller._clear_lateral_pulse_mode()
+        self.controller.current = self._zero()
         self.generation = int(generation)
         self.phase = "idle"
         self._clear_session_state()
@@ -3104,15 +3442,38 @@ class RawServoRuntime:
                 self.vertical_recenter_armed = False
             self._clear_viewer_overlay()
             self.head_monitor_hold_active = False
+            self.head_yaw_loss_hold_active = False
             self.active_camera_stream = next_stream
             self.control_source_stream = next_stream
             self.phase = "switching"
-            self._reset_controller(now)
+            self.camera_switch_lateral_settle_active = (
+                self.controller.lateral_pulse_mode_active
+                and self.controller.lateral_pulse_state
+                in {
+                    LateralPulseState.PULSING,
+                    LateralPulseState.SETTLING,
+                }
+            )
+            self._reset_controller(
+                now,
+                lateral_settle_reason=(
+                    "camera switching"
+                    if self.camera_switch_lateral_settle_active
+                    else None
+                ),
+            )
             self.last_observation_at = None
             self.soft_stale = False
             self.last_applied_frame_index = None
             command = self._zero()
-            self._publish(command, "hold")
+            self._publish(
+                command,
+                (
+                    "visual_servo"
+                    if self.camera_switch_lateral_settle_active
+                    else "hold"
+                ),
+            )
             self.next_publish_at = float(now) + 1.0 / self.config.planner_hz
             self.logger(
                 "[RawServo] HOLD switching camera "
@@ -3130,6 +3491,9 @@ class RawServoRuntime:
                 self._discard_event_diagnostic(event)
                 return False
             self.head_monitor_hold_active = True
+            self.controller.restart_lateral_settle(
+                now=now, reason="head monitor hold event"
+            )
             command = self._zero()
             self.controller.current = command
             self._publish(command, "visual_servo")
@@ -3166,7 +3530,15 @@ class RawServoRuntime:
                     f"stream={self.active_camera_stream}"
                 )
             command = self._zero()
-            self._publish(command, "hold")
+            self._publish(
+                command,
+                (
+                    "visual_servo"
+                    if self.controller.lateral_pulse_state
+                    is LateralPulseState.SETTLING
+                    else "hold"
+                ),
+            )
             self.next_publish_at = float(now) + 1.0 / self.config.planner_hz
             self._discard_event_diagnostic(event)
             return True
@@ -3198,13 +3570,26 @@ class RawServoRuntime:
                 if self.navigation_started_at is None:
                     self.navigation_started_at = produced_at
                 self.phase = "aligning"
-                self._reset_controller(now)
+                self._reset_controller(
+                    now,
+                    lateral_settle_reason=(
+                        "camera switch initialized"
+                        if self.camera_switch_lateral_settle_active
+                        else None
+                    ),
+                )
+                self.camera_switch_lateral_settle_active = False
             elif self.soft_stale:
                 self.soft_stale = False
                 recovered_from_soft_stale = True
+                self.controller.restart_lateral_settle(
+                    now=now, reason="camera stream recovered"
+                )
                 self.logger("[RawServo] RESUME camera stream recovered")
             self.last_observation_at = float(now) if initializing else produced_at
-            self._prepare_control_source(details, event.observation)
+            self._prepare_control_source(
+                details, event.observation, now=now
+            )
             joint_completion = self._joint_completion_enabled(
                 details, event.observation
             )
@@ -3242,8 +3627,8 @@ class RawServoRuntime:
         else:
             self._discard_event_diagnostic(event)
             return False
-        command = self._apply_head_monitor_hold(command, details)
-        command = self._apply_head_yaw_loss_hold(command, details)
+        command = self._apply_head_monitor_hold(command, details, now=now)
+        command = self._apply_head_yaw_loss_hold(command, details, now=now)
         if (
             previous_phase is ServoPhase.VERTICAL_RECENTER
             and self.controller.phase is not ServoPhase.VERTICAL_RECENTER
@@ -3368,6 +3753,7 @@ class RawServoRuntime:
         ):
             self._finish("maximum run time reached", timestamp)
             return self._zero()
+        pulse_state_before = self.controller.lateral_pulse_state
         if self.phase == "aligning":
             terminal = self.controller.stop_if_timed_out(now=timestamp)
             if (
@@ -3382,6 +3768,16 @@ class RawServoRuntime:
                     timestamp,
                 )
                 return self._zero()
+        pulse_stopped_on_deadline = (
+            pulse_state_before is LateralPulseState.PULSING
+            and self.controller.lateral_pulse_state
+            is LateralPulseState.SETTLING
+        )
+        if pulse_stopped_on_deadline:
+            command = self._zero()
+            self._publish(command, "visual_servo")
+            self.next_publish_at = timestamp + 1.0 / self.config.planner_hz
+            return command
         if timestamp + 1.0e-12 < self.next_publish_at:
             return None
         if (
@@ -3391,8 +3787,11 @@ class RawServoRuntime:
         ):
             if not self.soft_stale:
                 self.soft_stale = True
-                self.controller._integrate(timestamp)
-                self.controller.current = self._zero()
+                restarted = self.controller.restart_lateral_settle(
+                    now=timestamp, reason="camera stream soft stale"
+                )
+                if not restarted:
+                    self.controller.current = self._zero()
                 self._clear_viewer_overlay()
                 self.logger("[RawServo] HOLD camera stream soft stale")
         command = (
@@ -3400,14 +3799,19 @@ class RawServoRuntime:
             if self.phase == "aligning" and not self.soft_stale
             else self._zero()
         )
-        action = (
-            "stop"
-            if self.phase == "aligning"
+        if (
+            self.phase == "aligning"
             and self.controller.phase is ServoPhase.POST_STOP_SAMPLING
-            else "visual_servo"
-            if self.phase == "aligning"
-            else "hold"
-        )
+        ):
+            action = "stop"
+        elif (
+            self.phase == "aligning"
+            or self.controller.lateral_pulse_state
+            is LateralPulseState.SETTLING
+        ):
+            action = "visual_servo"
+        else:
+            action = "hold"
         self.next_publish_at = timestamp + 1.0 / self.config.planner_hz
         self._publish(command, action)
         return command
