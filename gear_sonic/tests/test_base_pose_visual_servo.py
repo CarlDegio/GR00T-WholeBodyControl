@@ -892,7 +892,7 @@ def test_chest_approach_mode_recenters_at_horizontal_guard() -> None:
     assert command.wz == 0.0
 
 
-def test_head_far_approach_reuses_forward_logic_until_cutoff() -> None:
+def test_head_approach_continues_past_cutoff_until_target_distance() -> None:
     controller = VisualServoController(
         target_distance_m=1.1,
         far_approach_cutoff_m=1.3,
@@ -950,10 +950,33 @@ def test_head_far_approach_reuses_forward_logic_until_cutoff() -> None:
     )
     command = controller.update(
         at_cutoff,
-        now=0.3,
+        now=0.7,
         orientation=orientation,
     )
 
+    assert controller.phase is ServoPhase.FORWARD_APPROACH
+    assert command.velocity == (0.0, 0.0, 0.0)
+    command = controller.update(at_cutoff, now=0.8, orientation=orientation)
+    assert command.vx > 0.35
+    assert command.vy == 0.0
+    assert command.wz == 0.0
+    assert controller.desired_heading_rad is None
+    assert not controller.yaw_alignment_required
+
+    at_target = replace(
+        at_cutoff,
+        target=replace(at_cutoff.target, forward_m=1.2),
+    )
+    for index in range(controller.recenter_frames_required):
+        command = controller.update(
+            at_target, now=0.9 + 0.1 * index, orientation=orientation
+        )
+        assert command.velocity == (0.0, 0.0, 0.0)
+    assert controller.phase is ServoPhase.YAW_ALIGN
+    assert controller.yaw_alignment_required
+    assert controller.desired_heading_rad is None
+
+    command = controller.update(at_target, now=1.2, orientation=orientation)
     assert controller.phase is ServoPhase.YAW_ALIGN
     assert command.vx == 0.0
     assert command.vy == 0.0
@@ -1464,7 +1487,10 @@ def test_completion_ignores_virtual_heading_setpoint_error() -> None:
     assert controller.terminal_reason == "aligned"
 
 
-def test_joint_completion_uses_the_standard_phase_order() -> None:
+@pytest.mark.parametrize("chest_approach_only", (False, True))
+def test_joint_completion_approaches_then_yaws_then_moves_laterally(
+    chest_approach_only: bool,
+) -> None:
     controller = VisualServoController(
         target_distance_m=0.7,
         far_approach_cutoff_m=1.0,
@@ -1473,7 +1499,7 @@ def test_joint_completion_uses_the_standard_phase_order() -> None:
         stable_frames=1,
         ema_alpha=1.0,
         lateral_pulse_enter_m=0.01,
-        chest_approach_only=True,
+        chest_approach_only=chest_approach_only,
     )
     controller.reset(0.0, initial_phase=ServoPhase.FORWARD_APPROACH)
 
@@ -1498,20 +1524,38 @@ def test_joint_completion_uses_the_standard_phase_order() -> None:
             yaw_align_geometry_camera_stream="ego_view",
         )
 
-    far_command = controller.update(
-        observation(1.2, 0.20, math.radians(20.0)),
-        now=0.1,
-        joint_completion=True,
-    )
-    assert controller.joint_completion_active
-    assert controller.phase is ServoPhase.FORWARD_APPROACH
-    assert far_command.vx > 0.0
-    assert far_command.vy == 0.0
-    assert far_command.wz == 0.0
+    # Crossing the old cutoff repeatedly, including a missing head-yaw frame,
+    # must not interrupt distance correction or start yaw/lateral control.
+    for index, forward_m in enumerate((1.2, 1.01, 0.99, 1.01, 0.99, 0.9)):
+        value = observation(forward_m, 0.20, math.radians(70.0))
+        if index == 4:
+            value = replace(value, yaw_align_geometry=None)
+        command = controller.update(
+            value,
+            now=0.1 + 0.1 * index,
+            joint_completion=index != 4,
+        )
+        assert controller.joint_completion_active
+        assert controller.phase is ServoPhase.FORWARD_APPROACH
+        assert command.vx > 0.0
+        assert command.vy == 0.0
+        assert command.wz == 0.0
+        assert not controller.yaw_alignment_required
+
+    for index in range(controller.recenter_frames_required):
+        command = controller.update(
+            observation(0.75, 0.20, math.radians(70.0)),
+            now=0.7 + 0.1 * index,
+            joint_completion=True,
+        )
+        assert command.velocity == (0.0, 0.0, 0.0)
+        if index < controller.recenter_frames_required - 1:
+            assert controller.phase is ServoPhase.FORWARD_APPROACH
+    assert controller.phase is ServoPhase.YAW_ALIGN
 
     coarse_command = controller.update(
-        observation(0.9, 0.20, math.radians(20.0)),
-        now=0.2,
+        observation(0.7, 0.20, math.radians(20.0)),
+        now=1.0,
         joint_completion=True,
     )
     assert controller.phase is ServoPhase.YAW_ALIGN
@@ -1520,16 +1564,16 @@ def test_joint_completion_uses_the_standard_phase_order() -> None:
     assert coarse_command.wz > 0.0
 
     trim_entry = controller.update(
-        observation(0.9, 0.20, math.radians(5.0)),
-        now=0.3,
+        observation(0.7, 0.20, math.radians(5.0)),
+        now=1.1,
         joint_completion=True,
     )
     assert controller.phase is ServoPhase.YAW_TRIM
     assert trim_entry.velocity == (0.0, 0.0, 0.0)
 
     trim_command = controller.update(
-        observation(0.9, 0.20, math.radians(10.5)),
-        now=0.4,
+        observation(0.7, 0.20, math.radians(10.5)),
+        now=1.2,
         joint_completion=True,
     )
     assert controller.phase is ServoPhase.YAW_TRIM
@@ -1539,25 +1583,27 @@ def test_joint_completion_uses_the_standard_phase_order() -> None:
 
     for frame_index in range(controller.yaw_lock_frames_required):
         command = controller.update(
-            observation(0.9, 0.20, 0.0),
-            now=0.5 + 0.1 * frame_index,
+            observation(0.7, 0.20, 0.0),
+            now=1.3 + 0.1 * frame_index,
             joint_completion=True,
         )
         assert command.vy == 0.0
     assert controller.phase is ServoPhase.TRANSLATE_TARGET
 
     lateral_command = controller.update(
-        observation(0.9, 0.20, 0.0),
-        now=0.8,
+        observation(0.7, 0.20, 0.0),
+        now=1.6,
         joint_completion=True,
     )
     assert lateral_command.vx == 0.0
     assert lateral_command.vy < 0.0
     assert lateral_command.wz == 0.0
 
+    # Distance/yaw drift introduced by the turn or lateral motion is still
+    # corrected before completion.
     distance_command = controller.update(
         observation(0.9, 0.0, 0.0),
-        now=0.9,
+        now=1.7,
         joint_completion=True,
     )
     assert distance_command.vx > 0.0
@@ -1566,7 +1612,7 @@ def test_joint_completion_uses_the_standard_phase_order() -> None:
 
     final_yaw_command = controller.update(
         observation(0.7, 0.0, math.radians(15.0)),
-        now=1.0,
+        now=1.8,
         joint_completion=True,
     )
     assert controller.phase is ServoPhase.GLOBAL_YAW_ALIGN
@@ -1577,20 +1623,55 @@ def test_joint_completion_uses_the_standard_phase_order() -> None:
     for frame_index in range(controller.yaw_lock_frames_required):
         controller.update(
             observation(0.7, 0.0, 0.0),
-            now=1.1 + 0.1 * frame_index,
+            now=1.9 + 0.1 * frame_index,
             joint_completion=True,
         )
     assert controller.phase is ServoPhase.TRANSLATE_TARGET
 
     final_command = controller.update(
         observation(0.7, 0.0, 0.0),
-        now=1.4,
+        now=2.2,
         joint_completion=True,
     )
 
     assert final_command.velocity == (0.0, 0.0, 0.0)
     assert controller.phase is ServoPhase.DONE
     assert controller.terminal_reason == "aligned"
+
+
+@pytest.mark.parametrize("chest_approach_only", (False, True))
+def test_approach_corrects_overshoot_and_requires_consecutive_distance_samples(
+    chest_approach_only: bool,
+) -> None:
+    controller = VisualServoController(
+        target_distance_m=0.9,
+        far_approach_cutoff_m=1.2,
+        forward_tolerance_m=0.1,
+        chest_approach_only=chest_approach_only,
+    )
+    controller.reset(0.0, initial_phase=ServoPhase.FORWARD_APPROACH)
+    for index, (distance, direction) in enumerate(
+        ((0.9, 0), (0.9, 0), (0.7, -1), (0.9, 0), (1.1, 1), (0.9, 0), (0.9, 0))
+    ):
+        value = _near_field_observation(0.2, forward_m=distance)
+        command = controller.update(
+            value, now=0.1 + 0.1 * index, joint_completion=True
+        )
+        assert controller.phase is ServoPhase.FORWARD_APPROACH
+        assert command.vy == 0.0
+        assert command.wz == 0.0
+        if direction == 0:
+            assert command.vx == 0.0
+        else:
+            assert direction * command.vx > 0.0
+
+    command = controller.update(
+        _near_field_observation(0.2, forward_m=0.9),
+        now=0.8,
+        joint_completion=True,
+    )
+    assert command.velocity == (0.0, 0.0, 0.0)
+    assert controller.phase is ServoPhase.YAW_ALIGN
 
 
 def test_joint_completion_defaults_to_three_stable_frames() -> None:
@@ -1760,7 +1841,7 @@ def test_vertical_recenter_exits_at_eighty_percent_box_bottom() -> None:
     )
 
     assert command.velocity == (0.0, 0.0, 0.0)
-    assert controller.phase is ServoPhase.YAW_ALIGN
+    assert controller.phase is ServoPhase.FORWARD_APPROACH
     assert controller.vertical_recenter_stable_frames == 1
 
 
@@ -1774,8 +1855,26 @@ def test_vertical_recenter_exits_after_point_seven_seconds() -> None:
     assert not controller.stop_if_timed_out(now=1.799)
     assert controller.phase is ServoPhase.VERTICAL_RECENTER
     assert not controller.stop_if_timed_out(now=1.8)
-    assert controller.phase is ServoPhase.YAW_ALIGN
+    assert controller.phase is ServoPhase.FORWARD_APPROACH
     assert controller.vertical_recenter_elapsed_s == pytest.approx(0.7)
+
+
+def test_skipped_vertical_recenter_still_approaches_before_yaw() -> None:
+    controller = VisualServoController(
+        target_distance_m=0.9, far_approach_cutoff_m=1.3
+    )
+    controller.reset(0.0, initial_phase=ServoPhase.VERTICAL_RECENTER)
+    observation = _observation(bbox=(240.0, 120.0, 400.0, 360.0), yaw=0.4)
+
+    command = controller.update(observation, now=0.1)
+    assert controller.phase is ServoPhase.FORWARD_APPROACH
+    assert command.velocity == (0.0, 0.0, 0.0)
+
+    command = controller.update(observation, now=0.2)
+    assert controller.phase is ServoPhase.FORWARD_APPROACH
+    assert command.vx > 0.0
+    assert command.vy == 0.0
+    assert command.wz == 0.0
 
 
 def test_normal_head_flow_does_not_use_vertical_target_position() -> None:

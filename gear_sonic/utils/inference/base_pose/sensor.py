@@ -304,9 +304,10 @@ class SensorGatewayDualBasePoseCamera:
         poll_hz: float = 60.0,
         client: SensorGatewayClient | None = None,
         client_factory: Callable[[str], Any] | None = None,
+        allow_single: bool = False,
     ) -> None:
         values = {str(name): str(depth) for name, depth in stream_depths.items()}
-        if len(values) != 2 or any(
+        if len(values) not in ({1, 2} if allow_single else {2}) or any(
             not name or not depth for name, depth in values.items()
         ):
             raise ValueError("dual BasePose requires two camera/depth stream pairs")

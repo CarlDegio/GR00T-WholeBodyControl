@@ -393,9 +393,11 @@ def build_navdp_planner_command(config: InferenceLaunchConfig, repo_root: Path) 
 def build_planner_velocity_executor_command(
     config: InferenceLaunchConfig, repo_root: Path
 ) -> str:
+    # NavDP heading goals (including the LA panorama) need SONIC yaw even when
+    # the experiment skips BasePose and hands navigation directly to VLA.
     orientation_output = (
         "--publish-orientation "
-        if config.base_pose_enabled
+        if config.base_pose_enabled or _uses_navdp(config)
         else ""
     )
     return (
@@ -722,6 +724,8 @@ def _check_prerequisites(config: InferenceLaunchConfig):
             ),
             (Path("/opt/ros/humble/setup.bash"), "ROS2 Humble"),
         ):
+            if label in {"X-NavDP server", "NavDP checkpoint"} and not _uses_navdp(config):
+                continue
             if not path.exists():
                 errors.append(f"{label} not found: {path}")
         camera_endpoint = profile.endpoint("camera_server")
@@ -862,10 +866,17 @@ def _tmux_cleanup_hook(repo_root: Path) -> str:
     return f"run-shell -b {shlex.quote(cleanup_command)}"
 
 
+def _uses_navdp(config: InferenceLaunchConfig) -> bool:
+    experiment = _runtime_profile(config).components.get("experiment", {})
+    return not experiment or (experiment["entry_stage"] == "navigation" and experiment["navigation_backend"] == "lavira")
+
+
 def _worker_pane_names(config: InferenceLaunchConfig) -> tuple[str, ...]:
     names = ["deploy", "vla"]
     if config.keyboard_planner:
         names.extend(("planner_input", "navdp", "planner_executor"))
+        if not _uses_navdp(config):
+            names.remove("navdp")
         if config.base_pose_enabled:
             names.append("base_pose")
     return tuple(names)
@@ -874,6 +885,9 @@ def _worker_pane_names(config: InferenceLaunchConfig) -> tuple[str, ...]:
 def _create_tmux_session(config: InferenceLaunchConfig) -> dict[str, str]:
     bash = shutil.which("bash") or "/bin/bash"
     shell = (bash, "--noprofile", "--norc")
+    if "experiment" in _runtime_profile(config).components:
+        # Existing pane shells do not inherit later tmux set-environment calls.
+        shell = ("env", "SONIC_EXPERIMENT_MINIMAL_LOGGING=1", *shell)
     _TMUX.command(
         "new-session",
         "-d",
@@ -977,6 +991,8 @@ def main(config: InferenceLaunchConfig):
 
     base_pose_runtime_enabled = config.keyboard_planner and config.base_pose_enabled
     panes = _create_tmux_session(config)
+    if "experiment" in profile.components:
+        _TMUX.command("set-environment", "-t", SESSION_NAME, "SONIC_EXPERIMENT_MINIMAL_LOGGING", "1")
     print(f"Created tmux session: {SESSION_NAME}")
 
     # --- Optional window: MuJoCo Simulator ---
@@ -1047,7 +1063,10 @@ def main(config: InferenceLaunchConfig):
         wait=2.0,
     )
 
-    if config.keyboard_planner:
+    if config.keyboard_planner and not _uses_navdp(config):
+        _start_in_pane(panes, "planner_input", "experiment agent",
+                       build_planner_input_command(config, repo_root), wait=1.)
+    elif config.keyboard_planner:
         planner_input_cmd = build_planner_input_command(config, repo_root)
         commands = [
             ("planner_input", "LaViRA semantic planner", planner_input_cmd),

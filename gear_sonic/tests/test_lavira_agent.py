@@ -1310,6 +1310,26 @@ def test_la_context_keeps_fresh_panorama_and_last_five_completed_moves():
     )
 
 
+def test_manipulation_postchecks_and_unknown_retry_use_fresh_head_views():
+    agent, camera, client, _intents, _waited = build_agent(
+        [move(), align(), decision("MANIPULATE")],
+        groundings=[grounding()] * 3,
+        alignment_groundings=[alignment_grounding()],
+        postchecks=[ready_to_manipulate()] * 2 + [
+            postcheck("NOT_SATISFIED"), postcheck("UNKNOWN"), task_complete(),
+        ],
+    )
+
+    result = agent.run(18)
+
+    assert result.state == "reached"
+    checks = [c for c in client.postcheck_calls if c.get("skill") == "MANIPULATE"]
+    assert len(checks) == 3
+    pixels = [int(c["image_bgr"][0, 0, 0]) for c in checks]
+    assert all(p > 100 for p in pixels), "All manipulation checks must use the head camera"
+    assert len(set(pixels)) == 3, "Each retry must capture a fresh image"
+
+
 def test_va_context_routes_manipulation_prompt_to_align_and_handoff():
     agent, _camera, client, _intents, _waited = build_agent(
         [move(), align(), decision("MANIPULATE")],

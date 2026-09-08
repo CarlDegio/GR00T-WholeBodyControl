@@ -1,0 +1,16 @@
+schema: sonic.experiment.v1
+method: semantic_roles
+table: semantic
+runtime_profile: ../launch_inference.yaml
+tasks_file: tasks.yaml
+cases_file: cases_semantic.yaml
+default_case: dataset
+navigation: vln
+navigation_backend: lavira
+entry_stage: navigation
+alignment: dual
+gates:
+  nav: true
+  align: true
+  completion: true
+runtime_overrides: {}

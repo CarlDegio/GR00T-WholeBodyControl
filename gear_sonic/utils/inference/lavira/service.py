@@ -102,7 +102,7 @@ class LaviraPlannerConfig:
     heading_correction_speed_rad_s: float = 0.2
     heading_correction_timeout_seconds: float = 10.0
     manipulation_window_seconds: float = 5.0
-    manipulation_max_windows: int = 12
+    manipulation_max_windows: int = 36
     manipulation_timeout_seconds: float = 180.0
     vla_start_timeout_seconds: float = 25.0
     profile: str = ""
@@ -213,10 +213,17 @@ class LaviraPlannerRuntime:
                 code,
             )
 
+    def report_agent_event(self, level: int, code: str, message: str, **fields: object) -> None:
+        """Keep late worker events from replacing the operator's terminal result."""
+        generation = fields.get("generation")
+        if generation is not None and self.is_cancelled(int(generation)):
+            return
+        self._event(level, code, message, **fields)
+
     def report_todo(self, generation: int, step: int, todo_list: str) -> None:
         """Publish TODO state for the persistent ControlGateway Events pane."""
 
-        self._event(
+        self.report_agent_event(
             logging.INFO,
             "TODO_UPDATED",
             "LaViRA TODO updated",
@@ -233,7 +240,10 @@ class LaviraPlannerRuntime:
         return self.stop_event.is_set() or generation != self.generation
 
     def publish_worker_result(self, item: WorkerResult) -> None:
-        replace_latest(self.results, item)
+        with self._condition:
+            if getattr(self, "experiment", None) and self.is_cancelled(item.generation):
+                return
+            replace_latest(self.results, item)
 
     def cancel(self, generation: int, reason: str) -> None:
         if generation < self.generation:
@@ -254,6 +264,13 @@ class LaviraPlannerRuntime:
             discard_queued(self.requests)
             self._condition.notify_all()
         LOGGER.info("LISTEN_WASD reason=%s", reason)
+        if reason == "operator_success":
+            self._event(
+                logging.INFO, "TASK_WORKER_RELEASED",
+                "LaViRA worker released after operator-confirmed success",
+                generation=generation, reason=reason,
+            )
+            return
         self._event(
             logging.WARNING,
             "TASK_CANCEL_REQUESTED",
@@ -331,6 +348,8 @@ class LaviraPlannerRuntime:
             reason=payload.get("reason"),
             status_type=payload.get("type"),
             channel=channel,
+            **({k: payload[k] for k in ('errors', 'control_source_stream', 'longitudinal_error_m', 'bearing_error_deg')
+                if k in payload} if getattr(self, 'experiment', None) else {}),
         )
         if state in {"reached", "failed", "stopped"} or (
             channel == "vla_task_status" and state == "active"
@@ -435,6 +454,29 @@ class LaviraPlannerRuntime:
 def run_agent_worker(
     factory: Callable[[], LaViRAAgent], runtime: LaviraPlannerRuntime
 ) -> None:
+    if getattr(runtime, "experiment", None):
+        def run_trial(generation):
+            trial_agent = None
+            try:
+                if runtime.is_cancelled(generation):
+                    return
+                trial_agent = factory()
+                item = WorkerResult(generation, trial_agent.run(generation), None)
+            except Exception as exc:
+                item = WorkerResult(generation, None, str(exc))
+            finally:
+                if trial_agent is not None:
+                    trial_agent.camera.close()
+            runtime.publish_worker_result(item)
+        while not runtime.stop_event.is_set():
+            generation = runtime.requests.get()
+            if generation is None:
+                break
+            # Each trial owns its model clients and camera cursor. A cancelled
+            # request may finish late without delaying or changing the next trial.
+            threading.Thread(target=run_trial, args=(generation,), daemon=True,
+                             name=f"experiment-agent-{generation}").start()
+        return
     agent: LaViRAAgent | None = None
     while not runtime.stop_event.is_set():
         generation = runtime.requests.get()
@@ -484,7 +526,16 @@ def _agent(
         la_timeout_seconds=config.la_timeout_seconds,
         va_timeout_seconds=config.va_timeout_seconds,
     )
-    return LaViRAAgent(
+    from gear_sonic.runtime.profile import load_runtime_profile
+    from gear_sonic.experiments.config import settings
+    from gear_sonic.experiments.agent import ExperimentAgent
+    experiment = settings(load_runtime_profile(config.profile or None, overlays=config.overlay))
+    agent_type = ExperimentAgent if experiment else LaViRAAgent
+    extra = {"experiment": experiment} if experiment else {}
+    if experiment:
+        client.save_request_context = False
+    return agent_type(
+        **extra,
         navigation_mode=config.navigation_mode,
         mission=config.mission,
         global_target=config.global_target,
@@ -519,7 +570,7 @@ def _agent(
         nav_handoff_min_depth_m=config.nav_handoff_min_depth_m,
         nav_handoff_max_depth_m=config.nav_handoff_max_depth_m,
         alignment_head_camera_stream=config.alignment_head_camera_stream,
-        report_event=runtime.report_event,
+        report_event=runtime.report_agent_event,
         report_todo=runtime.report_todo,
     )
 
@@ -540,6 +591,7 @@ def main(config: LaviraPlannerConfig) -> None:
         message: str,
         **fields: object,
     ) -> None:
+        service.experiment.runtime("lavira", code, **fields)
         payload = build_event("lavira", level, code, message, **fields)
         LOGGER.log(
             level,
@@ -564,6 +616,11 @@ def main(config: LaviraPlannerConfig) -> None:
         submit_intent=lambda name, parameters: intent.send(name, parameters),
         report_event=report_event,
     )
+    runtime.experiment = service.experiment.config
+    experiment_intents = queue.Queue()
+    if runtime.experiment:
+        # Keep the ZMQ socket and command sequence owned by the service thread.
+        runtime.submit_intent = lambda name, parameters: experiment_intents.put((name, dict(parameters)))
     control_gateway = ControlGatewaySubscriber(
         profile.endpoint_uri("control_gateway_dispatch"),
         context=context,
@@ -603,7 +660,7 @@ def main(config: LaviraPlannerConfig) -> None:
                 if command.name == "start_navigation":
                     runtime.start_navigation(generation)
                 elif command.name == "cancel_navigation":
-                    runtime.cancel(generation, "operator_stop")
+                    runtime.cancel(generation, str(command.parameters.get("reason") or "operator_stop"))
                 elif command.name in {
                     "navigation_status", "base_pose_status", "vla_task_status"
                 }:
@@ -611,6 +668,10 @@ def main(config: LaviraPlannerConfig) -> None:
                         command.parameters,
                         channel=command.name,
                     )
+            while not experiment_intents.empty():
+                name, parameters = experiment_intents.get_nowait()
+                if not runtime.is_cancelled(int(parameters.get("generation", -1))):
+                    intent.send(name, parameters)
             runtime.tick()
             flush_events()
             time.sleep(0.01)

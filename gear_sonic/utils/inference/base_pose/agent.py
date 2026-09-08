@@ -489,6 +489,11 @@ class GatewayRawServoAdapter:
                 "state": state,
                 "reason": reason,
             }
+            if getattr(self.runtime.config, 'minimal_logging', False):
+                errors = self.runtime.controller.last_errors
+                status['errors'] = {key: float(value) if value is not None and math.isfinite(float(value)) else None
+                    for key, value in zip(('forward_m', 'lateral_m', 'yaw_rad'), errors)}
+                status['control_source_stream'] = self.runtime.control_source_stream
             if self.skill_id:
                 status.update(
                     skill_id=self.skill_id,
@@ -528,6 +533,15 @@ def _dual_worker_kwargs(adapter: Any, camera: Any) -> dict[str, Any]:
 def run_base_pose_yolo_agent(config: Any) -> None:
     """Run dual-camera YOLOE without owning the SONIC socket."""
 
+    from gear_sonic.runtime.profile import load_runtime_profile
+    from gear_sonic.experiments.config import settings
+    from gear_sonic.experiments.base_pose import NullDiagnostics, run_head_worker, run_geometric_service
+    experiment_profile = load_runtime_profile(config.profile or None, overlays=config.overlay)
+    experiment = settings(experiment_profile)
+    config.minimal_logging = bool(experiment)
+    if experiment.get("alignment") == "geometric":
+        return run_geometric_service(config, experiment_profile)
+    head_only = experiment.get("alignment") == "head"
     validate_raw_servo_dependencies(config)
     service = InferenceServiceContext("base_pose", config)
     profile = service.profile
@@ -622,6 +636,8 @@ def run_base_pose_yolo_agent(config: Any) -> None:
         report_metrics=send_metrics,
         orientation_provider=orientation_provider,
     )
+    if experiment:
+        adapter.runtime._diagnostics = NullDiagnostics(logger=log_runtime)
     control = ControlGatewaySubscriber(
         profile.endpoint_uri("control_gateway_dispatch"),
         context=context,
@@ -631,8 +647,9 @@ def run_base_pose_yolo_agent(config: Any) -> None:
         profile.endpoint_uri("sensor_gateway_metadata"),
         stream_depths={
             config.dual_head_camera_stream: config.dual_head_depth_stream,
-            config.dual_chest_camera_stream: config.dual_chest_depth_stream,
+            **({} if head_only else {config.dual_chest_camera_stream: config.dual_chest_depth_stream}),
         },
+        allow_single=head_only,
         timeout_ms=config.camera_timeout_ms,
         request_timeout_ms=config.sensor_gateway_request_timeout_ms,
         max_age_ms=config.sensor_gateway_max_age_ms,
@@ -648,7 +665,7 @@ def run_base_pose_yolo_agent(config: Any) -> None:
     )
     worker_kwargs = _dual_worker_kwargs(adapter, camera)
     worker = threading.Thread(
-        target=run_dual_raw_servo_worker,
+        target=run_head_worker if head_only else run_dual_raw_servo_worker,
         args=(
             config,
             adapter.runtime.requests,

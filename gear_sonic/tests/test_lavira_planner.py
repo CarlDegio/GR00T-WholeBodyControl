@@ -280,6 +280,8 @@ def test_runtime_reports_todo_as_structured_event() -> None:
         ),
     )
 
+    runtime.start_navigation(7)
+    events.clear()
     runtime.report_todo(7, 3, "- [x] Find doorway\n- [ ] Approach chair")
 
     assert events == [(
@@ -292,3 +294,25 @@ def test_runtime_reports_todo_as_structured_event() -> None:
             "todo_list": "- [x] Find doorway\n- [ ] Approach chair",
         },
     )]
+
+
+def test_manual_success_discards_late_worker_failure_and_todo():
+    runtime, intents = runtime_with_intents()
+    events = []
+    runtime.report_event = lambda level, code, message, **fields: events.append((code, fields))
+    runtime.start_navigation(1)
+    runtime.cancel(2, "operator_success")
+    events.clear()
+
+    runtime.report_agent_event(logging.ERROR, "TASK_FAILED", "late failure", generation=1)
+    runtime.report_agent_event(logging.WARNING, "TASK_CANCELLED", "late cancel", generation=1)
+    runtime.report_todo(1, 3, "- [ ] Old manipulation")
+    assert events == []
+    runtime.publish_worker_result(WorkerResult(1, None, "late VA failure"))
+    runtime.tick()
+    assert not intents and runtime.phase == "listen_wasd"
+
+    assert runtime.start_navigation(3)
+    events.clear()
+    runtime.report_agent_event(logging.INFO, "SKILL_STARTED", "new task", generation=3)
+    assert [code for code, _ in events] == ["SKILL_STARTED"]

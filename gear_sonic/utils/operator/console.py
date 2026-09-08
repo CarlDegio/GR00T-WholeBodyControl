@@ -62,6 +62,7 @@ def main() -> None:
     print(f"[OperatorCLI] ControlGateway: {endpoint}")
     print(
         "Keys: k=start/stop, i=pose, o=planner, p=pause, [/]=hands; "
+        "g=agent success + stand; "
         "PLANNER: w/a/s/d/q/e manual, n=LaViRA, b=BasePose, space=cancel "
         "(single-key, no Enter); "
         ": enters a full command line"
@@ -72,6 +73,11 @@ def main() -> None:
             while True:
                 value = read_operator_input()
                 if value in {"", "\n", "\r"}:
+                    continue
+                if value == "perturb" and "experiment" in profile.components:
+                    event = core.accept_command("experiment_perturbation", parameters={})
+                    sender.send_string(event.command.to_json())
+                    print("\nRecorded prescribed perturbation.")
                     continue
                 event = router.accept_line(value, core=core)
                 sender.send_string(event.command.to_json())

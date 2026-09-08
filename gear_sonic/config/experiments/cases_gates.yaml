@@ -1,0 +1,27 @@
+cases:
+  normal:
+    layout_id: null
+    start_id: null
+    visibility: null
+    navigation_instructions:
+      T1: null
+      T2: null
+      T3: null
+      T4: null
+    perturbation:
+      enabled: false
+      description: null
+      amplitude: null
+  perturbed:
+    layout_id: null
+    start_id: null
+    visibility: null
+    navigation_instructions:
+      T1: null
+      T2: null
+      T3: null
+      T4: null
+    perturbation:
+      enabled: true
+      description: null
+      amplitude: null

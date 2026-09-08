@@ -3,6 +3,7 @@
 import queue
 
 from gear_sonic.runtime.profile import load_runtime_profile
+from gear_sonic.experiments.recording import Recorder
 from gear_sonic.runtime.telemetry import (
     build_event,
     configure_file_logging,
@@ -23,6 +24,7 @@ class InferenceServiceContext:
             overlays=tuple(getattr(config, "overlay", ())),
         )
         self.pending_events = queue.SimpleQueue()
+        self.experiment = Recorder(self.profile)
         endpoint = self.profile.endpoint_uri
         self._event_socket = open_telemetry_publisher(endpoint("runtime_event_ingress"))
         self._metrics_socket = (
@@ -35,6 +37,7 @@ class InferenceServiceContext:
     def event(
         self, level, code, message, *, queued=False, write_log=True, **fields
     ):
+        self.experiment.runtime(self.component, code, **fields)
         payload = build_event(self.component, level, code, message, **fields)
         if write_log:
             emit_event(payload, logger=self.logger)

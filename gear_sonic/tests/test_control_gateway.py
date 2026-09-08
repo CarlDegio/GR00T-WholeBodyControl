@@ -263,6 +263,32 @@ def test_navigation_state_preserves_existing_listen_wasd_mapping() -> None:
     assert state.mode == "listen_wasd"
 
 
+@pytest.mark.parametrize("key", ["g", "G"])
+@pytest.mark.parametrize("mode", ["PLANNER", "POSE"])
+def test_console_success_key_preserves_control_loop_and_backward_key(key, mode):
+    core = ControlGatewayCore(monotonic_ns=lambda: 100)
+    console = OperatorConsoleRouter()
+    console.control_running = True
+    console.control_mode = mode
+
+    command = console.accept_line(key, core=core).command
+
+    assert command.name == "complete_agent_success"
+    assert console.control_running and console.control_mode == "PLANNER"
+    backward = console.accept_line("s", core=core).command
+    assert backward.name == "navigation_key" and backward.parameters == {"key": "s"}
+
+
+def test_operator_success_clears_active_todo_display():
+    display = EventPaneDisplay(stream=io.StringIO(), interactive=False)
+    display.accept(build_event("lavira", logging.INFO, "TODO_UPDATED", "todo",
+                               generation=3, step=2, todo_list="- [ ] Manipulate"))
+    display.accept(build_event("control_gateway", logging.INFO, "TASK_COMPLETED", "operator success",
+                               generation=3, reason="operator_success"))
+
+    assert "no active task" in display.dashboard_text()
+
+
 def test_navigation_can_start_during_the_existing_manual_hold_window() -> None:
     state = NavigationControlState()
     state.handle_key("w", now=1.0)

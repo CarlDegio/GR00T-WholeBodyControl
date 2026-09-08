@@ -1,0 +1,16 @@
+schema: sonic.experiment.v1
+method: geometric_vla
+table: main
+runtime_profile: ../launch_inference.yaml
+tasks_file: tasks.yaml
+cases_file: cases_main.yaml
+default_case: visible_01
+navigation: vln
+navigation_backend: lavira
+entry_stage: navigation
+alignment: geometric
+gates:
+  nav: true
+  align: true
+  completion: true
+runtime_overrides: {}

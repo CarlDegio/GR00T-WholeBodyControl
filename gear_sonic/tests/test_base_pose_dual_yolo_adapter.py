@@ -1207,8 +1207,10 @@ def test_cancel_during_lateral_pulse_publishes_only_stop_commands(
     )
 
 
+@pytest.mark.parametrize("live_stream", (HEAD, CHEST))
 def test_runtime_allows_joint_completion_regardless_of_live_stream(
     tmp_path: Path,
+    live_stream: str,
 ) -> None:
     runtime = RawServoRuntime(
         BasePoseAgentConfig(
@@ -1225,7 +1227,7 @@ def test_runtime_allows_joint_completion_regardless_of_live_stream(
     assert runtime.start(1, now=0.0)
     details = {
         "attempt_id": 1,
-        "live_stream": HEAD,
+        "live_stream": live_stream,
         "failover_stage": "initial",
         "control_source_stream": CHEST,
         "yaw_source": {"stream": HEAD, "valid": True, "realtime": True},
@@ -1234,8 +1236,8 @@ def test_runtime_allows_joint_completion_regardless_of_live_stream(
         RawServoEvent(1, "detecting", details=details),
         now=0.01,
     )
-    # Three frames lock yaw, then five frames confirm the final pose.
-    for index in range(8):
+    # Three frames confirm distance, three lock yaw, then five confirm pose.
+    for index in range(11):
         assert runtime.accept_event(
             RawServoEvent(
                 1,
@@ -1245,6 +1247,14 @@ def test_runtime_allows_joint_completion_regardless_of_live_stream(
             ),
             now=0.02 + index * 0.01,
         )
+        if index < 2:
+            assert runtime.controller.phase is ServoPhase.FORWARD_APPROACH
+        elif index == 2:
+            assert runtime.controller.phase is ServoPhase.YAW_ALIGN
+        elif index < 5:
+            assert runtime.controller.phase is ServoPhase.YAW_TRIM
+        elif index < 10:
+            assert runtime.controller.phase is ServoPhase.TRANSLATE_TARGET
 
     assert runtime.controller.terminal_reason == "aligned"
     assert runtime.controller.current.velocity == (0.0, 0.0, 0.0)
@@ -1283,8 +1293,8 @@ def test_runtime_reuses_yoloe_after_ten_post_stop_deviation_frames(
         RawServoEvent(1, "detecting", details=details),
         now=0.01,
     )
-    # Three frames lock yaw, then five frames confirm the final pose.
-    for index in range(8):
+    # Three frames confirm distance, three lock yaw, then five confirm pose.
+    for index in range(11):
         assert runtime.accept_event(
             RawServoEvent(
                 1,
@@ -1304,7 +1314,7 @@ def test_runtime_reuses_yoloe_after_ten_post_stop_deviation_frames(
                 observation=_joint_observation(1.2),
                 details=details,
             ),
-            now=0.1 + index * 0.01,
+            now=0.2 + index * 0.01,
         )
 
     assert runtime.generation == 1
@@ -1371,7 +1381,8 @@ def test_runtime_pauses_chest_translation_during_head_yaw_loss_and_resumes(
         RawServoEvent(1, "detecting", details=common),
         now=0.01,
     )
-    for index in range(3):
+    # Complete the distance and yaw stages before exercising translation loss.
+    for index in range(6):
         assert runtime.accept_event(
             RawServoEvent(
                 1,
@@ -1390,7 +1401,7 @@ def test_runtime_pauses_chest_translation_during_head_yaw_loss_and_resumes(
             observation=_joint_observation(0.5),
             details=live_yaw,
         ),
-        now=0.05,
+        now=0.08,
     )
     assert runtime.controller.current.vx < 0.0
 
@@ -1412,7 +1423,7 @@ def test_runtime_pauses_chest_translation_during_head_yaw_loss_and_resumes(
                     "head_yaw_loss": loss,
                 },
             ),
-            now=0.05 + 0.01 * missing_frames,
+            now=0.08 + 0.01 * missing_frames,
         )
         assert runtime.controller.current.velocity == (0.0, 0.0, 0.0)
         assert runtime.controller.joint_completion_active
@@ -1434,7 +1445,7 @@ def test_runtime_pauses_chest_translation_during_head_yaw_loss_and_resumes(
                     "head_yaw_loss": loss,
                 },
             ),
-            now=0.05 + 0.01 * missing_frames,
+            now=0.08 + 0.01 * missing_frames,
         )
         assert runtime.controller.current.velocity == (0.0, 0.0, 0.0)
 
@@ -1446,7 +1457,7 @@ def test_runtime_pauses_chest_translation_during_head_yaw_loss_and_resumes(
                 observation=_joint_observation(0.5),
                 details=live_yaw,
             ),
-            now=0.25 + 0.01 * index,
+            now=0.30 + 0.01 * index,
         )
     assert runtime.controller.current.vx < 0.0
 

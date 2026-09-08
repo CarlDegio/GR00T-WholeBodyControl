@@ -6,6 +6,7 @@ from collections import deque
 from logging.handlers import RotatingFileHandler
 import json
 import logging
+import os
 import math
 from pathlib import Path
 import sys
@@ -73,6 +74,11 @@ def configure_file_logging(
     """Return one bounded, file-only logger for an inference component."""
     logger = logging.getLogger(f"sonic.{component}")
     if logger.handlers:
+        return logger
+    if os.getenv("SONIC_EXPERIMENT_MINIMAL_LOGGING") == "1":
+        logger.addHandler(logging.NullHandler())
+        logger.setLevel(logging.INFO)
+        logger.propagate = False
         return logger
     directory = (
         Path(log_dir) if log_dir is not None else default_inference_log_dir()

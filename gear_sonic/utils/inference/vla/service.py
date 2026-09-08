@@ -310,6 +310,7 @@ def prepare_observation_from_sensors(
     sensor_gateway: VlaSensorGatewayIngress,
     robot_model,
     language_prompt: str,
+    observation_callback=None,
 ):
     """Read sensors and prepare observation for the VLA policy.
 
@@ -384,6 +385,8 @@ def prepare_observation_from_sensors(
     timing_ms["observation_build"] = (
         time.perf_counter() - observation_started
     ) * 1000.0
+    if observation_callback is not None:
+        observation_callback(camera_msg, state_msg)
     return observation, timing_ms
 
 
@@ -435,6 +438,42 @@ def run_policy_inference_and_process(
         return None
 
 
+def _build_experiment_inference_callbacks(
+    state, *, prepare_observation, run_inference, first_observation
+):
+    """Record agent inputs while allowing manual POSE inference after cancellation."""
+    first_input = {}
+
+    def prepare(epoch):
+        first_input.clear()
+        if epoch != state.inference_generation:
+            return None
+        identity = (state.task_generation, state.task_skill_id)
+
+        def remember_input(camera, robot):
+            first_input.update(identity=identity, camera=camera, robot=robot)
+
+        return prepare_observation(
+            observation_callback=remember_input if state.task_active else None
+        )
+
+    def infer(epoch, observation):
+        if epoch != state.inference_generation:
+            first_input.clear()
+            return None
+        if first_input:
+            if not state.task_active or first_input["identity"] != (state.task_generation, state.task_skill_id):
+                first_input.clear()
+                return None
+            first_observation.capture(first_input["identity"], first_input["camera"], first_input["robot"])
+        first_input.clear()
+        if epoch != state.inference_generation:
+            return None
+        return run_inference(epoch, observation)
+
+    return prepare, infer
+
+
 def _inference_worker_loop(
     inference_queue: queue.Queue,
     result_queue: queue.Queue,
@@ -444,6 +483,9 @@ def _inference_worker_loop(
     inference_fn,
     event_callback=None,
     failure_callback=None,
+    prepare_for_generation=None,
+    infer_for_generation=None,
+    generation_is_current=None,
 ):
     """Persistent worker thread for async inference."""
     while not stop_event.is_set():
@@ -456,12 +498,12 @@ def _inference_worker_loop(
             busy_event.set()
             try:
                 worker_started = time.perf_counter()
-                prepared = prepare_obs_fn()
+                prepared = prepare_for_generation(request_generation) if prepare_for_generation is not None else prepare_obs_fn()
                 if prepared is None:
                     continue
                 observation, timing_ms = prepared
                 inference_start_time = time.monotonic()
-                result = inference_fn(observation)
+                result = infer_for_generation(request_generation, observation) if infer_for_generation is not None else inference_fn(observation)
                 if result is None:
                     continue
                 processed_action, action_timing = result
@@ -479,7 +521,7 @@ def _inference_worker_loop(
             _report_event(
                 event_callback, logging.ERROR, "WORKER_ERROR", str(exc), repeat_s=30.0
             )
-            if failure_callback is not None:
+            if failure_callback is not None and (generation_is_current is None or generation_is_current(request_generation)):
                 failure_callback(str(exc))
 
 
@@ -501,6 +543,8 @@ def main(config: InferenceConfig):
     service = InferenceServiceContext("vla", config)
     state = _VlaRuntimeState()
     profile = service.profile
+    from gear_sonic.experiments.snapshots import FirstObservationRecorder
+    first_observation = FirstObservationRecorder(profile)
     policy_endpoint = profile.endpoint("policy_server")
     last_event_at: dict[str, float] = {}
 
@@ -837,6 +881,17 @@ def main(config: InferenceConfig):
     # Mutable prompt container (single-writer from keyboard, single-reader from inference)
     language_prompt_ref: list[str] = [config.prompt]
 
+    command_policy = n1_policy
+    if service.experiment.config:
+        from types import SimpleNamespace
+        def ping_experiment_policy(*, timeout_ms):
+            probe = _MsgpackNumpyPolicyClient(n1_policy.host, n1_policy.port, timeout_ms=timeout_ms)
+            try:
+                return probe.ping()
+            finally:
+                probe.close()
+        command_policy = SimpleNamespace(ping=ping_experiment_policy)
+
     command_handler = _VlaCommandHandler(
         state,
         control_listener=control_listener,
@@ -846,7 +901,7 @@ def main(config: InferenceConfig):
         vla_safety_gate=vla_safety_gate,
         vla_safety_monitor=vla_safety_monitor,
         task_status_intent=task_status_intent,
-        policy=n1_policy,
+        policy=command_policy,
         record_event=record_event,
         invalidate_inference=invalidate_inference,
         publish_initial_pose=publish_initial_pose,
@@ -854,10 +909,38 @@ def main(config: InferenceConfig):
         activate_vla_metrics=activate_vla_metrics,
         fail_active_task=fail_active_task,
         publish_task_status=publish_task_status,
+        trained_prompt=service.experiment.config.get("task", {}).get("vla_trained_prompt"),
     )
 
     inference_stop_event = threading.Event()
     inference_busy_event = threading.Event()
+
+    prepare_experiment_observation, infer_experiment_observation = _build_experiment_inference_callbacks(
+        state,
+        prepare_observation=lambda **kwargs: prepare_observation_from_sensors(
+            gateway_ingress, robot_model, language_prompt_ref[0], **kwargs
+        ),
+        run_inference=lambda epoch, observation: run_policy_inference_and_process(
+            policy=n1_policy,
+            observation=observation,
+            event_callback=record_event,
+            failure_callback=lambda reason: (
+                report_inference_failure(reason) if epoch == state.inference_generation else None
+            ),
+        ),
+        first_observation=first_observation,
+    )
+
+    published_experiment_tasks = set()
+
+    def record_first_action():
+        identity = (state.task_generation, state.task_skill_id)
+        if not service.experiment.config or not state.task_active or identity in published_experiment_tasks:
+            return
+        published_experiment_tasks.add(identity)
+        first = service.experiment.write("vla_first_action", generation=identity[0], skill_id=identity[1])
+        task_status_intent.send("experiment_vla_started", {"generation": identity[0], "skill_id": identity[1],
+            "action_monotonic_ns": first['monotonic_ns']})
 
     inference_worker_thread = threading.Thread(
         target=_inference_worker_loop,
@@ -881,6 +964,9 @@ def main(config: InferenceConfig):
         kwargs={
             "event_callback": record_event,
             "failure_callback": report_inference_failure,
+            "prepare_for_generation": prepare_experiment_observation if service.experiment.config else None,
+            "infer_for_generation": infer_experiment_observation if service.experiment.config else None,
+            "generation_is_current": (lambda epoch: epoch == state.inference_generation) if service.experiment.config else None,
         },
         daemon=True,
     )
@@ -954,11 +1040,13 @@ def main(config: InferenceConfig):
                 _sleep_remaining(t_start, loop_period)
                 continue
 
-            _publish_cached_action(
+            published = _publish_cached_action(
                 state,
                 config=config,
                 zmq_socket=zmq_socket,
             )
+            if published:
+                record_first_action()
 
             _sleep_remaining(t_start, loop_period)
 
@@ -976,6 +1064,7 @@ def main(config: InferenceConfig):
     finally:
         inference_stop_event.set()
         inference_worker_thread.join(timeout=1.0)
+        first_observation.close()
         planner_relay_sub.close()
         zmq_socket.close()
         gateway_ingress.close()

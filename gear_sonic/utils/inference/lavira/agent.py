@@ -914,6 +914,8 @@ class LaViRAClient:
     ) -> None:
         """Persist the exact OpenAI-compatible request before transmission."""
 
+        if not getattr(self, "save_request_context", True):
+            return
         try:
             with self._request_context_lock:
                 self._request_context_sequence += 1
@@ -1269,7 +1271,7 @@ class LaViRAAgent:
         nav_handoff_max_depth_m: float = 3.0,
         alignment_head_camera_stream: str = "ego_view",
         manipulation_window_seconds: float = 5.0,
-        manipulation_max_windows: int = 12,
+        manipulation_max_windows: int = 36,
         manipulation_timeout_seconds: float = 180.0,
         vla_start_timeout_seconds: float = 25.0,
         heading_settle_seconds: float = 1.0,
@@ -2027,7 +2029,12 @@ class LaViRAAgent:
             expected_postcondition=expected,
             skill=skill,
             image_bgr=(
-                self.camera.capture_rgb() if image_bgr is None else image_bgr
+                self.camera.capture_rgb(
+                    camera_stream=(
+                        self.alignment_head_camera_stream
+                        if skill == "MANIPULATE" else "chest_view"
+                    ),
+                ) if image_bgr is None else image_bgr
             ),
         ), skill=skill)
         self._event(
@@ -2258,6 +2265,12 @@ class LaViRAAgent:
             result.update(status="UNKNOWN", transition="UNKNOWN")
         return result
 
+    def _alignment_views(self):
+        return (("chest", "chest_view"), ("head", self.alignment_head_camera_stream))
+
+    def _before_nav_handoff(self, generation, skill_id, target):
+        pass
+
     def _align_handoff(
         self, *, generation: int, skill_id: int, strategic_goal: str,
         controller_aligned: bool, controller_state: str,
@@ -2267,10 +2280,7 @@ class LaViRAAgent:
 
         camera_results: dict[str, dict[str, Any]] = {}
         camera_errors: dict[str, str] = {}
-        for label, stream_name in (
-            ("chest", "chest_view"),
-            ("head", self.alignment_head_camera_stream),
-        ):
+        for label, stream_name in self._alignment_views():
             try:
                 if label == "chest":
                     image = self.camera.capture_rgb()
@@ -2298,6 +2308,8 @@ class LaViRAAgent:
                     target=target,
                     yaw_align_target=yaw_align_target,
                 )
+                self._event(logging.INFO, "VA_CHECK", "ALIGN camera check", generation=generation,
+                            skill_id=skill_id, camera=label, skill="ALIGN", **camera_results[label])
             except Exception as exc:
                 camera_errors[label] = str(exc)
                 self._event(
@@ -2444,6 +2456,7 @@ class LaViRAAgent:
                 # so the selected warn-and-continue policy is safe here.  Wait
                 # timeouts, cancellation, and stale identities are not caught.
                 pass
+        self._before_nav_handoff(generation, skill_id, target)
         post_segment = self._segment_id
         result_snapshots: dict[str, RGBDSnapshot] = {}
         camera_errors: dict[str, str] = {}
@@ -2534,7 +2547,7 @@ class LaViRAAgent:
         if args:
             raise LaViRAAgentError("ALIGN skill_args must be empty")
         self._face_scan_direction(generation, skill_id, "front")
-        alignment_image = self.camera.capture_rgb()
+        alignment_image = self.camera.capture_rgb(camera_stream="ego_view") if getattr(self, "head_only", False) else self.camera.capture_rgb()
         grounding = self._alignment_ground(
             generation=generation,
             skill_id=skill_id,
@@ -2588,17 +2601,14 @@ class LaViRAAgent:
             post["status"], post["visual_evidence"],
         )
 
-    def _manipulate(
-        self, generation: int, skill_id: int, expected: str,
-        strategic_goal: str,
-    ) -> AgentHistoryEntry:
+    def _start_manipulation(self, generation, skill_id):
         ready, reason = self.readiness(generation, skill_id)
         if not ready:
             raise LaViRAAgentError(f"manipulate_gate:{reason}")
         self.submit_intent("start_vla_task", {
             "generation": generation, "skill_id": skill_id, "window_id": 0,
             "task": self.manipulation_prompt,
-            "handoff_context": self.manipulation_prompt,
+            "handoff_context": getattr(self, "vla_trained_prompt", self.manipulation_prompt),
         })
         try:
             try:
@@ -2644,6 +2654,12 @@ class LaViRAAgent:
             segment_id=max(0, self._segment_id),
             window_id=0,
         )
+
+    def _manipulate(
+        self, generation: int, skill_id: int, expected: str,
+        strategic_goal: str,
+    ) -> AgentHistoryEntry:
+        self._start_manipulation(generation, skill_id)
         started = self.monotonic()
         unknown_count = 0
         for window_id in range(1, self.manipulation_max_windows + 1):
@@ -2749,6 +2765,73 @@ class LaViRAAgent:
         evidence = str(post["visual_evidence"])
         raise LaViRAAgentError(f"manipulate_window_limit:{evidence}")
 
+    def _plan_next_step(self, generation, step, todo):
+        panorama = self._next_observation_mode == "panorama"
+        event_prefix = "PANORAMA" if panorama else "FRONT_OBSERVATION"
+        self._event(
+            logging.INFO,
+            f"{event_prefix}_STARTED",
+            (
+                "Fresh five-direction LA panorama started"
+                if panorama else "Fresh fixed-front LA observation started"
+            ),
+            generation=generation,
+            step=step,
+            skill_id=self._skill_id,
+            segment_id=max(0, self._segment_id),
+        )
+        try:
+            scan_views = (
+                self._capture_panorama(generation, self._skill_id)
+                if panorama else self._capture_front_observation()
+            )
+        except Exception as exc:
+            self._event(
+                logging.ERROR,
+                f"{event_prefix}_FAILED",
+                (
+                    "Fresh five-direction LA panorama failed"
+                    if panorama else "Fresh fixed-front LA observation failed"
+                ),
+                generation=generation,
+                step=step,
+                skill_id=self._skill_id,
+                segment_id=max(0, self._segment_id),
+                error=str(exc),
+            )
+            raise
+        self._event(
+            logging.INFO,
+            f"{event_prefix}_COMPLETED",
+            (
+                "Fresh five-direction LA panorama completed"
+                if panorama else "Fresh fixed-front LA observation completed"
+            ),
+            generation=generation,
+            step=step,
+            skill_id=self._skill_id,
+            segment_id=max(0, self._segment_id),
+            scan_id=scan_views[0].scan_id,
+            directions=[view.direction for view in scan_views],
+            anchor_pose=list(scan_views[0].reference_pose),
+        )
+        expected_global_target = self.global_target or None
+        la = validate_language_action(
+            self.client.language_action(
+                mission=self.mission,
+                navigation_mode=self.navigation_mode,
+                global_target=expected_global_target,
+                current_step=step,
+                todo_list=todo,
+                scan_views=tuple(scan_views),
+                move_to_views=tuple(self._recent_move_to_views),
+                transition_result=self._latest_transition,
+                manipulation_prompt=self.manipulation_prompt,
+            ),
+            expected_global_target=expected_global_target,
+        )
+        return la
+
     def run(self, generation: int) -> LaViRATaskResult:
         step = 0
         self._reset_task_context()
@@ -2772,70 +2855,7 @@ class LaViRAAgent:
             for step in range(1, self.max_steps + 1):
                 self._check_cancelled(generation)
                 self._skill_id += 1
-                panorama = self._next_observation_mode == "panorama"
-                event_prefix = "PANORAMA" if panorama else "FRONT_OBSERVATION"
-                self._event(
-                    logging.INFO,
-                    f"{event_prefix}_STARTED",
-                    (
-                        "Fresh five-direction LA panorama started"
-                        if panorama else "Fresh fixed-front LA observation started"
-                    ),
-                    generation=generation,
-                    step=step,
-                    skill_id=self._skill_id,
-                    segment_id=max(0, self._segment_id),
-                )
-                try:
-                    scan_views = (
-                        self._capture_panorama(generation, self._skill_id)
-                        if panorama else self._capture_front_observation()
-                    )
-                except Exception as exc:
-                    self._event(
-                        logging.ERROR,
-                        f"{event_prefix}_FAILED",
-                        (
-                            "Fresh five-direction LA panorama failed"
-                            if panorama else "Fresh fixed-front LA observation failed"
-                        ),
-                        generation=generation,
-                        step=step,
-                        skill_id=self._skill_id,
-                        segment_id=max(0, self._segment_id),
-                        error=str(exc),
-                    )
-                    raise
-                self._event(
-                    logging.INFO,
-                    f"{event_prefix}_COMPLETED",
-                    (
-                        "Fresh five-direction LA panorama completed"
-                        if panorama else "Fresh fixed-front LA observation completed"
-                    ),
-                    generation=generation,
-                    step=step,
-                    skill_id=self._skill_id,
-                    segment_id=max(0, self._segment_id),
-                    scan_id=scan_views[0].scan_id,
-                    directions=[view.direction for view in scan_views],
-                    anchor_pose=list(scan_views[0].reference_pose),
-                )
-                expected_global_target = self.global_target or None
-                la = validate_language_action(
-                    self.client.language_action(
-                        mission=self.mission,
-                        navigation_mode=self.navigation_mode,
-                        global_target=expected_global_target,
-                        current_step=step,
-                        todo_list=todo,
-                        scan_views=tuple(scan_views),
-                        move_to_views=tuple(self._recent_move_to_views),
-                        transition_result=self._latest_transition,
-                        manipulation_prompt=self.manipulation_prompt,
-                    ),
-                    expected_global_target=expected_global_target,
-                )
+                la = self._plan_next_step(generation, step, todo)
                 if not self.global_target:
                     self.global_target = str(la["global_target"]).strip()
                     self._event(

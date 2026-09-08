@@ -74,7 +74,7 @@ class EventPaneDisplay:
                     self.todo_step = None
                     self.waiting_for_todo = True
             elif (
-                component == "lavira"
+                component in {"lavira", "control_gateway"}
                 and code in self.TERMINAL_CODES
                 and (
                     self.todo_generation is None

@@ -1,0 +1,59 @@
+# Fill policy_id with the checkpoint actually served. Exact trained strings
+# must be verified against training; semantic prompts describe the real task.
+defaults:
+  policy_id: null
+  total_timeout_s: 600.0
+  vla_timeout_s: 180.0
+  fixed_manipulation_s: 180.0
+  recovery_budget_s: 600.0
+tasks:
+  T1:
+    vla_prompt:  move forward to approach the blue basket on the desk，pick up the pill bottle, and place it inside the blue basket.
+    vla_trained_prompt: collect the pill bottle
+    global_target: ''
+    geometry_target: blue basket
+    objectnav_instruction: Search the workspace for the basket and approach it.
+    policy_id: a
+    milestones: [stable_bottle_grasp, bottle_in_basket_released]
+  T2:
+    vla_prompt: Pick up the garbage bag and put it in the box, then lift the box off the handcart and place it in the designated area.
+    vla_trained_prompt: collect the bag and put it into box, then carry the box
+    global_target: cardboard box on a handcart
+    geometry_target: cardboard box
+    objectnav_instruction: Search the workspace for the cardboard box on a handcart and approach it.
+    milestones: [stable_bag_grasp, bag_in_box, stable_box_lift, box_off_cart_placed]
+  T3:
+    vla_prompt: Pick up the bowl, step on the trash bin pedal to hold the lid open, and empty the bowl into the bin.
+    vla_trained_prompt: null
+    global_target: trash bin
+    geometry_target: trash bin
+    objectnav_instruction: Search the workspace for the trash bin and approach it.
+    milestones: [stable_bowl_grasp, lid_open_for_pouring, contents_in_bin]
+  T4:
+    vla_prompt: Pick up the object on top of the bedside cabinet, open the drawer, place the object inside, and release it.
+    vla_trained_prompt: null
+    global_target: bedside cabinet
+    geometry_target: bedside cabinet
+    objectnav_instruction: Search the workspace for the bedside cabinet and approach it.
+    milestones: [stable_object_grasp, drawer_open, object_in_drawer_released]
+geometric:
+  distance_m: 1.1
+  longitudinal_tolerance_m: 0.1
+  angle_tolerance_deg: 9.0
+  coarse_wz: 0.3
+  vx: 0.4
+  fine_wz: 0.2
+  timeout_s: 60.0
+  stable_frames: 3
+navila:
+  # Model TCP endpoint, not SSH port. Forward the remote model port to this
+  # local port or replace host/port with the deployed accessible endpoint.
+  host: 127.0.0.1
+  port: 30000
+  timeout_s: 30.0
+  token_env: NAVILA_API_TOKEN
+  camera: chest_view
+  jpeg_quality: 80
+  vx: 0.3
+  wz: 0.3
+  max_actions: 50

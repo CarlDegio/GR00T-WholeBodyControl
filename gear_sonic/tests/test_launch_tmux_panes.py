@@ -843,6 +843,33 @@ def test_orientation_telemetry_is_enabled_for_base_pose() -> None:
     assert "--orientation-output-endpoint" not in executor
 
 
+@pytest.mark.parametrize(
+    ("method", "has_navdp", "has_base_pose", "publishes_orientation"),
+    [
+        ("nav_direct_vla", True, False, True),
+        ("full_vln", True, True, True),
+        ("near_vla", False, False, False),
+        ("near_dual", False, True, True),
+        ("navila_basepose_vla", False, True, True),
+    ],
+)
+def test_experiment_workers_keep_orientation_for_navigation_without_alignment(
+    tmp_path, method, has_navdp, has_base_pose, publishes_orientation
+) -> None:
+    from gear_sonic.experiments.config import CONFIGS, resolve
+
+    payload, _ = resolve(CONFIGS / f"{method}.yaml")
+    profile_path = tmp_path / "runtime.yaml"
+    profile_path.write_text(yaml.safe_dump(payload), encoding="utf-8")
+    config = load_inference_launch_config(profile_path)
+    workers = _worker_pane_names(config)
+    executor = shlex.split(build_planner_velocity_executor_command(config, tmp_path))
+
+    assert ("navdp" in workers) is has_navdp
+    assert ("base_pose" in workers) is has_base_pose
+    assert ("--publish-orientation" in executor) is publishes_orientation
+
+
 def test_runtime_sidecars_are_read_only_and_navdp_uses_gateway_by_default() -> None:
     config = InferenceLaunchConfig()
     root = Path("/workspace/sonic")

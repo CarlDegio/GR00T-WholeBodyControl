@@ -1,0 +1,162 @@
+# Physical layout/start and route instructions must be filled before running.
+cases:
+  visible_01:
+    layout_id: t1_layout_01
+    start_id: t1_start_01
+    visibility: visible
+    initial_path_distance_m: null
+    navigation_instructions:
+      T1: Move forward to the front of the table with the blue basket
+      T2: null
+      T3: null
+      T4: null
+  visible_02:
+    layout_id: t1_layout_02
+    start_id: t1_start_01
+    visibility: visible
+    initial_path_distance_m: null
+    navigation_instructions:
+      T1: Move forward to the front of the table with the blue basket
+      T2: null
+      T3: null
+      T4: null
+  visible_03:
+    layout_id: null
+    start_id: null
+    visibility: visible
+    initial_path_distance_m: null
+    navigation_instructions:
+      T1: null
+      T2: null
+      T3: null
+      T4: null
+  visible_04:
+    layout_id: null
+    start_id: null
+    visibility: visible
+    initial_path_distance_m: null
+    navigation_instructions:
+      T1: null
+      T2: null
+      T3: null
+      T4: null
+  visible_05:
+    layout_id: null
+    start_id: null
+    visibility: visible
+    initial_path_distance_m: null
+    navigation_instructions:
+      T1: null
+      T2: null
+      T3: null
+      T4: null
+  visible_06:
+    layout_id: null
+    start_id: null
+    visibility: visible
+    initial_path_distance_m: null
+    navigation_instructions:
+      T1: null
+      T2: null
+      T3: null
+      T4: null
+  visible_07:
+    layout_id: null
+    start_id: null
+    visibility: visible
+    initial_path_distance_m: null
+    navigation_instructions:
+      T1: null
+      T2: null
+      T3: null
+      T4: null
+  visible_08:
+    layout_id: null
+    start_id: null
+    visibility: visible
+    initial_path_distance_m: null
+    navigation_instructions:
+      T1: null
+      T2: null
+      T3: null
+      T4: null
+  invisible_01:
+    layout_id: null
+    start_id: null
+    visibility: invisible
+    initial_path_distance_m: null
+    navigation_instructions:
+      T1: null
+      T2: null
+      T3: null
+      T4: null
+  invisible_02:
+    layout_id: null
+    start_id: null
+    visibility: invisible
+    initial_path_distance_m: null
+    navigation_instructions:
+      T1: null
+      T2: null
+      T3: null
+      T4: null
+  invisible_03:
+    layout_id: null
+    start_id: null
+    visibility: invisible
+    initial_path_distance_m: null
+    navigation_instructions:
+      T1: null
+      T2: null
+      T3: null
+      T4: null
+  invisible_04:
+    layout_id: null
+    start_id: null
+    visibility: invisible
+    initial_path_distance_m: null
+    navigation_instructions:
+      T1: null
+      T2: null
+      T3: null
+      T4: null
+  invisible_05:
+    layout_id: null
+    start_id: null
+    visibility: invisible
+    initial_path_distance_m: null
+    navigation_instructions:
+      T1: null
+      T2: null
+      T3: null
+      T4: null
+  invisible_06:
+    layout_id: null
+    start_id: null
+    visibility: invisible
+    initial_path_distance_m: null
+    navigation_instructions:
+      T1: null
+      T2: null
+      T3: null
+      T4: null
+  invisible_07:
+    layout_id: null
+    start_id: null
+    visibility: invisible
+    initial_path_distance_m: null
+    navigation_instructions:
+      T1: null
+      T2: null
+      T3: null
+      T4: null
+  invisible_08:
+    layout_id: null
+    start_id: null
+    visibility: invisible
+    initial_path_distance_m: null
+    navigation_instructions:
+      T1: null
+      T2: null
+      T3: null
+      T4: null

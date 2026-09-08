@@ -1,0 +1,4 @@
+{"sample_id":"T1_example_001","task_id":"T1","vla_prompt":"Pick up the pill bottle, place it inside the basket, and release it.","rgb":"REQUIRED/T1_rgb.png"}
+{"sample_id":"T2_example_001","task_id":"T2","vla_prompt":"Pick up the garbage bag and put it in the box, then lift the box off the handcart and place it in the designated area.","rgb":"REQUIRED/T2_rgb.png"}
+{"sample_id":"T3_example_001","task_id":"T3","vla_prompt":"Pick up the bowl, step on the trash bin pedal to hold the lid open, and empty the bowl into the bin.","rgb":"REQUIRED/T3_rgb.png"}
+{"sample_id":"T4_example_001","task_id":"T4","vla_prompt":"Pick up the object on top of the bedside cabinet, open the drawer, place the object inside, and release it.","rgb":"REQUIRED/T4_rgb.png"}

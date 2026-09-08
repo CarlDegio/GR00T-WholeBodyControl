@@ -1753,6 +1753,14 @@ class VisualServoController:
         self,
         observation: RawServoObservation,
     ) -> bool:
+        # The far cutoff can restart approach, but crossing it must not skip
+        # the remaining distance correction. Keep yaw out of control/filtering
+        # until approach has confirmed the target distance for stable frames.
+        if self.phase in {
+            ServoPhase.FORWARD_APPROACH,
+            ServoPhase.FORWARD_RECENTER,
+        }:
+            return True
         cutoff = self.far_approach_cutoff_m
         return (
             cutoff is not None
@@ -1790,7 +1798,7 @@ class VisualServoController:
         if self.vertical_recenter_elapsed_s < 0.7:
             return False
         self._transition(
-            ServoPhase.YAW_ALIGN,
+            ServoPhase.FORWARD_APPROACH,
             "vertical recenter completed after 0.7 seconds",
         )
         return True
@@ -1815,7 +1823,7 @@ class VisualServoController:
                 or height_from_bottom <= 0.90
             ):
                 return self._transition(
-                    ServoPhase.YAW_ALIGN,
+                    ServoPhase.FORWARD_APPROACH,
                     "vertical recenter not required after chest-to-head switch",
                 )
             self.vertical_recenter_started_at = float(now)
@@ -1827,7 +1835,7 @@ class VisualServoController:
         if bottom_fraction is not None and bottom_fraction >= 0.80:
             self.vertical_recenter_stable_frames = 1
             return self._transition(
-                ServoPhase.YAW_ALIGN,
+                ServoPhase.FORWARD_APPROACH,
                 "target box bottom reached 80 percent image height",
             )
         self.vertical_recenter_stable_frames = 0
@@ -1839,7 +1847,7 @@ class VisualServoController:
     def _forward_approach_vx(self, forward_error: float) -> float:
         if self.chest_approach_only and not self.joint_completion_active:
             return math.nextafter(self.min_linear_speed_m_s, math.inf)
-        if forward_error <= self.forward_tolerance_m + 1.0e-12:
+        if abs(forward_error) <= self.forward_tolerance_m + 1.0e-12:
             return 0.0
         desired_vx = self._clip(0.5 * forward_error, 0.20)
         vx, _ = self._enforce_min_linear_speed(desired_vx, 0.0)
@@ -2014,20 +2022,6 @@ class VisualServoController:
             yaw_align_geometry_lost = False
             self.last_errors = (forward_error, right_error, yaw_error)
         else:
-            if (
-                (
-                    not self.chest_approach_only
-                    or self.joint_completion_active
-                )
-                and self.far_approach_cutoff_m is not None
-                and self.phase
-                in {ServoPhase.FORWARD_APPROACH, ServoPhase.FORWARD_RECENTER}
-            ):
-                self.resume_phase = None
-                self._transition(
-                    ServoPhase.YAW_ALIGN,
-                    "target reached approach cutoff",
-                )
             yaw_error, yaw_align_geometry_lost = self._refresh_yaw_error(
                 observation, visual_yaw_error, orientation
             )
@@ -2103,7 +2097,7 @@ class VisualServoController:
                 )
                 return self.current
             forward_reached = (
-                forward_error <= self.forward_tolerance_m + 1.0e-12
+                abs(forward_error) <= self.forward_tolerance_m + 1.0e-12
             )
             self.forward_approach_stable_frames = (
                 self.forward_approach_stable_frames + 1
@@ -2119,7 +2113,7 @@ class VisualServoController:
                     return self.current
                 return self._transition(
                     ServoPhase.YAW_ALIGN,
-                    "chest-camera forward error reduced before yaw",
+                    "target distance stable within tolerance before yaw",
                 )
             vx = self._forward_approach_vx(forward_error)
             self.current = ServoCommand(vx, 0.0, 0.0)

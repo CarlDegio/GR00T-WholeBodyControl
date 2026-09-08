@@ -1,0 +1,15 @@
+schema: sonic.experiment.v1
+method: gate_nav_on
+table: gates
+runtime_profile: ../launch_inference.yaml
+tasks_file: tasks.yaml
+cases_file: cases_gates.yaml
+default_case: normal
+navigation: vln
+navigation_backend: lavira
+entry_stage: navigation
+alignment: dual
+gates:
+  nav: true
+runtime_overrides: {}
+gate_under_test: nav

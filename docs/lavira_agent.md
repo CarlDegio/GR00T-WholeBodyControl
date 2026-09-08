@@ -12,6 +12,13 @@ goals. It does not emit velocity. Press `N` to start the manipulation task
 fixed in the runtime YAML; Space invalidates the generation and stops motion
 immediately.
 
+Press `G` in the same operator CLI to confirm the active task's physical success.
+The gateway records `operator_success`, the completion wall-clock timestamp, and
+elapsed seconds since `N`, then invalidates the task and returns to PLANNER
+standing without stopping the C++ control loop. In experiment runs this also
+writes the human success, completed milestones, and completion-time annotation.
+With no active agent task, `G` is ignored; `S` remains manual backward motion.
+
 ## Cloud model endpoints
 
 The default profile uses Alibaba Cloud Model Studio's OpenAI-compatible
@@ -159,6 +166,10 @@ handoff. Sensor freshness and controller ownership remain independent safety
 gates. The legacy `lavira.alignment_prompt` and standalone `base_pose` prompt
 fields remain in YAML for manual use or rollback, but do not drive LaViRA's
 dynamic ALIGN role selection.
+
+Every MANIPULATE POSTCHECK, including UNKNOWN retries and checks with the
+completion gate disabled, uses fresh head RGB (`ego_view`, configured by
+`alignment_head_camera_stream`). Experiment check records label this view `head`.
 
 Each VA request still contains exactly one image and reuses the existing
 `GROUNDING`, `ALIGN_GROUNDING`, or `POSTCHECK` schema. Navigation and ordinary

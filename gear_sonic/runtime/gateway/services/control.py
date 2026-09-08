@@ -21,6 +21,7 @@ from gear_sonic.runtime.gateway.control import (
 )
 from gear_sonic.runtime.gateway.event_display import EventPaneDisplay
 from gear_sonic.runtime.profile import RuntimeProfile, load_runtime_profile
+from gear_sonic.experiments.supervisor import ExperimentSupervisor
 from gear_sonic.runtime.protocol import OperatorCommand, build_navigation_message
 from gear_sonic.runtime.telemetry import (
     build_event,
@@ -120,10 +121,12 @@ class ControlGatewayRuntime:
         self.gateway_events = ControlGatewayCore(
             source="control_gateway_navigation"
         )
+        self.experiment = ExperimentSupervisor(self)
         self.command_handlers: dict[
             str, Callable[[OperatorCommand], DispatchDisposition]
         ] = {
             "navigation_key": self._handle_navigation_key,
+            "complete_agent_success": self._handle_complete_agent_success,
             "lavira_depth_request": self._handle_lavira_depth_request,
             "lavira_rgbd_captured": self._handle_lavira_rgbd_captured,
             "navigation_goal": self._handle_navigation_goal,
@@ -133,6 +136,9 @@ class ControlGatewayRuntime:
             "base_pose_velocity": self._handle_base_pose_velocity,
             "base_pose_status": self._handle_base_pose_status,
             "select_pose_mode": self._handle_select_pose_mode,
+            "experiment_vla_started": self._handle_experiment_vla_started,
+            "experiment_nav_step": self._handle_experiment_nav_step,
+            "experiment_perturbation": self._handle_experiment_perturbation,
         }
         for name in (
             "start_vla_task",
@@ -295,6 +301,11 @@ class ControlGatewayRuntime:
         self,
         command: OperatorCommand,
     ) -> DispatchDisposition:
+        if self.experiment.active and command.metadata.source == "operator_console" and command.name in {
+            "toggle_control_loop", "select_pose_mode", "select_planner_mode", "toggle_policy_pause",
+            "toggle_left_hand_initial_pose", "toggle_right_hand_initial_pose", "set_prompt",
+        }:
+            self.experiment.recorder.write("intervention", generation=self.experiment.active[0], command=command.name)
         handler = self.command_handlers.get(command.name)
         if handler is None:
             self.show_command(command, "CONTROL_COMMAND")
@@ -342,8 +353,11 @@ class ControlGatewayRuntime:
             self.show_event(logging.WARNING, "INVALID_RUNTIME_EVENT", str(exc))
 
     def _handle_timeout(self) -> None:
+        self.experiment.tick()
         timeout_action = self.navigation.tick(now=time.monotonic())
         if timeout_action is not None:
+            if timeout_action.agent_event == 'cancel_navigation' and self.experiment.active:
+                self.experiment.finish(self.experiment.active[0], 'failed', timeout_action.reason)
             self.publish_navigation_action(
                 timeout_action,
                 source="ControlGateway manual-hold timer",
@@ -389,16 +403,60 @@ class ControlGatewayRuntime:
         key = command.parameters.get("key")
         if not isinstance(key, str) or len(key) != 1:
             raise ValueError("navigation_key requires one string key")
+        if key.lower() == "n" and self.experiment.active:
+            previous = self.experiment.active[0]
+            self.experiment.recorder.write("intervention", generation=previous, command="restart_with_n")
+            self.experiment.finish(previous, "cancelled", "restarted_with_n")
+            cancel = self.navigation.handle_key(" ", now=time.monotonic(), cancel_reason="restarted_with_n")
+            self.publish_navigation_action(cancel, source="experiment_restart")
+        old_generation = self.navigation.generation
         action = self.navigation.handle_key(
             key,
             now=time.monotonic(),
             cancel_reason=str(command.parameters.get("reason", "")),
         )
+        if action.agent_event == "start_navigation":
+            self.experiment.start(action.generation)
+        elif action.agent_event == "cancel_navigation":
+            self.experiment.recorder.write("intervention", generation=old_generation, command="operator_cancel")
+            self.experiment.finish(old_generation, "cancelled", "operator_cancel")
         self.publish_navigation_action(
             action,
             source=command.metadata.source,
             input_key="Space" if key == " " else key.upper(),
             agent_parameters=command.parameters,
+        )
+        return DispatchDisposition.HANDLED
+
+    def _handle_complete_agent_success(self, command: OperatorCommand) -> DispatchDisposition:
+        self._require_source(command, "operator_console", "Agent success requires the operator console")
+        nav = self.navigation
+        if not nav.lavira_task_active or nav.task_started_at is None:
+            self.show_command(
+                command, "CONTROL_IGNORED", "No active agent task to mark successful",
+                level=logging.WARNING, reason="no_active_agent",
+            )
+            return DispatchDisposition.HANDLED
+        now = time.monotonic()
+        generation = nav.generation
+        timing = dict(
+            completion_time_s=max(0.0, now - nav.task_started_at),
+            completed_wall_time_ns=time.time_ns(),
+        )
+        result = dict(
+            generation=generation, skill_id=nav.skill_id, segment_id=max(0, nav.segment_id),
+            state="reached", reason="operator_success", **timing,
+        )
+        # Invalidate in-flight model/controller replies before releasing ownership.
+        # VLA handles this cancellation by selecting PLANNER with C++ still running.
+        action = nav.handle_key(" ", now=now, cancel_reason="operator_success")
+        self.publish_navigation_action(action, source=command.metadata.source, input_key="G")
+        self.experiment.confirm_success(generation, **timing)
+        self.experiment.recorder.runtime("control_gateway", "TASK_COMPLETED", **result)
+        self.show_event(
+            logging.INFO, "TASK_COMPLETED",
+            f"Operator confirmed success in {timing['completion_time_s']:.2f}s; returning to PLANNER",
+            source=command.metadata.source, **result,
         )
         return DispatchDisposition.HANDLED
 
@@ -545,6 +603,13 @@ class ControlGatewayRuntime:
         if not self.navigation.accept_status(command.parameters, owner="lavira"):
             raise ValueError("stale navigation agent status")
         generation = int(command.parameters["generation"])
+        self.experiment.finish(generation, str(command.parameters.get("state", "failed")),
+                               str(command.parameters.get("reason", "")))
+        if self.experiment.config:
+            # A model exception can leave a VLA or BasePose worker active.
+            # Invalidate that generation on every experimental terminal result.
+            action = self.navigation.handle_key(" ", now=time.monotonic(), cancel_reason="experiment_terminal")
+            self.publish_navigation_action(action, source="experiment_terminal")
         self._send_navigation_stop(
             generation=generation,
             skill_id=int(command.parameters.get("skill_id", 0)),
@@ -556,6 +621,33 @@ class ControlGatewayRuntime:
         state = str(command.parameters.get("state", "failed"))
         level = logging.ERROR if state == "failed" else logging.INFO
         self.show_command(command, "NAVIGATION_STATUS", state, level)
+        return DispatchDisposition.HANDLED
+
+    def _handle_experiment_vla_started(self, command):
+        self._require_source(command, "vla_service", "VLA first-action event requires vla_service")
+        self.experiment.first_action(command.parameters)
+        return DispatchDisposition.HANDLED
+
+    def _handle_experiment_nav_step(self, command):
+        self._require_source(command, "lavira_agent", "NaVILA actions require lavira_agent")
+        self.experiment.begin_step(command.parameters)
+        return DispatchDisposition.HANDLED
+
+    def _handle_experiment_perturbation(self, command):
+        self._require_source(command, "operator_console", "Disturbance markers require the operator console")
+        from gear_sonic.experiments.recording import read_events
+        if not self.experiment.active:
+            raise ValueError("No active experiment trial")
+        protocol = self.experiment.config["condition"].get("perturbation", {})
+        recorder = self.experiment.recorder
+        generation = self.experiment.active[0]
+        events = [e for e in read_events(recorder.path) if e.get("trial_id") == recorder.trial_id(generation)]
+        if not protocol.get("enabled") or not any(e["type"] == "perturbation_cue" for e in events):
+            raise ValueError("Wait for this trial's configured perturbation cue")
+        if any(e["type"] == "perturbation" for e in events):
+            raise ValueError("This trial's disturbance is already marked")
+        recorder.write("perturbation", generation=generation, protocol=protocol,
+                       gate=self.experiment.config["gate_under_test"])
         return DispatchDisposition.HANDLED
 
     def _handle_start_base_pose(
@@ -601,6 +693,9 @@ class ControlGatewayRuntime:
             command.name, command.parameters
         ):
             raise ValueError("stale or unexpected VLA task command")
+        self.experiment.recorder.write("vla_command", generation=self.navigation.generation,
+            command=command.name, skill_id=self.navigation.skill_id,
+            window_id=command.parameters.get("window_id"))
         if command.name == "start_vla_task":
             self._send_navigation_stop(
                 generation=self.navigation.generation,

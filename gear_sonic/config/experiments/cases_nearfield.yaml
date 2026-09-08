@@ -1,0 +1,47 @@
+# Extend this paired start set and fix its size before formal evaluation.
+cases:
+  nominal_01:
+    layout_id: null
+    start_id: null
+    visibility: nearfield
+    nearfield_group: nominal_01
+    distance_m: null
+    lateral_m: null
+    bearing_deg: null
+    yaw_offset_deg: null
+  distance_01:
+    layout_id: null
+    start_id: null
+    visibility: nearfield
+    nearfield_group: distance_01
+    distance_m: null
+    lateral_m: null
+    bearing_deg: null
+    yaw_offset_deg: null
+  lateral_01:
+    layout_id: null
+    start_id: null
+    visibility: nearfield
+    nearfield_group: lateral_01
+    distance_m: null
+    lateral_m: null
+    bearing_deg: null
+    yaw_offset_deg: null
+  bearing_01:
+    layout_id: null
+    start_id: null
+    visibility: nearfield
+    nearfield_group: bearing_01
+    distance_m: null
+    lateral_m: null
+    bearing_deg: null
+    yaw_offset_deg: null
+  yaw_01:
+    layout_id: null
+    start_id: null
+    visibility: nearfield
+    nearfield_group: yaw_01
+    distance_m: null
+    lateral_m: null
+    bearing_deg: null
+    yaw_offset_deg: null

@@ -1,0 +1,16 @@
+schema: sonic.experiment.v1
+method: near_head
+table: nearfield
+runtime_profile: ../launch_inference.yaml
+tasks_file: tasks.yaml
+cases_file: cases_nearfield.yaml
+default_case: nominal_01
+navigation: vln
+navigation_backend: lavira
+entry_stage: alignment
+alignment: head
+gates:
+  nav: true
+  align: true
+  completion: true
+runtime_overrides: {}

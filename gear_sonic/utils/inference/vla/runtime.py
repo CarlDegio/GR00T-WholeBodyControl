@@ -164,6 +164,7 @@ class _VlaCommandHandler:
         activate_vla_metrics,
         fail_active_task,
         publish_task_status,
+        trained_prompt: str | None = None,
     ) -> None:
         self.state = state
         self.control_listener = control_listener
@@ -181,6 +182,7 @@ class _VlaCommandHandler:
         self.activate_vla_metrics = activate_vla_metrics
         self.fail_active_task = fail_active_task
         self.publish_task_status = publish_task_status
+        self.trained_prompt = trained_prompt
         self.handlers = {
             "set_prompt": self._set_prompt,
             "select_pose_mode": self._select_pose_mode,
@@ -232,7 +234,7 @@ class _VlaCommandHandler:
     def _start_task(self, command, identity, active_identity, window_id: int) -> None:
         if identity < active_identity or identity == active_identity:
             return
-        prompt = command.parameters.get("handoff_context")
+        prompt = self.trained_prompt if self.trained_prompt is not None else command.parameters.get("handoff_context")
         original_task = command.parameters.get("task")
         if not isinstance(prompt, str) or not prompt.strip():
             self.record_event(
@@ -353,7 +355,7 @@ class _VlaCommandHandler:
                 )
             return
         if command.name == "resume_vla_task":
-            prompt = command.parameters.get("handoff_context")
+            prompt = self.trained_prompt if self.trained_prompt is not None else command.parameters.get("handoff_context")
             if isinstance(prompt, str) and prompt.strip():
                 self.language_prompt_ref[0] = prompt
             if not self.state.pause_loop:
@@ -616,7 +618,7 @@ def _publish_cached_action(
     *,
     config: InferenceConfig,
     zmq_socket,
-) -> None:
+) -> bool:
     processed_action = state.cached_action_chunk
     if processed_action:
         motion_token = np.asarray(
@@ -664,3 +666,4 @@ def _publish_cached_action(
         state.action_chunk_index + 1,
         config.action_horizon - 1,
     )
+    return bool(processed_action)

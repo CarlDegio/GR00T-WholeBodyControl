@@ -12,6 +12,7 @@ CONSOLE_COMMAND_NAMES = {
     "c": "start_recording",
     "e": "stop_recording_success",
     "f": "stop_recording_failure",
+    "g": "complete_agent_success",
     "i": "select_pose_mode",
     "k": "toggle_control_loop",
     "o": "select_planner_mode",
@@ -146,6 +147,8 @@ class OperatorConsoleRouter:
         core: ControlGatewayCore,
     ) -> ControlIngressEvent:
         value = line.lower()
+        if value == "g":
+            line = value
         if value == "space":
             value = " "
         if value in RECORDING_ALIASES:
@@ -163,7 +166,7 @@ class OperatorConsoleRouter:
             self.control_running = not self.control_running
         elif event.command.name == "select_pose_mode" and self.control_running:
             self.control_mode = "POSE"
-        elif event.command.name == "select_planner_mode" and self.control_running:
+        elif event.command.name in {"select_planner_mode", "complete_agent_success"} and self.control_running:
             self.control_mode = "PLANNER"
         return event
 
@@ -199,6 +202,7 @@ class NavigationControlState:
         self.manual_velocity = (0.0, 0.0, 0.0)
         self.manual_deadline = 0.0
         self.lavira_task_active = False
+        self.task_started_at: float | None = None
         self.window_id = 0
 
     @property
@@ -239,6 +243,7 @@ class NavigationControlState:
             self.manual_deadline = 0.0
             is_lavira = normalized == "n"
             self.lavira_task_active = is_lavira
+            self.task_started_at = float(now) if is_lavira else None
             self.mode = "lavira_pending" if is_lavira else "base_pose_inference"
             return NavigationControlAction(
                 self.generation,
@@ -255,6 +260,7 @@ class NavigationControlState:
             self.manual_deadline = 0.0
             self.mode = "listen_wasd"
             self.lavira_task_active = False
+            self.task_started_at = None
             return NavigationControlAction(
                 self.generation,
                 "stop",
@@ -299,6 +305,7 @@ class NavigationControlState:
             self.mode = "listen_wasd"
             self.lavira_task_active = False
             self.window_id = 0
+            self.task_started_at = None
             return NavigationControlAction(
                 self.generation,
                 "stop",
@@ -501,6 +508,7 @@ class NavigationControlState:
             if owner == "lavira" and agent_final:
                 self.mode = "listen_wasd"
                 self.lavira_task_active = False
+                self.task_started_at = None
             elif self.lavira_task_active:
                 self.mode = "lavira_pending"
             else:
