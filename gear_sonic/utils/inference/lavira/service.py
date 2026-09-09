@@ -264,10 +264,10 @@ class LaviraPlannerRuntime:
             discard_queued(self.requests)
             self._condition.notify_all()
         LOGGER.info("LISTEN_WASD reason=%s", reason)
-        if reason == "operator_success":
+        if reason in {"operator_success", "operator_failure"}:
             self._event(
                 logging.INFO, "TASK_WORKER_RELEASED",
-                "LaViRA worker released after operator-confirmed success",
+                "LaViRA worker released after operator-confirmed result",
                 generation=generation, reason=reason,
             )
             return

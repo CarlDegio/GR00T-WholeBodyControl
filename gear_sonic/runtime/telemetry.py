@@ -70,12 +70,17 @@ def configure_file_logging(
     component: str,
     *,
     log_dir: str | Path | None = None,
+    force: bool = False,
 ) -> logging.Logger:
     """Return one bounded, file-only logger for an inference component."""
     logger = logging.getLogger(f"sonic.{component}")
+    if force:
+        for handler in tuple(logger.handlers):
+            if isinstance(handler, logging.NullHandler):
+                logger.removeHandler(handler)
     if logger.handlers:
         return logger
-    if os.getenv("SONIC_EXPERIMENT_MINIMAL_LOGGING") == "1":
+    if not force and os.getenv("SONIC_EXPERIMENT_MINIMAL_LOGGING") == "1":
         logger.addHandler(logging.NullHandler())
         logger.setLevel(logging.INFO)
         logger.propagate = False

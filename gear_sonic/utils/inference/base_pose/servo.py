@@ -2711,6 +2711,7 @@ class RawServoRuntime:
         orientation_provider: (
             Callable[[float], Mapping[str, Any] | None] | None
         ) = None,
+        observation_listener: Callable[[RawServoEvent, str | None], None] | None = None,
     ):
         self.config = config
         self.publish = publish
@@ -2756,6 +2757,7 @@ class RawServoRuntime:
         self.output_dir: str | None = None
         self._diagnostics = diagnostics
         self.orientation_provider = orientation_provider
+        self.observation_listener = observation_listener
         self.last_observation_at: float | None = None
         self.last_applied_frame_index: int | None = None
         self.current_attempt_id = 0
@@ -2785,6 +2787,13 @@ class RawServoRuntime:
 
     def _zero(self) -> ServoCommand:
         return ServoCommand(0.0, 0.0, 0.0)
+
+    def _notify_observation(self, event: RawServoEvent) -> None:
+        if self.observation_listener is not None:
+            try:
+                self.observation_listener(event, self.control_source_stream)
+            except Exception as exc:
+                self.logger(f"[RawServo] WARNING pulse observation recording failed: {exc}")
 
     @staticmethod
     def _event_camera_stream(details: Mapping[str, Any]) -> str | None:
@@ -3439,6 +3448,7 @@ class RawServoRuntime:
             self.head_yaw_loss_hold_active = False
             self.active_camera_stream = next_stream
             self.control_source_stream = next_stream
+            self._notify_observation(event)
             self.phase = "switching"
             self.camera_switch_lateral_settle_active = (
                 self.controller.lateral_pulse_mode_active
@@ -3498,6 +3508,7 @@ class RawServoRuntime:
             self._discard_event_diagnostic(event)
             return True
         if event.kind == "error":
+            self._notify_observation(event)
             self._discard_event_diagnostic(event)
             self.logger(f"[RawServo] FAILURE {event.error}")
             self._reset_controller(now)
@@ -3621,6 +3632,7 @@ class RawServoRuntime:
         else:
             self._discard_event_diagnostic(event)
             return False
+        self._notify_observation(event)
         command = self._apply_head_monitor_hold(command, details, now=now)
         command = self._apply_head_yaw_loss_hold(command, details, now=now)
         if (

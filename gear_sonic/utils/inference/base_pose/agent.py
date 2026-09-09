@@ -6,6 +6,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import logging
 import math
+from pathlib import Path
 import threading
 import time
 from typing import Any, Callable, Mapping
@@ -27,10 +28,12 @@ from gear_sonic.runtime.zmq_sockets import connect_subscriber
 from gear_sonic.utils.inference.base_pose.dual_servo import (
     run_dual_raw_servo_worker,
 )
+from gear_sonic.utils.inference.base_pose.pulse_recording import VyPulseRecorder
 from gear_sonic.utils.inference.base_pose.sensor import (
     SensorGatewayDualBasePoseCamera,
 )
 from gear_sonic.utils.inference.base_pose.servo import (
+    LateralPulseState,
     RawServoRuntime,
     validate_raw_servo_dependencies,
 )
@@ -223,12 +226,14 @@ class GatewayRawServoAdapter:
         orientation_provider: (
             Callable[[float], Mapping[str, Any] | None] | None
         ) = None,
+        pulse_recorder: VyPulseRecorder | None = None,
     ) -> None:
         self.submit_intent = submit_intent
         self.logger = logger
         self.report_event = report_event
         self.report_metrics = report_metrics
         self.monotonic = monotonic
+        self.pulse_recorder = pulse_recorder
         self._publish_enabled = False
         self._terminal_reported = True
         self.task_generation = 0
@@ -241,6 +246,7 @@ class GatewayRawServoAdapter:
             monotonic=monotonic,
             metrics=report_metrics,
             orientation_provider=orientation_provider,
+            observation_listener=(pulse_recorder.observe_frame if pulse_recorder is not None else None),
         )
 
     def _log(self, message: str) -> None:
@@ -255,6 +261,13 @@ class GatewayRawServoAdapter:
             else "RUNTIME_WARNING"
         )
         self.report_event(logging.WARNING, code, message)
+
+    def _record_pulse(self, method: str, *args, **kwargs) -> None:
+        if self.pulse_recorder is not None:
+            try:
+                getattr(self.pulse_recorder, method)(*args, **kwargs)
+            except Exception as exc:
+                self.logger(f"[RawServo] WARNING vy pulse recording failed: {exc}")
 
     def _publish(self, payload: Mapping[str, Any]) -> None:
         if not self._publish_enabled:
@@ -277,6 +290,19 @@ class GatewayRawServoAdapter:
             "base_pose_velocity",
             parameters,
         )
+        if self.pulse_recorder is not None:
+            controller = self.runtime.controller
+            self._record_pulse(
+                "observe_send",
+                command,
+                pulse_token=(
+                    controller.lateral_pulse_started_at
+                    if controller.lateral_pulse_state is LateralPulseState.PULSING
+                    else None
+                ),
+                identity=(self.task_generation, self.skill_id, self.segment_id),
+                stop_reason=controller.lateral_pulse_last_stop_reason,
+            )
 
     def _retire_invocation(self, generation: int) -> None:
         """Return a completed invocation to the public generation axis."""
@@ -426,6 +452,7 @@ class GatewayRawServoAdapter:
                 f"active_generation={self.task_generation}"
             )
             return False
+        self._record_pulse("cancel", reason)
         self._publish_enabled = False
         if self.runtime.phase == "idle":
             # Global navigation cancellation is also delivered while BasePose
@@ -456,6 +483,7 @@ class GatewayRawServoAdapter:
         was_soft_stale = self.runtime.soft_stale
         self.runtime.poll_events()
         self.runtime.publish_due(timestamp)
+        self._record_pulse("tick")
         if self.report_event is not None:
             if not was_soft_stale and self.runtime.soft_stale:
                 self.report_event(
@@ -512,6 +540,7 @@ class GatewayRawServoAdapter:
     def shutdown(self) -> None:
         self._publish_enabled = False
         self.runtime.shutdown()
+        self._record_pulse("close")
 
 
 def _dual_worker_kwargs(adapter: Any, camera: Any) -> dict[str, Any]:
@@ -535,15 +564,17 @@ def run_base_pose_yolo_agent(config: Any) -> None:
 
     from gear_sonic.runtime.profile import load_runtime_profile
     from gear_sonic.experiments.config import settings
-    from gear_sonic.experiments.base_pose import NullDiagnostics, run_head_worker, run_geometric_service
+    from gear_sonic.experiments.base_pose import run_head_worker, run_geometric_service
     experiment_profile = load_runtime_profile(config.profile or None, overlays=config.overlay)
     experiment = settings(experiment_profile)
     config.minimal_logging = bool(experiment)
     if experiment.get("alignment") == "geometric":
         return run_geometric_service(config, experiment_profile)
+    # Keep all scalar diagnostics in experiments, without copying/saving RGB frames.
+    config.raw_diagnostic_image_interval_frames = 0
     head_only = experiment.get("alignment") == "head"
     validate_raw_servo_dependencies(config)
-    service = InferenceServiceContext("base_pose", config)
+    service = InferenceServiceContext("base_pose", config, force_file_logging=True)
     profile = service.profile
     context = zmq.Context.instance()
 
@@ -622,6 +653,16 @@ def run_base_pose_yolo_agent(config: Any) -> None:
             return latest_orientation.diagnostics(now)
 
         orientation_provider = read_orientation
+    pulse_log_path = (
+        Path(experiment["run_dir"]) / "vy_pulses.jsonl"
+        if experiment.get("run_dir")
+        else Path(config.output_root) / f"vy_pulses_{time.time_ns()}.jsonl"
+    )
+    pulse_recorder = VyPulseRecorder(
+        pulse_log_path,
+        settle_s=config.raw_lateral_pulse_settle_s,
+        max_frame_gap_s=config.raw_camera_stale_s,
+    )
     adapter = GatewayRawServoAdapter(
         config,
         submit_intent=lambda name, parameters: intent.send(name, parameters),
@@ -635,9 +676,8 @@ def run_base_pose_yolo_agent(config: Any) -> None:
         ),
         report_metrics=send_metrics,
         orientation_provider=orientation_provider,
+        pulse_recorder=pulse_recorder,
     )
-    if experiment:
-        adapter.runtime._diagnostics = NullDiagnostics(logger=log_runtime)
     control = ControlGatewaySubscriber(
         profile.endpoint_uri("control_gateway_dispatch"),
         context=context,
@@ -684,6 +724,9 @@ def run_base_pose_yolo_agent(config: Any) -> None:
         "BasePose is ready and waiting for a start command",
         streams=stream_summary,
         task=config.task,
+        vy_pulse_log=str(pulse_log_path.resolve()),
+        frame_log_root=str(Path(config.output_root).resolve()),
+        diagnostic_images=False,
     )
     flush_events()
     try:

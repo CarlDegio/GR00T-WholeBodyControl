@@ -43,7 +43,7 @@ bash gear_sonic/scripts/experiments/full_vln.sh --task T1 --case visible_01
 | 表 1 | `full_vln.sh` | 完整 VLN agent | `visible_01` |
 | 表 1 | `nav_direct_vla.sh` | 导航交接后直接 VLA | `visible_01` |
 | 表 1 | `navila_basepose_vla.sh` | NaVILA 导航，共用 BasePose 与 VLA | `visible_01` |
-| 表 1 | `geometric_vla.sh` | 头部单目标几何接近/居中 | `visible_01` |
+| 表 1 | `geometric_vla.sh` | 头部优先、头胸切换的单目标几何接近/居中 | `visible_01` |
 | 表 1 | `full_objectnav.sh` | 完整 agent，目标搜索指令 | `visible_01` |
 | 表 2 | `near_dual.sh` | 给定起点直接双相机 ALIGN → VLA | `nominal_01` |
 | 表 2 | `near_head.sh` | 给定起点直接单头相机 ALIGN → VLA | `nominal_01` |
@@ -59,6 +59,7 @@ bash gear_sonic/scripts/experiments/full_vln.sh --task T1 --case visible_01
 
 - `n`：新建试验 ID 并开始；当前试验未结束时再次按 `n`，先取消并关闭旧试验，再开始新试验。旧回复无法控制新试验。
 - `g`：人工确认当前试验已成功，记录按键时刻及从 `n` 开始的完成耗时，并写入成功、全部子目标完成及适用的导航成功标注。立即结束本轮 agent，回到 PLANNER 站立，C++ 控制循环继续运行；迟到的 VA 回复不能覆盖成功结果。没有运行中的 agent 时忽略此键，`s` 仍用于手动后退。
+- `h`：人工确认当前试验失败，结束流程与 `g` 相同，结果记为 `failed` / `operator_failure`。以 CLI 按键事件的时间作为任务结束时间，立即停止本轮 agent 并回到 PLANNER 站立；没有运行中的 agent 时忽略。`g` / `h` 均支持大写，重复按键或迟到回复不能覆盖已结束的结果。`f` 仍用于停止录制并标记录制失败。
 - 空格：取消、停止并记录人工接管。若物理任务已成功完成，应在标注中填写停止前的实际完成时间；完成后的停止不降低 SR。
 - 扰动组出现 `PERTURBATION_CUE` 时，施加预先定义的扰动，立即输入 `:perturb` 并回车。系统记录该时刻并继续阶段检查；提示前、重复或无扰动组的标记会被拒绝。此标记是操作员确认的触发时刻，可用外部视频核查。
 - 扰动等待计入总时间。预定义扰动不算额外接管；额外切换控制模式、手动改提示词、暂停策略等单独记录为人工干预。
@@ -67,9 +68,11 @@ bash gear_sonic/scripts/experiments/full_vln.sh --task T1 --case visible_01
 
 所有方法在 MANIPULATE 操作阶段的 VA 检查均使用头部 `ego_view` 图像，包括 UNKNOWN 重试和完成门控关闭时的旁路检查；日志中的 `camera` 记为 `head`。
 
+**VA 完成后的延时**：启用完成门控时，VA 判定 `TASK_COMPLETE` 后立即记录试验完成，VLA 继续推理并发送动作 5 s，再停止并切回 PLANNER。这 5 s 不加入完成时间；独立物理成功及耗时标注保持原有口径。延时期间保留导航控制权，空格、`n` 开始新任务或人工切换控制可提前结束延时，VLA 底层保护继续生效。`g` / `h` 人工确认、失败、超时与完成门控关闭组仍按原规则立即停止。日志另记 `vla_completion_delay_started` / `vla_completion_delay_ended`，实际 `stop_vla_task` 在延时结束时记录。
+
 **单头相机**：角色选择、检测/跟踪、BasePose 控制、ALIGN 视觉交接仅使用 `ego_view`。VLA 仍使用头、胸、左右腕四视角；首帧归档中的胸部图像和离线 mask 不参与该版本的对齐决策。近场导航阶段记为“不适用”。
 
-**简单几何对齐**：参数在 `tasks.yaml` 的 `geometric` 中，目标由每任务 `geometry_target` 给定。头部 RGB-D + YOLOE，先以 `wz=0.3 rad/s` 转向目标中心，再以 `vx=0.4 m/s` 接近，最后以 `wz=0.2 rad/s` 居中。纵向距离默认 1.1 m、距离容差 0.1 m、角度容差 9°，连续 3 个新观测满足才记为 aligned。目标丢失时保持静止，过近时以相同速度后退纠偏，无侧移及结构边缘 yaw 控制。60 s 超时记录 `geometric_timeout`、停止底座，完成共同的交接检查记录后继续 VLA；VA 建议不会阻挡此分支。硬件/控制错误、取消和总时限仍可结束试验。对齐超时不自动等于物理任务失败。
+**简单几何对齐**：参数在 `tasks.yaml` 的 `geometric` 中，目标由每任务 `geometry_target` 给定。使用头、胸 RGB-D + YOLOE，初始化优先选有有效目标几何的头相机，头部不可用时尝试胸相机；运行中保持当前相机，当前目标丢失时先保持零速度，再尝试另一相机。两路分别使用自身内外参，切换时重置跟踪状态、转向阶段和稳定帧计数。先以 `wz=0.3 rad/s` 转向目标中心，再以 `vx=0.4 m/s` 接近，最后以 `wz=0.2 rad/s` 居中。纵向距离默认 1.1 m、距离容差 0.1 m、角度容差 9°，连续 3 个新观测满足才记为 aligned。两路都没有可用目标时，每轮两路各取得一个新观测才累计一次连续丢失；任一路恢复清零。达到 `both_lost_frames: 20` 时记录 `geometric_target_lost`、停止底座，进入共同的头胸 ALIGN VA 检查并归档图片和结果，然后继续 VLA，不记为对齐成功。本分支的 ALIGN VA 返回 `NOT_SATISFIED` 或 `UNKNOWN` 也不会直接判整次任务失败或阻止 VLA；操作完成仍由后续 MANIPULATE 完成检查判定。重复帧和相机取帧超时不冒充目标丢失帧；无新帧的等待仍受 60 s 总对齐时限约束。过近时以相同速度后退纠偏，无侧移及结构边缘 yaw 控制。60 s 超时记录 `geometric_timeout`、停止底座，完成共同的交接检查记录后继续 VLA；VA 建议不会阻挡此分支。硬件/模型/控制错误、取消和试验总时限仍可结束试验。对齐超时不自动等于物理任务失败。最小日志保留 YOLOE 就绪、相机选择/切换、两路检测与可用性、丢失计数、首次非零指令及停止原因。
 
 **NaVILA**：在 `tasks.yaml` 的 `navila.host` / `port` 填写可达的模型 ZMQ 端口；默认 `127.0.0.1:30000` 只是客户端配置，可以配合已有端口转发。不要填写 SSH 端口。需要认证时设置 `NAVILA_API_TOKEN`。每次 `n` 先 `ping`、`reset`，同一试验导航恢复保留服务端历史。请求使用 MessagePack `endpoint=get_action`、JPEG、instruction、sequence，响应检查字典类型、协议版本、序号和错误。支持 25/50/75 cm 前进、15/30/45° 左右转和 stop；超时或不支持的动作结束试验，绝不猜测动作。离散动作由共享网关定时执行并停止。使用专用服务实例，避免其他客户端修改同一服务端历史；本次没有修改服务端。
 
@@ -104,7 +107,7 @@ semantic/sample_*/                    # 副表 2 的角色 mask
 
 最终物理成功、有效子目标数、实际完成时间、Nav SR，以及每次门控的独立真值均需要人工标注。**VA 宣告完成不会自动填成成功，也不会替代实际完成时间。** 开始前固定任务成功的保持时间、倾倒条件和放置区域。
 
-运行中按 `g` 就是一次人工成功标注，汇总可直接读取；也可用下方命令追加或更正标注。
+运行中按 `g` / `h` 分别写入人工成功 / 失败标注及按键结束时间，汇总可直接读取。`h` 保留已有的有效子目标数和 Nav SR 标注，缺失时需要另行填写，因为任务失败不代表所有子目标或导航都失败。两键的 `completion_time_s` 和 `actual_runtime_s` 按按键时刻截止，不包含传输和停止处理延迟；论文统计字段 `time_s` 对失败试验仍采用既定的总时限惩罚值。也可用下方命令追加或更正标注。
 
 ```bash
 # 查看 trial_id、门控 event_id 和语义 sample_id。

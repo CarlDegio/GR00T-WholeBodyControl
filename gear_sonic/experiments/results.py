@@ -49,6 +49,7 @@ def trial_rows(events):
     for start in (e for e in events if e["type"] == "trial_start"):
         trial = [e for e in events if e.get("trial_id") == start["trial_id"]]
         end = next((e for e in trial if e["type"] == "trial_end"), None)
+        end_ns = end.get("completed_monotonic_ns", end["monotonic_ns"]) if end else None
         synthetic_end = end is not None and end.get("reason") == "operator_closed_log_offline"
         annotations = {}
         for event in trial:
@@ -57,7 +58,7 @@ def trial_rows(events):
         runtime = [e for e in trial if e["type"] == "runtime"]
         # Late model replies remain evidence but cannot create another completed skill.
         if end:
-            runtime = [e for e in runtime if e["monotonic_ns"] <= end["monotonic_ns"]]
+            runtime = [e for e in runtime if e["monotonic_ns"] <= end_ns]
         skill_starts = [e for e in runtime if e["code"] == "SKILL_STARTED"]
         align_count = sum(e.get("skill") == "ALIGN" for e in skill_starts)
         nav_retries = 0
@@ -70,7 +71,7 @@ def trial_rows(events):
                 recovery_needed = event.get("controller_state") in {"failed", "target_not_found"} or event.get(
                     "va_result"
                 ) in {"NOT_FOUND", "NOT_SATISFIED", "UNKNOWN"}
-        active_events = [e for e in trial if end is None or e["monotonic_ns"] <= end["monotonic_ns"]]
+        active_events = [e for e in trial if end_ns is None or e["monotonic_ns"] <= end_ns]
         started_vla = any(e["type"] == "vla_first_action" for e in active_events)
         invoked = {e.get("skill_id") for e in active_events if e["type"] == "vla_first_action"}
         success = annotations.get("success")
@@ -127,7 +128,7 @@ def trial_rows(events):
             progress=progress,
             time_s=duration,
             completion_time_s=completion,
-            actual_runtime_s=(end["monotonic_ns"] - start["monotonic_ns"]) / 1e9
+            actual_runtime_s=(end_ns - start["monotonic_ns"]) / 1e9
             if end and not synthetic_end
             else None,
             nav_success=annotations.get("nav_success") if session["entry_stage"] == "navigation" else None,

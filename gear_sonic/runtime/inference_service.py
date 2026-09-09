@@ -16,9 +16,12 @@ from gear_sonic.runtime.telemetry import (
 class InferenceServiceContext:
     """Own profile, logging, telemetry publishers, and queued runtime events."""
 
-    def __init__(self, component: str, config: object, *, enable_metrics=True):
+    def __init__(
+        self, component: str, config: object, *, enable_metrics=True,
+        force_file_logging=False,
+    ):
         self.component = str(component)
-        self.logger = configure_file_logging(self.component)
+        self.logger = configure_file_logging(self.component, force=force_file_logging)
         self.profile = load_runtime_profile(
             getattr(config, "profile", "") or None,
             overlays=tuple(getattr(config, "overlay", ())),

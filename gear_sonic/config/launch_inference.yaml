@@ -165,7 +165,7 @@ components:
     # Chest position ignores head edge yaw above this distance and approaches.
     raw_chest_approach_cutoff_m: 1.2
     raw_forward_tolerance_m: 0.10
-    raw_lateral_tolerance_m: 0.06
+    raw_lateral_tolerance_m: 0.10
     raw_lateral_pulse_enter_m: 0.10
     raw_lateral_pulse_exit_m: 0.10
     raw_lateral_pulse_max_s: 0.40

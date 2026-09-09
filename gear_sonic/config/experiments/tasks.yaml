@@ -45,6 +45,7 @@ geometric:
   fine_wz: 0.2
   timeout_s: 60.0
   stable_frames: 3
+  both_lost_frames: 20
 navila:
   # Model TCP endpoint, not SSH port. Forward the remote model port to this
   # local port or replace host/port with the deployed accessible endpoint.

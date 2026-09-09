@@ -804,8 +804,7 @@ def run_dual_raw_servo_worker(
                     Path(config.output_root).resolve()
                     / f"dual_raw_yoloe_{stamp}_g{generation}"
                 )
-                if not getattr(config, "minimal_logging", False):
-                    output_dir.mkdir(parents=True, exist_ok=False)
+                output_dir.mkdir(parents=True, exist_ok=False)
                 initial_targets: dict[str, TrackedInstance | None] = {}
                 initial_yaw_align_targets: dict[str, TrackedInstance | None] = {}
                 if eligibility_factory is not None:

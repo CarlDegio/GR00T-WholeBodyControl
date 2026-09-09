@@ -97,7 +97,6 @@ ALIGN_DISTANCE_TARGET_KEYS = {
 ALIGN_YAW_TARGET_KEYS = {
     "name", "visible", "confidence",
 }
-MIN_ALIGNMENT_TARGET_BBOX_AREA = 10_000.0
 POSTCHECK_KEYS = {
     "mode", "status", "transition", "visual_evidence", "confidence",
 }
@@ -440,22 +439,12 @@ def validate_alignment_grounding(value: Any) -> dict[str, Any]:
         raise LaViRAAgentError(
             "VA ALIGN_GROUNDING invisible target cannot include a bbox"
         )
-    bbox_area = (
-        0.0
-        if bbox is None
-        else (bbox[2] - bbox[0]) * (bbox[3] - bbox[1])
-    )
-    eligible = bool(
-        target_visible
-        and yaw_target_visible
-        and bbox is not None
-        and bbox_area >= MIN_ALIGNMENT_TARGET_BBOX_AREA
-    )
+    eligible = bool(target_visible and yaw_target_visible and bbox is not None)
     found = value["status"] == "FOUND"
     if found and not eligible:
         raise LaViRAAgentError(
-            "VA ALIGN_GROUNDING FOUND requires both roles visible and a stable "
-            f"target bbox (area={bbox_area / 10_000.0:.2f}% of image)"
+            "VA ALIGN_GROUNDING FOUND requires both roles visible and a valid "
+            "target bbox"
         )
     return {
         "mode": "ALIGN_GROUNDING",
@@ -2748,13 +2737,15 @@ class LaViRAAgent:
             else:
                 unknown_count = 0
             if post["transition"] == "TASK_COMPLETE":
+                # The gateway records completion now and delays the actual
+                # VLA stop / PLANNER handoff by five seconds.
                 self.submit_intent("stop_vla_task", {
                     "generation": generation, "skill_id": skill_id,
                     "window_id": window_id,
                     "reason": "postcondition_satisfied",
                 })
                 return AgentHistoryEntry(
-                    skill_id, "MANIPULATE", self.global_target, "stopped",
+                    skill_id, "MANIPULATE", self.global_target, "completion_confirmed",
                     "SATISFIED", post["visual_evidence"],
                 )
         self.submit_intent("stop_vla_task", {

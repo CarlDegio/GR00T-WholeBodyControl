@@ -12,12 +12,17 @@ goals. It does not emit velocity. Press `N` to start the manipulation task
 fixed in the runtime YAML; Space invalidates the generation and stops motion
 immediately.
 
-Press `G` in the same operator CLI to confirm the active task's physical success.
-The gateway records `operator_success`, the completion wall-clock timestamp, and
-elapsed seconds since `N`, then invalidates the task and returns to PLANNER
-standing without stopping the C++ control loop. In experiment runs this also
-writes the human success, completed milestones, and completion-time annotation.
-With no active agent task, `G` is ignored; `S` remains manual backward motion.
+Press `G` in the same operator CLI to confirm the active task's physical success,
+or `H` to mark it failed. Both keys record the CLI key event's timestamp and
+elapsed seconds since `N`, then invalidate the task and return to PLANNER standing
+without stopping the C++ control loop. Their results are `reached` /
+`operator_success` and `failed` / `operator_failure`, respectively. Experiment
+runs also receive the human result and time annotations. Success marks all
+milestones and applicable navigation successful; failure preserves independent
+progress and navigation labels for manual annotation. Repeated keys and late
+worker replies cannot overwrite the result. With no active agent task, both keys
+are ignored. Lowercase `g` / `h` work too; `f` continues to stop recording with a
+failure label, and `S` remains manual backward motion.
 
 ## Cloud model endpoints
 
@@ -154,6 +159,8 @@ clear straight edge; a clear non-floor support is preferred, while the floor is
 never selected. The response contains the selected names, a tight target bbox,
 per-role visibility and confidence, and visual evidence. The runtime passes the
 two names and target bbox to BasePose without changing its controller API.
+A `FOUND` response requires both roles to be visible and the target bbox to have
+valid coordinates and positive width/height, regardless of its image-area fraction.
 
 After BasePose returns, ALIGN reuses the VA `POSTCHECK` interface twice: once
 with a fresh chest RGB and once with a fresh head RGB. Each request explicitly
@@ -236,6 +243,15 @@ LA emits only `EXECUTE` or `FAIL`; it does not make a final `COMPLETE`
 decision. Once MANIPULATE returns the paired `SATISFIED` / `TASK_COMPLETE` VA
 postcheck, the runtime emits the completed skill event and directly finalizes
 the task without another LA request.
+
+After this VA-confirmed completion, ControlGateway keeps VLA inference and its
+POSE action stream running for another 5 seconds, then sends the stop and
+returns to PLANNER. The task completion record is written when the VA completion
+intent arrives; the extra execution time does not extend the completion clock or
+independent physical-success annotations. Navigation remains reserved during
+this interval. Space, a new task via N, and operator mode controls can interrupt
+it; VLA safety checks remain active. Failures, timeouts, manual results via G/H,
+and experiments with the completion gate disabled retain their immediate stop.
 
 Every LA and VA request is archived before transmission under
 `outputs/logs/inference/lavira_requests/`, alongside the inference component

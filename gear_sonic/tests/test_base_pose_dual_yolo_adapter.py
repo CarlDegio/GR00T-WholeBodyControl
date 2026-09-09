@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import replace
 import inspect
+import json
 from pathlib import Path
 import queue
 import threading
@@ -47,6 +48,7 @@ from gear_sonic.utils.inference.base_pose.servo import (
     TrackedInstance,
 )
 from gear_sonic.utils.inference.base_pose.diagnostics import (
+    AsyncFrameDiagnosticsWriter,
     DetectionFrameData,
 )
 
@@ -1632,8 +1634,10 @@ def test_runtime_stops_on_first_head_hit_and_resumes_after_three_misses(
     assert runtime.controller.current.vx > 0.0
 
 
+@pytest.mark.parametrize("minimal_logging", [False, True])
 def test_close_chest_distance_does_not_trigger_head_handoff(
     tmp_path: Path,
+    minimal_logging: bool,
 ) -> None:
     from gear_sonic.utils.inference.base_pose.sensor import AlignedRGBDSnapshot
 
@@ -1723,7 +1727,10 @@ def test_close_chest_distance_does_not_trigger_head_handoff(
     config = BasePoseAgentConfig(
         task="approach the blue basket",
         output_root=str(tmp_path),
+        raw_diagnostic_image_interval_frames=0,
     )
+    config.minimal_logging = minimal_logging
+    diagnostics = AsyncFrameDiagnosticsWriter()
     requests: queue.Queue[int | None] = queue.Queue()
     requests.put(1)
     requests.put(None)
@@ -1760,6 +1767,7 @@ def test_close_chest_distance_does_not_trigger_head_handoff(
             ),
             "yaw_alignment_required": lambda: False,
             "position_fallback_allowed": lambda: True,
+            "diagnostics": diagnostics,
         },
         daemon=True,
     )
@@ -1774,6 +1782,7 @@ def test_close_chest_distance_does_not_trigger_head_handoff(
         emitted.append(events.get(timeout=2.0))
     gate.cancel(1)
     worker.join(timeout=2.0)
+    diagnostics.close()
     while not events.empty():
         emitted.append(events.get_nowait())
     applied = [
@@ -1796,6 +1805,17 @@ def test_close_chest_distance_does_not_trigger_head_handoff(
     assert tracker.start_calls == 1
     assert not worker.is_alive()
     assert camera.closed
+    output_dir = next(tmp_path.glob("dual_raw_yoloe_*"))
+    records = [
+        json.loads(line)
+        for line in (output_dir / "raw_servo_frames.jsonl").read_text().splitlines()
+    ]
+    assert len(records) >= 5
+    assert all(record["geometry"]["target"] for record in records)
+    assert all(not record["image_artifacts"] for record in records)
+    assert {path.name for path in output_dir.rglob("*") if path.is_file()} == {
+        "raw_servo_frames.jsonl"
+    }
 
 
 def test_head_monitor_keeps_chest_position_when_live_head_yaw_is_valid(

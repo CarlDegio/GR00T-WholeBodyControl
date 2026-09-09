@@ -13,6 +13,7 @@ CONSOLE_COMMAND_NAMES = {
     "e": "stop_recording_success",
     "f": "stop_recording_failure",
     "g": "complete_agent_success",
+    "h": "complete_agent_failure",
     "i": "select_pose_mode",
     "k": "toggle_control_loop",
     "o": "select_planner_mode",
@@ -147,7 +148,7 @@ class OperatorConsoleRouter:
         core: ControlGatewayCore,
     ) -> ControlIngressEvent:
         value = line.lower()
-        if value == "g":
+        if value in {"g", "h"}:
             line = value
         if value == "space":
             value = " "
@@ -166,7 +167,9 @@ class OperatorConsoleRouter:
             self.control_running = not self.control_running
         elif event.command.name == "select_pose_mode" and self.control_running:
             self.control_mode = "POSE"
-        elif event.command.name in {"select_planner_mode", "complete_agent_success"} and self.control_running:
+        elif event.command.name in {
+            "select_planner_mode", "complete_agent_success", "complete_agent_failure",
+        } and self.control_running:
             self.control_mode = "PLANNER"
         return event
 
@@ -492,6 +495,7 @@ class NavigationControlState:
         *,
         owner: str | None = None,
         agent_final: bool = True,
+        defer_vla_stop: bool = False,
     ) -> bool:
         if int(payload.get("generation", -1)) != self.generation:
             return False
@@ -506,7 +510,7 @@ class NavigationControlState:
                 return False
         if payload.get("state") in {"reached", "failed", "stopped"}:
             if owner == "lavira" and agent_final:
-                self.mode = "listen_wasd"
+                self.mode = "lavira_completing" if defer_vla_stop else "listen_wasd"
                 self.lavira_task_active = False
                 self.task_started_at = None
             elif self.lavira_task_active:

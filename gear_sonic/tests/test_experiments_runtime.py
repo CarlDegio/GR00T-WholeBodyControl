@@ -236,6 +236,7 @@ def supervisor(monkeypatch, tmp_path, method="near_vla"):
     gateway = SimpleNamespace(
         profile=profile,
         navigation=navigation,
+        pending_vla_completion=None,
         publish_navigation_action=lambda action, **kw: sent.append(action),
         _send_navigation_stop=lambda **kw: sent.append(("stop", kw)),
         dispatch_navigation_event=lambda *args: sent.append(args),
@@ -266,12 +267,20 @@ def test_gateway_total_clock_cancels_blocked_model_and_isolates_new_trial(monkey
 
 
 @pytest.mark.parametrize("mode", ["lavira_pending", "lavira_nav", "base_pose_motion", "lavira_manipulate"])
-def test_operator_success_records_result_time_and_invalidates_old_commands(monkeypatch, tmp_path, mode):
+@pytest.mark.parametrize("method", [method for method in METHODS if method != "semantic_roles"])
+@pytest.mark.parametrize("key,success", [("g", True), ("h", False)])
+def test_operator_result_records_key_time_and_invalidates_old_commands(
+    monkeypatch, tmp_path, mode, method, key, success,
+):
     from gear_sonic.experiments.results import trial_rows
     from gear_sonic.runtime.gateway.control import ControlGatewayCore, OperatorConsoleRouter
     from gear_sonic.runtime.gateway.services.control import ControlGatewayRuntime
 
-    controller, clock, sent = supervisor(monkeypatch, tmp_path, "full_vln")
+    event_clock = [0.0]
+    monkeypatch.setattr("time.monotonic", lambda: event_clock[0])
+    monkeypatch.setattr("time.monotonic_ns", lambda: round(event_clock[0] * 1e9))
+    monkeypatch.setattr("time.time_ns", lambda: round((1000.0 + event_clock[0]) * 1e9))
+    controller, clock, sent = supervisor(monkeypatch, tmp_path, method)
     gateway = controller.gateway
     shown = []
     gateway.show_command = lambda *a, **k: shown.append((a, k))
@@ -283,43 +292,63 @@ def test_operator_success_records_result_time_and_invalidates_old_commands(monke
     nav.mode, nav.skill_id, nav.segment_id = mode, 3, 6
     nav.manual_velocity = (0.3, 0.0, 0.0)
     nav.manual_deadline = 100.0
-    clock[0] = 42.75
-    monkeypatch.setattr("gear_sonic.runtime.gateway.services.control.time.monotonic", lambda: clock[0])
-    command = OperatorConsoleRouter().accept_line("g", core=ControlGatewayCore()).command
+    clock[0] = event_clock[0] = 42.75
+    core = ControlGatewayCore()
+    command = OperatorConsoleRouter().accept_line(key, core=core).command
+    # A model reply and gateway processing arrive after the operator's key.
+    clock[0] = event_clock[0] = 43.25
+    controller.recorder.runtime("lavira", "SKILL_STARTED", generation=generation, skill="ALIGN")
 
-    ControlGatewayRuntime._handle_complete_agent_success(gateway, command)
+    ControlGatewayRuntime._handle_complete_agent_result(gateway, command)
 
     assert controller.active is None and nav.mode == "listen_wasd"
     assert not nav.lavira_task_active and nav.task_started_at is None
     assert nav.manual_velocity == (0.0, 0.0, 0.0) and nav.manual_deadline == 0.0
     action = sent[-1]
     assert action.mode == "stop" and action.agent_event == "cancel_navigation"
-    assert action.generation > generation and action.reason == "operator_success"
+    reason = "operator_success" if success else "operator_failure"
+    assert action.generation > generation and action.reason == reason
     events = read_events(controller.recorder.path)
     end = next(e for e in events if e["type"] == "trial_end")
-    assert end["state"] == "reached" and end["reason"] == "operator_success"
+    assert end["state"] == ("reached" if success else "failed") and end["reason"] == reason
     assert end["completion_time_s"] == pytest.approx(42.75)
-    assert end["completed_wall_time_ns"] > 0
+    assert end["completed_wall_time_ns"] == 1_042_750_000_000
+    assert end["completed_monotonic_ns"] == 42_750_000_000
+    assert end["monotonic_ns"] == 43_250_000_000
     row = trial_rows(events)[0]
-    assert row["success"] is True and row["physical_success"] is True
-    assert row["time_s"] == pytest.approx(42.75) and row["completion_time_s"] == pytest.approx(42.75)
-    assert row["progress"] == 1.0 and row["nav_success"] is True
-    assert not row["intervention"] and not row["missing_annotations"]
+    assert row["success"] is success and row["physical_success"] is success
+    assert row["completion_time_s"] == pytest.approx(42.75)
+    assert row["actual_runtime_s"] == pytest.approx(42.75)
+    # Published experiment scores retain their fixed penalty for failed tasks.
+    assert row["time_s"] == pytest.approx(42.75 if success else controller.config["task"]["total_timeout_s"])
+    navigation_entry = controller.config["entry_stage"] == "navigation"
+    assert row["progress"] == (1.0 if success else None)
+    assert row["nav_success"] is (True if success and navigation_entry else None)
+    missing = [] if success else ["progress"] + (["nav_success"] if navigation_entry else [])
+    assert row["missing_annotations"] == missing
+    assert not row["intervention"] and row["align_attempts"] == 0
+    assert shown[-1][0][1] == ("TASK_COMPLETED" if success else "TASK_FAILED")
 
-    # Repeat G and late model/controller replies cannot overwrite this result.
-    ControlGatewayRuntime._handle_complete_agent_success(gateway, command)
+    # Neither repeated nor opposite result keys can overwrite a finished trial.
+    for repeated_key in ("g", "h"):
+        ControlGatewayRuntime._handle_complete_agent_result(gateway, core.accept_console_line(repeated_key).command)
     assert len(sent) == 1
     assert not nav.accept_status(dict(generation=generation, skill_id=3, state="failed"), owner="lavira")
     assert not nav.accept_vla_command("start_vla_task", dict(generation=generation, skill_id=3))
     controller.finish(generation, "failed", "late_failure")
+    controller.finish(generation, "reached", "late_success")
     assert read_events(controller.recorder.path) == events
+    clock[0] = event_clock[0] = 50.0
     restarted = nav.handle_key("n", now=50.0)
     controller.start(restarted.generation)
     controller.finish(generation, "failed", "late_failure")
+    ControlGatewayRuntime._handle_complete_agent_result(gateway, command)
     assert controller.active[0] == restarted.generation and nav.task_started_at == 50.0
+    assert len(sent) == 1 and shown[-1][1]["reason"] == "result_before_task_start"
 
 
-def test_operator_success_also_works_without_experiment_profile(monkeypatch):
+@pytest.mark.parametrize("key,state", [("g", "reached"), ("h", "failed")])
+def test_operator_result_also_works_without_experiment_profile(monkeypatch, key, state):
     from gear_sonic.runtime.gateway.control import ControlGatewayCore
     from gear_sonic.runtime.gateway.services.control import ControlGatewayRuntime
 
@@ -332,16 +361,40 @@ def test_operator_success_also_works_without_experiment_profile(monkeypatch):
         _require_source=ControlGatewayRuntime._require_source,
     )
     gateway.experiment = ExperimentSupervisor(gateway)
-    command = ControlGatewayCore().accept_console_line("g").command
-    ControlGatewayRuntime._handle_complete_agent_success(gateway, command)
+    monkeypatch.setattr("time.monotonic", lambda: 17.0)
+    monkeypatch.setattr("time.monotonic_ns", lambda: 17_000_000_000)
+    monkeypatch.setattr("time.time_ns", lambda: 1_017_000_000_000)
+    command = ControlGatewayCore().accept_console_line(key).command
+    ControlGatewayRuntime._handle_complete_agent_result(gateway, command)
     assert not actions and events[-1]["reason"] == "no_active_agent"
     gateway.navigation.handle_key("n", now=10.0)
-    monkeypatch.setattr("gear_sonic.runtime.gateway.services.control.time.monotonic", lambda: 17.0)
 
-    ControlGatewayRuntime._handle_complete_agent_success(gateway, command)
+    ControlGatewayRuntime._handle_complete_agent_result(gateway, command)
 
     assert actions[-1].agent_event == "cancel_navigation"
-    assert events[-1]["state"] == "reached" and events[-1]["completion_time_s"] == 7.0
+    assert events[-1]["state"] == state and events[-1]["completion_time_s"] == 7.0
+
+
+def test_operator_failure_preserves_partial_progress_and_navigation_labels(monkeypatch, tmp_path):
+    from gear_sonic.experiments.results import trial_rows
+
+    monkeypatch.setattr("time.monotonic_ns", lambda: 0)
+    controller, _, _ = supervisor(monkeypatch, tmp_path, "full_vln")
+    generation = controller.active[0]
+    controller.recorder.write("session", experiment=controller.config)
+    controller.recorder.write("annotation", generation=generation, values=dict(progress=1, nav_success=True))
+    monkeypatch.setattr("time.monotonic_ns", lambda: 42_750_000_000)
+
+    controller.confirm_result(
+        generation, success=False, completion_time_s=42.75,
+        completed_wall_time_ns=1_042_750_000_000, completed_monotonic_ns=42_750_000_000,
+    )
+
+    row = trial_rows(read_events(controller.recorder.path))[0]
+    assert row["success"] is False and row["nav_success"] is True
+    assert row["progress"] == 1 / len(controller.config["task"]["milestones"])
+    assert row["actual_runtime_s"] == row["completion_time_s"] == 42.75
+    assert not row["missing_annotations"]
 
 
 def test_fixed_vla_deadline_starts_on_action_and_resume_does_not_reset(monkeypatch, tmp_path):

@@ -459,7 +459,8 @@ def test_late_policy_worker_exception_cannot_fail_new_trial():
 
 
 @pytest.mark.parametrize("cpp_mode", ["POSE", "PLANNER"])
-def test_success_cancellation_returns_to_planner_without_stopping_cpp(cpp_mode):
+@pytest.mark.parametrize("reason", ["operator_success", "operator_failure"])
+def test_operator_result_cancellation_returns_to_planner_without_stopping_cpp(cpp_mode, reason):
     from gear_sonic.runtime.gateway.control import ControlGatewayCore
     from gear_sonic.utils.inference.vla.runtime import _VlaCommandHandler, _VlaRuntimeState
 
@@ -479,7 +480,7 @@ def test_success_cancellation_returns_to_planner_without_stopping_cpp(cpp_mode):
 
     handler.send_cpp_control_command = send_cpp_control_command
     command = ControlGatewayCore().accept_command(
-        "cancel_navigation", parameters=dict(generation=2, reason="operator_success"),
+        "cancel_navigation", parameters=dict(generation=2, reason=reason),
     ).command
 
     handler._handle_task_command(command)

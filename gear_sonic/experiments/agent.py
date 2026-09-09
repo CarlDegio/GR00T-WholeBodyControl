@@ -320,6 +320,7 @@ class ExperimentAgent(LaViRAAgent):
         geometric = self.experiment["alignment"] == "geometric"
         # A failed role lookup has not run the controller to its terminal state.
         controller_ended = kwargs["controller_state"] != "target_not_found"
+        # The geometric baseline records VA evidence without gating entry to VLA.
         allow = recommended or (not enabled and controller_ended) or geometric
         self.recorder.write(
             "gate",
@@ -364,7 +365,7 @@ class ExperimentAgent(LaViRAAgent):
         )
         status = self._wait(generation, skill_id, segment)
         reason = status.get("reason")
-        if reason not in {"aligned", "geometric_timeout"}:
+        if reason not in {"aligned", "geometric_timeout", "geometric_target_lost"}:
             raise LaViRAAgentError(f"geometric_controller_failed:{reason}")
         post = self._align_handoff(
             generation=generation,

@@ -47,18 +47,30 @@ class ExperimentSupervisor:
             self.recorder.write("trial_end", generation=generation, state=state, reason=reason, **fields)
             self.active = self.step = self.vla_deadline = None
 
-    def confirm_success(self, generation, *, completion_time_s, completed_wall_time_ns):
-        """Persist the operator's physical success and time for result aggregation."""
+    def confirm_result(
+        self, generation, *, success, completion_time_s, completed_wall_time_ns, completed_monotonic_ns,
+    ):
+        """Persist the operator's physical result and key time for aggregation."""
         if not self.active or self.active[0] != generation:
             return
-        timing = dict(completion_time_s=completion_time_s, completed_wall_time_ns=completed_wall_time_ns)
-        values = dict(success=True, progress=len(self.config["task"]["milestones"]), **timing)
-        if self.config["entry_stage"] == "navigation":
-            values["nav_success"] = True
+        timing = dict(
+            completion_time_s=completion_time_s, completed_wall_time_ns=completed_wall_time_ns,
+            completed_monotonic_ns=completed_monotonic_ns,
+        )
+        values = dict(success=success, **timing)
+        # A failed task can still have completed milestones or navigation.
+        # Keep those independent labels; the failure key does not determine them.
+        if success:
+            values["progress"] = len(self.config["task"]["milestones"])
+            if self.config["entry_stage"] == "navigation":
+                values["nav_success"] = True
         self.recorder.write(
             "annotation", generation=generation, source="operator_console", values=values,
         )
-        self.finish(generation, "reached", "operator_success", **timing)
+        self.finish(
+            generation, "reached" if success else "failed",
+            "operator_success" if success else "operator_failure", **timing,
+        )
 
     def abort(self, state, reason):
         if not self.active:

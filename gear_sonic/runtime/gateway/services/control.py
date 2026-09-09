@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+from dataclasses import dataclass
 from enum import Enum, auto
 import json
 import logging
@@ -12,6 +13,7 @@ from typing import Callable, Mapping
 
 import zmq
 
+from gear_sonic.experiments.supervisor import ExperimentSupervisor
 from gear_sonic.runtime.gateway.control import (
     BASE_POSE_RUNTIME_STATUS_COMMAND,
     ControlGatewayCore,
@@ -21,7 +23,6 @@ from gear_sonic.runtime.gateway.control import (
 )
 from gear_sonic.runtime.gateway.event_display import EventPaneDisplay
 from gear_sonic.runtime.profile import RuntimeProfile, load_runtime_profile
-from gear_sonic.experiments.supervisor import ExperimentSupervisor
 from gear_sonic.runtime.protocol import OperatorCommand, build_navigation_message
 from gear_sonic.runtime.telemetry import (
     build_event,
@@ -78,6 +79,14 @@ class DispatchDisposition(Enum):
     FORWARD_ORIGINAL = auto()
 
 
+@dataclass(frozen=True)
+class PendingVlaCompletion:
+    generation: int
+    skill_id: int
+    deadline: float
+    parameters: dict[str, object]
+
+
 class ControlGatewayRuntime:
     """Own Control Gateway transport and route one event at a time."""
 
@@ -122,11 +131,13 @@ class ControlGatewayRuntime:
             source="control_gateway_navigation"
         )
         self.experiment = ExperimentSupervisor(self)
+        self.pending_vla_completion: PendingVlaCompletion | None = None
         self.command_handlers: dict[
             str, Callable[[OperatorCommand], DispatchDisposition]
         ] = {
             "navigation_key": self._handle_navigation_key,
-            "complete_agent_success": self._handle_complete_agent_success,
+            "complete_agent_success": self._handle_complete_agent_result,
+            "complete_agent_failure": self._handle_complete_agent_result,
             "lavira_depth_request": self._handle_lavira_depth_request,
             "lavira_rgbd_captured": self._handle_lavira_rgbd_captured,
             "navigation_goal": self._handle_navigation_goal,
@@ -211,6 +222,13 @@ class ControlGatewayRuntime:
                 generation=action.generation,
             )
             return False
+        pending = self.pending_vla_completion
+        if pending is not None and action.generation != pending.generation:
+            self.pending_vla_completion = None
+            self.experiment.recorder.write(
+                "vla_completion_delay_ended", generation=pending.generation,
+                skill_id=pending.skill_id, reason=action.reason or "superseded",
+            )
         self.navigation_pub.send_string(
             build_navigation_message(
                 mode=action.mode,
@@ -301,11 +319,23 @@ class ControlGatewayRuntime:
         self,
         command: OperatorCommand,
     ) -> DispatchDisposition:
+        if (
+            self.pending_vla_completion is not None
+            and command.metadata.source == "operator_console"
+            and command.name in {
+                "toggle_control_loop", "select_planner_mode", "toggle_policy_pause",
+                "toggle_left_hand_initial_pose", "toggle_right_hand_initial_pose", "set_prompt",
+            }
+        ):
+            action = self.navigation.handle_key(" ", now=time.monotonic(), cancel_reason=command.name)
+            self.publish_navigation_action(action, source=command.metadata.source)
         if self.experiment.active and command.metadata.source == "operator_console" and command.name in {
             "toggle_control_loop", "select_pose_mode", "select_planner_mode", "toggle_policy_pause",
             "toggle_left_hand_initial_pose", "toggle_right_hand_initial_pose", "set_prompt",
         }:
-            self.experiment.recorder.write("intervention", generation=self.experiment.active[0], command=command.name)
+            self.experiment.recorder.write(
+                "intervention", generation=self.experiment.active[0], command=command.name,
+            )
         handler = self.command_handlers.get(command.name)
         if handler is None:
             self.show_command(command, "CONTROL_COMMAND")
@@ -353,6 +383,31 @@ class ControlGatewayRuntime:
             self.show_event(logging.WARNING, "INVALID_RUNTIME_EVENT", str(exc))
 
     def _handle_timeout(self) -> None:
+        pending = self.pending_vla_completion
+        if pending is not None:
+            if (pending.generation, pending.skill_id) != (self.navigation.generation, self.navigation.skill_id):
+                self.pending_vla_completion = None
+            elif time.monotonic() >= pending.deadline:
+                self.pending_vla_completion = None
+                self.experiment.recorder.write(
+                    "vla_command", generation=pending.generation,
+                    command="stop_vla_task", skill_id=pending.skill_id,
+                    window_id=pending.parameters.get("window_id"),
+                )
+                self.dispatch_navigation_event("stop_vla_task", pending.parameters)
+                action = self.navigation.handle_key(
+                    " ", now=time.monotonic(), cancel_reason="post_completion_delay_elapsed",
+                )
+                self.publish_navigation_action(action, source="va_completion")
+                self.experiment.recorder.write(
+                    "vla_completion_delay_ended", generation=pending.generation,
+                    skill_id=pending.skill_id, reason="elapsed",
+                )
+                self.show_event(
+                    logging.INFO, "VLA_COMPLETION_DELAY_ENDED",
+                    "Post-completion VLA execution finished; returning to PLANNER",
+                    generation=pending.generation, skill_id=pending.skill_id,
+                )
         self.experiment.tick()
         timeout_action = self.navigation.tick(now=time.monotonic())
         if timeout_action is not None:
@@ -403,6 +458,9 @@ class ControlGatewayRuntime:
         key = command.parameters.get("key")
         if not isinstance(key, str) or len(key) != 1:
             raise ValueError("navigation_key requires one string key")
+        if key.lower() == "n" and self.pending_vla_completion is not None:
+            cancel = self.navigation.handle_key(" ", now=time.monotonic(), cancel_reason="restarted_with_n")
+            self.publish_navigation_action(cancel, source="experiment_restart")
         if key.lower() == "n" and self.experiment.active:
             previous = self.experiment.active[0]
             self.experiment.recorder.write("intervention", generation=previous, command="restart_with_n")
@@ -428,34 +486,49 @@ class ControlGatewayRuntime:
         )
         return DispatchDisposition.HANDLED
 
-    def _handle_complete_agent_success(self, command: OperatorCommand) -> DispatchDisposition:
-        self._require_source(command, "operator_console", "Agent success requires the operator console")
+    def _handle_complete_agent_result(self, command: OperatorCommand) -> DispatchDisposition:
+        self._require_source(command, "operator_console", "Agent result requires the operator console")
+        success = command.name == "complete_agent_success"
+        outcome = "success" if success else "failure"
+        reason = f"operator_{outcome}"
+        code = "TASK_COMPLETED" if success else "TASK_FAILED"
         nav = self.navigation
         if not nav.lavira_task_active or nav.task_started_at is None:
             self.show_command(
-                command, "CONTROL_IGNORED", "No active agent task to mark successful",
+                command, "CONTROL_IGNORED", f"No active agent task to mark as {outcome}",
                 level=logging.WARNING, reason="no_active_agent",
+            )
+            return DispatchDisposition.HANDLED
+        # Use the CLI key event, so transport and stop/recording latency do not
+        # extend the task. An old key must not terminate a newer task.
+        completed_ns = command.metadata.timestamp_ns
+        completed_at = completed_ns / 1e9
+        if completed_at < nav.task_started_at:
+            self.show_command(
+                command, "CONTROL_IGNORED", "Agent result key predates the active task",
+                level=logging.WARNING, reason="result_before_task_start",
             )
             return DispatchDisposition.HANDLED
         now = time.monotonic()
         generation = nav.generation
         timing = dict(
-            completion_time_s=max(0.0, now - nav.task_started_at),
-            completed_wall_time_ns=time.time_ns(),
+            completion_time_s=completed_at - nav.task_started_at,
+            completed_monotonic_ns=completed_ns,
+            completed_wall_time_ns=time.time_ns() - max(0, time.monotonic_ns() - completed_ns),
         )
         result = dict(
             generation=generation, skill_id=nav.skill_id, segment_id=max(0, nav.segment_id),
-            state="reached", reason="operator_success", **timing,
+            state="reached" if success else "failed", reason=reason, **timing,
         )
         # Invalidate in-flight model/controller replies before releasing ownership.
         # VLA handles this cancellation by selecting PLANNER with C++ still running.
-        action = nav.handle_key(" ", now=now, cancel_reason="operator_success")
-        self.publish_navigation_action(action, source=command.metadata.source, input_key="G")
-        self.experiment.confirm_success(generation, **timing)
-        self.experiment.recorder.runtime("control_gateway", "TASK_COMPLETED", **result)
+        action = nav.handle_key(" ", now=now, cancel_reason=reason)
+        self.publish_navigation_action(action, source=command.metadata.source, input_key="G" if success else "H")
+        self.experiment.confirm_result(generation, success=success, **timing)
+        self.experiment.recorder.runtime("control_gateway", code, **result)
         self.show_event(
-            logging.INFO, "TASK_COMPLETED",
-            f"Operator confirmed success in {timing['completion_time_s']:.2f}s; returning to PLANNER",
+            logging.INFO if success else logging.WARNING, code,
+            f"Operator confirmed {outcome} at {timing['completion_time_s']:.2f}s; returning to PLANNER",
             source=command.metadata.source, **result,
         )
         return DispatchDisposition.HANDLED
@@ -600,21 +673,30 @@ class ControlGatewayRuntime:
             "lavira_agent",
             "navigation status requires lavira_agent source",
         )
-        if not self.navigation.accept_status(command.parameters, owner="lavira"):
+        pending = self.pending_vla_completion
+        defer_stop = (
+            pending is not None
+            and pending.generation == int(command.parameters.get("generation", -1))
+            and pending.skill_id == int(command.parameters.get("skill_id", 0))
+            and command.parameters.get("state") == "reached"
+            and command.parameters.get("reason") == "manipulation_completed"
+        )
+        if not self.navigation.accept_status(command.parameters, owner="lavira", defer_vla_stop=defer_stop):
             raise ValueError("stale navigation agent status")
         generation = int(command.parameters["generation"])
         self.experiment.finish(generation, str(command.parameters.get("state", "failed")),
                                str(command.parameters.get("reason", "")))
-        if self.experiment.config:
+        if not defer_stop and (self.experiment.config or pending is not None):
             # A model exception can leave a VLA or BasePose worker active.
             # Invalidate that generation on every experimental terminal result.
             action = self.navigation.handle_key(" ", now=time.monotonic(), cancel_reason="experiment_terminal")
             self.publish_navigation_action(action, source="experiment_terminal")
-        self._send_navigation_stop(
-            generation=generation,
-            skill_id=int(command.parameters.get("skill_id", 0)),
-            segment_id=int(command.parameters.get("segment_id", 0)),
-        )
+        if not defer_stop:
+            self._send_navigation_stop(
+                generation=generation,
+                skill_id=int(command.parameters.get("skill_id", 0)),
+                segment_id=int(command.parameters.get("segment_id", 0)),
+            )
         self.dispatch_navigation_event(
             "navigation_status", dict(command.parameters)
         )
@@ -693,6 +775,30 @@ class ControlGatewayRuntime:
             command.name, command.parameters
         ):
             raise ValueError("stale or unexpected VLA task command")
+        if command.name == "stop_vla_task" and command.parameters.get("reason") == "postcondition_satisfied":
+            # Close the task clock at VA completion, while the independent VLA
+            # service keeps inferring and publishing for five more seconds.
+            # Keep navigation ownership until the timer or an operator cancels
+            # it; terminal-result cleanup must not cut this interval short.
+            duration_s = 5.0
+            generation, skill_id = self.navigation.generation, self.navigation.skill_id
+            self.pending_vla_completion = PendingVlaCompletion(
+                generation, skill_id, time.monotonic() + duration_s, dict(command.parameters),
+            )
+            self.navigation.accept_status(
+                {**command.parameters, "state": "reached"}, owner="lavira", defer_vla_stop=True,
+            )
+            self.experiment.finish(generation, "reached", "manipulation_completed")
+            self.experiment.recorder.write(
+                "vla_completion_delay_started", generation=generation, skill_id=skill_id,
+                window_id=command.parameters.get("window_id"), duration_s=duration_s,
+            )
+            self.show_command(
+                command, "VLA_COMPLETION_DELAY_STARTED",
+                "VA confirmed completion; continuing VLA for 5 seconds before PLANNER",
+                duration_s=duration_s,
+            )
+            return DispatchDisposition.HANDLED
         self.experiment.recorder.write("vla_command", generation=self.navigation.generation,
             command=command.name, skill_id=self.navigation.skill_id,
             window_id=command.parameters.get("window_id"))

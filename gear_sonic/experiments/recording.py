@@ -30,6 +30,12 @@ EVENTS = {
     "VLA_INFERENCE_FAILED",
     "CAMERA_STALE",
     "CAMERA_RECOVERED",
+    "GEOMETRIC_STARTED",
+    "GEOMETRIC_PERCEPTION_READY",
+    "GEOMETRIC_CAMERA_SELECTED",
+    "GEOMETRIC_TARGET_LOST",
+    "GEOMETRIC_MOTION_STARTED",
+    "GEOMETRIC_FINISHED",
 }
 OMIT = {"skill_args", "expected_postcondition", "mission", "manipulation_prompt", "max_steps", "todo_list"}
 

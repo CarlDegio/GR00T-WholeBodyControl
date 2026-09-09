@@ -99,6 +99,36 @@ def test_component_file_logging_is_bounded_and_idempotent(tmp_path) -> None:
     assert "ready" in (tmp_path / f"{component}.log").read_text()
 
 
+@pytest.mark.parametrize("already_suppressed", [False, True])
+def test_component_can_keep_file_logging_in_minimal_experiments(
+    tmp_path, monkeypatch, already_suppressed,
+) -> None:
+    monkeypatch.setenv("SONIC_EXPERIMENT_MINIMAL_LOGGING", "1")
+    component = f"test_base_pose_{tmp_path.name}"
+    other_component = f"test_navdp_{tmp_path.name}"
+    other = configure_file_logging(other_component, log_dir=tmp_path)
+    if already_suppressed:
+        configure_file_logging(component, log_dir=tmp_path)
+    logger = configure_file_logging(component, log_dir=tmp_path, force=True)
+    try:
+        logger.info("pulse stopped; settling 0.5 s")
+        other.info("still minimal")
+        assert configure_file_logging(
+            component, log_dir=tmp_path, force=True,
+        ) is logger
+        assert len(logger.handlers) == 1
+        logger.handlers[0].flush()
+        assert "pulse stopped; settling 0.5 s" in (
+            tmp_path / f"{component}.log"
+        ).read_text()
+        assert not (tmp_path / f"{other_component}.log").exists()
+    finally:
+        for target in (logger, other):
+            for handler in tuple(target.handlers):
+                target.removeHandler(handler)
+                handler.close()
+
+
 def test_metrics_publish_is_non_blocking_and_drops_when_unavailable() -> None:
     socket = Mock()
     socket.send_json.side_effect = zmq.Again()

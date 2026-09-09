@@ -145,6 +145,7 @@ def resolve(path, task_id="T1", case_id=None):
             yoloe=c["base_pose"]["raw_yoloe_model_path"],
         ),
     )
+    experiment["geometric"].setdefault("both_lost_frames", 20)
     experiment["geometric"]["target"] = task.get("geometry_target", "")
     if experiment["alignment"] not in {"dual", "head", "none", "geometric"} or experiment["entry_stage"] not in {
         "navigation",
@@ -166,6 +167,7 @@ def resolve(path, task_id="T1", case_id=None):
                 "fine_wz",
                 "timeout_s",
                 "stable_frames",
+                "both_lost_frames",
             ),
         ),
         ("navila", ("timeout_s", "vx", "wz", "max_actions")),
@@ -175,7 +177,7 @@ def resolve(path, task_id="T1", case_id=None):
             if not math.isfinite(value) or value <= 0:
                 raise ValueError(f"Invalid {group}.{name}")
     geo, nv = experiment["geometric"], experiment["navila"]
-    for value in (geo["stable_frames"], nv["max_actions"], nv["port"]):
+    for value in (geo["stable_frames"], geo["both_lost_frames"], nv["max_actions"], nv["port"]):
         if isinstance(value, bool) or not float(value).is_integer():
             raise ValueError("Frame counts, action budget and model port must be integers")
     if geo["vx"] > 0.4 or max(geo["coarse_wz"], geo["fine_wz"]) > 0.3 or nv["vx"] > 0.3 or nv["wz"] > 0.3:

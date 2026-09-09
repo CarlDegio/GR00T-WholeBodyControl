@@ -12,12 +12,15 @@ from gear_sonic.utils.inference.vla.service import _build_experiment_inference_c
 
 
 class GeometricServiceHarness:
-    def __init__(self, monkeypatch, *, manual=False, gap_s=0.5, rounds=1, perceive=False):
+    def __init__(
+        self, monkeypatch, *, manual=False, gap_s=0.5, rounds=1, perceive=False, perception_sample=None
+    ):
         self.now = 1.0
         self.rounds = 0
         self.sent = []
         self.workers = []
         self.timeouts = []
+        self.events = []
         self.nav = NavigationControlState()
         start = self.nav.handle_key("b" if manual else "n", now=self.now)
         parameters = dict(generation=start.generation, skill_id=0, segment_id=0)
@@ -32,6 +35,7 @@ class GeometricServiceHarness:
         )
         self.config = SimpleNamespace(
             dual_head_camera_stream="ego_view", dual_head_depth_stream="ego_depth",
+            dual_chest_camera_stream="chest_view", dual_chest_depth_stream="chest_depth",
             sensor_gateway_request_timeout_ms=100, sensor_gateway_max_age_ms=1000,
             sensor_gateway_max_skew_ms=5, planner_hz=50, raw_camera_stale_s=0.2,
         )
@@ -60,10 +64,10 @@ class GeometricServiceHarness:
 
             def is_set(self):
                 self.checks += 1
-                return self.checks > 1
+                return self.checks > 2
 
             def set(self):
-                self.checks = 2
+                self.checks = 3
 
         def worker(*, target, args, **kwargs):
             self.workers.append(args)
@@ -72,7 +76,9 @@ class GeometricServiceHarness:
         def close():
             pass
 
-        monkeypatch.setattr(base_pose, "InferenceServiceContext", lambda *args: SimpleNamespace(close=close))
+        monkeypatch.setattr(base_pose, "InferenceServiceContext", lambda *args: SimpleNamespace(
+            close=close, flush_events=close, event=lambda *a, **k: self.events.append((a, k)),
+        ))
         monkeypatch.setattr(base_pose, "ControlGatewaySubscriber", lambda *a, **k: SimpleNamespace(
             read_command=lambda: next(commands, None), close=close,
         ))
@@ -87,11 +93,10 @@ class GeometricServiceHarness:
             Thread=worker, Lock=threading.Lock, Event=SingleFrameStop,
         ))
         monkeypatch.setattr(base_pose, "time", SimpleNamespace(monotonic=lambda: self.now, sleep=sleep))
-        monkeypatch.setattr(base_pose, "head_calibration", lambda config: None)
-        monkeypatch.setattr(base_pose, "tracker_for", lambda *a: SimpleNamespace(track=lambda rgb: []))
-        monkeypatch.setattr(base_pose, "_resolve_target", lambda *a: (SimpleNamespace(track_id=1), None, None))
-        monkeypatch.setattr(base_pose, "_observation", lambda *a, **k: SimpleNamespace(
-            target=SimpleNamespace(forward_m=2.0, right_m=0.0),
+        monkeypatch.setattr(base_pose, "GeometricPerception", lambda *a, **k: SimpleNamespace(
+            step=lambda **kwargs: perception_sample or base_pose.GeometricSample(
+                2.0, 0.0, ("ego_view", 10.0), self.now, "ego_view"
+            ),
         ))
 
     def run(self):
@@ -130,6 +135,21 @@ def test_geometric_actual_motion_keeps_velocity_watchdog(monkeypatch):
     assert any(p.get("velocity") == [0.4, 0.0, 0.0] for name, p in harness.sent)
     assert len(harness.timeouts) == 1
     assert harness.timeouts[0].reason == "base_pose_velocity_timeout"
+
+
+def test_geometric_loss_sends_zero_stop_before_terminal_status(monkeypatch):
+    harness = GeometricServiceHarness(
+        monkeypatch, perceive=True,
+        perception_sample=base_pose.GeometricSample(both_lost_frames=20, reason="geometric_target_lost"),
+    )
+    harness.run()
+    assert not harness.timeouts
+    status_index = next(i for i, (name, _) in enumerate(harness.sent) if name == "base_pose_status")
+    assert harness.sent[status_index - 1][1]["action"] == "stop"
+    assert harness.sent[status_index - 1][1]["velocity"] == [0.0, 0.0, 0.0]
+    assert harness.sent[status_index][1]["reason"] == "geometric_target_lost"
+    assert harness.sent[status_index][1]["both_lost_frames"] == 20
+    assert any(args[1] == "GEOMETRIC_FINISHED" for args, fields in harness.events)
 
 
 def inference_callbacks(*, active):

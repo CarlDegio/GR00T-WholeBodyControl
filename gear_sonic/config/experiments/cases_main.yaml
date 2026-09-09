@@ -5,7 +5,7 @@ cases:
     start_id: t1_start_01
     visibility: visible
     initial_path_distance_m: null
-    navigation_instructions:
+    navigation_instructions: 
       T1: Move forward to the front of the table with the blue basket
       T2: null
       T3: null
@@ -21,22 +21,22 @@ cases:
       T3: null
       T4: null
   visible_03:
-    layout_id: null
-    start_id: null
+    layout_id: t1_layout_01
+    start_id: t1_start_02
     visibility: visible
     initial_path_distance_m: null
     navigation_instructions:
-      T1: null
+      T1: Move forward to the front of the table with the blue basket
       T2: null
       T3: null
       T4: null
   visible_04:
-    layout_id: null
-    start_id: null
+    layout_id: t1_layout_02
+    start_id: t1_start_02
     visibility: visible
     initial_path_distance_m: null
     navigation_instructions:
-      T1: null
+      T1: Move forward to the front of the table with the blue basket
       T2: null
       T3: null
       T4: null

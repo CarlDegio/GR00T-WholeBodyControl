@@ -296,15 +296,18 @@ def test_runtime_reports_todo_as_structured_event() -> None:
     )]
 
 
-def test_manual_success_discards_late_worker_failure_and_todo():
+@pytest.mark.parametrize("reason", ["operator_success", "operator_failure"])
+def test_manual_result_discards_late_worker_result_and_todo(reason):
     runtime, intents = runtime_with_intents()
     events = []
     runtime.report_event = lambda level, code, message, **fields: events.append((code, fields))
     runtime.start_navigation(1)
-    runtime.cancel(2, "operator_success")
+    runtime.cancel(2, reason)
+    assert events[-1] == ("TASK_WORKER_RELEASED", dict(generation=2, reason=reason))
     events.clear()
 
     runtime.report_agent_event(logging.ERROR, "TASK_FAILED", "late failure", generation=1)
+    runtime.report_agent_event(logging.INFO, "TASK_COMPLETED", "late success", generation=1)
     runtime.report_agent_event(logging.WARNING, "TASK_CANCELLED", "late cancel", generation=1)
     runtime.report_todo(1, 3, "- [ ] Old manipulation")
     assert events == []

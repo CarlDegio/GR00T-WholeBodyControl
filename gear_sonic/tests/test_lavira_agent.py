@@ -1580,7 +1580,12 @@ def test_align_grounding_can_select_operation_target_independent_of_global_targe
     assert base_pose["yaw_align_target"] == "desk"
 
 
-def test_base_pose_target_comes_from_align_va_grounding():
+@pytest.mark.parametrize("bbox", [
+    [200, 200, 800, 800],
+    [320, 345, 440, 405],  # 0.72% of the image: below the former 1% cutoff.
+    [500, 500, 501, 501],
+])
+def test_base_pose_target_comes_from_align_va_grounding(bbox):
     agent, _camera, client, intents, _waited = build_agent(
         [
             move(
@@ -1597,6 +1602,7 @@ def test_base_pose_target_comes_from_align_va_grounding():
         groundings=[grounding() for _ in range(3)],
         alignment_groundings=[alignment_grounding(
             target="  blue basket  ", yaw_align_target="  desk  ",
+            bbox=bbox,
         )],
         postchecks=[ready_to_manipulate(), ready_to_manipulate()],
         global_target="desk with blue basket",
@@ -1610,6 +1616,7 @@ def test_base_pose_target_comes_from_align_va_grounding():
     )
     assert base_pose["target"] == "blue basket"
     assert base_pose["yaw_align_target"] == "desk"
+    assert base_pose["reference_bbox"] == bbox
     assert set(client.alignment_grounding_calls[0]) == {
         "manipulation_prompt", "direction", "image_bgr",
     }
@@ -1971,6 +1978,7 @@ def test_manipulation_recovers_in_vla_then_system_completes_after_va_success():
     assert names.count("hold_vla_task") == 0
     assert names.count("resume_vla_task") == 0
     assert names.count("stop_vla_task") == 1
+    assert agent._history[-1].controller_state == "completion_confirmed"
     start = next(args for name, args in intents if name == "start_vla_task")
     assert start["task"] == static_prompt
     assert start["handoff_context"] == static_prompt
@@ -2120,10 +2128,12 @@ def test_align_grounding_accepts_different_target_roles() -> None:
         yaw_align_target="desk",
         target_confidence=0.95,
         yaw_align_target_confidence=0.81,
+        bbox=[925, 406, 971, 513],
     ))
 
     assert result["target"]["name"] == "medicine bottle"
     assert result["yaw_align_target"]["name"] == "desk"
+    assert result["target"]["bbox_2d"] == [925.0, 406.0, 971.0, 513.0]
     assert result["confidence"] == pytest.approx(0.81)
 
 
@@ -2215,11 +2225,11 @@ def test_strict_schemas_fail_closed():
     legacy["surface"] = "desk"
     with pytest.raises(LaViRAAgentError, match="schema"):
         validate_alignment_grounding(legacy)
-    with pytest.raises(LaViRAAgentError, match="stable target bbox"):
+    with pytest.raises(LaViRAAgentError, match="both roles visible"):
         validate_alignment_grounding(alignment_grounding(
             target="medicine bottle",
             yaw_align_target="desk",
-            bbox=[925, 406, 971, 513],
+            yaw_align_target_visible=False,
         ))
     with pytest.raises(LaViRAAgentError, match="corner ordering"):
         validate_alignment_grounding(alignment_grounding(

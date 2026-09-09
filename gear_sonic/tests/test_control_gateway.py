@@ -121,6 +121,7 @@ def test_latest_only_intent_client_conflates_pending_commands() -> None:
 
 def test_standalone_base_pose_start_forwards_dynamic_align_parameters() -> None:
     runtime = object.__new__(ControlGatewayRuntime)
+    runtime.pending_vla_completion = None
     runtime.navigation_pub = type(
         "NavigationPublisher",
         (),
@@ -263,9 +264,9 @@ def test_navigation_state_preserves_existing_listen_wasd_mapping() -> None:
     assert state.mode == "listen_wasd"
 
 
-@pytest.mark.parametrize("key", ["g", "G"])
+@pytest.mark.parametrize("key,outcome", [("g", "success"), ("G", "success"), ("h", "failure"), ("H", "failure")])
 @pytest.mark.parametrize("mode", ["PLANNER", "POSE"])
-def test_console_success_key_preserves_control_loop_and_backward_key(key, mode):
+def test_console_result_key_preserves_control_loop_and_existing_keys(key, outcome, mode):
     core = ControlGatewayCore(monotonic_ns=lambda: 100)
     console = OperatorConsoleRouter()
     console.control_running = True
@@ -273,18 +274,21 @@ def test_console_success_key_preserves_control_loop_and_backward_key(key, mode):
 
     command = console.accept_line(key, core=core).command
 
-    assert command.name == "complete_agent_success"
+    assert command.name == f"complete_agent_{outcome}"
     assert console.control_running and console.control_mode == "PLANNER"
     backward = console.accept_line("s", core=core).command
     assert backward.name == "navigation_key" and backward.parameters == {"key": "s"}
+    for recording_key in ("f", "record-failure"):
+        assert console.accept_line(recording_key, core=core).command.name == "stop_recording_failure"
 
 
-def test_operator_success_clears_active_todo_display():
+@pytest.mark.parametrize("code,reason", [("TASK_COMPLETED", "operator_success"), ("TASK_FAILED", "operator_failure")])
+def test_operator_result_clears_active_todo_display(code, reason):
     display = EventPaneDisplay(stream=io.StringIO(), interactive=False)
     display.accept(build_event("lavira", logging.INFO, "TODO_UPDATED", "todo",
                                generation=3, step=2, todo_list="- [ ] Manipulate"))
-    display.accept(build_event("control_gateway", logging.INFO, "TASK_COMPLETED", "operator success",
-                               generation=3, reason="operator_success"))
+    display.accept(build_event("control_gateway", logging.INFO, code, "operator result",
+                               generation=3, reason=reason))
 
     assert "no active task" in display.dashboard_text()
 
