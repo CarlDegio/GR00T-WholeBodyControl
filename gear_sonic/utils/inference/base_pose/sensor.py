@@ -17,24 +17,10 @@ from gear_sonic.runtime.gateway.sensor_client import (
     SensorGatewayClientError,
 )
 from gear_sonic.runtime.gateway.snapshot import SnapshotRequest, TimestampBasis
-
-
-class BasePoseCameraError(RuntimeError):
-    """Raised when a head-camera observation is unavailable or malformed."""
-
-
-@dataclass(frozen=True)
-class AlignedRGBDSnapshot:
-    rgb: np.ndarray
-    depth_raw: np.ndarray | None
-    fx: float
-    fy: float
-    cx: float
-    cy: float
-    depth_scale_m: float | None
-    depth_aligned_to: str | None
-    depth_source: str | None
-    timestamp: float
+from gear_sonic.utils.inference.base_pose.types import (
+    AlignedRGBDSnapshot,
+    BasePoseCameraError,
+)
 
 
 def _decode_rgbd_snapshot(

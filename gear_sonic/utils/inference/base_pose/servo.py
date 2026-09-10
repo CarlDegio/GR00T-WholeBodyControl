@@ -21,8 +21,7 @@ from typing import Any, Callable, Mapping, Sequence
 import cv2
 import numpy as np
 
-from gear_sonic.runtime.queues import replace_latest
-from gear_sonic.utils.inference.base_pose.sensor import (
+from gear_sonic.utils.inference.base_pose.types import (
     AlignedRGBDSnapshot,
     BasePoseCameraError,
 )
@@ -313,6 +312,22 @@ class YoloePersistentTracker:
             raise ValueError("YOLOE target text prompt must be non-empty")
         yaw_align_target_reuses_target = _prompts_match(target, self.yaw_align_target_prompt)
         prompts = [target] if yaw_align_target_reuses_target else [target, self.yaw_align_target_prompt]
+        self.start_texts(prompts)
+        return {
+            "class_names": list(self.class_names),
+            "prompt_mode": (
+                "target_text_as_yaw_align_target"
+                if yaw_align_target_reuses_target
+                else "target_text_yaw_align_target_text"
+            ),
+            "yaw_align_target_reuses_target": yaw_align_target_reuses_target,
+        }
+
+    def start_texts(self, prompts: list[str]) -> None:
+        """Install a task vocabulary; OVMM also needs the destination receptacle."""
+        prompts = [str(prompt).strip() for prompt in prompts]
+        if not prompts or any(not prompt for prompt in prompts):
+            raise ValueError("YOLOE text prompts must be non-empty")
         embeddings = self.model.get_text_pe(prompts)
         if embeddings.ndim != 3 or embeddings.shape[1] != len(prompts):
             raise RuntimeError(
@@ -323,15 +338,6 @@ class YoloePersistentTracker:
         self.model.set_classes(list(self.class_names), embeddings=embeddings)
         self.reset_tracking()
         self._model_updated()
-        return {
-            "class_names": list(self.class_names),
-            "prompt_mode": (
-                "target_text_as_yaw_align_target"
-                if yaw_align_target_reuses_target
-                else "target_text_yaw_align_target_text"
-            ),
-            "yaw_align_target_reuses_target": yaw_align_target_reuses_target,
-        }
 
     def track(self, rgb: np.ndarray) -> list[TrackedInstance]:
         if self.class_names is None:
@@ -2155,7 +2161,6 @@ class VisualServoController:
                 )
 
         if self.phase is ServoPhase.RECENTER:
-            self.invalid_frames = 0
             recovered = self._target_center_recovered(observation)
             self.recenter_stable_frames = (
                 self.recenter_stable_frames + 1 if recovered else 0
@@ -2176,8 +2181,10 @@ class VisualServoController:
                         integrated=True,
                         orientation=orientation,
                     )
+                self.invalid_frames = 0
                 self.resume_phase = None
                 return self._transition(resume, "target recentered")
+            self.invalid_frames = 0
             controlled_right = 0.0 if abs(right_error) <= 0.03 else right_error
             return self._lateral_command(controlled_right, now=now)
 
@@ -2404,6 +2411,10 @@ def _route_worker_event(
     observation_events: queue.Queue[RawServoEvent] | None,
     item: RawServoEvent,
 ) -> RawServoEvent | None:
+    # Only the hardware worker needs the runtime queue implementation. Keep
+    # geometry and VisualServoController importable in the OVMM Python env.
+    from gear_sonic.runtime.queues import replace_latest
+
     if item.kind != "observation" or observation_events is None:
         events.put(item)
         return None
@@ -2539,6 +2550,7 @@ def _observation(
     *,
     include_yaw_align_geometry: bool = True,
     exclude_target_from_yaw_align_edge: bool = True,
+    target_geometry: TargetGeometry | None = None,
 ) -> RawServoObservation:
     yaw_align_geometry = None
     yaw_align_geometry_error = None
@@ -2563,7 +2575,7 @@ def _observation(
             ),
         )
     return RawServoObservation(
-        target=estimate_target_geometry(
+        target=target_geometry if target_geometry is not None else estimate_target_geometry(
             snapshot,
             target.mask,
             calibration,
