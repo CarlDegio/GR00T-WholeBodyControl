@@ -55,6 +55,7 @@ class BasePoseSession:
         self.actions = ResidualActionAdapter(
             limits,
             dt_s=config.control_dt_s,
+            minimum_step_actions=config.minimum_step_actions,
             max_displacement_m=config.max_displacement_m,
             max_turn_degrees=config.max_turn_degrees,
         )

@@ -75,7 +75,22 @@ class RecoveryPlanner:
             path = self._polyline(corners)
             if path and self._safe_path(oracle, path):
                 return path, strategy
-        return self._grid_route(oracle, goal)
+        path, strategy = self._grid_route(oracle, goal)
+        if path:
+            return path, strategy
+        extended = self.config.navmesh_extended_radius_m
+        if self.config.navmesh_geodesic_fallback and hasattr(oracle, "geodesic_route"):
+            corners = oracle.geodesic_route(
+                goal, max_length=4 * max(self.config.navmesh_local_radius_m, extended))
+            if corners is not None:
+                path = self._polyline(corners)
+                if path and self._safe_path(oracle, path):
+                    return path, "native_navmesh_geodesic"
+        if extended > self.config.navmesh_local_radius_m:
+            path, strategy = self._grid_route(oracle, goal, radius=extended)
+            if path:
+                return path, "extended_visibility_graph"
+        return None, "no_executable_path_in_local_graph"
 
     def _safe_path(self, oracle, points):
         start = np.zeros(2)
@@ -85,10 +100,11 @@ class RecoveryPlanner:
             start = end
         return True
 
-    def _grid_route(self, oracle, goal):
+    def _grid_route(self, oracle, goal, radius=None):
         """Finite local visibility graph; never claim completeness outside it."""
         spacing = self.config.navmesh_grid_spacing_m
-        n = int(self.config.navmesh_local_radius_m / spacing)
+        radius = self.config.navmesh_local_radius_m if radius is None else radius
+        n = int(math.floor(radius / spacing + 1e-9))
         points = [np.zeros(2), goal]
         for x in range(-n, n + 1):
             for y in range(-n, n + 1):
@@ -170,6 +186,8 @@ class RecoveryPlanner:
             "clearance_m": self.config.navmesh_clearance_m,
             "standoff_reserve_m": self.config.navmesh_standoff_reserve_m,
             "local_radius_m": self.config.navmesh_local_radius_m,
+            "extended_radius_m": self.config.navmesh_extended_radius_m,
+            "geodesic_fallback": self.config.navmesh_geodesic_fallback,
             "max_target_distance_m": self.config.navmesh_max_target_distance_m,
             "expanded_search": False,
             "tested_distances": [],

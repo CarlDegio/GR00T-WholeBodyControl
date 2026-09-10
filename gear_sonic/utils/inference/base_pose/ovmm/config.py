@@ -32,6 +32,7 @@ class BasePoseConfig:
     horizontal_recovery_fraction: float = 0.30
     control_dt_s: float = 0.05
     max_steps: int = 200
+    minimum_step_actions: bool = False
     episode_pick_reserve_steps: int = 5
     reference_recovery_max_attempts: int = 2
     target_small_mask_fallback: bool = False
@@ -62,6 +63,8 @@ class BasePoseConfig:
     navmesh_grid_spacing_m: float = 0.10
     navmesh_execution_tolerance_m: float = 0.003
     navmesh_max_replans: int = 3
+    navmesh_extended_radius_m: float = 0.0
+    navmesh_geodesic_fallback: bool = False
     navmesh_reframe_after_translation: bool = True
 
     def __post_init__(self) -> None:
@@ -119,6 +122,8 @@ class BasePoseConfig:
             raise ValueError(
                 "Recovery pose tolerance must leave a lateral safety reserve"
             )
+        if not math.isfinite(self.navmesh_extended_radius_m) or self.navmesh_extended_radius_m < 0:
+            raise ValueError("Extended recovery radius must be finite and nonnegative")
         if (
             self.navmesh_max_replans < 1
             or int(self.navmesh_max_replans) != self.navmesh_max_replans
@@ -144,6 +149,7 @@ class BasePoseConfig:
     def controller_kwargs(self) -> dict:
         adapter_only = {
             "control_dt_s",
+            "minimum_step_actions",
             "max_steps",
             "episode_pick_reserve_steps",
             "reference_recovery_max_attempts",

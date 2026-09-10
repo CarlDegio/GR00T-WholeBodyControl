@@ -31,9 +31,11 @@ class ResidualActionAdapter:
         dt_s: float = 0.05,
         max_displacement_m: float = 0.25,
         max_turn_degrees: float = 30.0,
+        minimum_step_actions: bool = False,
     ):
         self.limits = limits
         self.dt_s = float(dt_s)
+        self.minimum_step_actions = bool(minimum_step_actions)
         self.translation_cap = min(float(max_displacement_m), limits.max_displacement_m)
         self.rotation_cap = math.radians(
             min(float(max_turn_degrees), limits.max_turn_degrees)
@@ -90,6 +92,24 @@ class ResidualActionAdapter:
         if not np.isfinite(velocity).all():
             self.reset()
             raise ValueError("Servo command must be finite")
+        if self.minimum_step_actions:
+            # Habitat completes a waypoint before the next RGB-D observation.
+            # Send a legal atomic move now instead of spending environment
+            # actions integrating a real-time velocity below its deadzone.
+            waypoint = np.zeros(3, dtype=np.float64)
+            displacement = velocity[:2] * self.dt_s
+            if np.linalg.norm(displacement) > 1e-12:
+                waypoint[:2] = self._above_float32_deadzone(
+                    displacement, self.translation_min, self.translation_cap)
+            if abs(velocity[2]) > 1e-12:
+                waypoint[2] = math.copysign(
+                    min(max(abs(velocity[2]) * self.dt_s,
+                            self.rotation_min * (1 + 1e-6)), self.rotation_cap),
+                    velocity[2])
+            self.residual[:] = 0.0
+            self.previous = velocity.copy()
+            self.phase = phase
+            return waypoint
         if phase != self.phase:
             self.reset()
             self.phase = phase
