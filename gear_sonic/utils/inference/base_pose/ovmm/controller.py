@@ -95,6 +95,10 @@ class BasePoseSession:
         self.reference_tracker.reset()
         self.reference_edge_missing_frames = 0
         self.bearing_fallback_active = False
+        self.rgbd_recovery_active = False
+        self.rgbd_recovery_reason = None
+        self.reference_unresolved_frames = 0
+        self.reference_conflict_frames = 0
         self.geometry_diagnostics = {}
         self._current_obs = None
         if self.recovery is not None:
@@ -155,7 +159,50 @@ class BasePoseSession:
         ):
             geometry = target_bearing_reference(targets)
             diagnostic = dict(source='rgbd_target_bearing' if geometry is not None else 'unavailable')
+        # Recover from an image-edge loop using a freshly measured target
+        # bearing. The selected instance remains associated by RGB-D position.
+        # This state is sticky within Gaze, but never supplies a stale bearing.
+        bearing = target_bearing_reference(targets)
+        if self.config.reference_rgbd_recovery and update_reference and include_yaw_align_geometry:
+            tol = math.radians(self.config.yaw_tolerance_deg)
+            resolved = (
+                geometry is not None
+                and abs(geometry.yaw_error_rad) <= tol
+                and abs(targets.target_geometry.forward_m - self.controller.target_distance_m)
+                    <= self.config.forward_tolerance_m
+                and abs(targets.target_geometry.right_m) <= self.controller.lateral_tolerance_m
+            )
+            self.reference_unresolved_frames = 0 if resolved else self.reference_unresolved_frames + 1
+            conflict = (
+                bearing is not None and geometry is not None
+                and abs(math.remainder(geometry.yaw_error_rad - bearing.yaw_error_rad, 2*math.pi))
+                    > math.radians(30)
+            )
+            self.reference_conflict_frames = self.reference_conflict_frames + 1 if conflict else 0
+            reason = None
+            if self.reference_edge_missing_frames >= self.config.reference_geometry_grace_frames:
+                reason = 'required image edge absent in consecutive fresh frames'
+            elif self.reference_conflict_frames >= self.config.reference_geometry_grace_frames:
+                reason = 'image-edge heading conflicts with measured target bearing'
+            elif self.reference_unresolved_frames >= self.config.reference_progress_max_frames:
+                reason = 'image-edge servo did not converge within its observation budget'
+            if self.recovery is not None and self.recovery.angular_recovery_used:
+                reason = 'verify rotated approach against current target bearing'
+            if reason is not None and bearing is not None and not self.rgbd_recovery_active:
+                self.rgbd_recovery_active = True
+                self.rgbd_recovery_reason = reason
+                # Clear old image-yaw, filter and stability history, keeping the
+                # original episode/Gaze clocks and effective stand-off intact.
+                self.controller.reset(snapshot.timestamp, initial_phase=ServoPhase.FORWARD_APPROACH)
+                self.actions.reset()
+        if self.config.reference_rgbd_recovery and self.rgbd_recovery_active and include_yaw_align_geometry:
+            geometry = bearing
+            diagnostic = dict(source='rgbd_target_bearing_recovery' if bearing is not None else 'unavailable')
         self.geometry_diagnostics = dict(
+            rgbd_recovery_active=self.rgbd_recovery_active,
+            rgbd_recovery_reason=self.rgbd_recovery_reason,
+            reference_unresolved_frames=self.reference_unresolved_frames,
+            reference_conflict_frames=self.reference_conflict_frames,
             yaw_geometry_source=diagnostic['source'],
             reference_edge_tracking=diagnostic,
             reference_edge_missing_frames=self.reference_edge_missing_frames,
@@ -254,8 +301,9 @@ class BasePoseSession:
                 and self.config.navmesh_reframe_after_translation
                 and (
                     observation.yaw_align_geometry is None
-                    or abs(observation.yaw_align_geometry.yaw_error_rad)
-                    > math.radians(self.config.yaw_tolerance_deg)
+                    or (not self.rgbd_recovery_active
+                        and abs(observation.yaw_align_geometry.yaw_error_rad)
+                        > math.radians(self.config.yaw_tolerance_deg))
                 )
             ):
                 # Translation can move the previously aligned edge outside

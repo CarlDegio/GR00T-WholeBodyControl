@@ -18,6 +18,7 @@ class RecoveryPlan:
     effective_distance_m: float
     diagnostics: dict
     effective_lateral_tolerance_m: float = 0.06
+    turn_before_translation_rad: float = 0.0
 
 
 class RecoveryPlanner:
@@ -148,8 +149,10 @@ class RecoveryPlanner:
             nominal_lateral_tolerance_m=self.config.lateral_tolerance_m,
             effective_lateral_tolerance_m=plan.effective_lateral_tolerance_m)
         maximum = self.config.navmesh_max_lateral_tolerance_m
-        if plan.waypoints or maximum <= self.config.lateral_tolerance_m:
+        if plan.waypoints:
             return plan
+        if maximum <= self.config.lateral_tolerance_m:
+            return self._heading_fallback(oracle, forward_m, right_m, plan)
         # Exhaust both original and outer distances at the nominal lateral
         # tolerance before relaxing this one endpoint constraint.
         expanded = RecoveryPlanner(replace(self.config,
@@ -170,7 +173,74 @@ class RecoveryPlanner:
                 endpoint_trials=sum(item['lateral_candidates_tested']
                                     for item in plan.diagnostics['tested_distances']),
             ))
-        return expanded
+        if expanded.waypoints:
+            return expanded
+        return self._heading_fallback(oracle, forward_m, right_m, expanded)
+
+    def _heading_fallback(self, oracle, forward, right, failed):
+        """Search new safe headings only after fixed-heading searches fail.
+
+        New headings use a finite coarse stand-off search. The preceding
+        original/outer 1 mm searches and safety constraints are unchanged.
+        Rotated snapshots never move or render the simulator.
+        """
+        bound = self.config.navmesh_heading_search_degrees
+        if bound <= 0 or not hasattr(oracle, 'rotated') or not hasattr(oracle, 'rotation_safe'):
+            return failed
+        target = np.array([forward, -right], dtype=float)
+        bearing = math.degrees(math.atan2(target[1], target[0]))
+        angles = [bearing] + [bearing + sign*offset
+            for offset in (15, 30, 45, 60, 75, 90) for sign in (1, -1)]
+        minimum_turn = math.radians(self.limits.min_turn_degrees)*(1+1e-5)
+        nominal = self.config.target_distance_m
+        distances = [nominal]
+        distances += list(np.arange(nominal-.05, self.config.navmesh_min_target_distance_m-1e-8, -.05))
+        distances += list(np.arange(nominal+.025, self.config.navmesh_max_target_distance_m+1e-8, .025))
+        lateral = max(self.config.lateral_tolerance_m, self.config.navmesh_max_lateral_tolerance_m)
+        residual_bound = lateral-self.config.navmesh_execution_tolerance_m
+        residuals = [0.0] + [sign*v for v in (.05, .10, residual_bound)
+            if 0 < v <= residual_bound+1e-10 for sign in (1, -1)]
+        trials = []
+        for deg in angles:
+            angle = math.radians(deg)
+            if abs(deg) > bound+1e-8 or abs(angle) < minimum_turn:
+                continue
+            trial = dict(angle_deg=deg, rotation_safe=False, endpoint_trials=0)
+            trials.append(trial)
+            if not oracle.rotation_safe(angle, self.config.navmesh_clearance_m):
+                continue
+            trial['rotation_safe'] = True
+            rotated = oracle.rotated(angle)
+            c, s = math.cos(angle), math.sin(angle)
+            rotation = np.array([[c, -s], [s, c]])
+            rotated_target = rotation.T @ target
+            for distance in distances:
+                for residual in residuals:
+                    goal = rotated_target - np.array([distance, -residual])
+                    trial['endpoint_trials'] += 1
+                    if not rotated.endpoint(goal, self.config.navmesh_clearance_m)['reachable']:
+                        continue
+                    path, strategy = self._route(rotated, goal, 0)
+                    if not path:
+                        continue
+                    points = [rotation @ p for p in path]
+                    report = dict(failed.diagnostics)
+                    report.pop('failure', None)
+                    report.update(strategy='rotated_approach/'+strategy,
+                        search_phase='heading_fallback', heading_trials=trials,
+                        preceding_fixed_heading_failure=failed.diagnostics.get('failure'),
+                        turn_before_translation_rad=angle,
+                        effective_distance_m=float(distance),
+                        planned_right_residual_m=residual,
+                        effective_lateral_tolerance_m=max(self.config.lateral_tolerance_m,
+                            abs(residual)+self.config.navmesh_execution_tolerance_m),
+                        waypoints_local_xy=[p.tolist() for p in points],
+                        endpoint_local_xy=points[-1].tolist())
+                    return RecoveryPlan(points, float(distance), report,
+                        report['effective_lateral_tolerance_m'], angle)
+        failed.diagnostics['heading_trials'] = trials
+        failed.diagnostics['heading_search_exhausted'] = True
+        return failed
 
     def _plan(self, oracle, forward_m, right_m, blocked_axis):
         nominal = self.config.target_distance_m
@@ -284,6 +354,9 @@ class RecoveryExecution:
 
     def reset(self):
         self.pending = None
+        self.pending_turn = None
+        self.rotation_goal = None
+        self.angular_recovery_used = False
         self.path = []
         self.blocked_axis = None
         self.events = []
@@ -301,6 +374,22 @@ class RecoveryExecution:
 
     def observe(self, obs, frame):
         self.completed = False
+        if self.pending_turn is not None:
+            pending, self.pending_turn = self.pending_turn, None
+            actual = math.remainder(float(np.asarray(obs.compass).reshape(-1)[0])-pending['heading'], 2*math.pi)
+            position_error = float(np.linalg.norm(np.asarray(obs.gps)-pending['gps']))
+            violation = bool(self.provider.navmesh_violated())
+            self.events.append(dict(frame=frame, command_frame=pending['frame'],
+                commanded_turn_rad=pending['turn'], actual_turn_rad=actual,
+                turn_position_error_m=position_error, navmesh_violation=violation,
+                recovery_action=True, turn_recovery_action=True))
+            if (violation or abs(math.remainder(actual-pending['turn'], 2*math.pi)) > math.radians(.25)
+                    or position_error > self.config.navmesh_execution_tolerance_m):
+                self.failure = 'recovery turn did not reach its measured heading'
+                self.path, self.rotation_goal = [], None
+            elif abs(math.remainder(self.rotation_goal-float(obs.compass[0]), 2*math.pi)) <= math.radians(.25):
+                self.rotation_goal = None
+                self.completed = not self.path
         if self.pending is None:
             return
         pending, self.pending = self.pending, None
@@ -357,6 +446,20 @@ class RecoveryExecution:
             self.effective_lateral_tolerance_m = plan.effective_lateral_tolerance_m
             rotation = self.rotation(obs)
             self.path = [np.asarray(obs.gps) + rotation @ p for p in plan.waypoints]
+            if plan.turn_before_translation_rad:
+                self.rotation_goal = float(np.asarray(obs.compass).reshape(-1)[0]) + plan.turn_before_translation_rad
+                self.angular_recovery_used = True
+        if self.rotation_goal is not None:
+            remaining = math.remainder(self.rotation_goal-float(obs.compass[0]), 2*math.pi)
+            maximum = math.radians(min(self.config.max_turn_degrees, self.planner.limits.max_turn_degrees))
+            count = max(1, int(math.ceil(abs(remaining)/maximum)))
+            turn = remaining/count
+            if (abs(turn) < math.radians(self.planner.limits.min_turn_degrees)
+                    or not self.provider.snapshot().rotation_safe(turn, self.config.navmesh_clearance_m)):
+                self.failure = 'fresh navmesh preflight rejected recovery turn'
+                self.path, self.rotation_goal = [], None
+                return np.zeros(3)
+            return np.array([0.0, 0.0, turn])
         if not self.path:
             return None
         local = self.rotation(obs).T @ (self.path[0] - np.asarray(obs.gps))
@@ -374,6 +477,10 @@ class RecoveryExecution:
         return np.r_[local, 0.0]
 
     def record(self, xyt, obs, frame):
+        if self.rotation_goal is not None and xyt[2] != 0:
+            self.pending_turn = dict(turn=float(xyt[2]), heading=float(obs.compass[0]),
+                gps=np.asarray(obs.gps).copy(), frame=frame)
+            return
         if np.linalg.norm(xyt[:2]) == 0:
             return
         self.pending = {
@@ -393,6 +500,7 @@ class RecoveryExecution:
                 }
             )
         self.path, self.pending = [], None
+        self.rotation_goal, self.pending_turn = None, None
 
     def diagnostics(self):
         return {
@@ -404,6 +512,8 @@ class RecoveryExecution:
             "nominal_lateral_tolerance_m": self.config.lateral_tolerance_m,
             "effective_lateral_tolerance_m": self.effective_lateral_tolerance_m,
             "remaining_waypoints": len(self.path),
+            "rotation_goal_rad": self.rotation_goal,
+            "angular_recovery_used": self.angular_recovery_used,
             "plan_count": len(self.plans),
             "last_motion": self.events[-1] if self.events else None,
             "last_plan": self.plans[-1] if self.plans else None,

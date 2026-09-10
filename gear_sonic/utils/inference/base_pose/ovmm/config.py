@@ -38,6 +38,11 @@ class BasePoseConfig:
     target_small_mask_fallback: bool = False
     target_small_mask_min_pixels: int = 30
     reference_track_edges: bool = False
+    reference_rgbd_recovery: bool = False
+    reference_progress_max_frames: int = 30
+    reference_geometry_grace_frames: int = 3
+    acquisition_body_yaw_guidance: bool = False
+    navmesh_heading_search_degrees: float = 0.0
     reference_parallel_edge_max_offset_m: float = 0.40
     reference_bearing_fallback: bool = False
     reference_bearing_after_frames: int = 10
@@ -111,7 +116,11 @@ class BasePoseConfig:
             value = getattr(self, key)
             if isinstance(value, bool) or value < 0 or int(value) != value:
                 raise ValueError(f"{key} must be a nonnegative integer")
-        for key in ("target_small_mask_min_pixels", "reference_bearing_after_frames"):
+        if (not math.isfinite(self.navmesh_heading_search_degrees)
+                or not 0 <= self.navmesh_heading_search_degrees <= 90):
+            raise ValueError("navmesh heading search must be between zero and 90 degrees")
+        for key in ("reference_progress_max_frames", "reference_geometry_grace_frames",
+                    "target_small_mask_min_pixels", "reference_bearing_after_frames"):
             value = getattr(self, key)
             if isinstance(value, bool) or value < 1 or int(value) != value:
                 raise ValueError(f"{key} must be a positive integer")
@@ -156,6 +165,10 @@ class BasePoseConfig:
             "target_small_mask_fallback",
             "target_small_mask_min_pixels",
             "reference_track_edges",
+            "reference_rgbd_recovery",
+            "reference_progress_max_frames",
+            "reference_geometry_grace_frames",
+            "acquisition_body_yaw_guidance",
             "reference_parallel_edge_max_offset_m",
             "reference_bearing_fallback",
             "reference_bearing_after_frames",
