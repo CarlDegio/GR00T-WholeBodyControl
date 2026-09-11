@@ -21,8 +21,14 @@ class PlaceSurfaceProvider:
     end_recep_goal, never object_goal or start_recep_goal.
     """
 
-    def __init__(self, minimum_margin_m=.07):
+    def __init__(self, minimum_margin_m=.07, *, preferred_margin_m=None):
         self.minimum_margin_m = float(minimum_margin_m)
+        self.preferred_margin_m = (None if preferred_margin_m is None
+                                   else float(preferred_margin_m))
+        if self.preferred_margin_m is not None and (
+                not math.isfinite(self.preferred_margin_m)
+                or self.preferred_margin_m < self.minimum_margin_m):
+            raise ValueError('Preferred support margin must be finite and at least the minimum')
         self.reset()
 
     def reset(self):
@@ -45,6 +51,7 @@ class PlaceSurfaceProvider:
             for candidate in support_candidates(
                 snapshot.depth_raw, calibration, instance.mask,
                 minimum_margin_m=self.minimum_margin_m,
+                preferred_margin_m=self.preferred_margin_m,
                 preferred_body=preferred,
             ):
                 body = np.asarray(candidate['body_point'])
@@ -60,7 +67,10 @@ class PlaceSurfaceProvider:
                 options.append((float(score), instance, candidate, position))
         if not options:
             raise MissingTarget('no associated visible support patch with sufficient interior margin')
-        _, instance, candidate, position = min(options, key=lambda item: item[0])
+        # Across visible patches, prefer an available interior point;
+        # association was already enforced for every candidate above.
+        _, instance, candidate, position = min(options, key=lambda item:
+            (not item[2].get('preferred_margin_used', False), item[0]))
         body = np.asarray(candidate['body_point'])
         if self.anchor_start is None:
             self.anchor_start = position.copy()
@@ -129,9 +139,11 @@ class PlaceSurfaceProvider:
 class BasePosePlaceSession(BasePoseSession):
     """Change target/reference geometry while preserving the base control loop."""
 
-    def __init__(self, config, limits, *, use_opencv_camera_pose=False, minimum_margin_m=.07):
+    def __init__(self, config, limits, *, use_opencv_camera_pose=False,
+                 minimum_margin_m=.07, preferred_margin_m=None):
         super().__init__(config, limits, use_opencv_camera_pose=use_opencv_camera_pose)
-        self.targets = PlaceSurfaceProvider(minimum_margin_m)
+        self.targets = PlaceSurfaceProvider(minimum_margin_m,
+                                            preferred_margin_m=preferred_margin_m)
 
     def reset(self, start_frame_id=None):
         self._place_reference_source = None
