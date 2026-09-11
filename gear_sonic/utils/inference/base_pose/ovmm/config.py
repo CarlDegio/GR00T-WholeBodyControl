@@ -43,6 +43,7 @@ class BasePoseConfig:
     reference_geometry_grace_frames: int = 3
     acquisition_body_yaw_guidance: bool = False
     acquisition_body_yaw_max_attempts: int = 3
+    acquisition_prefer_current_target: bool = False
     navmesh_heading_search_degrees: float = 0.0
     reference_parallel_edge_max_offset_m: float = 0.40
     reference_bearing_fallback: bool = False
@@ -74,6 +75,8 @@ class BasePoseConfig:
     navmesh_reframe_after_translation: bool = True
 
     def __post_init__(self) -> None:
+        if not isinstance(self.acquisition_prefer_current_target, bool):
+            raise ValueError("acquisition_prefer_current_target must be boolean")
         for key in (
             "control_dt_s",
             "max_displacement_m",
@@ -171,6 +174,7 @@ class BasePoseConfig:
             "reference_geometry_grace_frames",
             "acquisition_body_yaw_guidance",
             "acquisition_body_yaw_max_attempts",
+            "acquisition_prefer_current_target",
             "reference_parallel_edge_max_offset_m",
             "reference_bearing_fallback",
             "reference_bearing_after_frames",
