@@ -109,6 +109,22 @@ class TargetMemory:
             return True
         return False
 
+    def guided_yaw(self, obs, frame_id):
+        """Bearing of a recent same-goal RGB-D observation in today's body frame."""
+        diagnostic = self.diagnostics(frame_id)
+        if not self.available(frame_id) or self.goal != self.goal_key(obs):
+            return None, dict(diagnostic, guidance_reason='no recent matching target memory')
+        gps = np.asarray(obs.gps, dtype=float).reshape(-1)
+        heading = np.asarray(obs.compass, dtype=float).reshape(-1)
+        if gps.size != 2 or heading.size != 1 or not np.isfinite(np.r_[gps, heading]).all():
+            return None, dict(diagnostic, guidance_reason='invalid own pose')
+        delta = self.position[:2]-gps
+        if np.linalg.norm(delta) < .05:
+            return None, dict(diagnostic, guidance_reason='remembered point too close for bearing')
+        angle = math.remainder(math.atan2(delta[1], delta[0])-heading[0], 2*math.pi)
+        return angle, dict(diagnostic, guided_body_yaw_deg=math.degrees(angle),
+            guidance_reason='recent visible RGB-D target bearing in current body frame')
+
     def guided_tilt(self, obs, frame_id):
         """Project the remembered point and aim vertically; keep pan at zero."""
         diagnostic = self.diagnostics(frame_id)

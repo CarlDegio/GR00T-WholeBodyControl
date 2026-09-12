@@ -31,7 +31,8 @@ def horizontal_pixels(points, depth, visible_mask):
     return horizontal
 
 
-def _candidate(points, region, minimum_margin_m, resolution, preferred_body=None):
+def _candidate(points, region, minimum_margin_m, resolution, preferred_body=None,
+               preferred_margin_m=None):
     pixels=np.column_stack(np.nonzero(region))
     cloud=points[region]
     origin=np.floor(cloud[:,:2].min(axis=0)/resolution)*resolution-3*resolution
@@ -47,21 +48,32 @@ def _candidate(points, region, minimum_margin_m, resolution, preferred_body=None
     distance=cv2.distanceTransform(filled,cv2.DIST_L2,5)*resolution-resolution
     margins=distance[cells[:,1],cells[:,0]]
     eligible=margins>=minimum_margin_m
-    if not eligible.any():return None
-    # Choose the nearest sufficiently interior observed point, keeping large
-    # bed/table centers from pulling the base unnecessarily far underneath.
     ranges=np.linalg.norm(cloud[:,:2],axis=1)
     score=(ranges+.15*np.abs(cloud[:,1]) if preferred_body is None
            else np.linalg.norm(cloud-np.asarray(preferred_body),axis=1))
+    # Association takes priority over interior preference. A deeper point
+    # outside the existing anchor's window cannot pull the target elsewhere.
+    if preferred_body is not None:
+        eligible &= score <= .12
+    if not eligible.any():return None
+    preferred = (np.zeros_like(eligible) if preferred_margin_m is None else
+                 eligible & (margins >= preferred_margin_m))
+    preferred_margin_used = bool(preferred.any())
+    if preferred_margin_used:
+        eligible = preferred
+    # Choose the nearest measured point within the selected margin. If no
+    # preferred point is visible, retain the original minimum-margin choice.
     index=int(np.argmin(np.where(eligible,score,np.inf)))
     anchor=cloud[index]
-    if preferred_body is not None and np.linalg.norm(anchor-preferred_body)>.12:
-        return None
     if observed.sum()*resolution**2 < .03:
         return None
     result=dict(body_point=anchor.tolist(),pixel=pixels[index,::-1].tolist(),
                 distance_m=float(ranges[index]),height_m=float(np.median(cloud[:,2])),
                 observed_margin_m=float(margins[index]),
+                preferred_margin_m=preferred_margin_m,
+                preferred_margin_used=preferred_margin_used,
+                selection_minimum_margin_m=float(preferred_margin_m
+                    if preferred_margin_used else minimum_margin_m),
                 observed_area_m2=float(observed.sum()*resolution**2),
                 support_pixels=int(region.sum()),yaw_error_rad=None,
                 reference_source='visible_horizontal_surface_contour')
@@ -102,7 +114,7 @@ def _candidate(points, region, minimum_margin_m, resolution, preferred_body=None
 
 
 def support_candidates(depth, calibration, visible_mask, *, minimum_margin_m=.07,
-                       resolution=.01, preferred_body=None):
+                       resolution=.01, preferred_body=None, preferred_margin_m=None):
     points=point_image(depth,calibration)
     horizontal=horizontal_pixels(points,depth,visible_mask)
     if horizontal.sum()<200:return []
@@ -117,7 +129,8 @@ def support_candidates(depth, calibration, visible_mask, *, minimum_margin_m=.07
         count,labels,stats,_=cv2.connectedComponentsWithStats(plane.astype(np.uint8))
         for component in range(1,count):
             if stats[component,cv2.CC_STAT_AREA]<200:continue
-            candidate=_candidate(points,labels==component,minimum_margin_m,resolution,preferred_body)
+            candidate=_candidate(points,labels==component,minimum_margin_m,resolution,
+                                 preferred_body,preferred_margin_m)
             if candidate is None:continue
             if any(np.linalg.norm(np.asarray(candidate['body_point'])-other['body_point'])<.05 for other in options):
                 continue

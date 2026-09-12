@@ -21,8 +21,21 @@ class PlaceSurfaceProvider:
     end_recep_goal, never object_goal or start_recep_goal.
     """
 
-    def __init__(self, minimum_margin_m=.07):
+    def __init__(self, minimum_margin_m=.07, *, preferred_margin_m=None,
+                 fallback_margin_m=None):
         self.minimum_margin_m = float(minimum_margin_m)
+        self.preferred_margin_m = (None if preferred_margin_m is None
+                                   else float(preferred_margin_m))
+        if self.preferred_margin_m is not None and (
+                not math.isfinite(self.preferred_margin_m)
+                or self.preferred_margin_m < self.minimum_margin_m):
+            raise ValueError('Preferred support margin must be finite and at least the minimum')
+        self.fallback_margin_m = (None if fallback_margin_m is None
+                                  else float(fallback_margin_m))
+        if self.fallback_margin_m is not None and (
+                not math.isfinite(self.fallback_margin_m)
+                or not 0 < self.fallback_margin_m < self.minimum_margin_m):
+            raise ValueError('Fallback support margin must be finite, positive and below the minimum')
         self.reset()
 
     def reset(self):
@@ -34,17 +47,14 @@ class PlaceSurfaceProvider:
         self.last_reason = None
         self.reference_fallback_reason = None
 
-    def get_alignment_targets(self, obs, _legacy_mode, snapshot, calibration, start):
-        self.last_candidate = self.last_reference_yaw = None
-        self.last_reason = None
-        category = _goal_id(obs.task_observations.get('end_recep_goal'))
-        preferred = (None if self.anchor_start is None else
-                     start[:3, :3].T @ (self.anchor_start-start[:3, 3]))
+    def _associated_options(self, instances, snapshot, calibration, start,
+                            preferred, minimum_margin_m):
         options = []
-        for instance in _instances(obs, category):
+        for instance in instances:
             for candidate in support_candidates(
                 snapshot.depth_raw, calibration, instance.mask,
-                minimum_margin_m=self.minimum_margin_m,
+                minimum_margin_m=minimum_margin_m,
+                preferred_margin_m=self.preferred_margin_m,
                 preferred_body=preferred,
             ):
                 body = np.asarray(candidate['body_point'])
@@ -58,9 +68,39 @@ class PlaceSurfaceProvider:
                 else:
                     score = candidate['distance_m'] + .15*abs(body[1])
                 options.append((float(score), instance, candidate, position))
+        return options
+
+    def get_alignment_targets(self, obs, _legacy_mode, snapshot, calibration, start):
+        self.last_candidate = self.last_reference_yaw = None
+        self.last_reason = None
+        category = _goal_id(obs.task_observations.get('end_recep_goal'))
+        preferred = (None if self.anchor_start is None else
+                     start[:3, :3].T @ (self.anchor_start-start[:3, 3]))
+        instances = _instances(obs, category)
+        # Finish the original search across every associated visible patch
+        # before admitting a narrower patch. Recheck the strict tier on each
+        # new observation; neither the old anchor nor an earlier fallback can
+        # stand in for a currently measured support point.
+        options = self._associated_options(instances, snapshot, calibration,
+                                           start, preferred, self.minimum_margin_m)
+        strict_candidate_count = len(options)
+        fallback_margin_used = not options and self.fallback_margin_m is not None
+        if fallback_margin_used:
+            options = self._associated_options(instances, snapshot, calibration,
+                                               start, preferred, self.fallback_margin_m)
         if not options:
             raise MissingTarget('no associated visible support patch with sufficient interior margin')
-        _, instance, candidate, position = min(options, key=lambda item: item[0])
+        # Across visible patches, prefer an available interior point;
+        # association was already enforced for every candidate above.
+        _, instance, candidate, position = min(options, key=lambda item:
+            (not item[2].get('preferred_margin_used', False), item[0]))
+        if self.fallback_margin_m is not None:
+            candidate = dict(candidate,
+                strict_minimum_margin_m=self.minimum_margin_m,
+                fallback_margin_m=self.fallback_margin_m,
+                fallback_margin_used=bool(fallback_margin_used),
+                strict_candidate_count=strict_candidate_count,
+                fallback_candidate_count=len(options) if fallback_margin_used else 0)
         body = np.asarray(candidate['body_point'])
         if self.anchor_start is None:
             self.anchor_start = position.copy()
@@ -129,9 +169,12 @@ class PlaceSurfaceProvider:
 class BasePosePlaceSession(BasePoseSession):
     """Change target/reference geometry while preserving the base control loop."""
 
-    def __init__(self, config, limits, *, use_opencv_camera_pose=False, minimum_margin_m=.07):
+    def __init__(self, config, limits, *, use_opencv_camera_pose=False,
+                 minimum_margin_m=.07, preferred_margin_m=None, fallback_margin_m=None):
         super().__init__(config, limits, use_opencv_camera_pose=use_opencv_camera_pose)
-        self.targets = PlaceSurfaceProvider(minimum_margin_m)
+        self.targets = PlaceSurfaceProvider(minimum_margin_m,
+                                            preferred_margin_m=preferred_margin_m,
+                                            fallback_margin_m=fallback_margin_m)
 
     def reset(self, start_frame_id=None):
         self._place_reference_source = None

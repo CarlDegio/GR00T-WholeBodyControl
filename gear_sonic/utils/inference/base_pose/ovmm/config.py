@@ -32,11 +32,19 @@ class BasePoseConfig:
     horizontal_recovery_fraction: float = 0.30
     control_dt_s: float = 0.05
     max_steps: int = 200
+    minimum_step_actions: bool = False
     episode_pick_reserve_steps: int = 5
     reference_recovery_max_attempts: int = 2
     target_small_mask_fallback: bool = False
     target_small_mask_min_pixels: int = 30
     reference_track_edges: bool = False
+    reference_rgbd_recovery: bool = False
+    reference_progress_max_frames: int = 30
+    reference_geometry_grace_frames: int = 3
+    acquisition_body_yaw_guidance: bool = False
+    acquisition_body_yaw_max_attempts: int = 3
+    acquisition_prefer_current_target: bool = False
+    navmesh_heading_search_degrees: float = 0.0
     reference_parallel_edge_max_offset_m: float = 0.40
     reference_bearing_fallback: bool = False
     reference_bearing_after_frames: int = 10
@@ -62,9 +70,13 @@ class BasePoseConfig:
     navmesh_grid_spacing_m: float = 0.10
     navmesh_execution_tolerance_m: float = 0.003
     navmesh_max_replans: int = 3
+    navmesh_extended_radius_m: float = 0.0
+    navmesh_geodesic_fallback: bool = False
     navmesh_reframe_after_translation: bool = True
 
     def __post_init__(self) -> None:
+        if not isinstance(self.acquisition_prefer_current_target, bool):
+            raise ValueError("acquisition_prefer_current_target must be boolean")
         for key in (
             "control_dt_s",
             "max_displacement_m",
@@ -108,7 +120,11 @@ class BasePoseConfig:
             value = getattr(self, key)
             if isinstance(value, bool) or value < 0 or int(value) != value:
                 raise ValueError(f"{key} must be a nonnegative integer")
-        for key in ("target_small_mask_min_pixels", "reference_bearing_after_frames"):
+        if (not math.isfinite(self.navmesh_heading_search_degrees)
+                or not 0 <= self.navmesh_heading_search_degrees <= 90):
+            raise ValueError("navmesh heading search must be between zero and 90 degrees")
+        for key in ("acquisition_body_yaw_max_attempts", "reference_progress_max_frames", "reference_geometry_grace_frames",
+                    "target_small_mask_min_pixels", "reference_bearing_after_frames"):
             value = getattr(self, key)
             if isinstance(value, bool) or value < 1 or int(value) != value:
                 raise ValueError(f"{key} must be a positive integer")
@@ -119,6 +135,8 @@ class BasePoseConfig:
             raise ValueError(
                 "Recovery pose tolerance must leave a lateral safety reserve"
             )
+        if not math.isfinite(self.navmesh_extended_radius_m) or self.navmesh_extended_radius_m < 0:
+            raise ValueError("Extended recovery radius must be finite and nonnegative")
         if (
             self.navmesh_max_replans < 1
             or int(self.navmesh_max_replans) != self.navmesh_max_replans
@@ -144,12 +162,19 @@ class BasePoseConfig:
     def controller_kwargs(self) -> dict:
         adapter_only = {
             "control_dt_s",
+            "minimum_step_actions",
             "max_steps",
             "episode_pick_reserve_steps",
             "reference_recovery_max_attempts",
             "target_small_mask_fallback",
             "target_small_mask_min_pixels",
             "reference_track_edges",
+            "reference_rgbd_recovery",
+            "reference_progress_max_frames",
+            "reference_geometry_grace_frames",
+            "acquisition_body_yaw_guidance",
+            "acquisition_body_yaw_max_attempts",
+            "acquisition_prefer_current_target",
             "reference_parallel_edge_max_offset_m",
             "reference_bearing_fallback",
             "reference_bearing_after_frames",
