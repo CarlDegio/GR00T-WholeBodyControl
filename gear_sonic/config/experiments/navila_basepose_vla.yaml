@@ -10,7 +10,7 @@ navigation_backend: navila
 entry_stage: navigation
 alignment: dual
 gates:
-  nav: true
-  align: true
-  completion: true
+  nav: false  # NaVILA never calls LA or VA, including shadow checks.
+  align: false  # Wait for BasePose aligned; use the case's two configured targets.
+  completion: false  # Operator g/h or the existing fixed manipulation budget.
 runtime_overrides: {}

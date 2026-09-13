@@ -16,7 +16,15 @@ def parse_action(response, sequence, config):
     if response.get("sequence") != sequence:
         raise ValueError("NaVILA response sequence mismatch")
     text = str(response.get("text", "")).strip().lower().rstrip(".")
-    if text == "stop":
+    # The deployed model may introduce its single action with this phrase.
+    text = re.sub(r"^the\s+next\s+action\s+is\s+", "", text, count=1)
+    # Match an affirmative, complete STOP utterance, including the deployed
+    # model's completion sentence. Negated or compound actions must not match.
+    if re.fullmatch(
+        r"(?:(?:i\s+think\s+)?i\s+should\s+)?stop"
+        r"(?:\s+because\s+i\s+have\s+(?:finished|completed)\s+the\s+(?:instruction|task))?",
+        text,
+    ):
         return None
     turn = re.fullmatch(r"turn\s+(left|right)(?:\s+by)?\s+(\d+(?:\.\d+)?)\s*(?:degrees?|°)", text)
     forward = re.fullmatch(r"move\s+forward(?:\s+by)?\s+(\d+(?:\.\d+)?)\s*(cm|centimeters?|m|meters?)", text)
@@ -65,7 +73,7 @@ class NavilaClient:
             raise RuntimeError("NaVILA ping/reset failed")
         self.sequence = 0
 
-    def action(self, image, instruction):
+    def action(self, image, instruction, *, on_response=None):
         ok, jpeg = cv2.imencode(".jpg", image, [cv2.IMWRITE_JPEG_QUALITY, self.config["jpeg_quality"]])
         if not ok:
             raise ValueError("NaVILA JPEG encoding failed")
@@ -83,4 +91,6 @@ class NavilaClient:
                 image_jpeg=jpeg.tobytes(),
             ),
         )
+        if on_response is not None:
+            on_response(response)
         return parse_action(response, self.sequence, self.config)

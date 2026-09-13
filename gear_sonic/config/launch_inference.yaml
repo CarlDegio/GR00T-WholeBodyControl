@@ -163,7 +163,7 @@ components:
     raw_head_approach_cutoff_m: 1.5
     raw_chest_target_distance_m: 0.9
     # Chest position ignores head edge yaw above this distance and approaches.
-    raw_chest_approach_cutoff_m: 1.2
+    raw_chest_approach_cutoff_m: 1.1
     raw_forward_tolerance_m: 0.10
     raw_lateral_tolerance_m: 0.10
     raw_lateral_pulse_enter_m: 0.10
@@ -193,7 +193,7 @@ components:
     mpc_hz: 10.0
     mpc_result_timeout_s: 0.3
     heading_preview_s: 0.5
-    goal_tolerance_m: 2.0
+    goal_tolerance_m: 1.5
     stop_threshold: -4.0
     request_timeout_s: 10.0
     sensor_gateway_poll_hz: 20.0

@@ -5,21 +5,23 @@ from __future__ import annotations
 import math
 import time
 
-from gear_sonic.runtime.protocol.navigation import build_navigation_message
+from gear_sonic.runtime.protocol.navigation import NavigationRuntimeStatus, build_navigation_message
 
 from .recording import Recorder
 
 
 class ExperimentSupervisor:
-    def __init__(self, gateway, *, clock=time.monotonic):
+    def __init__(self, gateway, *, clock=time.monotonic, wall_clock=time.time):
         self.gateway = gateway
         self.recorder = Recorder(gateway.profile)
         self.config = self.recorder.config
         self.clock = clock
+        self.wall_clock = wall_clock
         self.active = None
         self.vla_identity = None
         self.vla_deadline = None
         self.step = None
+        self.step_stop_requested = None
         self.last_step_publish = 0.0
 
     def start(self, generation):
@@ -31,6 +33,7 @@ class ExperimentSupervisor:
             self.finish(old_generation, "cancelled", "restarted_with_n")
         self.active = (generation, self.clock() + self.config["task"]["total_timeout_s"])
         self.vla_identity = self.vla_deadline = self.step = None
+        self.step_stop_requested = None
         self.recorder.write(
             "trial_start",
             generation=generation,
@@ -46,6 +49,7 @@ class ExperimentSupervisor:
         if self.active and self.active[0] == generation:
             self.recorder.write("trial_end", generation=generation, state=state, reason=reason, **fields)
             self.active = self.step = self.vla_deadline = None
+            self.step_stop_requested = None
 
     def confirm_result(
         self, generation, *, success, completion_time_s, completed_wall_time_ns, completed_monotonic_ns,
@@ -115,11 +119,46 @@ class ExperimentSupervisor:
         if len(velocity) != 3 or not all(math.isfinite(v) for v in (*velocity, duration)):
             raise ValueError("Invalid NaVILA velocity")
         vx, vy, wz = velocity
-        if not 0 < duration <= 30 or abs(vx) > 0.3 or vy != 0 or abs(wz) > 0.3 or (vx and wz):
+        if not 0 < duration <= 30 or not -0.3 <= vx <= 0.4 or vy != 0 or abs(wz) > 0.3 or (vx and wz):
             raise ValueError("NaVILA step exceeds experiment motion envelope")
         nav.mode, nav.skill_id, nav.segment_id = "lavira_nav", skill, segment
         self.step = (generation, skill, segment, velocity, self.clock() + duration)
+        self.step_stop_requested = None
         self.last_step_publish = -math.inf
+
+    def accept_executor_status(self, status: NavigationRuntimeStatus) -> bool:
+        """Complete a NaVILA step only after its stop output was sent to SONIC."""
+        if not self.active or self.step is None or self.step_stop_requested is None:
+            return False
+        generation, skill, segment, _, _ = self.step
+        stop_at, stop_wall = self.step_stop_requested
+        now = self.clock()
+        if (
+            now >= self.active[1]
+            or now - stop_at >= self.config["navila"].get("stop_ack_timeout_s", 3.0)
+            or (status.generation, status.skill_id, status.segment_id) != (generation, skill, segment)
+            or self.gateway.navigation.mode != "lavira_nav"
+            or status.timestamp < stop_wall
+            or status.mode != "stop"
+            or any(abs(v) > 1e-6 for v in (*status.requested_velocity, *status.velocity))
+        ):
+            return False
+        self.recorder.write(
+            "navila_stop_confirmed", generation=generation, skill_id=skill, segment_id=segment,
+            executor_status=status.to_dict(), wait_s=now - stop_at,
+        )
+        self.gateway.navigation.mode = "lavira_pending"
+        self.gateway.dispatch_navigation_event(
+            "navigation_status",
+            dict(
+                generation=generation, skill_id=skill, segment_id=segment,
+                state="reached", reason="navila_step_completed",
+                executor_zero_confirmed=True, executor_timestamp=status.timestamp,
+                velocity=list(status.velocity),
+            ),
+        )
+        self.step = self.step_stop_requested = None
+        return True
 
     def tick(self):
         if not self.active:
@@ -149,19 +188,14 @@ class ExperimentSupervisor:
         if self.step is not None:
             generation, skill, segment, velocity, deadline = self.step
             if now >= deadline:
-                self.gateway._send_navigation_stop(generation=generation, skill_id=skill, segment_id=segment)
-                self.gateway.navigation.mode = "lavira_pending"
-                self.gateway.dispatch_navigation_event(
-                    "navigation_status",
-                    dict(
-                        generation=generation,
-                        skill_id=skill,
-                        segment_id=segment,
-                        state="reached",
-                        reason="navila_step_completed",
-                    ),
-                )
-                self.step = None
+                if self.step_stop_requested is None:
+                    self.step_stop_requested = (now, self.wall_clock())
+                    self.last_step_publish = -math.inf
+                if now - self.step_stop_requested[0] >= self.config["navila"].get("stop_ack_timeout_s", 3.0):
+                    self.abort("failed", "navila_stop_ack_timeout")
+                elif now - self.last_step_publish >= 0.05:
+                    self.gateway._send_navigation_stop(generation=generation, skill_id=skill, segment_id=segment)
+                    self.last_step_publish = now
             elif now - self.last_step_publish >= 0.05:
                 self.gateway.navigation_pub.send_string(
                     build_navigation_message(

@@ -23,7 +23,11 @@ from gear_sonic.runtime.gateway.control import (
 )
 from gear_sonic.runtime.gateway.event_display import EventPaneDisplay
 from gear_sonic.runtime.profile import RuntimeProfile, load_runtime_profile
-from gear_sonic.runtime.protocol import OperatorCommand, build_navigation_message
+from gear_sonic.runtime.protocol import (
+    OperatorCommand,
+    build_navigation_message,
+    decode_navigation_runtime_status_message,
+)
 from gear_sonic.runtime.telemetry import (
     build_event,
     configure_file_logging,
@@ -131,6 +135,13 @@ class ControlGatewayRuntime:
             source="control_gateway_navigation"
         )
         self.experiment = ExperimentSupervisor(self)
+        self.executor_status_sub = (
+            connect_subscriber(
+                self.context, profile.endpoint_uri("navigation_runtime_status"),
+                high_water_mark=1, conflate=True, linger_ms=0,
+            )
+            if self.experiment.config.get("navigation_backend") == "navila" else None
+        )
         self.pending_vla_completion: PendingVlaCompletion | None = None
         self.command_handlers: dict[
             str, Callable[[OperatorCommand], DispatchDisposition]
@@ -273,18 +284,24 @@ class ControlGatewayRuntime:
         poller.register(self.intent_pull, zmq.POLLIN)
         poller.register(self.event_pull, zmq.POLLIN)
         poller.register(self.navigation_status_sub, zmq.POLLIN)
+        if self.executor_status_sub is not None:
+            poller.register(self.executor_status_sub, zmq.POLLIN)
         while True:
             events = dict(poller.poll(100))
             if self.intent_pull in events:
                 self._receive_intent()
             if self.navigation_status_sub in events:
                 self._receive_navigation_status()
+            if self.executor_status_sub is not None and self.executor_status_sub in events:
+                self._receive_executor_status()
             if self.event_pull in events:
                 self._receive_runtime_event()
             self._handle_timeout()
 
     def close(self) -> None:
         self.display.close()
+        if self.executor_status_sub is not None:
+            self.executor_status_sub.close()
         for socket in (
             self.intent_pull,
             self.event_pull,
@@ -368,6 +385,13 @@ class ControlGatewayRuntime:
                 "INVALID_NAVIGATION_STATUS",
                 str(exc),
             )
+
+    def _receive_executor_status(self) -> None:
+        try:
+            status = decode_navigation_runtime_status_message(self.executor_status_sub.recv())
+            self.experiment.accept_executor_status(status)
+        except (json.JSONDecodeError, KeyError, TypeError, ValueError) as exc:
+            self.show_event(logging.WARNING, "INVALID_EXECUTOR_STATUS", str(exc))
 
     def _receive_runtime_event(self) -> None:
         try:

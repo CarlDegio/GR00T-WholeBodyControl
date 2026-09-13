@@ -279,6 +279,11 @@ def main(
 ) -> None:
     configure_file_logging("planner_executor")
     profile = load_runtime_profile(config.profile or None, overlays=config.overlay)
+    velocity_recorder = None
+    if profile.components.get("experiment", {}).get("navigation_backend") == "navila":
+        from gear_sonic.experiments.velocity_recording import NavilaVelocityRecorder
+
+        velocity_recorder = NavilaVelocityRecorder(profile)
     command_endpoint = profile.endpoint_uri("navigation_command")
     navdp_endpoint = profile.endpoint_uri("navdp_velocity")
     output_endpoint = profile.endpoint_uri("planner_relay")
@@ -424,6 +429,17 @@ def main(
                 )
                 last_owner = owner
             output.send(decision.message)
+            if velocity_recorder is not None:
+                try:
+                    velocity_recorder.record_sent(decision, mode=core.mode)
+                except OSError as exc:
+                    report_event(
+                        logging.WARNING,
+                        "NAVILA_VELOCITY_RECORDING_FAILED",
+                        "NaVILA velocity recording disabled after a file error",
+                        error=str(exc),
+                    )
+                    velocity_recorder = None
             try:
                 runtime_status.send_string(
                     build_navigation_runtime_status_message(
@@ -483,7 +499,13 @@ def main(
                 time.sleep(delay)
     finally:
         for _ in range(3):
-            output.send(core.sonic.message((0.0, 0.0, 0.0)))
+            message = core.sonic.message((0.0, 0.0, 0.0))
+            output.send(message)
+        if velocity_recorder is not None:
+            try:
+                velocity_recorder.record_shutdown(message)
+            except OSError as exc:
+                LOGGER.warning("NaVILA shutdown velocity recording failed: %s", exc)
         sensors.close()
         navigation.close(0)
         navdp.close(0)

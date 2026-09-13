@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 import logging
 import math
+from pathlib import Path
 import queue
 import threading
 import time
@@ -12,7 +13,8 @@ import time
 from gear_sonic.camera.calibration import load_camera_intrinsics
 from gear_sonic.runtime.gateway.control_client import ControlGatewayIntentClient, ControlGatewaySubscriber
 from gear_sonic.runtime.inference_service import InferenceServiceContext
-from gear_sonic.utils.inference.base_pose.dual_servo import dual_calibrations_from_config
+from gear_sonic.utils.inference.base_pose.diagnostics import AsyncFrameDiagnosticsWriter
+from gear_sonic.utils.inference.base_pose.dual_servo import _camera_image_data, dual_calibrations_from_config
 from gear_sonic.utils.inference.base_pose.sensor import SensorGatewayDualBasePoseCamera
 from gear_sonic.utils.inference.base_pose.servo import (
     RawServoCalibration,
@@ -40,6 +42,45 @@ class NullDiagnostics:
 
     def close(self, *args, **kwargs):
         pass
+
+
+class SampledCameraImages:
+    """Record existing perception snapshots without advancing camera cursors."""
+
+    def __init__(self, config, diagnostics, generation, mode):
+        self.diagnostics = diagnostics
+        self.interval = int(getattr(config, "raw_diagnostic_image_interval_frames", 5))
+        # A geometric task can invoke alignment repeatedly with the same generation.
+        self.writer_generation = time.time_ns()
+        self.output_dir = None
+        if diagnostics is not None and self.interval > 0:
+            self.output_dir = Path(config.output_root).resolve() / (
+                f"{mode}_raw_yoloe_{time.strftime('%Y%m%d_%H%M%S')}_g{generation}_{self.writer_generation}"
+            )
+        self.frame_index = -1
+        self.last_stamps = {}
+
+    def record(self, stream, snapshot, *, target=None, observation=None):
+        if self.output_dir is None:
+            return
+        stamp = float(snapshot.timestamp)
+        if not math.isfinite(stamp) or stamp <= self.last_stamps.get(stream, -math.inf):
+            return
+        self.last_stamps[stream] = stamp
+        self.frame_index += 1
+        if self.frame_index % self.interval:
+            return
+        try:
+            image = _camera_image_data(
+                stream, snapshot, target=target,
+                edge_intersection=None if observation is None else observation.yaw_align_target_rgb_edges,
+                selected_yaw_align_geometry=None if observation is None else observation.yaw_align_geometry,
+            )
+            self.diagnostics.submit_camera_images(
+                self.writer_generation, self.output_dir, self.frame_index, (image,),
+            )
+        except Exception as exc:
+            self.diagnostics.logger(f"[BasePose] WARNING diagnostic image submit failed: {exc}")
 
 
 def head_calibration(config):
@@ -97,6 +138,7 @@ def run_head_worker(
                 target, yaw = config.target_prompt, config.yaw_align_target_prompt
                 tracker = tracker_for(config, target, yaw)
                 camera.begin_generation(generation)
+                images = SampledCameraImages(config, diagnostics, generation, "head")
                 details = {
                     "attempt_id": 1,
                     "live_stream": config.dual_head_camera_stream,
@@ -118,6 +160,7 @@ def run_head_worker(
                     if not _prompts_match(target, yaw):
                         yaw_instance, _, _ = _resolve_target(instances, yaw_id, 1)
                     if target_instance is None:
+                        images.record(config.dual_head_camera_stream, snapshot)
                         continue
                     target_id = target_instance.track_id
                     if yaw_instance is not None:
@@ -131,7 +174,12 @@ def run_head_worker(
                             exclude_target_from_yaw_align_edge=not _prompts_match(target, yaw),
                         )
                     except (ValueError, RuntimeError):
+                        images.record(config.dual_head_camera_stream, snapshot, target=target_instance)
                         continue
+                    images.record(
+                        config.dual_head_camera_stream, snapshot,
+                        target=target_instance, observation=observation,
+                    )
                     _publish_worker_event(
                         events,
                         observation_events,
@@ -153,8 +201,10 @@ def run_head_worker(
 
 
 class GeometricController:
-    def __init__(self, config, started):
+    def __init__(self, config, started, *, chest_camera_stream="chest_view"):
         self.config, self.started = config, started
+        self.chest_camera_stream = chest_camera_stream
+        self.target_distance_m = config["distance_m"]
         self.phase = "coarse"
         self.stable = 0
         self.last_stamp = None
@@ -165,6 +215,10 @@ class GeometricController:
     def select_camera(self, stream):
         if stream != self.camera_stream:
             self.camera_stream = stream
+            self.target_distance_m = (
+                self.config.get("chest_distance_m", self.config["distance_m"])
+                if stream == self.chest_camera_stream else self.config["distance_m"]
+            )
             self.phase, self.stable, self.last_stamp = "coarse", 0, None
             self.error_m = self.error_deg = None
 
@@ -180,7 +234,7 @@ class GeometricController:
             self.stable = 0
             return zero
         bearing = math.atan2(-right, forward)
-        self.error_m = forward - c["distance_m"]
+        self.error_m = forward - self.target_distance_m
         self.error_deg = math.degrees(bearing)
         new_frame = stamp != self.last_stamp
         self.last_stamp = stamp
@@ -224,7 +278,7 @@ class GeometricSample:
 class GeometricPerception:
     """Prefer head initially, then keep the selected camera until its target is lost."""
 
-    def __init__(self, config, camera, target, *, both_lost_frames=20):
+    def __init__(self, config, camera, target, *, both_lost_frames=20, image_recorder=None):
         self.config, self.camera = config, camera
         self.streams = (config.dual_head_camera_stream, config.dual_chest_camera_stream)
         self.calibrations = dual_calibrations_from_config(config)
@@ -234,6 +288,7 @@ class GeometricPerception:
         self.last_stamps = {}
         self.both_lost_frames = 0
         self.loss_limit = int(both_lost_frames)
+        self.image_recorder = image_recorder
 
     def _observe(self, stream):
         try:
@@ -249,6 +304,8 @@ class GeometricPerception:
             self.tracker.reset_tracking()
             self.track_id, self.tracking_stream = -1, stream
         instance, _, _ = _resolve_target(self.tracker.track(snap.rgb), self.track_id)
+        if self.image_recorder is not None:
+            self.image_recorder.record(stream, snap, target=instance)
         details = dict(fresh=True, timestamp=stamp, target_visible=instance is not None, usable=False)
         if instance is None:
             return None, details
@@ -315,6 +372,7 @@ def run_geometric_service(config, profile):
     sample = GeometricSample()
     worker_error = None
     stopped = threading.Event()
+    diagnostics = AsyncFrameDiagnosticsWriter(logger=logging.getLogger(__name__).warning)
 
     def report(identity, code, message, **fields):
         service.event(
@@ -332,7 +390,8 @@ def run_geometric_service(config, profile):
         nonlocal worker_error
         try:
             perception = GeometricPerception(
-                config, camera, target, both_lost_frames=geometry.get("both_lost_frames", 20)
+                config, camera, target, both_lost_frames=geometry.get("both_lost_frames", 20),
+                image_recorder=SampledCameraImages(config, diagnostics, identity[0], "geometric"),
             )
             if stopped.is_set() or active != identity:
                 return
@@ -385,7 +444,9 @@ def run_geometric_service(config, profile):
                 elif active is None:
                     active = tuple(int(p.get(k, 0)) for k in ("generation", "skill_id", "segment_id"))
                     sample, worker_error = GeometricSample(), None
-                    controller = GeometricController(geometry, time.monotonic())
+                    controller = GeometricController(
+                        geometry, time.monotonic(), chest_camera_stream=config.dual_chest_camera_stream
+                    )
                     motion_logged = False
                     camera.begin_generation(active[0])
                     publish(active, (0.0, 0.0, 0.0), "hold")
@@ -448,4 +509,5 @@ def run_geometric_service(config, profile):
         control.close()
         intent.close()
         camera.close()
+        diagnostics.close()
         service.close()

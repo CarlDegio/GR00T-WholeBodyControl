@@ -12,8 +12,18 @@ import cv2
 
 from gear_sonic.utils.inference.lavira.agent import AgentHistoryEntry, LaViRAAgent, LaViRAAgentError, _same_target
 
+from .config import navila_alignment_targets
 from .navila import NavilaClient
 from .recording import Recorder, read_events
+
+
+class DisabledLanguageVisualClient:
+    """Fail locally if a NaVILA branch accidentally reaches an LA/VA call."""
+
+    def _disabled(self, **kwargs):
+        raise LaViRAAgentError("LA and VA are disabled for NaVILA experiments")
+
+    language_action = grounding = alignment_grounding = postcheck = _disabled
 
 
 class RecordedCamera:
@@ -140,6 +150,12 @@ class ExperimentAgent(LaViRAAgent):
         self.client = RecordedVisualClient(self.client, self)
         self.generation = -1
         self.navila = NavilaClient(experiment["navila"]) if experiment["navigation_backend"] == "navila" else None
+        if self.navila is not None:
+            self.navila_targets = navila_alignment_targets(experiment["condition"])
+            if any(not name or name.startswith("REQUIRED") for name in self.navila_targets.values()):
+                raise ValueError("Fill this case's navila_alignment.target and yaw_align_target before launch")
+            if experiment["alignment"] != "dual" or any(experiment["gates"].values()):
+                raise ValueError("NaVILA requires dual BasePose alignment and all LA/VA gates disabled")
         self._perturbation_requested = False
 
     def run(self, generation):
@@ -349,6 +365,38 @@ class ExperimentAgent(LaViRAAgent):
         return result
 
     def _align(self, generation, skill_id, args, strategic_goal):
+        if self.navila is not None:
+            if args:
+                raise LaViRAAgentError("ALIGN skill_args must be empty")
+            segment = self._next_segment()
+            self.recorder.write(
+                "alignment_targets", generation=generation, skill_id=skill_id,
+                segment_id=segment, source="case_navila_alignment", **self.navila_targets,
+            )
+            self.submit_intent(
+                "start_base_pose",
+                dict(generation=generation, skill_id=skill_id, segment_id=segment, **self.navila_targets),
+            )
+            status = self._wait(generation, skill_id, segment)
+            aligned = status.get("state") == "reached" and status.get("reason") == "aligned"
+            post = dict(
+                transition="READY_TO_MANIPULATE" if aligned else "RETRY_ALIGN",
+                status="SKIPPED",
+                visual_evidence="BasePose controller result; NaVILA does not use an ALIGN visual check.",
+            )
+            self.recorder.write(
+                "gate", generation=generation, gate="align", enabled=False,
+                skill_id=skill_id, va_recommendation=None, applied="allow" if aligned else "block",
+                controller_aligned=aligned, controller_state=status.get("reason"),
+                reason="navila_controller_alignment", result=post, check_ids=[],
+            )
+            if not aligned:
+                raise LaViRAAgentError(f"navila_base_pose_failed:{status.get('reason', status.get('state'))}")
+            self.forced_skill = "MANIPULATE"
+            self._store_transition("ALIGN", post)
+            return AgentHistoryEntry(
+                skill_id, "ALIGN", self.navila_targets["target"], "aligned", post["status"], post["visual_evidence"]
+            )
         if self.experiment["alignment"] != "geometric":
             return super()._align(generation, skill_id, args, strategic_goal)
         target = self.experiment["geometric"]["target"]
@@ -379,6 +427,21 @@ class ExperimentAgent(LaViRAAgent):
         return AgentHistoryEntry(skill_id, "ALIGN", target, str(reason), post["status"], post["visual_evidence"])
 
     def _manipulate(self, generation, skill_id, expected, strategic_goal):
+        if self.navila is not None:
+            self._start_manipulation(generation, skill_id)
+            self.recorder.write(
+                "gate", generation=generation, gate="completion", enabled=False,
+                skill_id=skill_id, va_recommendation=None, applied="wait_operator_or_fixed_duration",
+                reason="navila_no_va", check_ids=[],
+            )
+            while True:
+                self._check_cancelled(generation)
+                failure = self.poll_failure(generation, skill_id)
+                if failure is not None:
+                    raise LaViRAAgentError(f"manipulate_safety:{failure.get('reason')}")
+                # The gateway owns operator completion, first-action timing,
+                # fixed-duration stopping, and cancellation independently.
+                self.sleep(0.05)
         if self.experiment["gates"]["completion"]:
             return super()._manipulate(generation, skill_id, expected, strategic_goal)
         self._start_manipulation(generation, skill_id)
@@ -418,40 +481,40 @@ class ExperimentAgent(LaViRAAgent):
     def _move_to(self, generation, skill_id, args, strategic_goal):
         if self.navila is None:
             return super()._move_to(generation, skill_id, args, strategic_goal)
+        frame_after_ns = time.time_ns()
         while self.navila.sequence < self.experiment["navila"]["max_actions"]:
             self._check_cancelled(generation)
+            image = self.camera.capture_rgb(
+                camera_stream=self.experiment["navila"]["camera"], after_timestamp_ns=frame_after_ns,
+            )
+            self._check_cancelled(generation)
             action = self.navila.action(
-                self.camera.capture_rgb(camera_stream=self.experiment["navila"]["camera"]), self.mission
+                image,
+                self.mission,
+                on_response=lambda response: self.recorder.write(
+                    "navila_response",
+                    generation=generation,
+                    skill_id=skill_id,
+                    camera=self.experiment["navila"]["camera"],
+                    frame_after_ns=frame_after_ns,
+                    observation=self.camera.observations.get(id(image), {}),
+                    response=response,
+                ),
             )
             self._check_cancelled(generation)
             if action is None:
                 self._before_nav_handoff(generation, skill_id, self.global_target)
-                views, errors = {}, {}
-                for label, stream in (("head", "ego_view"), ("chest", "chest_view")):
-                    try:
-                        snapshot = self.camera.capture_camera_aligned_rgbd(
-                            camera_stream=stream, depth_stream=f"camera/{stream}_depth"
-                        )
-                        grounded = self._ground(
-                            generation=generation,
-                            skill_id=skill_id,
-                            target=self.global_target,
-                            direction="front",
-                            image=snapshot.rgb_bgr,
-                            strategic_goal=strategic_goal,
-                            strategic_stop=True,
-                            camera_label=label,
-                        )
-                        views[label] = (grounded, snapshot)
-                    except Exception as exc:
-                        errors[label] = str(exc)
-                post, _ = self._nav_handoff(
-                    generation=generation,
-                    skill_id=skill_id,
-                    target=self.global_target,
-                    navigation_completed=True,
-                    camera_views=views,
-                    camera_errors=errors,
+                self._global_target_navigation_ready = True
+                self.forced_skill = "ALIGN"
+                post = dict(
+                    transition="READY_TO_ALIGN", status="SKIPPED",
+                    visual_evidence="NaVILA returned stop; NAV visual arrival check was skipped.",
+                )
+                self._store_transition("MOVE_TO", post)
+                self.recorder.write(
+                    "gate", generation=generation, gate="nav", enabled=False, skill_id=skill_id,
+                    va_recommendation=None, applied="allow", terminal_candidate=True,
+                    reason="navila_stop", result=post, check_ids=[],
                 )
                 return AgentHistoryEntry(
                     skill_id, "MOVE_TO", self.global_target, "reached", post["status"], post["visual_evidence"]
@@ -468,5 +531,8 @@ class ExperimentAgent(LaViRAAgent):
                     duration_s=duration,
                 ),
             )
-            self._wait(generation, skill_id, segment)
+            status = self._wait(generation, skill_id, segment)
+            if status.get("state") != "reached" or status.get("reason") != "navila_step_completed":
+                raise LaViRAAgentError(f"navila_step_failed:{status.get('reason', status.get('state'))}")
+            frame_after_ns = time.time_ns()
         raise LaViRAAgentError("navila_action_budget_exceeded")

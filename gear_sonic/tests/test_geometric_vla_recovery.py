@@ -137,6 +137,17 @@ def test_geometric_actual_motion_keeps_velocity_watchdog(monkeypatch):
     assert harness.timeouts[0].reason == "base_pose_velocity_timeout"
 
 
+def test_geometric_service_uses_configured_chest_stream_distance(monkeypatch):
+    harness = GeometricServiceHarness(
+        monkeypatch, perceive=True,
+        perception_sample=base_pose.GeometricSample(1.15, 0.0, ("torso_rgb", 10.0), 1.0, "torso_rgb"),
+    )
+    harness.config.dual_chest_camera_stream = "torso_rgb"
+    harness.profile.components["experiment"]["geometric"]["chest_distance_m"] = 1.0
+    harness.run()
+    assert any(p.get("velocity") == [0.4, 0.0, 0.0] for name, p in harness.sent)
+
+
 def test_geometric_loss_sends_zero_stop_before_terminal_status(monkeypatch):
     harness = GeometricServiceHarness(
         monkeypatch, perceive=True,

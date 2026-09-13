@@ -309,6 +309,7 @@ class SensorGatewayRGBDCamera:
         timeout_ms: int | None = None,
         *,
         camera_stream: str = "chest_view",
+        after_timestamp_ns: int | None = None,
     ) -> np.ndarray:
         """Capture one fresh RGB frame without acquiring a depth lease."""
 
@@ -343,6 +344,7 @@ class SensorGatewayRGBDCamera:
                     )
                 if (
                     self._last_rgb_timestamp_by_stream.get(stream) != timestamp_ns
+                    and (after_timestamp_ns is None or timestamp_ns > after_timestamp_ns)
                 ):
                     self._last_rgb_timestamp_by_stream[stream] = timestamp_ns
                     if stream == self.RGB_STREAM:
@@ -408,5 +410,3 @@ class SensorGatewayRGBDCamera:
     def close(self) -> None:
         if self._owns_client:
             self.client.close()
-
-

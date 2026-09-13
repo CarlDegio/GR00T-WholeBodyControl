@@ -18,6 +18,7 @@ EVENTS = {
     "TASK_FAILED",
     "TASK_CANCELLED",
     "TASK_RESULT_PUBLISHED",
+    "TODO_UPDATED",
     "SKILL_STARTED",
     "SKILL_COMPLETED",
     "SKILL_FAILED",
@@ -37,7 +38,7 @@ EVENTS = {
     "GEOMETRIC_MOTION_STARTED",
     "GEOMETRIC_FINISHED",
 }
-OMIT = {"skill_args", "expected_postcondition", "mission", "manipulation_prompt", "max_steps", "todo_list"}
+OMIT = {"skill_args", "expected_postcondition", "mission", "manipulation_prompt", "max_steps"}
 
 
 def read_events(path):

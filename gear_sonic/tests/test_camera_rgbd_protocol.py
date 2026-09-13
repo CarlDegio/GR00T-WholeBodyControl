@@ -315,6 +315,31 @@ def test_composed_camera_enables_depth_only_for_chest_and_merges_camera_info(mon
     assert result["camera_info"] == {"chest_view": {"fx": 500.0}}
 
 
+@pytest.mark.parametrize("chest_depth,right_depth", [(False, False), (True, False), (False, True), (True, True)])
+def test_right_wrist_depth_is_independent_of_chest_depth(monkeypatch, chest_depth, right_depth):
+    """Right-wrist RGB-D must not enable depth on the left or change the chest flag."""
+    from gear_sonic.camera.composed_camera import ComposedCameraConfig, ComposedCameraSensor
+
+    fake_driver = types.ModuleType("gear_sonic.camera.drivers.realsense")
+    fake_driver.RealSenseConfig = lambda: types.SimpleNamespace(fps=30, enable_depth=True)
+    fake_driver.RealSenseSensor = lambda **kwargs: types.SimpleNamespace(**kwargs)
+    monkeypatch.setitem(sys.modules, "gear_sonic.camera.drivers.realsense", fake_driver)
+
+    composed = object.__new__(ComposedCameraSensor)
+    composed.config = ComposedCameraConfig(
+        realsense_enable_depth=chest_depth,
+        realsense_right_wrist_enable_depth=right_depth,
+    )
+    enabled = {
+        mount: composed._instantiate_camera(mount, "realsense").config.enable_depth
+        for mount in ("ego_view", "chest_view", "left_wrist", "right_wrist")
+    }
+    assert enabled == {
+        "ego_view": False, "chest_view": chest_depth,
+        "left_wrist": False, "right_wrist": right_depth,
+    }
+
+
 def test_composed_camera_merges_producer_image_shapes():
     """Catch raw-camera shape metadata being dropped during composition."""
     from gear_sonic.camera.composed_camera import ComposedCameraConfig, ComposedCameraSensor

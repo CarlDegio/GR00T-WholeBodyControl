@@ -266,8 +266,21 @@ def test_warning_and_error_logs_are_promoted_to_structured_runtime_events() -> N
     assert pending.empty()
 
 
-def test_runtime_reports_todo_as_structured_event() -> None:
+def test_runtime_reports_todo_as_structured_event(monkeypatch, tmp_path) -> None:
+    from types import SimpleNamespace
+
+    from gear_sonic.experiments.recording import Recorder, read_events
+
+    monkeypatch.setenv("SONIC_EXPERIMENT_MINIMAL_LOGGING", "1")
+    recorder = Recorder(SimpleNamespace(components={
+        "experiment": {"run_dir": str(tmp_path), "session_id": "todo-test"},
+    }))
     events = []
+
+    def report_event(level, code, message, **fields):
+        events.append((level, code, message, fields))
+        recorder.runtime("lavira", code, **fields)
+
     runtime = LaviraPlannerRuntime(
         LaviraPlannerConfig(
             mission="find chair",
@@ -275,9 +288,7 @@ def test_runtime_reports_todo_as_structured_event() -> None:
             global_target="chair",
         ),
         submit_intent=lambda _name, _parameters: None,
-        report_event=lambda level, code, message, **fields: events.append(
-            (level, code, message, fields)
-        ),
+        report_event=report_event,
     )
 
     runtime.start_navigation(7)
@@ -294,6 +305,14 @@ def test_runtime_reports_todo_as_structured_event() -> None:
             "todo_list": "- [x] Find doorway\n- [ ] Approach chair",
         },
     )]
+    updated_todo = '- [x] 已到垃圾桶  Result: "SATISFIED"\r\n- [ ] 去蓝篮子所在桌前  \n'
+    runtime.report_todo(7, 4, updated_todo)
+    saved = [e for e in read_events(recorder.path) if e.get("code") == "TODO_UPDATED"]
+    assert [e["todo_list"] for e in saved] == [
+        "- [x] Find doorway\n- [ ] Approach chair", updated_todo,
+    ]
+    assert [e["step"] for e in saved] == [3, 4]
+    assert all(e["generation"] == 7 and e["trial_id"] == "todo-test-g7" for e in saved)
 
 
 @pytest.mark.parametrize("reason", ["operator_success", "operator_failure"])

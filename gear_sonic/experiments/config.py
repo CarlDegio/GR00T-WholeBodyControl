@@ -40,6 +40,17 @@ def settings(profile):
     return dict(profile.components.get("experiment", {}))
 
 
+def navila_alignment_targets(condition):
+    targets = condition.get("navila_alignment") or {}
+    names = ("target", "yaw_align_target")
+    if not isinstance(targets, dict) or set(targets) - set(names):
+        raise ValueError("navila_alignment must contain target and yaw_align_target")
+    for name in names:
+        if targets.get(name) is not None and not isinstance(targets[name], str):
+            raise ValueError(f"navila_alignment.{name} must be an object name")
+    return {name: (targets.get(name) or "").strip() for name in names}
+
+
 def resolve(path, task_id="T1", case_id=None):
     path = Path(path).resolve()
     spec = read_yaml(path)
@@ -110,7 +121,7 @@ def resolve(path, task_id="T1", case_id=None):
     c["launcher"].update(
         base_pose_enabled=spec.get("alignment", "dual") != "none", data_exporter=False, slam_debug=False
     )
-    c["base_pose"]["raw_diagnostic_image_interval_frames"] = 0
+    c["base_pose"]["raw_diagnostic_image_interval_frames"] = 5
     for name in ("total_timeout_s", "vla_timeout_s", "fixed_manipulation_s", "recovery_budget_s"):
         if not 0 < float(task[name]) <= 86400:
             raise ValueError(f"Invalid {name}")
@@ -145,8 +156,10 @@ def resolve(path, task_id="T1", case_id=None):
             yoloe=c["base_pose"]["raw_yoloe_model_path"],
         ),
     )
+    experiment["geometric"].setdefault("chest_distance_m", experiment["geometric"]["distance_m"])
     experiment["geometric"].setdefault("both_lost_frames", 20)
     experiment["geometric"]["target"] = task.get("geometry_target", "")
+    experiment["navila"].setdefault("stop_ack_timeout_s", 3.0)
     if experiment["alignment"] not in {"dual", "head", "none", "geometric"} or experiment["entry_stage"] not in {
         "navigation",
         "alignment",
@@ -155,11 +168,21 @@ def resolve(path, task_id="T1", case_id=None):
         raise ValueError("Unsupported alignment or entry_stage")
     if experiment["navigation_backend"] not in {"lavira", "navila"} or nav not in {"vln", "object_nav"}:
         raise ValueError("Unsupported navigation backend or mode")
+    if experiment["navigation_backend"] == "navila":
+        if any(gates.values()):
+            raise ValueError("NaVILA runs without LA/VA; nav, align and completion gates must all be false")
+        if experiment["alignment"] != "dual":
+            raise ValueError("NaVILA requires dual BasePose alignment with configured targets")
+        case["navila_alignment"] = navila_alignment_targets(case)
+        for name, value in case["navila_alignment"].items():
+            required(value, f"{case_id}.navila_alignment.{name}")
+        experiment["models"]["la"] = experiment["models"]["va"] = None
     for group, names in (
         (
             "geometric",
             (
                 "distance_m",
+                "chest_distance_m",
                 "longitudinal_tolerance_m",
                 "angle_tolerance_deg",
                 "coarse_wz",
@@ -170,7 +193,7 @@ def resolve(path, task_id="T1", case_id=None):
                 "both_lost_frames",
             ),
         ),
-        ("navila", ("timeout_s", "vx", "wz", "max_actions")),
+        ("navila", ("timeout_s", "vx", "wz", "max_actions", "stop_ack_timeout_s")),
     ):
         for name in names:
             value = float(experiment[group][name])
@@ -180,7 +203,7 @@ def resolve(path, task_id="T1", case_id=None):
     for value in (geo["stable_frames"], geo["both_lost_frames"], nv["max_actions"], nv["port"]):
         if isinstance(value, bool) or not float(value).is_integer():
             raise ValueError("Frame counts, action budget and model port must be integers")
-    if geo["vx"] > 0.4 or max(geo["coarse_wz"], geo["fine_wz"]) > 0.3 or nv["vx"] > 0.3 or nv["wz"] > 0.3:
+    if geo["vx"] > 0.4 or max(geo["coarse_wz"], geo["fine_wz"]) > 0.3 or nv["vx"] > 0.4 or nv["wz"] > 0.3:
         raise ValueError("Experiment speed exceeds the shared gateway envelope")
     if not 1 <= int(nv["port"]) <= 65535 or not str(nv["host"]).strip():
         raise ValueError("Invalid NaVILA model endpoint")

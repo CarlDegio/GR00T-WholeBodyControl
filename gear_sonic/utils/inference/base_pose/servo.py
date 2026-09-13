@@ -1753,14 +1753,8 @@ class VisualServoController:
         self,
         observation: RawServoObservation,
     ) -> bool:
-        # The far cutoff can restart approach, but crossing it must not skip
-        # the remaining distance correction. Keep yaw out of control/filtering
-        # until approach has confirmed the target distance for stable frames.
-        if self.phase in {
-            ServoPhase.FORWARD_APPROACH,
-            ServoPhase.FORWARD_RECENTER,
-        }:
-            return True
+        # Approach only to the far cutoff before yaw alignment. Correct the
+        # remaining standoff distance after yaw and lateral centering.
         cutoff = self.far_approach_cutoff_m
         return (
             cutoff is not None
@@ -2022,6 +2016,19 @@ class VisualServoController:
             yaw_align_geometry_lost = False
             self.last_errors = (forward_error, right_error, yaw_error)
         else:
+            if (
+                self.far_approach_cutoff_m is not None
+                and (not self.chest_approach_only or self.joint_completion_active)
+                and self.phase in {
+                    ServoPhase.FORWARD_APPROACH,
+                    ServoPhase.FORWARD_RECENTER,
+                }
+            ):
+                self.resume_phase = None
+                self._transition(
+                    ServoPhase.YAW_ALIGN,
+                    "target reached approach cutoff",
+                )
             yaw_error, yaw_align_geometry_lost = self._refresh_yaw_error(
                 observation, visual_yaw_error, orientation
             )

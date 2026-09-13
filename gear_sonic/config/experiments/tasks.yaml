@@ -38,6 +38,7 @@ tasks:
     milestones: [stable_object_grasp, drawer_open, object_in_drawer_released]
 geometric:
   distance_m: 1.1
+  chest_distance_m: 1.0
   longitudinal_tolerance_m: 0.1
   angle_tolerance_deg: 9.0
   coarse_wz: 0.3
@@ -55,6 +56,7 @@ navila:
   token_env: NAVILA_API_TOKEN
   camera: chest_view
   jpeg_quality: 80
-  vx: 0.3
+  vx: 0.4
   wz: 0.3
   max_actions: 50
+  stop_ack_timeout_s: 3.0

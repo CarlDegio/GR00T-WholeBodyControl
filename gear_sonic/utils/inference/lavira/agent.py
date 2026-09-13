@@ -2969,7 +2969,7 @@ class LaViRAAgent:
                     todo = _complete_move_to_todo(
                         todo,
                         active_move_to_todo_line,
-                        target_hint,
+                        entry.target,
                     )
                     self._todo(generation, step, todo)
                 if skill == "MANIPULATE":

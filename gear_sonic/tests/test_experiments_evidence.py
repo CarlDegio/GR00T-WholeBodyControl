@@ -53,7 +53,7 @@ def test_navila_msgpack_wire_reset_history_and_sequence(monkeypatch, tmp_path):
             assert cv2.imdecode(np.frombuffer(d["image_jpeg"], np.uint8), cv2.IMREAD_COLOR).shape == (8, 8, 3)
             server_history.append(d["sequence"])
             return msgpack.packb(
-                dict(type="navila_action", version=1, sequence=d["sequence"], text="Move forward 25 cm."),
+                dict(type="navila_action", version=1, sequence=d["sequence"], text="The next action is move forward 25 cm."),
                 use_bin_type=True,
             )
 
@@ -64,7 +64,9 @@ def test_navila_msgpack_wire_reset_history_and_sequence(monkeypatch, tmp_path):
     client = NavilaClient(experiment(tmp_path)["navila"])
     image = np.zeros((8, 8, 3), np.uint8)
     client.reset()
-    assert client.action(image, "test route")[1] == pytest.approx(0.25 / 0.3)
+    velocity, duration = client.action(image, "test route")
+    assert velocity == (0.4, 0.0, 0.0)
+    assert duration == pytest.approx(0.625)
     client.action(image, "test route")
     assert server_history == [1, 2]
     client.reset()
@@ -75,6 +77,105 @@ def test_navila_msgpack_wire_reset_history_and_sequence(monkeypatch, tmp_path):
         parse_action(dict(type="navila_action", version=1, sequence=99, text="stop"), 1, client.config)
     with pytest.raises(ValueError, match="Unsupported"):
         parse_action(dict(type="navila_action", version=1, sequence=1, text="move backward 2m"), 1, client.config)
+
+
+@pytest.mark.parametrize("prefix", ["", "The next action is ", "  THE  NEXT ACTION IS\n"])
+@pytest.mark.parametrize(
+    "action,velocity,duration",
+    [
+        ("move forward 25 cm", (0.4, 0, 0), 0.625),
+        ("move forward 50 cm", (0.4, 0, 0), 1.25),
+        ("move forward 75 cm", (0.4, 0, 0), 1.875),
+        ("move forward by 0.5 meters", (0.4, 0, 0), 1.25),
+        ("turn left by 30 degrees", (0, 0, 0.3), np.deg2rad(30) / 0.3),
+        ("turn right 15°", (0, 0, -0.3), np.deg2rad(15) / 0.3),
+        ("stop", None, None),
+    ],
+)
+def test_navila_action_accepts_optional_model_prefix(prefix, action, velocity, duration):
+    result = parse_action(
+        dict(type="navila_action", version=1, sequence=1, text=f"{prefix}{action}."),
+        1,
+        dict(vx=0.4, wz=0.3),
+    )
+    if velocity is None:
+        assert result is None
+    else:
+        assert result[0] == velocity
+        assert result[1] == pytest.approx(duration)
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "i think i should stop because i have finished the instruction",
+        "I think I should stop because I have finished the instruction.",
+        "The next action is I think I should stop because I have finished the instruction.",
+        "  I THINK\nI SHOULD  STOP because I have finished the instruction.  ",
+        "I should stop because I have completed the task.",
+        "Stop because I have finished the instruction.",
+        "I think I should stop.",
+    ],
+)
+def test_navila_action_accepts_affirmative_completion_stop(text):
+    assert parse_action(
+        dict(type="navila_action", version=1, sequence=7, text=text),
+        7,
+        dict(vx=0.4, wz=0.3),
+    ) is None
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "I think I should not stop because I have not finished the instruction.",
+        "I do not think I should stop because I have finished the instruction.",
+        "I think I should stop because I have not finished the instruction.",
+        "I think I should stop because I haven't finished the instruction.",
+        "I think I should stop if I have finished the instruction.",
+        "I think I should stop because I have finished the instruction. Move forward 25 cm.",
+        "I think I should stop because I have finished the instruction and turn left 30 degrees.",
+        "Move forward 25 cm then stop.",
+    ],
+)
+def test_navila_action_rejects_negated_conditional_and_compound_stop(text):
+    with pytest.raises(ValueError, match="Unsupported NaVILA action"):
+        parse_action(
+            dict(type="navila_action", version=1, sequence=7, text=text),
+            7,
+            dict(vx=0.4, wz=0.3),
+        )
+
+
+def test_navila_client_preserves_unsupported_raw_response(monkeypatch, tmp_path):
+    response = dict(type="navila_action", version=1, sequence=1, text="Unexpected model reply.")
+    client = NavilaClient(experiment(tmp_path)["navila"])
+    monkeypatch.setattr(client, "call", lambda *args: response)
+    recorded = []
+    with pytest.raises(ValueError, match="Unsupported NaVILA action"):
+        client.action(np.zeros((8, 8, 3), np.uint8), "route", on_response=recorded.append)
+    assert recorded == [response]
+
+
+@pytest.mark.parametrize(
+    "action",
+    [
+        "move forward 26 cm",
+        "move forward 1 m",
+        "turn left 60 degrees",
+        "move backward 25 cm",
+        "not move forward 25 cm",
+        "move forward 25 cm then turn left 30 degrees",
+        "stop. Move forward 25 cm",
+    ],
+)
+def test_navila_prefixed_action_keeps_single_action_and_distance_limits(action):
+    with pytest.raises(ValueError, match="Unsupported NaVILA"):
+        parse_action(
+            dict(type="navila_action", version=1, sequence=1, text=f"The next action is {action}."),
+            1,
+            dict(vx=0.4, wz=0.3),
+        )
 
 
 def test_navila_real_zmq_req_rep_timeout_and_error(monkeypatch, tmp_path):
@@ -235,7 +336,8 @@ def test_offline_role_masks_use_saved_image_and_keep_geometry_unknown(monkeypatc
         assert result[key]["track_id"] == 9
 
 
-def test_offline_visual_client_reuses_local_va_key_without_la(monkeypatch, tmp_path):
+@pytest.mark.parametrize("experiment_mode", [False, True])
+def test_offline_visual_client_reuses_local_va_key_without_la(monkeypatch, tmp_path, experiment_mode):
     from gear_sonic.experiments import offline
     from gear_sonic.runtime.profile import load_runtime_profile
 
@@ -249,9 +351,19 @@ def test_offline_visual_client_reuses_local_va_key_without_la(monkeypatch, tmp_p
         return SimpleNamespace()
 
     monkeypatch.setattr(offline, "LaViRAClient", factory)
-    client = offline.visual_client(load_runtime_profile())
+    profile = load_runtime_profile()
+    if experiment_mode:
+        profile = SimpleNamespace(
+            component=profile.component,
+            components={"experiment": experiment(tmp_path)},
+        )
+    client = offline.visual_client(profile)
     assert captured["va_api_key"] == "fake-key" and captured["la_client"] is not None
-    assert client.save_request_context is False
+    if experiment_mode:
+        assert client.request_context_dir == tmp_path / "lavira_requests" / "offline"
+        assert getattr(client, "save_request_context", True)
+    else:
+        assert client.save_request_context is False
 
 
 def log_events(tmp_path, task="T1", successes=(True,), *, method="full_vln", completions=None):
@@ -314,6 +426,36 @@ def test_actual_action_required_late_actions_and_interventions_do_not_inflate_sr
     end["reason"] = "operator_closed_log_offline"
     row = trial_rows(events)[0]
     assert row["actual_runtime_s"] is None and not row["complete_log"]
+
+
+def test_explicit_progress_denominator_survives_annotation_and_export(tmp_path):
+    events = log_events(tmp_path, successes=(False,))
+    trial = next(e["trial_id"] for e in events if e["type"] == "trial_start")
+    path = tmp_path / "events.jsonl"
+    main(["result", str(path), "--trial", trial, "--progress", "2", "--progress-denominator", "3"])
+    report = summarize([read_events(path)])
+    row = report["trials"][0]
+    assert row["progress"] == pytest.approx(2 / 3)
+    assert row["progress_numerator"] == 2 and row["progress_denominator"] == 3
+    assert report["methods"]["full_vln"]["tasks"]["T1"]["progress"] == pytest.approx(2 / 3)
+    export(report, tmp_path / "summary")
+    exported = json.loads((tmp_path / "summary/statistics.json").read_text())["trials"][0]
+    assert exported["progress"] == pytest.approx(2 / 3) and exported["progress_denominator"] == 3
+    main(["result", str(path), "--trial", trial, "--progress", "1"])
+    updated = read_events(path)
+    assert trial_rows(updated)[0]["progress"] == pytest.approx(1 / 3)
+    assert len(updated[0]["experiment"]["task"]["milestones"]) == 2
+
+
+@pytest.mark.parametrize("count,total", [(2, 0), (0, -1), (4, 3)])
+def test_invalid_progress_fraction_does_not_append_annotation(tmp_path, count, total):
+    events = log_events(tmp_path, successes=(False,))
+    trial = next(e["trial_id"] for e in events if e["type"] == "trial_start")
+    path = tmp_path / "events.jsonl"
+    before = path.read_bytes()
+    with pytest.raises(SystemExit):
+        main(["result", str(path), "--trial", trial, "--progress", str(count), "--progress-denominator", str(total)])
+    assert path.read_bytes() == before
 
 
 def test_gate_truth_denominators_are_independent_and_ignore_late_decisions(tmp_path):

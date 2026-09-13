@@ -1,6 +1,11 @@
 # Physical layout/start and route instructions must be filled before running.
+# NaVILA only: target controls distance/centering; yaw_align_target supplies the
+# alignment edge. Fill both object names for the selected case before launch.
 cases:
   visible_01:
+    navila_alignment:
+      target: blue basket
+      yaw_align_target: desk
     layout_id: t1_layout_01
     start_id: t1_start_01
     visibility: visible
@@ -11,6 +16,9 @@ cases:
       T3: null
       T4: null
   visible_02:
+    navila_alignment:
+      target: null
+      yaw_align_target: null
     layout_id: t1_layout_02
     start_id: t1_start_01
     visibility: visible
@@ -21,6 +29,9 @@ cases:
       T3: null
       T4: null
   visible_03:
+    navila_alignment:
+      target: null
+      yaw_align_target: null
     layout_id: t1_layout_01
     start_id: t1_start_02
     visibility: visible
@@ -31,6 +42,9 @@ cases:
       T3: null
       T4: null
   visible_04:
+    navila_alignment:
+      target: null
+      yaw_align_target: null
     layout_id: t1_layout_02
     start_id: t1_start_02
     visibility: visible
@@ -41,66 +55,87 @@ cases:
       T3: null
       T4: null
   visible_05:
-    layout_id: null
-    start_id: null
+    navila_alignment:
+      target: null
+      yaw_align_target: null
+    layout_id: t1_layout_02
+    start_id: t1_start_03
     visibility: visible
     initial_path_distance_m: null
     navigation_instructions:
-      T1: null
+      T1: move to the black rubbish bin,turn right,and move foward to the front of the table with the blue basket.
       T2: null
       T3: null
       T4: null
   visible_06:
-    layout_id: null
-    start_id: null
-    visibility: visible
+    navila_alignment:
+      target: blue basket
+      yaw_align_target: desk
+    layout_id: t1_layout_02
+    start_id: t1_start_03
+    visibility: not visible
     initial_path_distance_m: null
     navigation_instructions:
-      T1: null
+      T1: move to the white rubbish bin ,turn left ,move to the black rubbish bin ,move forward to the open area,and move foward to the front of the table with the blue basket.
       T2: null
       T3: null
       T4: null
   visible_07:
-    layout_id: null
-    start_id: null
-    visibility: visible
+    navila_alignment:
+      target: blue basket
+      yaw_align_target: desk
+    layout_id: t1_layout_02
+    start_id: t1_start_04
+    visibility: not visible
     initial_path_distance_m: null
     navigation_instructions:
-      T1: null
+      T1: move to the white rubbish bin ,turn left ,move to the black rubbish bin ,move forward to the green rubbish bin,and move foward to the front of the table with the blue basket.
       T2: null
       T3: null
       T4: null
   visible_08:
-    layout_id: null
-    start_id: null
-    visibility: visible
+    navila_alignment:
+      target: blue basket
+      yaw_align_target: desk
+    layout_id: t1_layout_02
+    start_id: t1_start_05
+    visibility: not visible
     initial_path_distance_m: null
     navigation_instructions:
-      T1: null
+      T1: move to the white rubbish bin ,turn left ,move to the black rubbish bin ,move forward to the green rubbish bin,and move foward to the front of the table with the blue basket.
       T2: null
       T3: null
       T4: null
   invisible_01:
-    layout_id: null
-    start_id: null
-    visibility: invisible
+    navila_alignment:
+      target: blue basket
+      yaw_align_target: desk
+    layout_id: t1_layout_02
+    start_id: t1_start_05
+    visibility: not visible
     initial_path_distance_m: null
     navigation_instructions:
-      T1: null
+      T1: move to the white rubbish bin ,turn left ,move to the open area ,move forward to the refrigerator,turn left and move forward to the front of the table with the blue basket.
       T2: null
       T3: null
       T4: null
   invisible_02:
-    layout_id: null
-    start_id: null
-    visibility: invisible
+    navila_alignment:
+      target: blue basket
+      yaw_align_target: desk
+    layout_id: t1_layout_02
+    start_id: t1_start_06
+    visibility: visible
     initial_path_distance_m: null
     navigation_instructions:
-      T1: null
+      T1: find and move to the front of the desk with the blue basket
       T2: null
       T3: null
       T4: null
   invisible_03:
+    navila_alignment:
+      target: null
+      yaw_align_target: null
     layout_id: null
     start_id: null
     visibility: invisible
@@ -111,6 +146,9 @@ cases:
       T3: null
       T4: null
   invisible_04:
+    navila_alignment:
+      target: null
+      yaw_align_target: null
     layout_id: null
     start_id: null
     visibility: invisible
@@ -121,6 +159,9 @@ cases:
       T3: null
       T4: null
   invisible_05:
+    navila_alignment:
+      target: null
+      yaw_align_target: null
     layout_id: null
     start_id: null
     visibility: invisible
@@ -131,6 +172,9 @@ cases:
       T3: null
       T4: null
   invisible_06:
+    navila_alignment:
+      target: null
+      yaw_align_target: null
     layout_id: null
     start_id: null
     visibility: invisible
@@ -141,6 +185,9 @@ cases:
       T3: null
       T4: null
   invisible_07:
+    navila_alignment:
+      target: null
+      yaw_align_target: null
     layout_id: null
     start_id: null
     visibility: invisible
@@ -151,6 +198,9 @@ cases:
       T3: null
       T4: null
   invisible_08:
+    navila_alignment:
+      target: null
+      yaw_align_target: null
     layout_id: null
     start_id: null
     visibility: invisible

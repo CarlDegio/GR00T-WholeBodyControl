@@ -140,7 +140,7 @@ def test_base_pose_config_rejects_invalid_lateral_pulse_values(
 def test_launch_profile_configures_near_field_lateral_pulses() -> None:
     config = load_base_pose_config()
 
-    assert config.raw_lateral_tolerance_m == pytest.approx(0.06)
+    assert config.raw_lateral_tolerance_m == pytest.approx(0.10)
     assert config.raw_lateral_pulse_enter_m == pytest.approx(0.10)
     assert config.raw_lateral_pulse_exit_m == pytest.approx(0.10)
     assert config.raw_lateral_pulse_max_s == pytest.approx(0.40)
@@ -1238,8 +1238,8 @@ def test_runtime_allows_joint_completion_regardless_of_live_stream(
         RawServoEvent(1, "detecting", details=details),
         now=0.01,
     )
-    # Three frames confirm distance, three lock yaw, then five confirm pose.
-    for index in range(11):
+    # Start yaw immediately inside the cutoff: three yaw frames, then five pose frames.
+    for index in range(8):
         assert runtime.accept_event(
             RawServoEvent(
                 1,
@@ -1250,12 +1250,8 @@ def test_runtime_allows_joint_completion_regardless_of_live_stream(
             now=0.02 + index * 0.01,
         )
         if index < 2:
-            assert runtime.controller.phase is ServoPhase.FORWARD_APPROACH
-        elif index == 2:
-            assert runtime.controller.phase is ServoPhase.YAW_ALIGN
-        elif index < 5:
             assert runtime.controller.phase is ServoPhase.YAW_TRIM
-        elif index < 10:
+        elif index < 7:
             assert runtime.controller.phase is ServoPhase.TRANSLATE_TARGET
 
     assert runtime.controller.terminal_reason == "aligned"
@@ -1295,8 +1291,8 @@ def test_runtime_reuses_yoloe_after_ten_post_stop_deviation_frames(
         RawServoEvent(1, "detecting", details=details),
         now=0.01,
     )
-    # Three frames confirm distance, three lock yaw, then five confirm pose.
-    for index in range(11):
+    # Three frames lock yaw, then five confirm pose.
+    for index in range(8):
         assert runtime.accept_event(
             RawServoEvent(
                 1,
@@ -1383,8 +1379,8 @@ def test_runtime_pauses_chest_translation_during_head_yaw_loss_and_resumes(
         RawServoEvent(1, "detecting", details=common),
         now=0.01,
     )
-    # Complete the distance and yaw stages before exercising translation loss.
-    for index in range(6):
+    # Lock yaw before exercising translation loss.
+    for index in range(3):
         assert runtime.accept_event(
             RawServoEvent(
                 1,
@@ -1635,9 +1631,11 @@ def test_runtime_stops_on_first_head_hit_and_resumes_after_three_misses(
 
 
 @pytest.mark.parametrize("minimal_logging", [False, True])
+@pytest.mark.parametrize("image_interval", [0, 5])
 def test_close_chest_distance_does_not_trigger_head_handoff(
     tmp_path: Path,
     minimal_logging: bool,
+    image_interval: int,
 ) -> None:
     from gear_sonic.utils.inference.base_pose.sensor import AlignedRGBDSnapshot
 
@@ -1727,7 +1725,7 @@ def test_close_chest_distance_does_not_trigger_head_handoff(
     config = BasePoseAgentConfig(
         task="approach the blue basket",
         output_root=str(tmp_path),
-        raw_diagnostic_image_interval_frames=0,
+        raw_diagnostic_image_interval_frames=image_interval,
     )
     config.minimal_logging = minimal_logging
     diagnostics = AsyncFrameDiagnosticsWriter()
@@ -1778,7 +1776,7 @@ def test_close_chest_distance_does_not_trigger_head_handoff(
             for event in emitted
             if event.kind in {"initialized", "observation"}
         ]
-    ) < 5:
+    ) < 6:
         emitted.append(events.get(timeout=2.0))
     gate.cancel(1)
     worker.join(timeout=2.0)
@@ -1812,10 +1810,22 @@ def test_close_chest_distance_does_not_trigger_head_handoff(
     ]
     assert len(records) >= 5
     assert all(record["geometry"]["target"] for record in records)
-    assert all(not record["image_artifacts"] for record in records)
-    assert {path.name for path in output_dir.rglob("*") if path.is_file()} == {
-        "raw_servo_frames.jsonl"
-    }
+    if image_interval:
+        sampled = [record for record in records if record["frame_index"] % image_interval == 0]
+        assert sampled and all(record["image_artifacts"] for record in sampled)
+        assert all(
+            not record["image_artifacts"] for record in records
+            if record["frame_index"] % image_interval
+        )
+        for record in sampled:
+            for artifact in record["image_artifacts"]:
+                assert (output_dir / artifact["path"]).is_file()
+        assert (output_dir / "diagnostic_images/chest_view/initial.jpg").is_file()
+    else:
+        assert all(not record["image_artifacts"] for record in records)
+        assert {path.name for path in output_dir.rglob("*") if path.is_file()} == {
+            "raw_servo_frames.jsonl"
+        }
 
 
 def test_head_monitor_keeps_chest_position_when_live_head_yaw_is_valid(

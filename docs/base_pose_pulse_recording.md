@@ -22,7 +22,7 @@ READY 事件显示绝对路径。精简日志模式也保存，每个实际发�
 切相机、换目标、跟踪中断、缺少边界图像或帧间隔过大时写 `missing_reason`，不填零。
 `vy_pulses.jsonl` 只保存脉冲摘要及三个边界样本，文件写入在独立线程执行。
 
-自己的 BasePose 服务同时恢复原有非图片日志，即使 ObjectNav 实验设置了
+自己的 BasePose 服务同时保存运行日志和采样图片，即使实验设置了
 `SONIC_EXPERIMENT_MINIMAL_LOGGING=1` 也会保存：
 
 - `outputs/logs/inference/base_pose.log`：原有运行状态、控制阶段、告警和错误文字日志（沿用原有轮转）。
@@ -31,6 +31,14 @@ READY 事件显示绝对路径。精简日志模式也保存，每个实际发�
   根目录可通过 `output_root` 修改，READY 事件包含 `frame_log_root`。
 - 实验目录中的 `events.jsonl` 和 `vy_pulses.jsonl` 继续保存。
 
-BasePose 服务将诊断图片采样间隔设为 0，既不保存初始诊断图，也不保存逐帧诊断图；
-上述逐帧 JSONL 仍正常写入。ObjectNav 自身的 grounding/postcheck 证据图不属于此开关。
-记录不调整任何运动参数，下次启动自己的 BasePose 时生效；过去未保存的详细日志无法补回。
+所有实验的 BasePose 诊断图片采样间隔统一为 5，重启旧的冻结实验配置时也会启用。
+双相机 BasePose 恢复初始诊断图，并在第 0、5、10… 个感知帧分别保存可用的头、胸相机图片：
+`outputs/base_pose_adjustment/dual_raw_yoloe_<时间>_g<generation>/diagnostic_images/<相机>/frame_<帧号>.jpg`。
+图片叠加目标 mask（紫色）、头部候选边线（黄色）和实际选中线（绿色）；逐帧 JSONL 的
+`image_artifacts` 保存对应图片路径及各相机时间戳。单头和几何基线也按每 5 个新感知帧
+保存当前使用相机的图片，分别位于同一根目录的 `head_raw_yoloe_*` 和 `geometric_raw_yoloe_*`
+目录；几何基线仅标注目标 mask。编码和写盘沿用异步诊断线程。
+
+独立 BasePose 默认同样每 5 帧采样，可通过 `raw_diagnostic_image_interval_frames` 修改，
+设为 0 可关闭独立运行的图片采样。READY 事件显示实际采样间隔。grounding/postcheck 证据图继续保存。
+图片记录配置在下次启动 BasePose 服务时生效；过去未保存的过程图片无法补回。

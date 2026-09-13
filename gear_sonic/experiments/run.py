@@ -1,4 +1,4 @@
-"""Shared entrypoint used by the fifteen executable experiment wrappers."""
+"""Shared entrypoint used by the executable experiment wrappers."""
 
 import sys
 

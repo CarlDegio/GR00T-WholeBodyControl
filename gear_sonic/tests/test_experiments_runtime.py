@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import threading
+import time
 from types import SimpleNamespace
 
 import numpy as np
@@ -25,6 +26,8 @@ def experiment(tmp_path, method="near_dual"):
     exp = payload["components"]["experiment"]
     exp.update(run_dir=str(tmp_path), session_id="offline-test")
     exp["task"].update(vla_prompt="SEMANTIC real physical task", vla_trained_prompt="TRAINED exact policy string")
+    if exp["navigation_backend"] == "navila":
+        exp["condition"]["navila_alignment"] = dict(target="blue basket", yaw_align_target="desk")
     return exp
 
 
@@ -34,6 +37,24 @@ def make_agent(monkeypatch, tmp_path, method, decisions=(), **kwargs):
     agent, camera, client, intents, waited = helpers.build_agent(
         decisions, manipulation_prompt=exp["task"]["vla_prompt"], mission="NAVIGATION ROUTE", **kwargs
     )
+    if agent.navila is not None:
+        capture = camera.capture_rgb
+        camera.capture_cutoffs = []
+
+        def capture_after(*, camera_stream="chest_view", after_timestamp_ns=None):
+            camera.capture_cutoffs.append(after_timestamp_ns)
+            return capture(camera_stream=camera_stream)
+
+        camera.capture_rgb = capture_after
+        wait = agent.wait_status
+
+        def wait_navila(*args):
+            status = wait(*args)
+            if intents[-1][0] == "experiment_nav_step":
+                status["reason"] = "navila_step_completed"
+            return status
+
+        agent.wait_status = wait_navila
     return agent, camera, client, intents
 
 
@@ -46,6 +67,7 @@ def test_every_profile_loads_strict_runtime_components(tmp_path, method, task):
     from gear_sonic.utils.inference.vla.service import load_inference_config
 
     payload, missing = resolve(CONFIGS / f"{method}.yaml", task)
+    assert payload["components"]["base_pose"]["raw_diagnostic_image_interval_frames"] == 5
     path = tmp_path / "runtime.yaml"
     path.write_text(yaml.safe_dump(payload))
     for loader in (load_inference_launch_config, load_base_pose_config, load_lavira_config, load_inference_config):
@@ -57,8 +79,9 @@ def test_every_profile_loads_strict_runtime_components(tmp_path, method, task):
         assert not missing
 
 
-def test_fifteen_dry_runs_do_not_launch_or_create_results(tmp_path, capsys, monkeypatch):
-    assert len(METHODS) == 15
+def test_all_dry_runs_do_not_launch_or_create_results(tmp_path, capsys, monkeypatch):
+    scripts = CONFIGS.parents[1] / "scripts" / "experiments"
+    assert set(METHODS) == {path.stem for path in scripts.glob("*.sh")}
     monkeypatch.setattr(
         "gear_sonic.experiments.config.subprocess.run", lambda *a, **k: pytest.fail("dry-run invoked a process")
     )
@@ -478,19 +501,41 @@ def test_shadow_completion_can_be_cancelled_while_va_is_blocked(monkeypatch, tmp
 
 
 def test_navila_discrete_action_uses_gateway_and_stops_at_deadline(monkeypatch, tmp_path):
+    from gear_sonic.experiments.navila import parse_action
+    from gear_sonic.runtime.protocol import decode_navigation_message
+    from gear_sonic.runtime.protocol.navigation import NavigationRuntimeStatus
+
     controller, clock, sent = supervisor(monkeypatch, tmp_path, "navila_basepose_vla")
     gen = controller.active[0]
-    controller.begin_step(dict(generation=gen, skill_id=1, segment_id=1, velocity=[0.3, 0, 0], duration_s=1.0))
+    velocity, duration = parse_action(
+        dict(type="navila_action", version=1, sequence=1, text="Move forward 50 cm."),
+        1,
+        controller.config["navila"],
+    )
+    assert velocity == (0.4, 0.0, 0.0) and duration == pytest.approx(1.25)
+    step = dict(generation=gen, skill_id=1, segment_id=1, velocity=velocity, duration_s=duration)
+    controller.begin_step(step)
     controller.tick()
-    assert isinstance(sent[-1], str)
-    clock[0] = 1.0
+    assert decode_navigation_message(sent[-1]).velocity == (0.4, 0.0, 0.0)
+    clock[0] = 1.20
     controller.tick()
+    assert controller.step is not None
+    clock[0] = 1.25
+    controller.tick()
+    assert sent[-1][0] == "stop" and controller.step is not None
+    assert controller.gateway.navigation.mode == "lavira_nav"
+    assert controller.accept_executor_status(NavigationRuntimeStatus(
+        generation=gen, skill_id=1, segment_id=1, timestamp=time.time(),
+        mode="stop", source="stop", requested_velocity=(0.0, 0.0, 0.0),
+        velocity=(0.0, 0.0, 0.0), reason="stopped",
+    ))
     assert sent[-1][0] == "navigation_status" and controller.step is None
     assert controller.gateway.navigation.mode == "lavira_pending"
     with pytest.raises(ValueError, match="Stale"):
-        controller.begin_step(dict(generation=gen, skill_id=1, segment_id=1, velocity=[0.3, 0, 0], duration_s=1.0))
-    with pytest.raises(ValueError, match="envelope"):
-        controller.begin_step(dict(generation=gen, skill_id=1, segment_id=2, velocity=[0, 0.2, 0], duration_s=1.0))
+        controller.begin_step(step)
+    for velocity in ([0, 0.2, 0], [0.41, 0, 0], [-0.31, 0, 0], [0, 0, 0.31]):
+        with pytest.raises(ValueError, match="envelope"):
+            controller.begin_step(dict(generation=gen, skill_id=1, segment_id=2, velocity=velocity, duration_s=1.0))
 
 
 def test_operator_repeat_n_cancels_old_generation_and_perturb_requires_cue(monkeypatch, tmp_path):
@@ -517,39 +562,170 @@ def test_operator_repeat_n_cancels_old_generation_and_perturb_requires_cue(monke
     assert len([e for e in read_events(controller.recorder.path) if e["type"] == "perturbation"]) == 1
 
 
-def test_navila_agent_executes_navigation_alignment_and_manipulation(monkeypatch, tmp_path):
-    class FakeNavila:
-        def __init__(self, *a):
-            self.sequence = 0
+@pytest.fixture
+def fake_navila(monkeypatch):
+    from gear_sonic.experiments.navila import NavilaClient
+
+    class FakeNavila(NavilaClient):
+        def __init__(self, config):
+            super().__init__(config)
             self.resets = 0
+            self.stop_text = "stop"
 
-        def reset(self):
-            self.sequence = 0
-            self.resets += 1
-
-        def action(self, image, instruction):
-            self.sequence += 1
-            assert instruction == "NAVIGATION ROUTE"
-            return ((0.3, 0, 0), 0.5) if self.sequence == 1 else None
+        def call(self, endpoint, data=None):
+            if endpoint == "reset":
+                self.resets += 1
+            if endpoint in {"ping", "reset"}:
+                return {"status": "ok"}
+            assert endpoint == "get_action" and data["instruction"] == "NAVIGATION ROUTE"
+            return dict(
+                type="navila_action",
+                version=1,
+                sequence=data["sequence"],
+                text="The next action is move forward 50 cm." if self.sequence == 1 else self.stop_text,
+            )
 
     monkeypatch.setattr("gear_sonic.experiments.agent.NavilaClient", FakeNavila)
+
+
+@pytest.mark.parametrize(
+    "stop_text",
+    [
+        "stop",
+        "i think i should stop because i have finished the instruction",
+        "The next action is I think I should stop because I have finished the instruction.",
+    ],
+)
+def test_navila_agent_executes_navigation_alignment_and_manipulation(monkeypatch, tmp_path, fake_navila, stop_text):
+    payload, _ = resolve(CONFIGS / "navila_basepose_vla.yaml", "T1")
     agent, camera, client, intents = make_agent(
         monkeypatch,
         tmp_path,
         "navila_basepose_vla",
-        groundings=[helpers.grounding()] * 2,
-        alignment_groundings=[helpers.alignment_grounding()],
-        postchecks=[helpers.ready_to_manipulate()] * 2 + [helpers.task_complete()],
+        global_target=payload["components"]["lavira"]["global_target"],
     )
-    original = camera.capture_camera_aligned_rgbd
-    camera.capture_camera_aligned_rgbd = lambda *, camera_stream, depth_stream: original(
-        camera_stream=camera_stream
-    )
+    agent.navila.stop_text = stop_text
+    cancelled = threading.Event()
+    agent.cancelled = lambda generation: cancelled.is_set()
+    agent.sleep = lambda seconds: cancelled.set()  # Operator ends the VLA phase.
+    camera.capture_camera_aligned_rgbd = lambda **kwargs: pytest.fail("NaVILA stop must skip NAV RGB-D checks")
     result = agent.run(1)
-    assert result.state == "reached", result
+    assert result.state == "stopped" and result.reason == "operator_cancelled", result
     assert agent.navila.resets == 1 and not client.la_calls
+    assert agent.navila.sequence == 2 and not client.grounding_calls
+    assert agent.global_target == payload["components"]["lavira"]["global_target"]
+    assert not client.alignment_grounding_calls and not client.postcheck_calls
     names = [name for name, _ in intents]
-    assert names == ["experiment_nav_step", "start_base_pose", "start_vla_task", "stop_vla_task"]
+    assert names == ["experiment_nav_step", "start_base_pose", "start_vla_task"]
+    base_pose = next(args for name, args in intents if name == "start_base_pose")
+    assert (base_pose["target"], base_pose["yaw_align_target"]) == ("blue basket", "desk")
+    events = read_events(agent.recorder.path)
+    navila_responses = [e for e in events if e["type"] == "navila_response"]
+    assert [e["response"]["sequence"] for e in navila_responses] == [1, 2]
+    assert [e["response"]["text"] for e in navila_responses] == [
+        "The next action is move forward 50 cm.", stop_text
+    ]
+    assert all(e["generation"] == 1 and e["skill_id"] == 1 and e["camera"] == "chest_view" for e in navila_responses)
+    nav_gates = [e for e in events if e["type"] == "gate" and e["gate"] == "nav"]
+    assert len(nav_gates) == 1
+    gate = nav_gates[0]
+    assert gate["enabled"] is False and gate["applied"] == "allow"
+    assert gate["reason"] == "navila_stop" and gate["va_recommendation"] is None
+    assert gate["check_ids"] == [] and gate["result"]["status"] == "SKIPPED"
+    assert not any(e["type"] == "check" for e in events)
+    gates = [e for e in events if e["type"] == "gate"]
+    assert [e["gate"] for e in gates] == ["nav", "align", "completion"]
+    assert all(e["enabled"] is False and e["va_recommendation"] is None for e in gates)
+    assert gates[1]["controller_aligned"] is True
+    assert gates[2]["applied"] == "wait_operator_or_fixed_duration"
+
+
+@pytest.mark.parametrize("state,reason", [("failed", "target_lost"), ("failed", "timeout"), ("reached", "unverified")])
+def test_navila_alignment_failure_never_starts_vla(monkeypatch, tmp_path, fake_navila, state, reason):
+    agent, _, client, intents = make_agent(
+        monkeypatch,
+        tmp_path,
+        "navila_basepose_vla",
+        global_target="",
+    )
+    wait = agent.wait_status
+
+    def failed_alignment(*args):
+        status = wait(*args)
+        if intents[-1][0] == "start_base_pose":
+            status.update(state=state, reason=reason)
+        return status
+
+    agent.wait_status = failed_alignment
+    result = agent.run(1)
+    assert result.state == "failed" and result.reason == f"navila_base_pose_failed:{reason}"
+    assert agent.global_target == "" and not client.grounding_calls and not client.la_calls
+    assert not client.alignment_grounding_calls and not client.postcheck_calls
+    assert agent.navila.resets == 1 and agent.navila.sequence == 2
+    assert [name for name, _ in intents] == ["experiment_nav_step", "start_base_pose"]
+    events = read_events(agent.recorder.path)
+    align_gates = [e for e in events if e["type"] == "gate" and e["gate"] == "align"]
+    assert [e["applied"] for e in align_gates] == ["block"]
+    assert all(e["enabled"] is False for e in align_gates)
+
+
+def test_navila_waits_for_each_controller_before_next_frame_or_vla(monkeypatch, tmp_path, fake_navila):
+    agent, camera, client, intents = make_agent(monkeypatch, tmp_path, "navila_basepose_vla", global_target="")
+    nav_waiting, align_waiting, vla_started = (threading.Event() for _ in range(3))
+    nav_release, align_release, cancelled = (threading.Event() for _ in range(3))
+    wait = agent.wait_status
+
+    def blocking_wait(*args):
+        name = intents[-1][0]
+        if name == "experiment_nav_step":
+            nav_waiting.set()
+            assert nav_release.wait(3)
+        elif name == "start_base_pose":
+            align_waiting.set()
+            assert align_release.wait(3)
+        elif name == "start_vla_task":
+            vla_started.set()
+        return wait(*args)
+
+    agent.wait_status = blocking_wait
+    agent.cancelled = lambda generation: cancelled.is_set()
+    agent.sleep = lambda seconds: cancelled.wait(0.01)
+    results = []
+    worker = threading.Thread(target=lambda: results.append(agent.run(1)), daemon=True)
+    worker.start()
+    try:
+        assert nav_waiting.wait(2)
+        assert agent.navila.sequence == 1 and len(camera.capture_cutoffs) == 1
+        assert [name for name, _ in intents] == ["experiment_nav_step"]
+        released_ns = time.time_ns()
+        nav_release.set()
+        assert align_waiting.wait(2)
+        assert agent.navila.sequence == 2 and camera.capture_cutoffs[1] >= released_ns
+        assert not vla_started.is_set()
+        align_release.set()
+        assert vla_started.wait(2)
+    finally:
+        cancelled.set()
+        nav_release.set()
+        align_release.set()
+        worker.join(3)
+    assert not worker.is_alive() and results[0].state == "stopped"
+    assert not (client.la_calls or client.grounding_calls or client.alignment_grounding_calls or client.postcheck_calls)
+
+
+@pytest.mark.parametrize("state,reason", [("failed", "controller_error"), ("reached", "unverified")])
+def test_navila_bad_step_result_does_not_request_another_image(monkeypatch, tmp_path, fake_navila, state, reason):
+    agent, camera, _, intents = make_agent(monkeypatch, tmp_path, "navila_basepose_vla")
+    wait = agent.wait_status
+
+    def bad_step(*args):
+        return {**wait(*args), "state": state, "reason": reason}
+
+    agent.wait_status = bad_step
+    result = agent.run(1)
+    assert result.state == "failed" and result.reason == f"navila_step_failed:{reason}"
+    assert agent.navila.sequence == 1 and len(camera.capture_cutoffs) == 1
+    assert [name for name, _ in intents] == ["experiment_nav_step"]
 
 
 def test_nearfield_missing_role_retries_alignment_without_navigation(monkeypatch, tmp_path):

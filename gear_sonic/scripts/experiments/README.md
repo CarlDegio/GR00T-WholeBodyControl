@@ -66,17 +66,33 @@ bash gear_sonic/scripts/experiments/full_vln.sh --task T1 --case visible_01
 
 ## 特殊分支的执行规则
 
-所有方法在 MANIPULATE 操作阶段的 VA 检查均使用头部 `ego_view` 图像，包括 UNKNOWN 重试和完成门控关闭时的旁路检查；日志中的 `camera` 记为 `head`。
+除 NaVILA 外，各方法在 MANIPULATE 操作阶段的 VA 检查均使用头部 `ego_view` 图像，包括 UNKNOWN 重试和完成门控关闭时的旁路检查；日志中的 `camera` 记为 `head`。NaVILA 全程不调用 LA 或 VA。
 
 **VA 完成后的延时**：启用完成门控时，VA 判定 `TASK_COMPLETE` 后立即记录试验完成，VLA 继续推理并发送动作 5 s，再停止并切回 PLANNER。这 5 s 不加入完成时间；独立物理成功及耗时标注保持原有口径。延时期间保留导航控制权，空格、`n` 开始新任务或人工切换控制可提前结束延时，VLA 底层保护继续生效。`g` / `h` 人工确认、失败、超时与完成门控关闭组仍按原规则立即停止。日志另记 `vla_completion_delay_started` / `vla_completion_delay_ended`，实际 `stop_vla_task` 在延时结束时记录。
 
 **单头相机**：角色选择、检测/跟踪、BasePose 控制、ALIGN 视觉交接仅使用 `ego_view`。VLA 仍使用头、胸、左右腕四视角；首帧归档中的胸部图像和离线 mask 不参与该版本的对齐决策。近场导航阶段记为“不适用”。
 
-**简单几何对齐**：参数在 `tasks.yaml` 的 `geometric` 中，目标由每任务 `geometry_target` 给定。使用头、胸 RGB-D + YOLOE，初始化优先选有有效目标几何的头相机，头部不可用时尝试胸相机；运行中保持当前相机，当前目标丢失时先保持零速度，再尝试另一相机。两路分别使用自身内外参，切换时重置跟踪状态、转向阶段和稳定帧计数。先以 `wz=0.3 rad/s` 转向目标中心，再以 `vx=0.4 m/s` 接近，最后以 `wz=0.2 rad/s` 居中。纵向距离默认 1.1 m、距离容差 0.1 m、角度容差 9°，连续 3 个新观测满足才记为 aligned。两路都没有可用目标时，每轮两路各取得一个新观测才累计一次连续丢失；任一路恢复清零。达到 `both_lost_frames: 20` 时记录 `geometric_target_lost`、停止底座，进入共同的头胸 ALIGN VA 检查并归档图片和结果，然后继续 VLA，不记为对齐成功。本分支的 ALIGN VA 返回 `NOT_SATISFIED` 或 `UNKNOWN` 也不会直接判整次任务失败或阻止 VLA；操作完成仍由后续 MANIPULATE 完成检查判定。重复帧和相机取帧超时不冒充目标丢失帧；无新帧的等待仍受 60 s 总对齐时限约束。过近时以相同速度后退纠偏，无侧移及结构边缘 yaw 控制。60 s 超时记录 `geometric_timeout`、停止底座，完成共同的交接检查记录后继续 VLA；VA 建议不会阻挡此分支。硬件/模型/控制错误、取消和试验总时限仍可结束试验。对齐超时不自动等于物理任务失败。最小日志保留 YOLOE 就绪、相机选择/切换、两路检测与可用性、丢失计数、首次非零指令及停止原因。
+**简单几何对齐**：参数在 `tasks.yaml` 的 `geometric` 中，目标由每任务 `geometry_target` 给定。使用头、胸 RGB-D + YOLOE，初始化优先选有有效目标几何的头相机，头部不可用时尝试胸相机；运行中保持当前相机，当前目标丢失时先保持零速度，再尝试另一相机。两路分别使用自身内外参，切换时重置跟踪状态、转向阶段和稳定帧计数。先以 `wz=0.3 rad/s` 转向目标中心，再以 `vx=0.4 m/s` 接近，最后以 `wz=0.2 rad/s` 居中。纵向目标距离按当前相机选择：头部 `distance_m: 1.1` m、胸部 `chest_distance_m: 1.0` m；距离容差 0.1 m、角度容差 9°，连续 3 个新观测满足才记为 aligned。两路都没有可用目标时，每轮两路各取得一个新观测才累计一次连续丢失；任一路恢复清零。达到 `both_lost_frames: 20` 时记录 `geometric_target_lost`、停止底座，进入共同的头胸 ALIGN VA 检查并归档图片和结果，然后继续 VLA，不记为对齐成功。本分支的 ALIGN VA 返回 `NOT_SATISFIED` 或 `UNKNOWN` 也不会直接判整次任务失败或阻止 VLA；操作完成仍由后续 MANIPULATE 完成检查判定。重复帧和相机取帧超时不冒充目标丢失帧；无新帧的等待仍受 60 s 总对齐时限约束。过近时以相同速度后退纠偏，无侧移及结构边缘 yaw 控制。60 s 超时记录 `geometric_timeout`、停止底座，完成共同的交接检查记录后继续 VLA；VA 建议不会阻挡此分支。硬件/模型/控制错误、取消和试验总时限仍可结束试验。对齐超时不自动等于物理任务失败。最小日志保留 YOLOE 就绪、相机选择/切换、两路检测与可用性、丢失计数、首次非零指令及停止原因。
 
 **NaVILA**：在 `tasks.yaml` 的 `navila.host` / `port` 填写可达的模型 ZMQ 端口；默认 `127.0.0.1:30000` 只是客户端配置，可以配合已有端口转发。不要填写 SSH 端口。需要认证时设置 `NAVILA_API_TOKEN`。每次 `n` 先 `ping`、`reset`，同一试验导航恢复保留服务端历史。请求使用 MessagePack `endpoint=get_action`、JPEG、instruction、sequence，响应检查字典类型、协议版本、序号和错误。支持 25/50/75 cm 前进、15/30/45° 左右转和 stop；超时或不支持的动作结束试验，绝不猜测动作。离散动作由共享网关定时执行并停止。使用专用服务实例，避免其他客户端修改同一服务端历史；本次没有修改服务端。
 
-**门控关闭**：仍保存 VA 观测和建议，与实际执行决定分开。NAV 门控关闭时，只在最终目标的导航结束候选后放行，中间探索步不冒充阶段结束。ALIGN 门控关闭时，控制器到达终止状态后放行；尚未找到角色、尚未启动控制器的状态仍重试。完成门控关闭时，VA 在旁路运行，执行到首个有效动作后固定 180 s 停止并记录完成候选；阻塞或迟到的 VA 回复不延长操作时间，迟到结果不再计入有效门控决定。所有分支保留底层保护、取消和总时限。
+NaVILA 本地前进速度为 `0.4 m/s`，前进 50 cm 对应执行 `1.25 s`；转速为 `0.3 rad/s`。动作解析兼容 `The next action is ...` 前缀，以及 `I think I should stop because I have finished the instruction.` 这类明确的停止完成句；否定、条件句和混合动作仍拒绝，距离、角度范围不变。每次上传一张胸部 `chest_view` 图像，等待推理回复，再执行一段动作。计时到期后网关发送 `stop`，并等待执行器在向 SONIC 发布数据包之后发出的 `navigation_runtime_status`：必须对应本次 generation / skill / segment，处于 stop 模式，且请求与最终输出的 `[vx, vy, wz]` 全部归零、消息时间不早于本次 stop 请求，才报告 `reached / navila_step_completed`。等待期间重发 stop；超过 `navila.stop_ack_timeout_s`（默认 3 s）仍未确认则以 `navila_stop_ack_timeout` 结束本轮，不拍摄下一帧。下一张图的源时间戳必须晚于收到完成状态的时刻，旧帧不会用于下一轮推理。此检查仅确认已发布指令归零，不读取 IMU 或里程计，也不判定实测距离或物理停稳。确认写入 `navila_stop_confirmed`；每次原始回复在解析前写入 `events.jsonl` 的 `navila_response`，保存序号、动作文本、取图时间约束和服务端元数据，包括无法解析的回复。
+
+NaVILA 全程不初始化或调用 LA/VA 客户端，不需要它们的 API key；NAV、ALIGN、MANIPULATE 及旁路、试验后的离线选目标都不调用 VA。每个 `cases_main.yaml` 条件下填写两个目标，例如：
+
+```yaml
+visible_01:
+  navila_alignment:
+    target: blue basket       # BasePose 的距离、居中目标
+    yaw_align_target: desk    # BasePose 用其结构边缘对齐朝向
+  # 其他条件和导航指令照常填写
+```
+
+两个名称都必须填写，可以是同一物体；未填写时启动校验会列出缺项。收到 NaVILA `stop` 后直接使用这两个名称启动双相机 BasePose，由原有 YOLOE/几何控制完成对齐，不要求填写 `global_target`。必须等 BasePose 返回 `reached / aligned`，才会启动 VLA；失败或超时会结束本轮，不放行到操作。导航与对齐的 VA 结果记为 `SKIPPED`，不据此填人工成功。VLA 持续执行到操作员 `g` / `h` 确认、取消、底层故障或现有操作预算结束；预算从首个实际 VLA 动作计时，默认 180 s，到时停止只记录 `completion_candidate`，不自动标注物理成功。NaVILA 的三个 VA 门控须全部关闭；其他实验方法保持原来的调用与交接行为。
+
+**门控关闭**：NaVILA 使用上述无 VA 流程。其他门控关闭组仍保存 VA 观测和建议，与实际执行决定分开。NAV 门控关闭时，只在最终目标的导航结束候选后放行，中间探索步不冒充阶段结束。ALIGN 门控关闭时，控制器到达终止状态后放行；尚未找到角色、尚未启动控制器的状态仍重试。完成门控关闭时，VA 在旁路运行，执行到首个有效动作后固定 180 s 停止并记录完成候选；阻塞或迟到的 VA 回复不延长操作时间，迟到结果不再计入有效门控决定。所有分支保留底层保护、取消和总时限。
+
+NaVILA 导航额外在共享执行器发送 Sonic 数据包之后记录 `navila_velocity`，保存在本次试验的 `events.jsonl`，最小日志模式也保留。字段包括 `requested_velocity` / `velocity`（保护前后 `[vx, vy, wz]`，单位为 m/s、m/s、rad/s）、`reason`、试验与动作段标识，以及从已发送数据包解码的 `sonic.speed_m_s`、移动方向和朝向。每段首次输出、速度或保护状态变化、段末停止及执行器正常退出归零均记录，稳定输出每 0.5 s 采样一次。跨 generation 取消时，结束输出仍关联原 NaVILA 段，`executor_identity` 保留输出时的实际标识。这些是发布给 Sonic 的指令记录，不是实测机身速度或 C++ 接收确认；其他实验方法不启用此记录。
 
 ## 日志、首帧与人工标注
 
@@ -84,7 +100,9 @@ bash gear_sonic/scripts/experiments/full_vln.sh --task T1 --case visible_01
 
 ```text
 runtime.yaml                         # 完整有效配置、版本标识、预算和两个 prompt
-events.jsonl                         # 本次启动的所有试验与追加标注
+events.jsonl                         # 本次启动的所有试验、TODO 更新原文与追加标注
+lavira_requests/*.json               # 在线 LA/VA 每次调用及重试的完整请求
+lavira_requests/offline/*.json       # 离线角色评估/补 mask 的 VA 完整请求
 checks/<trial_id>/*.png               # 每次 VA 实际检查的图像
 snapshots/<trial_id>/vla_<skill_id>/   # 每次 VLA 首次真正请求策略时的输入
   ego_view.jpg / chest_view.jpg / left_wrist.jpg / right_wrist.jpg
@@ -95,6 +113,8 @@ semantic/sample_*/                    # 副表 2 的角色 mask
 
 `events.jsonl` 使用试验 ID、事件 ID 和技能 ID 关联以下证据：试验开始/结束、各阶段开始/结束、VLA 请求/确认/首次推理/首个动作/停止、对齐状态和误差、VA 轮次/视角/检查图像/观测时间/回复时间/置信度/简短依据/角色、合并门控结果、扰动提示与确认、取消/接管、首帧和缺失原因。配置记录方法、任务、条件、策略/模型标识、两个 prompt、预算、代码版本及有效配置摘要。重试按失败后的恢复统计；正常探索移动不算重试。
 
+实验模式默认归档每次 `TODO_UPDATED` 的完整 `todo_list` 字符串，保留换行、勾选状态和 Result 原文，并记录 `generation`、`trial_id`、`step` 与时间戳。`lavira_requests/` 在每次 LA/VA 调用前保存实际请求参数，包括完整 system/user 提示词、内嵌 JPEG 图像、模型参数和重试提示；文件中的 `request_kind`、`attempt` 与时间戳可用于追溯。这些记录在开启最小日志时仍然保存。
+
 相机源时间戳可获得时保存；不可获得时明确为空，另保留本机取得观测的时间。四张首帧 JPEG 是真正交给策略的原始字节。头/胸深度按源时间戳匹配，默认最大误差 5 ms；匹配失败不使用后续帧补位。保存深度单位/来源、相机内参与安装标定、可获得的 FAST-LIO 位姿与坐标系属性。配置外参不是每帧测量的全身运动学外参，缺失机器人位姿时不能凭它恢复世界坐标。
 
 运行中不额外检测首帧角色。结束 tmux 会话后启动器尝试离线补 mask；若只是 detach，需结束会话后手动执行：
@@ -103,7 +123,7 @@ semantic/sample_*/                    # 副表 2 的角色 mask
 .venv_inference/bin/python -m gear_sonic.experiments.offline /absolute/path/run/runtime.yaml
 ```
 
-补 mask 只读取保存的首帧。优先采用实际对齐角色；纯 VLA 等未选角色的分支用 `vla_prompt` 离线选择，并标记 `offline_semantic_selection`。几何分支标记其配置的居中目标。文件齐全的快照可重复补处理，已成功生成的记录跳过。没有终止记录的试验会阻止补处理，需要先确认真实运行已停止并关闭该记录。
+补 mask 只读取保存的首帧。NaVILA 使用冻结 case 中的两个配置目标，标记 `case_navila_alignment`，缺项只记录错误，绝不回退调用 VA。其他分支优先采用实际对齐角色；纯 VLA 等未选角色的分支用 `vla_prompt` 离线选择，并标记 `offline_semantic_selection`。几何分支标记其配置的居中目标。文件齐全的快照可重复补处理，已成功生成的记录跳过。没有终止记录的试验会阻止补处理，需要先确认真实运行已停止并关闭该记录。
 
 最终物理成功、有效子目标数、实际完成时间、Nav SR，以及每次门控的独立真值均需要人工标注。**VA 宣告完成不会自动填成成功，也不会替代实际完成时间。** 开始前固定任务成功的保持时间、倾倒条件和放置区域。
 

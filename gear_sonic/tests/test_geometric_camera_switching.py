@@ -77,6 +77,26 @@ def test_initial_head_preference(perception):
     assert p.calls == [HEAD] and not p.holds
 
 
+def test_image_recording_receives_fresh_frames_including_target_loss(perception):
+    p = perception
+    recorded = []
+    p.value.image_recorder = SimpleNamespace(
+        record=lambda stream, snap, **kwargs: recorded.append((stream, snap.timestamp, kwargs["target"]))
+    )
+    p.feed(HEAD, 1, True)
+    p.step()
+    p.feed(HEAD, 1, True)
+    p.feed(CHEST, 1, False)
+    p.step()
+    p.feed(HEAD, 2, False)
+    p.feed(CHEST, 2, True)
+    p.step()
+    assert [(stream, stamp) for stream, stamp, _ in recorded] == [
+        (HEAD, 1), (CHEST, 1), (HEAD, 2), (CHEST, 2),
+    ]
+    assert recorded[1][2] is None and recorded[2][2] is None
+
+
 @pytest.mark.parametrize("head_has_frame", [True, False])
 def test_initial_chest_fallback_and_keep_chest_while_visible(perception, head_has_frame):
     p = perception
@@ -187,6 +207,43 @@ def test_switch_resets_alignment_phase_and_stability_without_extending_timeout(t
     assert controller.update(1.1, 0.3, (CHEST, 2), 2.0) == (0.0, 0.0, -0.3)
     controller.update(None, None, None, 60.0)
     assert controller.reason == "geometric_timeout"
+
+
+@pytest.mark.parametrize("stream,forward,vx", [
+    (HEAD, 1.15, 0.0), (CHEST, 1.15, 0.4),
+    (HEAD, 0.95, -0.4), (CHEST, 0.95, 0.0),
+    (CHEST, 0.9, 0.0), (CHEST, 0.899, -0.4),
+    (CHEST, 1.1, 0.0), (CHEST, 1.101, 0.4),
+])
+def test_camera_specific_distance_controls_approach_reverse_and_alignment(tmp_path, stream, forward, vx):
+    controller = base_pose.GeometricController(experiment(tmp_path)["geometric"], 0.0)
+    controller.select_camera(stream)
+    for stamp in (1, 2, 3):
+        assert controller.update(forward, 0.0, (stream, stamp), float(stamp)) == (vx, 0.0, 0.0)
+        assert controller.reason == ("aligned" if vx == 0.0 and stamp == 3 else None)
+
+
+def test_camera_switch_updates_distance_in_both_directions(tmp_path):
+    controller = base_pose.GeometricController(experiment(tmp_path)["geometric"], 0.0)
+    controller.select_camera(HEAD)
+    for stamp in (1, 2):
+        assert controller.update(1.15, 0.0, (HEAD, stamp), float(stamp)) == (0.0, 0.0, 0.0)
+    controller.select_camera(CHEST)
+    assert controller.update(1.15, 0.0, (CHEST, 3), 3.0) == (0.4, 0.0, 0.0)
+    controller.select_camera(HEAD)
+    for stamp in (4, 5, 6):
+        assert controller.update(1.15, 0.0, (HEAD, stamp), float(stamp)) == (0.0, 0.0, 0.0)
+        assert controller.reason == ("aligned" if stamp == 6 else None)
+
+
+def test_legacy_geometric_config_keeps_shared_distance(tmp_path):
+    geometry = experiment(tmp_path)["geometric"]
+    geometry.pop("chest_distance_m")
+    controller = base_pose.GeometricController(geometry, 0.0)
+    controller.select_camera(CHEST)
+    for stamp in (1, 2, 3):
+        assert controller.update(1.15, 0.0, (CHEST, stamp), float(stamp)) == (0.0, 0.0, 0.0)
+    assert controller.reason == "aligned"
 
 
 @pytest.mark.parametrize("va_status", ["SATISFIED", "NOT_SATISFIED", "UNKNOWN"])

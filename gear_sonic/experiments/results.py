@@ -43,6 +43,16 @@ def complete_mean(values):
     return mean(values) if values and all(v is not None for v in values) else None
 
 
+def progress_measurement(annotations, default_denominator):
+    numerator = annotations.get("progress")
+    denominator = annotations.get("progress_denominator", default_denominator)
+    if type(denominator) is not int or denominator <= 0:
+        raise ValueError("Progress denominator must be a positive integer")
+    if numerator is not None and (type(numerator) is not int or not 0 <= numerator <= denominator):
+        raise ValueError("Progress must be an integer between zero and its denominator")
+    return numerator, denominator
+
+
 def trial_rows(events):
     session = next(e["experiment"] for e in events if e["type"] == "session")
     rows = []
@@ -83,8 +93,10 @@ def trial_rows(events):
         )
         if intervention and success is True:
             success = False
-        progress = annotations.get("progress")
-        progress = progress / len(session["task"]["milestones"]) if progress is not None else None
+        progress_count, progress_denominator = progress_measurement(
+            annotations, len(session["task"]["milestones"])
+        )
+        progress = progress_count / progress_denominator if progress_count is not None else None
         duration = (
             session["task"]["total_timeout_s"] if success is False else completion if success is True else None
         )
@@ -119,13 +131,15 @@ def trial_rows(events):
             repeat=1 + len(rows),
             entry_stage=session["entry_stage"],
             task_id=session["task_id"],
-            case_id=session["case_id"],
+            case_id=condition.get("case_id", session["case_id"]),
             visibility=condition.get("visibility"),
             nearfield_group=condition.get("nearfield_group"),
             condition=condition,
             success=success,
             physical_success=annotations.get("success"),
             progress=progress,
+            progress_numerator=progress_count,
+            progress_denominator=progress_denominator,
             time_s=duration,
             completion_time_s=completion,
             actual_runtime_s=(end_ns - start["monotonic_ns"]) / 1e9
@@ -418,6 +432,7 @@ def main(argv=None):
     result.add_argument("--trial", required=True)
     result.add_argument("--success", type=boolean)
     result.add_argument("--progress", type=int)
+    result.add_argument("--progress-denominator", type=int, help="Explicit total for an independently scored fraction")
     result.add_argument("--completion-time", type=float)
     result.add_argument("--nav-success", type=boolean)
     result.add_argument("--exclude-reason")
@@ -479,8 +494,20 @@ def main(argv=None):
         start = next((e for e in events if e["type"] == "trial_start" and e["trial_id"] == args.trial), None)
         if start is None:
             parser.error("Unknown trial")
-        if args.progress is not None and not 0 <= args.progress <= len(session["task"]["milestones"]):
-            parser.error("Progress is the valid completed milestone count")
+        progress_labels = {}
+        for event in events:
+            if event["type"] == "annotation" and event.get("trial_id") == args.trial:
+                progress_labels = merge(progress_labels, event["values"])
+        if args.progress is not None:
+            progress_labels["progress"] = args.progress
+        if args.progress_denominator is not None:
+            if args.progress is None:
+                parser.error("Provide --progress with --progress-denominator")
+            progress_labels["progress_denominator"] = args.progress_denominator
+        try:
+            progress_measurement(progress_labels, len(session["task"]["milestones"]))
+        except ValueError as exc:
+            parser.error(str(exc))
         if (
             args.completion_time is not None
             and not 0 <= args.completion_time <= session["task"]["total_timeout_s"]
@@ -491,6 +518,7 @@ def main(argv=None):
             for k, v in dict(
                 success=args.success,
                 progress=args.progress,
+                progress_denominator=args.progress_denominator,
                 completion_time_s=args.completion_time,
                 nav_success=args.nav_success,
                 exclude_reason=args.exclude_reason,

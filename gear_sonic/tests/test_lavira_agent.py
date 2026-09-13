@@ -364,7 +364,8 @@ def test_align_grounding_retries_after_legacy_surface_schema(
     assert "invalid object schema" in calls[1]["messages"][0]["content"]
 
 
-def test_lavira_cloud_calls_preserve_role_specific_thinking_mode(tmp_path) -> None:
+@pytest.mark.parametrize("experiment_mode", [False, True])
+def test_lavira_cloud_calls_preserve_role_specific_thinking_mode(monkeypatch, tmp_path, experiment_mode) -> None:
     calls = []
     responses = iter([
         json.dumps(move()),
@@ -376,6 +377,9 @@ def test_lavira_cloud_calls_preserve_role_specific_thinking_mode(tmp_path) -> No
     class Completions:
         def create(self, **kwargs):
             calls.append(kwargs)
+            saved_paths = sorted((tmp_path / "lavira_requests").glob("*.json"))
+            assert len(saved_paths) == len(calls)
+            assert json.loads(saved_paths[-1].read_text())["request"] == kwargs
             return SimpleNamespace(
                 choices=[SimpleNamespace(
                     message=SimpleNamespace(content=next(responses)),
@@ -391,8 +395,25 @@ def test_lavira_cloud_calls_preserve_role_specific_thinking_mode(tmp_path) -> No
         va_base_url="https://example.invalid/v1",
         la_client=client,
         va_client=client,
-        request_context_dir=tmp_path / "lavira_requests",
+        request_context_dir=tmp_path / ("default_requests" if experiment_mode else "lavira_requests"),
     )
+    if experiment_mode:
+        from gear_sonic.experiments.config import CONFIGS, resolve
+        from gear_sonic.utils.inference.lavira import service
+
+        payload, _ = resolve(CONFIGS / "full_vln.yaml")
+        payload["components"]["experiment"]["run_dir"] = str(tmp_path)
+        profile = SimpleNamespace(components=payload["components"])
+        monkeypatch.setenv("SONIC_EXPERIMENT_MINIMAL_LOGGING", "1")
+        monkeypatch.setattr("gear_sonic.runtime.profile.load_runtime_profile", lambda *a, **k: profile)
+        monkeypatch.setattr(service, "SensorGatewayRGBDCamera", lambda *a, **k: SimpleNamespace())
+        monkeypatch.setattr(service, "LaViRAClient", lambda **kwargs: lavira)
+        config = service.LaviraPlannerConfig(
+            mission="find basket", alignment_prompt="align to basket", global_target="basket",
+        )
+        runtime = service.LaviraPlannerRuntime(config, submit_intent=lambda *args: None)
+        service._agent(config, "inproc://unused", runtime)
+
     image = np.zeros((8, 8, 3), np.uint8)
     scans = [
         ScanView(2, direction, image, (1.0, 2.0, 0.0), yaw)
@@ -550,6 +571,7 @@ def test_lavira_cloud_calls_preserve_role_specific_thinking_mode(tmp_path) -> No
     }
     assert all(item["type"] == "sonic.model_request_context" for item in saved)
     assert all(item["attempt"] == 1 for item in saved)
+    assert [item["request"] for item in saved] == calls
     assert all(item["request"]["messages"] for item in saved)
     assert any(
         "data:image/jpeg;base64," in json.dumps(item["request"])
@@ -628,6 +650,7 @@ def test_lavira_retries_invalid_la_json_before_returning_a_skill(tmp_path) -> No
         for path in sorted((tmp_path / "lavira_requests").glob("*.json"))
     ]
     assert [item["attempt"] for item in saved] == [1, 2]
+    assert [item["request"] for item in saved] == calls
 
 
 def test_lavira_stops_only_after_three_invalid_json_responses(tmp_path) -> None:

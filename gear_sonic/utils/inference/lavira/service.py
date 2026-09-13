@@ -7,6 +7,7 @@ from dataclasses import asdict, dataclass
 import json
 import logging
 import math
+from pathlib import Path
 import queue
 import threading
 import time
@@ -516,7 +517,13 @@ def _agent(
         max_age_ms=config.sensor_gateway_max_age_ms,
         max_skew_ms=config.sensor_gateway_max_skew_ms,
     )
-    client = LaViRAClient(
+    from gear_sonic.runtime.profile import load_runtime_profile
+    from gear_sonic.experiments.config import settings
+    from gear_sonic.experiments.agent import DisabledLanguageVisualClient, ExperimentAgent
+    profile = load_runtime_profile(config.profile or None, overlays=config.overlay)
+    experiment = settings(profile)
+    no_language_visual = experiment.get("navigation_backend") == "navila"
+    client = DisabledLanguageVisualClient() if no_language_visual else LaViRAClient(
         la_base_url=config.la_base_url,
         va_base_url=config.va_base_url,
         la_model=config.la_model,
@@ -526,14 +533,10 @@ def _agent(
         la_timeout_seconds=config.la_timeout_seconds,
         va_timeout_seconds=config.va_timeout_seconds,
     )
-    from gear_sonic.runtime.profile import load_runtime_profile
-    from gear_sonic.experiments.config import settings
-    from gear_sonic.experiments.agent import ExperimentAgent
-    experiment = settings(load_runtime_profile(config.profile or None, overlays=config.overlay))
     agent_type = ExperimentAgent if experiment else LaViRAAgent
     extra = {"experiment": experiment} if experiment else {}
-    if experiment:
-        client.save_request_context = False
+    if experiment.get("run_dir") and not no_language_visual:
+        client.request_context_dir = Path(experiment["run_dir"]) / "lavira_requests"
     return agent_type(
         **extra,
         navigation_mode=config.navigation_mode,

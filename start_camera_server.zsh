@@ -12,5 +12,6 @@
     --right-wrist-device-id 352122270966 \
     --orbbec-enable-depth \
     --realsense-enable-depth \
+    --realsense-right-wrist-enable-depth \
     --jpeg-quality 95 \
     --port 5555

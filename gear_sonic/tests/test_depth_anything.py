@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 import math
 import msgpack
 from pathlib import Path
@@ -281,6 +282,39 @@ def test_lavira_reuses_rgb_capture_interface_for_head_handoff_view() -> None:
 
     assert fake.request.streams == (stream,)
     np.testing.assert_array_equal(image, rgb[..., ::-1])
+
+
+def test_rgb_capture_waits_for_a_frame_after_action_completion() -> None:
+    stream = "camera/chest_view"
+    cutoff = 13_000_000_000
+    snapshots = []
+    for index, timestamp in enumerate((cutoff - 1, cutoff, cutoff + 1), 1):
+        snapshot = _materialized({stream: np.full((2, 2, 3), index, np.uint8)})
+        frame = replace(snapshot.snapshot.frames[stream], source_timestamp_ns=timestamp)
+        snapshots.append(replace(snapshot, snapshot=replace(snapshot.snapshot, frames={stream: frame})))
+
+    class FakeClient:
+        def read_snapshot(self, request, **kwargs):
+            assert request.streams == (stream,)
+            return snapshots.pop(0)
+
+    camera = SensorGatewayRGBDCamera("inproc://unused", client=FakeClient())
+    image = camera.capture_rgb(after_timestamp_ns=cutoff)
+    assert not snapshots
+    assert np.all(image == 3)
+    assert camera._last_rgb_timestamp_by_stream[stream] == cutoff + 1
+
+
+def test_rgb_capture_does_not_return_old_frame_when_no_post_action_frame_arrives() -> None:
+    from gear_sonic.utils.inference.lavira.camera import ObjectNavCameraError
+
+    stream = "camera/chest_view"
+    snapshot = _materialized({stream: np.zeros((2, 2, 3), np.uint8)})
+    client = types.SimpleNamespace(read_snapshot=lambda *args, **kwargs: snapshot)
+    camera = SensorGatewayRGBDCamera("inproc://unused", client=client, timeout_ms=25)
+    with pytest.raises(ObjectNavCameraError, match="timed out waiting for fresh"):
+        camera.capture_rgb(after_timestamp_ns=snapshot.snapshot.frames[stream].source_timestamp_ns)
+    assert stream not in camera._last_rgb_timestamp_by_stream
 
 
 def test_lavira_captures_head_hardware_aligned_rgbd_for_nav_handoff() -> None:

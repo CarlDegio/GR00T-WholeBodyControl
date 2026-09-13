@@ -25,7 +25,7 @@ from gear_sonic.utils.inference.base_pose.servo import (
 from gear_sonic.utils.inference.lavira.agent import LaViRAClient
 
 from .base_pose import tracker_for
-from .config import ROOT
+from .config import ROOT, settings
 from .recording import Recorder, read_events
 
 
@@ -61,7 +61,11 @@ def visual_client(profile):
             )
         },
     )
-    client.save_request_context = False
+    run_dir = settings(profile).get("run_dir")
+    if run_dir:
+        client.request_context_dir = Path(run_dir) / "lavira_requests" / "offline"
+    else:
+        client.save_request_context = False
     return client
 
 
@@ -246,7 +250,15 @@ def enrich_snapshots(profile_path):
             ]
             roles = candidates[-1]["result"] if candidates else None
             source = "control_alignment" if roles else "offline_semantic_selection"
-            if recorder.config["alignment"] == "geometric":
+            if recorder.config.get("navigation_backend") == "navila":
+                from .config import navila_alignment_targets
+
+                targets = navila_alignment_targets(recorder.config["condition"])
+                if any(not name or name.startswith("REQUIRED") for name in targets.values()):
+                    raise ValueError("NaVILA snapshot masks require the case's two configured alignment targets")
+                roles = dict(status="FOUND", **{key: {"name": name} for key, name in targets.items()})
+                source = "case_navila_alignment"
+            elif recorder.config["alignment"] == "geometric":
                 target = recorder.config["geometric"]["target"]
                 roles = dict(status="FOUND", target={"name": target}, yaw_align_target={"name": target})
                 source = "control_geometric_centering"

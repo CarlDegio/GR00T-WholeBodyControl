@@ -568,10 +568,11 @@ def run_base_pose_yolo_agent(config: Any) -> None:
     experiment_profile = load_runtime_profile(config.profile or None, overlays=config.overlay)
     experiment = settings(experiment_profile)
     config.minimal_logging = bool(experiment)
+    if experiment:
+        # Also enable sampling when restarting an older frozen experiment profile.
+        config.raw_diagnostic_image_interval_frames = 5
     if experiment.get("alignment") == "geometric":
         return run_geometric_service(config, experiment_profile)
-    # Keep all scalar diagnostics in experiments, without copying/saving RGB frames.
-    config.raw_diagnostic_image_interval_frames = 0
     head_only = experiment.get("alignment") == "head"
     validate_raw_servo_dependencies(config)
     service = InferenceServiceContext("base_pose", config, force_file_logging=True)
@@ -726,7 +727,8 @@ def run_base_pose_yolo_agent(config: Any) -> None:
         task=config.task,
         vy_pulse_log=str(pulse_log_path.resolve()),
         frame_log_root=str(Path(config.output_root).resolve()),
-        diagnostic_images=False,
+        diagnostic_images=config.raw_diagnostic_image_interval_frames > 0,
+        diagnostic_image_interval_frames=config.raw_diagnostic_image_interval_frames,
     )
     flush_events()
     try:

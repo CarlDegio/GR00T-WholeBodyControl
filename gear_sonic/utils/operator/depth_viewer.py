@@ -1,4 +1,4 @@
-"""Display the chest depth stream from the composed camera server."""
+"""Display an aligned depth stream and optional RGB from the camera server."""
 
 from __future__ import annotations
 
@@ -25,6 +25,8 @@ class DepthViewerConfig:
     stream_name: str = "chest_view_depth"
     max_depth_m: float = 5.0
     fps: float = 20.0
+    show_rgb: bool = False
+    rotate_180: bool = False
 
 
 def colorize_depth(
@@ -62,7 +64,11 @@ def main(config: DepthViewerConfig) -> None:
         server_ip=camera.host,
         port=camera.port,
     )
-    window_name = "LaViRA Chest Depth (0-5 m)"
+    rgb_name = config.stream_name.removesuffix("_depth")
+    camera_label = rgb_name.replace("_", " ").title()
+    window_name = f"{camera_label} RGB + Depth" if config.show_rgb else f"{camera_label} Depth"
+    window_name += f" (0-{config.max_depth_m:g} m)"
+    cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
     period = 1.0 / max(config.fps, 1.0)
     print(
         f"[DepthViewer] waiting for {config.stream_name} at "
@@ -79,7 +85,7 @@ def main(config: DepthViewerConfig) -> None:
                 camera_info = packet.get("camera_info", {})
                 stream_info = camera_info.get(config.stream_name, {})
                 if not stream_info:
-                    stream_info = camera_info.get("chest_view", {})
+                    stream_info = camera_info.get(rgb_name, {})
                 scale = float(stream_info.get("depth_scale_m", 0.001))
                 try:
                     canvas, stats = colorize_depth(
@@ -90,6 +96,8 @@ def main(config: DepthViewerConfig) -> None:
                 except ValueError as exc:
                     print(f"[DepthViewer] {exc}")
                 else:
+                    if config.rotate_180:
+                        canvas = cv2.rotate(canvas, cv2.ROTATE_180)
                     label = (
                         f"valid {stats.valid_ratio * 100:.1f}%  "
                         f"min {stats.min_depth_m:.2f} m  "
@@ -105,6 +113,17 @@ def main(config: DepthViewerConfig) -> None:
                         2,
                         cv2.LINE_AA,
                     )
+                    rgb = images.get(rgb_name)
+                    if config.show_rgb and rgb is not None:
+                        rgb_bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
+                        if config.rotate_180:
+                            rgb_bgr = cv2.rotate(rgb_bgr, cv2.ROTATE_180)
+                        rgb_bgr = cv2.resize(rgb_bgr, (canvas.shape[1], canvas.shape[0]))
+                        cv2.putText(
+                            rgb_bgr, f"{camera_label} RGB", (10, 26),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2, cv2.LINE_AA,
+                        )
+                        canvas = np.hstack((rgb_bgr, canvas))
                     cv2.imshow(window_name, canvas)
 
             if cv2.waitKey(1) & 0xFF in (ord("q"), 27):

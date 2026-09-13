@@ -89,7 +89,10 @@ class ComposedCameraConfig:
     """Publish rate.  OAK cameras run at 30 FPS; lower values add latency."""
 
     realsense_enable_depth: bool = False
-    """Whether RealSense cameras should publish depth alongside color."""
+    """Whether the chest RealSense camera should publish depth alongside color."""
+
+    realsense_right_wrist_enable_depth: bool = False
+    """Publish aligned right-wrist depth; also avoids dark D405 color-only capture."""
 
     orbbec_enable_depth: bool = False
     """Whether Orbbec cameras should publish aligned depth alongside color."""
@@ -419,6 +422,9 @@ class ComposedCameraSensor(Sensor, SensorServer):
             realsense_config.enable_depth = (
                 self.config.realsense_enable_depth
                 and mount_position == CameraMountPosition.CHEST_VIEW.value
+            ) or (
+                self.config.realsense_right_wrist_enable_depth
+                and mount_position == CameraMountPosition.RIGHT_WRIST.value
             )
             return RealSenseSensor(
                 config=realsense_config,
