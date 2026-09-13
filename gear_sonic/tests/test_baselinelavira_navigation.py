@@ -64,9 +64,9 @@ def test_pure_pursuit_selects_half_meter_lookahead_and_applies_configured_speed_
     assert pure_pursuit([[0, 0.6]], 4.0, nav_config)[0] == pytest.approx((0.3, 0.0, 0.5))
     assert pure_pursuit([[-1, 0]], 4.0, nav_config)[0][0] == pytest.approx(0.3)
     assert pure_pursuit([[1, 0]], 4.0, nav_config)[0] == pytest.approx((0.4, 0.0, 0.0))
-    # A lateral error still requires steering inside two meters.
-    assert pure_pursuit(path, 1.5, nav_config)[0] == pytest.approx((0.3, 0.0, 0.4))
-    assert pure_pursuit(path, 0.9, nav_config)[0] == (0.0, 0.0, 0.0)
+    # Steering continues outside the configured arrival tolerance.
+    assert pure_pursuit(path, 2.01, nav_config)[0] == pytest.approx((0.3, 0.0, 0.4))
+    assert pure_pursuit(path, 1.99, nav_config)[0] == (0.0, 0.0, 0.0)
     assert pure_pursuit([], 4.0, nav_config)[0] == (0.0, 0.0, 0.0)
 
 
@@ -186,19 +186,19 @@ def test_degenerate_trajectory_is_a_failure_and_never_arrival(nav_config, safe_d
                        config=load_navdp_planner_config()) == (0.0, 0.0, 0.0)
 
 
-def test_arrival_checks_original_waypoint_at_one_meter(nav_config):
+def test_arrival_checks_original_waypoint_at_two_meters(nav_config):
     import time
 
-    assert nav_config.goal_tolerance == pytest.approx(1.0)
+    assert nav_config.goal_tolerance == pytest.approx(2.0)
     nav = IPlannerNavigation(nav_config)
     state = _NavDPRuntimeState(mode="nav_goal", generation=1, segment_id=1, world_goal=(3.0, 0.0))
     nav.sync_command(state, now=time.monotonic())
     statuses = []
-    for x in (1.0, 1.99):
+    for x in (0.0, 0.99):
         nav.schedule(state, SimpleNamespace(pose=Pose2D(x, 0, 0)), config=load_navdp_planner_config(),
                      infer=lambda *a: pytest.fail("server is not initialized"), send_status=lambda *a: statuses.append(a))
         assert state.mode == "nav_goal" and statuses == []
-    nav.schedule(state, SimpleNamespace(pose=Pose2D(2.01, 0, 0)), config=load_navdp_planner_config(),
+    nav.schedule(state, SimpleNamespace(pose=Pose2D(1.01, 0, 0)), config=load_navdp_planner_config(),
                  infer=lambda *a: pytest.fail("arrival does not infer"), send_status=lambda *a: statuses.append(a))
     assert statuses == [("reached", "iplanner_goal_tolerance")]
 
@@ -444,6 +444,8 @@ def test_move_to_submits_va_selected_area_without_object_grounding(monkeypatch):
 def test_nearby_right_goal_steers_right_in_every_world_heading(nav_config, yaw):
     from gear_sonic.utils.inference.navdp.navigation import base_goal_to_world, local_trajectory_to_world
 
+    # Exercise the former hardcoded 2 m steering cutoff with a smaller tolerance.
+    nav_config = replace(nav_config, goal_tolerance=1.0)
     pose = Pose2D(10, -4, yaw)
     local_goal = (1.5, -0.4)
     state = _NavDPRuntimeState(mode="nav_goal", world_goal=base_goal_to_world(local_goal, pose), trajectory_time=10.0)
