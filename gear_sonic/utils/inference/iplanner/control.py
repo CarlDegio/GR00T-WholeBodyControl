@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 import logging
 import math
 import queue
@@ -139,6 +139,16 @@ class IPlannerNavigation:
             if generation != state.generation or segment != state.segment_id or state.mode != "nav_goal":
                 continue
             send_metrics({"policy_inference": elapsed * 1000.0})
+            if not error and path is not None:
+                path = np.asarray(path, dtype=np.float64)
+                if (path.ndim != 2 or path.shape[1:] != (2,) or len(path) < 2
+                        or not np.isfinite(path).all()
+                        or np.linalg.norm(np.diff(path, axis=0), axis=1).sum() <= 1e-6):
+                    error = "iPlanner returned an invalid or zero-length trajectory"
+                elif self.first_plan:
+                    path = truncate_trajectory(path, self.config.safe_distance)
+                    if len(path) < 2:
+                        error = "iPlanner trajectory does not extend beyond the configured safety buffer"
             if error or path is None or pose is None:
                 state.invalid_count += 1
                 report_event(logging.WARNING, "INFERENCE_FAILED", "iPlanner inference failed",
@@ -148,18 +158,11 @@ class IPlannerNavigation:
                     send_status("failed", "three_invalid_trajectories")
                 continue
             initial_plan = self.first_plan
-            if self.first_plan:
-                path = truncate_trajectory(path, self.config.safe_distance)
-                if not len(path):
-                    state.mode = "stop"
-                    send_status("reached", "iplanner_path_within_safe_distance")
-                    continue
             self.world_path = local_trajectory_to_world(path, pose)
-            if self.first_plan:
-                # Match G1: replan to the truncated endpoint, apply the buffer
-                # once per segment rather than subtracting it on every replan.
-                state.world_goal = tuple(float(v) for v in self.world_path[-1])
-                self.first_plan = False
+            # A predicted path can stop short or bend away from the requested
+            # waypoint. Its endpoint must not silently become the arrival goal.
+            # Keep the VA waypoint fixed for replanning and distance checks.
+            self.first_plan = False
             self.current_index = 0
             state.trajectory = np.asarray(path, dtype=np.float32)
             state.trajectory_time = time.monotonic()
@@ -214,13 +217,20 @@ class IPlannerNavigation:
         state.heading_target_yaw = math.remainder(pose.yaw + velocity[2] * config.heading_preview_s, 2 * math.pi)
         if report_event is not None and now - self.last_control_event_at >= 1.0:
             self.last_control_event_at = now
+            orientation = state.latest_orientation
             report_event(
                 logging.INFO, "IPLANNER_CONTROL", "iPlanner path tracking in the current body frame",
                 generation=state.generation, skill_id=state.skill_id, segment_id=state.segment_id,
                 pose=[pose.x, pose.y, pose.yaw], local_goal=local_goal_from_world(state.world_goal, pose),
                 lookahead=local_path[self.current_index].tolist(), goal_distance_m=goal_distance,
+                goal_tolerance_m=self.config.goal_tolerance,
+                path_endpoint_distance_m=float(np.linalg.norm(local_path[-1])),
                 velocity=velocity, heading_target_rad=state.heading_target_yaw,
                 heading_reference_rad=state.heading_reference_yaw,
                 camera_timestamp_s=state.latest_camera_timestamp,
+                sonic_orientation=(None if orientation is None else {
+                    **asdict(orientation),
+                    "telemetry_age_s": max(0.0, now - orientation.emitted_at_monotonic_s),
+                }),
             )
         return velocity

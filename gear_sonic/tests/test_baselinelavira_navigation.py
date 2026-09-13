@@ -98,7 +98,7 @@ def test_safe_distance_is_applied_only_to_the_initial_plan(nav_config, monkeypat
     path = np.column_stack((np.arange(0, 3.01, 0.1), np.zeros(31)))
     shortened = truncate_trajectory(path, 0.5)
     np.testing.assert_allclose(shortened[-1], [2.5, 0])
-    state = _NavDPRuntimeState(mode="nav_goal", generation=2, segment_id=4, world_goal=(20, 30))
+    state = _NavDPRuntimeState(mode="nav_goal", generation=2, segment_id=4, world_goal=(10, 23))
     nav = IPlannerNavigation(nav_config)
     nav.sync_command(state, now=9.0)
     results = queue.Queue()
@@ -107,13 +107,14 @@ def test_safe_distance_is_applied_only_to_the_initial_plan(nav_config, monkeypat
     callbacks = dict(send_metrics=lambda *a, **kw: None, send_status=lambda *a: None,
                      report_event=lambda *a, **kw: None)
     nav.consume_results(state, results, **callbacks)
-    np.testing.assert_allclose(state.world_goal, [10, 22.5])
+    np.testing.assert_allclose(state.world_goal, [10, 23])
+    np.testing.assert_allclose(nav.world_path[-1], [10, 22.5])
     assert state.mpc_reference.size == 0
     assert nav.control(state, pose=Pose2D(10, 20, math.pi / 2), now=10.0,
                        config=load_navdp_planner_config()) == pytest.approx((0.4, 0, 0))
     results.put((2, 4, path[:21], Pose2D(10, 20.5, math.pi / 2), None, 0.1))
     nav.consume_results(state, results, **callbacks)
-    np.testing.assert_allclose(state.world_goal, [10, 22.5])
+    np.testing.assert_allclose(state.world_goal, [10, 23])
     assert len(state.trajectory) == 21  # No second safety-buffer subtraction.
     assert nav.control(state, pose=Pose2D(10, 20.5, math.pi / 2), now=20.0,
                        config=load_navdp_planner_config()) == (0.0, 0.0, 0.0)
@@ -143,6 +144,63 @@ def test_navigation_times_out_and_rejects_repeated_invalid_plans(nav_config, mon
                         send_status=lambda *a: statuses.append(a), report_event=lambda *a, **kw: None)
     assert state.mode == "stop"
     assert statuses[-1] == ("failed", "three_invalid_trajectories")
+
+
+@pytest.mark.parametrize("endpoint", [(0.6, 0.0), (0.1, 0.5), (0.1, -0.5)])
+def test_short_or_deviated_model_path_cannot_replace_the_requested_goal(nav_config, endpoint):
+    import time
+
+    state = _NavDPRuntimeState(mode="nav_goal", generation=1, skill_id=1, segment_id=1, world_goal=(3.0, 0.0))
+    nav = IPlannerNavigation(nav_config)
+    nav.sync_command(state, now=time.monotonic())
+    results = queue.Queue()
+    results.put((1, 1, np.array([[0.0, 0.0], endpoint]), Pose2D(0, 0, 0), None, 0.02))
+    statuses = []
+    nav.consume_results(state, results, send_metrics=lambda *a, **kw: None,
+                        send_status=lambda *a: statuses.append(a), report_event=lambda *a, **kw: None)
+    assert state.world_goal == (3.0, 0.0)
+    nav.schedule(state, SimpleNamespace(pose=Pose2D(0, 0, 0)), config=load_navdp_planner_config(),
+                 infer=lambda *a: pytest.fail("server is not initialized"), send_status=lambda *a: statuses.append(a))
+    assert state.mode == "nav_goal" and statuses == []
+    assert state.current_local_goal == pytest.approx((3.0, 0.0))
+
+
+@pytest.mark.parametrize("safe_distance", [0.0, 0.5])
+def test_degenerate_trajectory_is_a_failure_and_never_arrival(nav_config, safe_distance):
+    import time
+
+    nav = IPlannerNavigation(replace(nav_config, safe_distance=safe_distance))
+    state = _NavDPRuntimeState(mode="nav_goal", generation=1, segment_id=1, world_goal=(3.0, 0.0))
+    nav.sync_command(state, now=time.monotonic())
+    statuses = []
+    for attempt in range(3):
+        results = queue.Queue()
+        results.put((1, 1, np.zeros((51, 2)), Pose2D(0, 0, 0), None, 0.02))
+        nav.consume_results(state, results, send_metrics=lambda *a, **kw: None,
+                            send_status=lambda *a: statuses.append(a), report_event=lambda *a, **kw: None)
+        assert state.world_goal == (3.0, 0.0)
+        assert not any(status == "reached" for status, reason in statuses)
+        assert state.invalid_count == attempt + 1
+    assert statuses == [("failed", "three_invalid_trajectories")]
+    assert nav.control(state, pose=Pose2D(0, 0, 0), now=time.monotonic(),
+                       config=load_navdp_planner_config()) == (0.0, 0.0, 0.0)
+
+
+def test_arrival_checks_original_waypoint_at_one_meter(nav_config):
+    import time
+
+    assert nav_config.goal_tolerance == pytest.approx(1.0)
+    nav = IPlannerNavigation(nav_config)
+    state = _NavDPRuntimeState(mode="nav_goal", generation=1, segment_id=1, world_goal=(3.0, 0.0))
+    nav.sync_command(state, now=time.monotonic())
+    statuses = []
+    for x in (1.0, 1.99):
+        nav.schedule(state, SimpleNamespace(pose=Pose2D(x, 0, 0)), config=load_navdp_planner_config(),
+                     infer=lambda *a: pytest.fail("server is not initialized"), send_status=lambda *a: statuses.append(a))
+        assert state.mode == "nav_goal" and statuses == []
+    nav.schedule(state, SimpleNamespace(pose=Pose2D(2.01, 0, 0)), config=load_navdp_planner_config(),
+                 infer=lambda *a: pytest.fail("arrival does not infer"), send_status=lambda *a: statuses.append(a))
+    assert statuses == [("reached", "iplanner_goal_tolerance")]
 
 
 def test_replanning_uses_g1_interval_and_the_camera_pose(nav_config, monkeypatch):
