@@ -30,6 +30,15 @@ LA 根据原版导航提示词维护 TODO、选择方向和策略；VA 根据全
 导航 LA/VA 的原始回复及校验错误保存在 `lavira_requests/responses/`，成功和
 失败的回复都保留；这与原有请求文件分开存放。
 
+LA 当前视图使用 `CURRENT_VIEW_1` 至 `CURRENT_VIEW_5` 明确标注，
+`chosen_view_index` 必须与 `turn_direction` 的实际角度一致，否则重试。
+历史 MOVE_TO 图片标为 `PAST_MOVE_TO_*`，附带控制结果和观测结果；它们仍是
+旧位置的结果照片，不是原版的轨迹历史图，也不能参与当前视图编号或方向选择。
+VA 明确接收转向后的前视图，策略中的左右描述属于转向前的全景坐标。
+目标、相关地标及有效通道都不可见时，允许 `REOBSERVE` / `bbox_2d: null`，
+沿用现有未找到目标的交接检查和后续观察流程；不能为凑 bbox 选择无关桌子。
+`STOP` 需要可见全局目标的有效框。这些输出约束属于本适配层的修复。
+
 `baselinelavira.py` 每次从当前 `gear_sonic/config/launch_inference.yaml`
 读取配置，再叠加 `gear_sonic/config/baselinelavira.yaml`。只新增
 `navigation_policy.backend: iplanner`、iPlanner 服务和导航控制参数；主配置不被改写。
@@ -144,7 +153,8 @@ iPlanner 的 fear 分数与 LaViRA G1 原执行循环一样不作为额外停止
 - 速度：按当前设置，正常前进范围 0.3–0.4 m/s，直行 0.4 m/s，随转弯角度
   减速但不低于 0.3 m/s；到达目标、无有效轨迹或触发保护仍输出零速。
   对应 `target_speed: 0.4`、`min_forward_speed: 0.3`、`max_forward_speed: 0.4`。
-  角速度上限 0.5 rad/s，距目标不足 2 m 时停止转向修正。
+  角速度上限 0.5 rad/s。距目标不足 2 m 时仍根据轨迹修正横向偏差，
+  到达 1.0 m 容差后停止；这是相对原版 G1 近距离强制停止转向的显式调整。
 - 首条轨迹不再提前截短（`safe_distance: 0.0`），此后仍以首条轨迹末端为固定目标重规划。
 - 重规划间隔 0.1 s，目标容差 1.0 m，单段导航最长 60 s。
 
@@ -166,3 +176,17 @@ tmux 模型服务窗格及服务日志会显示 iPlanner。服务仍由原 launc
 模型、服务和导航提示词直接从本地 Uni-LaViRA 目录读取；轨迹控制公式和
 目标投影方法适配在 `gear_sonic/utils/inference/iplanner/`。
 作者及原始许可见该源码目录及 Groot 的第三方声明。
+
+2026-09-13 对照了官方 [Uni-LaViRA G1 提示词](https://github.com/NJU-R-L-Group-Embodied-Lab/uni-lavira-code/blob/main/real-world-code/unitree_g1/prompts.py)
+及 [控制器](https://github.com/NJU-R-L-Group-Embodied-Lab/uni-lavira-code/blob/main/real-world-code/unitree_g1/robot/robot_controller.py)，
+并检查原目录中 `baselinelavira_T1_visible_02_b58fccf87853` 的实际请求和回复。
+g3 的第二步 LA 在进展分析中写 Image 5 / 左前方 45°，却返回 `left`（90°）；
+转向后的 VA 自述蓝篮桌不可见，仍选了无关电脑桌。前者是模型输出自相矛盾及
+校验缺失，后者同时受到旧 prompt 缺少目标不可见分支、转向前后方向描述混用的影响。
+目前没有确认基础世界/机体旋转矩阵的左右符号写反；离线左右对称及多朝向测试
+用于检查这一点，不能替代实机验证，也不能证明所有偏左现象已经解决。
+
+最小实验日志现在保留 VA 框/深度投影、全景完成、最终朝向，以及
+`IPLANNER_PLAN_ACCEPTED` / `IPLANNER_CONTROL`。后两类每秒最多各一条，
+包含规划位姿、请求/执行世界目标、局部/世界轨迹、当前前视点与速度，
+用于后续追踪偏差从哪一环出现。此前缺少这些记录，无法从几个阶段端点恢复真实连续轨迹。

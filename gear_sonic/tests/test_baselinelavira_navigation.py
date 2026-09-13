@@ -64,8 +64,8 @@ def test_pure_pursuit_selects_half_meter_lookahead_and_applies_configured_speed_
     assert pure_pursuit([[0, 0.6]], 4.0, nav_config)[0] == pytest.approx((0.3, 0.0, 0.5))
     assert pure_pursuit([[-1, 0]], 4.0, nav_config)[0][0] == pytest.approx(0.3)
     assert pure_pursuit([[1, 0]], 4.0, nav_config)[0] == pytest.approx((0.4, 0.0, 0.0))
-    # Original G1 blind final approach: stop yaw correction inside two meters.
-    assert pure_pursuit(path, 1.5, nav_config)[0] == pytest.approx((0.4, 0.0, 0.0))
+    # A lateral error still requires steering inside two meters.
+    assert pure_pursuit(path, 1.5, nav_config)[0] == pytest.approx((0.3, 0.0, 0.4))
     assert pure_pursuit(path, 0.9, nav_config)[0] == (0.0, 0.0, 0.0)
     assert pure_pursuit([], 4.0, nav_config)[0] == (0.0, 0.0, 0.0)
 
@@ -230,19 +230,24 @@ def _navigation_client(monkeypatch, responses):
     return client, calls
 
 
+def _current_views(image):
+    return [SimpleNamespace(direction=direction, image_bgr=image) for direction in
+            ("front", "front_right", "right", "left", "front_left")]
+
+
 def test_navigation_uses_original_la_strategy_then_va_autonomous_waypoint(monkeypatch):
     client, calls = _navigation_client(monkeypatch, [
         "- [ ] Pass through the opening\n- [ ] Reach the desk",
         json.dumps(dict(progress_analysis="Opening ahead", updated_todo_list="- [ ] Pass through the opening",
                         reasoning="Use the open passage to continue along the corridor", turn_direction="front_left",
-                        stop=False, expected_landmark="doorway", global_target="desk")),
+                        chosen_view_index=5, stop=False, expected_landmark="doorway", global_target="desk")),
         json.dumps(dict(action="NAVIGATE", target="open corridor area", bbox_2d=[200, 300, 700, 900],
                         confidence=0.9, visual_check="Open floor continuing the route", stop_reasoning="")),
     ])
     image = np.zeros((100, 100, 3), np.uint8)
     decision = client.language_action(
         mission="Follow the corridor and reach the desk", navigation_mode="vln", global_target="desk",
-        current_step=1, todo_list="", scan_views=[SimpleNamespace(direction="front", image_bgr=image)],
+        current_step=1, todo_list="", scan_views=_current_views(image),
         move_to_views=[], transition_result=None, manipulation_prompt="Pick up the bottle",
     )
     selected = client.navigation_waypoint(
@@ -284,7 +289,7 @@ def test_navigation_prompt_examples_are_valid_complete_json(monkeypatch):
     image = np.zeros((10, 10, 3), np.uint8)
     decision = client.language_action(
         mission="Find the desk", navigation_mode="vln", global_target=None,
-        current_step=1, todo_list="- [ ] Reach the desk", scan_views=[], move_to_views=[],
+        current_step=1, todo_list="- [ ] Reach the desk", scan_views=_current_views(image), move_to_views=[],
         manipulation_prompt="Pick up the bottle",
     )
     assert decision["global_target"] != "Pick up the bottle"
@@ -342,7 +347,8 @@ def test_initial_global_target_cannot_copy_the_manipulation_instruction(monkeypa
     ))])
     with pytest.raises(LaViRAAgentError, match="object/area name"):
         client.language_action(mission="Find the desk", global_target=None, current_step=1,
-                               todo_list="- [ ] Approach the desk", scan_views=[], move_to_views=[],
+                               todo_list="- [ ] Approach the desk",
+                               scan_views=_current_views(np.zeros((10, 10, 3), np.uint8)), move_to_views=[],
                                manipulation_prompt=manipulation)
 
 
@@ -374,3 +380,62 @@ def test_move_to_submits_va_selected_area_without_object_grounding(monkeypatch):
     assert intents[0][0] == "navigation_goal"
     assert intents[0][1]["target"] == "open corridor area"
     assert intents[0][1]["goal_base"] == pytest.approx([2.5, 0.0])
+
+
+@pytest.mark.parametrize("yaw", [0.0, math.pi / 2, -math.pi / 2, math.pi - 0.01, -math.pi + 0.01])
+def test_nearby_right_goal_steers_right_in_every_world_heading(nav_config, yaw):
+    from gear_sonic.utils.inference.navdp.navigation import base_goal_to_world, local_trajectory_to_world
+
+    pose = Pose2D(10, -4, yaw)
+    local_goal = (1.5, -0.4)
+    state = _NavDPRuntimeState(mode="nav_goal", world_goal=base_goal_to_world(local_goal, pose), trajectory_time=10.0)
+    nav = IPlannerNavigation(nav_config)
+    nav.world_path = local_trajectory_to_world([[0, 0], [0.6, -0.16], local_goal], pose)
+    velocity = nav.control(state, pose=pose, now=10.0, config=load_navdp_planner_config())
+    assert nav_config.min_forward_speed <= velocity[0] <= nav_config.max_forward_speed
+    assert velocity[2] < 0  # The original <2m branch returned zero in all these cases.
+    mirrored = pure_pursuit([[0, 0], [0.6, 0.16], [1.5, 0.4]], math.hypot(*local_goal), nav_config)[0]
+    assert velocity[2] == pytest.approx(-mirrored[2], abs=2e-6)
+
+
+def test_la_cannot_execute_ninety_degree_left_for_chosen_forty_five_degree_view(monkeypatch):
+    client, _ = _navigation_client(monkeypatch, [json.dumps(dict(
+        progress_analysis="The table is in the 45-degree left view, Image 5",
+        updated_todo_list="- [ ] Approach table", reasoning="Turn left to face Image 5",
+        chosen_view_index=5, turn_direction="left", stop=False, expected_landmark="table", global_target="table",
+    ))])
+    with pytest.raises(LaViRAAgentError, match="CURRENT_VIEW_5 requires front_left"):
+        client.language_action(mission="Approach table", global_target="table", current_step=2,
+                               todo_list="- [ ] Approach table", scan_views=_current_views(np.zeros((10, 10, 3), np.uint8)),
+                               move_to_views=[])
+
+
+def test_history_is_labeled_as_old_outcome_and_does_not_renumber_current_views(monkeypatch):
+    client, calls = _navigation_client(monkeypatch, [json.dumps(dict(
+        progress_analysis="Table now to right", updated_todo_list="- [ ] Approach table", reasoning="Use Image 2",
+        chosen_view_index=2, turn_direction="front_right", stop=False, expected_landmark="table", global_target="table",
+    ))])
+    image = np.zeros((10, 10, 3), np.uint8)
+    history = SimpleNamespace(skill_id=1, target="door", image_bgr=image, controller_state="reached",
+                              va_result="SATISFIED", evidence="Doorway crossed")
+    decision = client.language_action(mission="Approach table", global_target="table", current_step=2,
+                                     todo_list="- [ ] Approach table", scan_views=_current_views(image), move_to_views=[history])
+    text = json.dumps(calls[0]["messages"])
+    assert "PAST_MOVE_TO_1" in text and "History Plan" not in text
+    assert "CURRENT_VIEW_2: turn_direction=front_right" in text
+    assert decision["skill_args"]["view_direction"] == "front_right"
+
+
+def test_va_can_request_reobservation_without_inventing_an_unrelated_target(monkeypatch):
+    client, calls = _navigation_client(monkeypatch, [json.dumps(dict(
+        visual_check="Only a computer desk is visible; no basket table or relevant passage",
+        action="REOBSERVE", bbox_2d=None, target="table with blue basket", confidence=0.9, stop_reasoning="",
+    ))])
+    client.navigation_strategy = "Go left. Find the basket table."
+    result = client.navigation_waypoint(mission="Approach basket table", global_target="table with blue basket",
+                                        strategic_goal="Find table", image_bgr=np.zeros((10, 10, 3), np.uint8))
+    assert result["status"] == "NOT_FOUND" and result["bbox_2d"] is None
+    assert result["navigation_action"] == "REOBSERVE"
+    text = json.dumps(calls[0]["messages"])
+    assert "ALREADY been executed" in text and "PRE-TURN panorama" in text
+    assert "Do not substitute an unrelated table" in text

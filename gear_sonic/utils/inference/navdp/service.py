@@ -387,7 +387,9 @@ def main(config: NavDPPlannerConfig) -> None:
             )
 
             if iplanner_navigation is not None and state.mode == "nav_goal":
-                velocity = iplanner_navigation.control(state, now=now, pose=sensor_cycle.pose, config=config)
+                velocity = iplanner_navigation.control(
+                    state, now=now, pose=sensor_cycle.pose, config=config, report_event=report_event,
+                )
                 zero_action_aborted = emit_heading_target = False
                 terminal_heading_status = None
             else:

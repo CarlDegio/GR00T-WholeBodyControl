@@ -99,10 +99,14 @@ class IPlannerLaViRAClient(LaViRAClient):
         mission, step = kwargs["mission"], kwargs["current_step"]
         global_target = kwargs["global_target"]
         views = []
+        view_directions = {index: view.direction for index, view in enumerate(kwargs["scan_views"], start=1)}
+        if not view_directions or any(direction not in DIRECTIONS for direction in view_directions.values()):
+            raise LaViRAAgentError("LaViRA navigation requires labeled current views")
         for index, view in enumerate(kwargs["scan_views"], start=1):
             views.extend([
+                {"type": "text", "text": f"CURRENT_VIEW_{index}: turn_direction={view.direction}. "
+                 + _g1_view_label(view.direction, step, index)},
                 {"type": "image_url", "image_url": {"url": _image_data_url(view.image_bgr)}},
-                {"type": "text", "text": _g1_view_label(view.direction, step, index)},
             ])
         todo = kwargs["todo_list"]
         if not todo.strip():
@@ -119,13 +123,25 @@ class IPlannerLaViRAClient(LaViRAClient):
         content = [{"type": "text", "text": f"Navigation Task: {mission}\nCurrent Step: {step}"}]
         for index, view in enumerate(kwargs["move_to_views"][-5:]):
             content.extend([
+                {"type": "text", "text": (
+                    f"PAST_MOVE_TO_{index + 1}: observation after skill {view.skill_id}; "
+                    f"target={view.target}; controller={view.controller_state}; "
+                    f"visual result={view.va_result}. {view.evidence}\n"
+                    "This is a past outcome photo, with a different observation pose. "
+                    "It is not a trajectory plot or a selectable current view. "
+                    "Determine current left/right only from the labeled CURRENT_VIEW images."
+                )},
                 {"type": "image_url", "image_url": {"url": _image_data_url(view.image_bgr)}},
-                {"type": "text", "text": f"History Plan {index + 1}"},
             ])
         content.extend(views)
+        history_info = (
+            "Past MOVE_TO outcome photos are provided above; their left/right directions "
+            "refer to their capture poses, not the current panorama."
+            if kwargs["move_to_views"] else "No past MOVE_TO observations are available."
+        )
         prompt = self.navigation_prompts.get_navigation_prompt_text(
             mission, global_target or "Not set yet; identify the final navigation destination",
-            todo, "Recent visual history is provided above.", step,
+            todo, history_info, step,
         )
         # The robot still captures Groot's five directions, with no rear view.
         directions = '"front", "front_right", "right", "left", "front_left"'
@@ -136,7 +152,7 @@ class IPlannerLaViRAClient(LaViRAClient):
             "progress_analysis": "Assessment of current navigation progress",
             "updated_todo_list": "- [ ] Next navigation step",
             "reasoning": "Why choose this direction and strategy",
-            "turn_direction": "front", "stop": False,
+            "chosen_view_index": 1, "turn_direction": view_directions[1], "stop": False,
             "expected_landmark": "Next navigation object or area",
             "global_target": global_target or "Short name of the final destination object or area",
         })
@@ -148,6 +164,12 @@ class IPlannerLaViRAClient(LaViRAClient):
                "Infer that destination from the mission. Subsequent manipulation context: "
                + str(kwargs.get("manipulation_prompt") or mission))
             + "\nChoose direction and strategy; VA will independently choose the best navigation object/area."
+            + "\nSelect exactly one CURRENT_VIEW by its integer chosen_view_index. "
+            "Copy that view's turn_direction exactly; front_left means 45 degrees left, "
+            "left means 90 degrees left, front_right means 45 degrees right, right means 90 degrees right. "
+            "All current directions refer to this step's forward panorama anchor. "
+            "Earlier TODO directional descriptions are historical and must be rechecked in the current views. "
+            f"Available index-to-direction mapping: {json.dumps(view_directions)}."
         )
         content.append({"type": "text", "text": prompt})
 
@@ -164,6 +186,15 @@ class IPlannerLaViRAClient(LaViRAClient):
                 if normalized in {str(text or "").strip().rstrip(".。").casefold()
                                   for text in (mission, kwargs.get("manipulation_prompt"))}:
                     raise LaViRAAgentError("global_target must be an object/area name, not a copied task instruction")
+            chosen = value.get("chosen_view_index")
+            if type(chosen) is not int or chosen not in view_directions:
+                raise LaViRAAgentError("chosen_view_index must select one of the provided CURRENT_VIEW images")
+            if value["turn_direction"] != view_directions[chosen]:
+                raise LaViRAAgentError(
+                    f"turn_direction does not match chosen view {chosen}: "
+                    f"CURRENT_VIEW_{chosen} requires {view_directions[chosen]}, "
+                    f"not {value['turn_direction']}"
+                )
             updated_todo = value.get("updated_todo_list")
             if not isinstance(updated_todo, str):
                 raise LaViRAAgentError("invalid LaViRA navigation TODO")
@@ -198,24 +229,35 @@ class IPlannerLaViRAClient(LaViRAClient):
             "confidence": 0.85, "stop_reasoning": "",
         })
         prompt += (
-            "\naction must be NAVIGATE or STOP. Coordinates must be normalized to [0,1000]. "
-            "confidence is REQUIRED for both actions: use a JSON number between 0.0 and 1.0, "
+            "\nFRAME REFERENCE: The LA-selected turn has ALREADY been executed. "
+            "This image is the CURRENT forward view after that turn. Direction words in CURRENT STRATEGY "
+            "describe the PRE-TURN panorama; do not apply that turn again or treat its left/right as current. "
+            "Select a visible target that advances the mission in this image.\n"
+            "action must be NAVIGATE, STOP or REOBSERVE. Coordinates must be normalized to [0,1000]. "
+            "confidence is REQUIRED for every action: use a JSON number between 0.0 and 1.0, "
             "not a string, percentage, boolean or null. Estimate it from the actual image; "
             "the example value and coordinates are format examples, not observations. "
-            "NAVIGATE requires a valid bbox_2d; STOP may use null if no target can be located. "
+            "NAVIGATE requires a valid bbox_2d of a relevant visible navigation target. "
+            "STOP requires a visible GLOBAL TARGET and a valid bbox_2d, with the arrival conditions above. "
+            "If neither the GLOBAL TARGET nor the strategy landmark nor a clearly relevant navigable area "
+            "can be located, use REOBSERVE with bbox_2d=null and explain the missing evidence in visual_check. "
+            "For REOBSERVE, target names the intended target being sought. "
+            "Do not substitute an unrelated table or object merely to supply a bbox. "
             "Select the navigation object or area yourself from the mission and current strategy. "
             "If selecting GLOBAL TARGET, return its exact name in target."
         )
 
         def parse(text):
             value = _strict_json_object(text, role="VA navigation")
-            if value.get("action") not in {"NAVIGATE", "STOP"}:
+            if value.get("action") not in {"NAVIGATE", "STOP", "REOBSERVE"}:
                 raise LaViRAAgentError("invalid LaViRA waypoint action")
             if not isinstance(value.get("target"), str) or not value["target"].strip():
                 raise LaViRAAgentError("LaViRA waypoint target/area is required")
             found = value.get("bbox_2d") is not None
-            if value["action"] == "NAVIGATE" and not found:
-                raise LaViRAAgentError("LaViRA NAVIGATE requires a waypoint bbox")
+            if value["action"] in {"NAVIGATE", "STOP"} and not found:
+                raise LaViRAAgentError(f"LaViRA {value['action']} requires a visible target bbox; use REOBSERVE when unavailable")
+            if value["action"] == "REOBSERVE" and found:
+                raise LaViRAAgentError("LaViRA REOBSERVE requires bbox_2d=null")
             confidence = value.get("confidence")
             if (isinstance(confidence, bool) or not isinstance(confidence, (int, float))
                     or not math.isfinite(confidence) or not 0 <= confidence <= 1):

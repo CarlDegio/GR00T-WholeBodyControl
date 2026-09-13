@@ -2447,6 +2447,15 @@ class LaViRAAgent:
             max_direct_travel=MAX_DIRECT_TRAVEL,
         )
         segment = self._next_segment()
+        if self.navigation_waypoint is not None:
+            snapshot = snapshots[POLICY_FRAME_INDEX]
+            self._event(
+                logging.INFO, "VA_NAVIGATION_GEOMETRY", "VA waypoint projected from its paired depth frame",
+                generation=generation, skill_id=skill_id, segment_id=segment,
+                target=target, bbox_2d=grounding["bbox_2d"],
+                image_shape=list(snapshot.rgb_bgr.shape), fx=snapshot.fx, cx=snapshot.cx,
+                **geometry,
+            )
         self.submit_intent("navigation_goal", {
             "generation": generation, "skill_id": skill_id,
             "segment_id": segment,

@@ -89,14 +89,14 @@ def pure_pursuit(path, goal_distance, config, *, current_index=0):
             break
     dx, dy = path[index]
     distance = math.hypot(dx, dy)
-    if goal_distance < 2.0:
-        alpha, yaw_speed = 0.0, 0.0
-    else:
-        alpha = math.atan2(dy, dx)
-        yaw_speed = float(np.clip(
-            2.0 * config.target_speed * math.sin(alpha) / max(distance, 0.1),
-            -config.max_yaw_speed, config.max_yaw_speed,
-        ))
+    # The G1 upstream disables steering inside 2 m. On this integration that
+    # also discards a known lateral goal error after a coarse panorama turn.
+    # Continue following the path until the existing arrival tolerance stops it.
+    alpha = math.atan2(dy, dx)
+    yaw_speed = float(np.clip(
+        2.0 * config.target_speed * math.sin(alpha) / max(distance, 0.1),
+        -config.max_yaw_speed, config.max_yaw_speed,
+    ))
     speed = min(config.max_forward_speed, max(
         config.min_forward_speed, config.target_speed * (1.0 - abs(alpha) / math.pi),
     ))
@@ -112,6 +112,9 @@ class IPlannerNavigation:
         self.current_index = 0
         self.started_at = 0.0
         self.next_inference = 0.0
+        self.requested_world_goal = None
+        self.last_plan_event_at = -math.inf
+        self.last_control_event_at = -math.inf
 
     def sync_command(self, state, *, now):
         key = (state.generation, state.skill_id, state.segment_id, state.mode)
@@ -123,6 +126,9 @@ class IPlannerNavigation:
         self.current_index = 0
         self.started_at = now
         self.next_inference = now
+        self.requested_world_goal = state.world_goal
+        self.last_plan_event_at = -math.inf
+        self.last_control_event_at = -math.inf
 
     def consume_results(self, state, results, *, send_metrics, send_status, report_event):
         while True:
@@ -141,6 +147,7 @@ class IPlannerNavigation:
                     state.mode = "stop"
                     send_status("failed", "three_invalid_trajectories")
                 continue
+            initial_plan = self.first_plan
             if self.first_plan:
                 path = truncate_trajectory(path, self.config.safe_distance)
                 if not len(path):
@@ -157,6 +164,15 @@ class IPlannerNavigation:
             state.trajectory = np.asarray(path, dtype=np.float32)
             state.trajectory_time = time.monotonic()
             state.invalid_count = 0
+            if state.trajectory_time - self.last_plan_event_at >= 1.0:
+                self.last_plan_event_at = state.trajectory_time
+                report_event(
+                    logging.INFO, "IPLANNER_PLAN_ACCEPTED", "iPlanner trajectory and coordinate reference",
+                    generation=state.generation, skill_id=state.skill_id, segment_id=state.segment_id,
+                    initial_plan=initial_plan, inference_pose=[pose.x, pose.y, pose.yaw],
+                    requested_world_goal=self.requested_world_goal, execution_world_goal=state.world_goal,
+                    trajectory_local=state.trajectory.tolist(), trajectory_world=self.world_path.tolist(),
+                )
 
     def schedule(self, state, cycle, *, config, infer, send_status):
         if state.mode != "nav_goal" or cycle.pose is None or state.world_goal is None:
@@ -184,7 +200,7 @@ class IPlannerNavigation:
             daemon=True,
         ).start()
 
-    def control(self, state, *, pose, now, config):
+    def control(self, state, *, pose, now, config, report_event=None):
         if (state.mode != "nav_goal" or pose is None or state.world_goal is None
                 or not len(self.world_path) or now - state.trajectory_time > config.trajectory_timeout_s):
             return (0.0, 0.0, 0.0)
@@ -196,4 +212,15 @@ class IPlannerNavigation:
             local_path, goal_distance, self.config, current_index=self.current_index,
         )
         state.heading_target_yaw = math.remainder(pose.yaw + velocity[2] * config.heading_preview_s, 2 * math.pi)
+        if report_event is not None and now - self.last_control_event_at >= 1.0:
+            self.last_control_event_at = now
+            report_event(
+                logging.INFO, "IPLANNER_CONTROL", "iPlanner path tracking in the current body frame",
+                generation=state.generation, skill_id=state.skill_id, segment_id=state.segment_id,
+                pose=[pose.x, pose.y, pose.yaw], local_goal=local_goal_from_world(state.world_goal, pose),
+                lookahead=local_path[self.current_index].tolist(), goal_distance_m=goal_distance,
+                velocity=velocity, heading_target_rad=state.heading_target_yaw,
+                heading_reference_rad=state.heading_reference_yaw,
+                camera_timestamp_s=state.latest_camera_timestamp,
+            )
         return velocity
