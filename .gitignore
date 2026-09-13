@@ -229,3 +229,15 @@ models/
 # Downloaded from HuggingFace (hf download)
 sample_data/
 sonic_release/
+
+# Local runtime asset links for the baselinelavira worktree
+/.venv_inference
+/.venv_teleop
+/.venv_camera
+/.venv_data_collection
+/.venv_sim
+/gear_sonic_deploy/build
+/gear_sonic_deploy/planner
+/gear_sonic_deploy/target
+/tools/yoloe26m/weights
+/tools/yoloe26m/config

@@ -16,6 +16,7 @@ from .recording import Recorder, read_events
 
 METHOD_LABELS = {
     "full_vln": "Full agent",
+    "baselinelavira": "LaViRA + iPlanner + BasePose + VLA",
     "full_objectnav": "Full agent（目标搜索）",
     "nav_direct_vla": "导航后直接 VLA",
     "navila_basepose_vla": "NaVILA + BasePose + VLA",

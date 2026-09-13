@@ -61,6 +61,7 @@ def resolve(path, task_id="T1", case_id=None):
         "method",
         "table",
         "runtime_profile",
+        "runtime_overlays",
         "tasks_file",
         "cases_file",
         "default_case",
@@ -107,7 +108,13 @@ def resolve(path, task_id="T1", case_id=None):
         for key in ("layout_id", "start_id"):
             required(case.get(key), f"{case_id}.{key}")
     runtime_path = (path.parent / spec["runtime_profile"]).resolve()
-    runtime = merge(read_yaml(runtime_path), spec.get("runtime_overrides", {}))
+    overlays = spec.get("runtime_overlays", [])
+    if not isinstance(overlays, list) or any(not isinstance(p, str) or not p.strip() for p in overlays):
+        raise ValueError("runtime_overlays must be a list of YAML paths relative to the experiment config")
+    runtime = read_yaml(runtime_path)
+    for overlay in overlays:
+        runtime = merge(runtime, read_yaml(path.parent / overlay))
+    runtime = merge(runtime, spec.get("runtime_overrides", {}))
     c = runtime["components"]
     c["lavira"].update(
         mission=mission or "REQUIRED",
@@ -156,6 +163,12 @@ def resolve(path, task_id="T1", case_id=None):
             yoloe=c["base_pose"]["raw_yoloe_model_path"],
         ),
     )
+    if c.get("navigation_policy", {}).get("backend") == "iplanner":
+        checkpoint = Path(c["iplanner"]["checkpoint"]).expanduser()
+        if not checkpoint.is_absolute():
+            checkpoint = Path(c["iplanner"]["root"]).expanduser() / checkpoint
+        experiment["models"].pop("navdp_checkpoint")
+        experiment["models"].update(navigation_policy="iplanner", iplanner_checkpoint=str(checkpoint))
     experiment["geometric"].setdefault("chest_distance_m", experiment["geometric"]["distance_m"])
     experiment["geometric"].setdefault("both_lost_frames", 20)
     experiment["geometric"]["target"] = task.get("geometry_target", "")
@@ -230,7 +243,9 @@ def launch(default_name, argv=None):
     profile, missing = resolve(args.config, args.task, args.case)
     # Validate the compiled worker profiles without connecting to any service.
     from gear_sonic.scripts.launch_inference import load_inference_launch_config
+    from gear_sonic.runtime.profile import load_runtime_profile
     from gear_sonic.utils.inference.base_pose.agent import load_base_pose_config
+    from gear_sonic.utils.inference.iplanner.config import load_iplanner_server_config, navigation_backend
     from gear_sonic.utils.inference.lavira.service import load_lavira_config
     from gear_sonic.utils.inference.vla.service import load_inference_config
 
@@ -244,6 +259,18 @@ def launch(default_name, argv=None):
             load_inference_config,
         ):
             loader(str(validation_path))
+        compiled = load_runtime_profile(validation_path)
+        if navigation_backend(compiled) == "iplanner":
+            from gear_sonic.utils.inference.iplanner.control import load_navigation_config
+
+            experiment = profile["components"]["experiment"]
+            launcher = profile["components"]["launcher"]
+            if (experiment["navigation_backend"] != "lavira" or experiment["entry_stage"] != "navigation"
+                    or not launcher["keyboard_planner"] or launcher["planner_input"] != "lavira"):
+                raise ValueError("iPlanner requires the LaViRA planner and a navigation entry stage")
+            server = load_iplanner_server_config(compiled)
+            load_navigation_config(compiled)
+            missing.extend(f"{label}: {path}" for path, label in server.required_assets() if not path.is_file())
     exp = profile["components"]["experiment"]
     if exp["table"] == "semantic" and (args.manifest is None or not args.manifest.is_file()):
         missing.append("--manifest (existing offline sample manifest)")
@@ -291,8 +318,6 @@ def launch(default_name, argv=None):
     resolved = run_dir / "runtime.yaml"
     exp["runtime_profile_path"] = str(resolved)
     resolved.write_text(yaml.safe_dump(profile, sort_keys=False, allow_unicode=True))
-    from gear_sonic.runtime.profile import load_runtime_profile
-
     from .recording import Recorder
 
     Recorder(load_runtime_profile(resolved)).write("session", experiment=exp)

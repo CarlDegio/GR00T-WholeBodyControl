@@ -85,6 +85,8 @@ def test_startup_clears_only_stale_navdp_processes(monkeypatch) -> None:
         ["pkill", "-TERM", "-f"],
         ["pkill", "-TERM", "-f"],
         ["pkill", "-TERM", "-f"],
+        ["pkill", "-TERM", "-f"],
+        ["pkill", "-KILL", "-f"],
         ["pkill", "-KILL", "-f"],
         ["pkill", "-KILL", "-f"],
         ["pkill", "-KILL", "-f"],
@@ -93,6 +95,7 @@ def test_startup_clears_only_stale_navdp_processes(monkeypatch) -> None:
         "gear_sonic\\.utils\\.inference\\.navdp\\.service" in command[-1]
         or "eval\\.src\\.policy_server" in command[-1]
         or "gear_sonic/scripts/navdp_planner\\.py" in command[-1]
+        or "gear_sonic\\.utils\\.inference\\.iplanner\\.server" in command[-1]
         for command in commands
     )
 

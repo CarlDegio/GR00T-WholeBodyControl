@@ -522,8 +522,19 @@ def _agent(
     from gear_sonic.experiments.agent import DisabledLanguageVisualClient, ExperimentAgent
     profile = load_runtime_profile(config.profile or None, overlays=config.overlay)
     experiment = settings(profile)
+    from gear_sonic.utils.inference.iplanner.config import navigation_backend, load_iplanner_server_config
+    client_type = LaViRAClient
+    client_kwargs = {}
+    if navigation_backend(profile) == "iplanner":
+        from gear_sonic.utils.inference.iplanner.agent import IPlannerLaViRAClient
+
+        client_type = IPlannerLaViRAClient
+        client_kwargs["navigation_prompts_path"] = (
+            Path(load_iplanner_server_config(profile).root).expanduser() / "../prompts.py"
+        ).resolve()
     no_language_visual = experiment.get("navigation_backend") == "navila"
-    client = DisabledLanguageVisualClient() if no_language_visual else LaViRAClient(
+    client = DisabledLanguageVisualClient() if no_language_visual else client_type(
+        **client_kwargs,
         la_base_url=config.la_base_url,
         va_base_url=config.va_base_url,
         la_model=config.la_model,
@@ -535,6 +546,10 @@ def _agent(
     )
     agent_type = ExperimentAgent if experiment else LaViRAAgent
     extra = {"experiment": experiment} if experiment else {}
+    if navigation_backend(profile) == "iplanner":
+        from gear_sonic.utils.inference.iplanner.geometry import build_waypoint_geometry
+
+        extra.update(navigation_waypoint=client.navigation_waypoint, navigation_geometry=build_waypoint_geometry)
     if experiment.get("run_dir") and not no_language_visual:
         client.request_context_dir = Path(experiment["run_dir"]) / "lavira_requests"
     return agent_type(

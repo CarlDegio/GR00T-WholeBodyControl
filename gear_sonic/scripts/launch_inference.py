@@ -82,6 +82,10 @@ from gear_sonic.runtime.profile import (  # noqa: E402
     load_component_config,
     load_runtime_profile,
 )
+from gear_sonic.utils.inference.iplanner.config import (  # noqa: E402
+    load_iplanner_server_config,
+    navigation_backend,
+)
 
 
 def default_launch_config_path() -> Path:
@@ -411,6 +415,20 @@ def build_planner_velocity_executor_command(
 def build_navdp_server_command(config: InferenceLaunchConfig) -> str:
     profile = _runtime_profile(config)
     navdp_port = profile.endpoint("xnavdp_http").port
+    if navigation_backend(profile) == "iplanner":
+        settings = load_iplanner_server_config(profile)
+        repo_root = Path(__file__).resolve().parents[2]
+        return (
+            f"cd {shlex.quote(str(repo_root))} && "
+            "PYTHONUNBUFFERED=1 conda run --no-capture-output "
+            f"-n {shlex.quote(settings.conda_env)} "
+            "python -m gear_sonic.utils.inference.iplanner.server "
+            f"--root {shlex.quote(str(Path(settings.root).expanduser().resolve()))} "
+            f"--port {navdp_port} "
+            f"--config {shlex.quote(str(settings.asset_path(settings.model_config).resolve()))} "
+            f"--checkpoint {shlex.quote(str(settings.asset_path(settings.checkpoint).resolve()))} "
+            f"--device {settings.device}"
+        )
     settings = profile.component("navdp")
     return (
         f"cd {shlex.quote(str(settings['root']))} && "
@@ -426,6 +444,7 @@ def build_navdp_server_background_command(config: InferenceLaunchConfig) -> str:
     """Start NavDP server as a managed background job in the planner pane."""
 
     server = build_navdp_server_command(config)
+    server_name = "iPlanner" if navigation_backend(_runtime_profile(config)) == "iplanner" else "NavDP"
     return (
         "_navdp_server_alive() { "
         "if [ -n \"${NAVDP_SERVER_PGID:-}\" ]; then "
@@ -453,12 +472,12 @@ def build_navdp_server_background_command(config: InferenceLaunchConfig) -> str:
         "}; "
         "trap _shutdown_navdp_pane EXIT HUP INT TERM; "
         f"{server} "
-        "> >(sed -u 's/^/[NavDP server] /') "
-        "2> >(sed -u 's/^/[NavDP server:stderr] /' >&2) & "
+        f"> >(sed -u 's/^/[{server_name} server] /') "
+        f"2> >(sed -u 's/^/[{server_name} server:stderr] /' >&2) & "
         "NAVDP_SERVER_PID=$!; "
         "NAVDP_SERVER_PGID=$(ps -o pgid= -p \"${NAVDP_SERVER_PID}\" "
         "| tr -d ' '); "
-        "echo \"[NavDP server] started in background as PID "
+        f"echo \"[{server_name} server] started in background as PID "
         "${NAVDP_SERVER_PID}, PGID ${NAVDP_SERVER_PGID}; "
         "logs are routed to this pane\""
     )
@@ -712,20 +731,28 @@ def _check_prerequisites(config: InferenceLaunchConfig):
         for endpoint_name in ("la_base_url", "va_base_url"):
             if not str(lavira[endpoint_name]).strip():
                 errors.append(f"components.lavira.{endpoint_name} is required")
+        navigation_assets = (
+            load_iplanner_server_config(profile).required_assets()
+            if navigation_backend(profile) == "iplanner"
+            else (
+                (
+                    Path(str(navdp["root"])) / "eval" / "src" / "policy_server.py",
+                    "X-NavDP server",
+                ),
+                (Path(str(navdp["checkpoint"])), "NavDP checkpoint"),
+            )
+        )
+        if _uses_navdp(config):
+            for path, label in navigation_assets:
+                if not path.is_file():
+                    errors.append(f"{label} not found: {path}")
         for path, label in (
-            (
-                Path(str(navdp["root"])) / "eval" / "src" / "policy_server.py",
-                "X-NavDP server",
-            ),
-            (Path(str(navdp["checkpoint"])), "NavDP checkpoint"),
             (
                 Path(str(fastlio["workspace"])) / "install" / "setup.bash",
                 "FAST-LIO workspace",
             ),
             (Path("/opt/ros/humble/setup.bash"), "ROS2 Humble"),
         ):
-            if label in {"X-NavDP server", "NavDP checkpoint"} and not _uses_navdp(config):
-                continue
             if not path.exists():
                 errors.append(f"{label} not found: {path}")
         camera_endpoint = profile.endpoint("camera_server")
@@ -976,6 +1003,8 @@ def _start_in_pane(
 def main(config: InferenceLaunchConfig):
     repo_root = Path(__file__).resolve().parent.parent.parent
     profile = _runtime_profile(config)
+    planner_name = "iPlanner" if navigation_backend(profile) == "iplanner" else "NavDP"
+    PANE_TITLES["navdp"] = f"WORKER · {planner_name} + Server"
 
     _check_prerequisites(config)
     _TMUX.kill()
@@ -1072,13 +1101,13 @@ def main(config: InferenceLaunchConfig):
             ("planner_input", "LaViRA semantic planner", planner_input_cmd),
             (
                 "navdp",
-                "NavDP planner",
+                f"{planner_name} planner",
                 build_navdp_planner_pane_command(config, repo_root),
             ),
         ]
         # Strictly serialized startup: the launcher does not dispatch a later
         # stage until real data has passed the previous readiness gate.
-        print("Starting NavDP server in background (navdp)...")
+        print(f"Starting {planner_name} server in background (navdp)...")
         _TMUX.send(
             panes["navdp"],
             build_navdp_server_background_command(config),
@@ -1090,10 +1119,10 @@ def main(config: InferenceLaunchConfig):
                 "MID-360 did not become ready; FAST-LIO and navigation were not started"
             )
 
-        print("Waiting for FAST-LIO odometry, registered cloud, camera, and NavDP server...")
+        print(f"Waiting for FAST-LIO odometry, registered cloud, camera, and {planner_name} server...")
         if not run_readiness_gate(config, repo_root, "navigation"):
             raise RuntimeError(
-                "navigation prerequisites did not become ready; LaViRA and NavDP planner were not started"
+                f"navigation prerequisites did not become ready; LaViRA and {planner_name} planner were not started"
             )
 
         for name, label, command in commands:

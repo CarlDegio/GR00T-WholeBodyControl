@@ -13,6 +13,8 @@ import numpy as np
 from gear_sonic.runtime.inference_service import InferenceServiceContext
 from gear_sonic.runtime.telemetry import NAVDP_TIMING_SEGMENTS
 from gear_sonic.runtime.zmq_sockets import bind_publisher, connect_subscriber
+from gear_sonic.utils.inference.iplanner.client import request_trajectory as request_iplanner
+from gear_sonic.utils.inference.iplanner.config import navigation_backend
 from gear_sonic.utils.inference.navdp.control import (
     AsyncMpcSolver,
 )
@@ -79,6 +81,8 @@ def _navigation_status_payload(
 def main(config: NavDPPlannerConfig) -> None:
     service = InferenceServiceContext("navdp", config)
     profile = service.profile
+    planner_backend = navigation_backend(profile)
+    LOGGER.info("trajectory backend=%s", planner_backend)
     command_endpoint = profile.endpoint_uri("navigation_command")
     output_endpoint = profile.endpoint_uri("navdp_velocity")
     navdp_endpoint = profile.endpoint_uri("xnavdp_http")
@@ -134,7 +138,12 @@ def main(config: NavDPPlannerConfig) -> None:
     inference_result: queue.Queue[
         tuple[int, int, np.ndarray | None, Pose2D | None, str | None, float]
     ] = queue.Queue(maxsize=1)
-    mpc_solver = AsyncMpcSolver()
+    iplanner_navigation = None
+    if planner_backend == "iplanner":
+        from gear_sonic.utils.inference.iplanner.control import IPlannerNavigation, load_navigation_config
+
+        iplanner_navigation = IPlannerNavigation(load_navigation_config(profile))
+    mpc_solver = AsyncMpcSolver() if iplanner_navigation is None else None
     heading_controller = HeadingGoalController(
         angular_speed_rad_s=config.heading_angular_speed_rad_s,
         fine_angular_speed_rad_s=config.heading_fine_angular_speed_rad_s,
@@ -173,14 +182,19 @@ def main(config: NavDPPlannerConfig) -> None:
     ) -> None:
         started = time.monotonic()
         try:
-            result = _navdp_request(
-                navdp_endpoint,
-                rgb,
-                depth,
-                goal,
-                pose=inference_pose,
-                timeout=config.request_timeout_s,
-            )
+            if planner_backend == "iplanner":
+                result = request_iplanner(
+                    navdp_endpoint, rgb, depth, goal, timeout=config.request_timeout_s,
+                )
+            else:
+                result = _navdp_request(
+                    navdp_endpoint,
+                    rgb,
+                    depth,
+                    goal,
+                    pose=inference_pose,
+                    timeout=config.request_timeout_s,
+                )
             item = (
                 request_generation,
                 request_segment_id,
@@ -338,8 +352,15 @@ def main(config: NavDPPlannerConfig) -> None:
                 navdp_endpoint=navdp_endpoint,
                 config=config,
                 report_event=report_event,
+                planner_backend=planner_backend,
             )
-            _consume_inference_results(
+            if iplanner_navigation is not None:
+                iplanner_navigation.sync_command(state, now=time.monotonic())
+            consume_results = (
+                iplanner_navigation.consume_results if iplanner_navigation is not None
+                else _consume_inference_results
+            )
+            consume_results(
                 state,
                 inference_result,
                 send_metrics=send_metrics,
@@ -353,7 +374,11 @@ def main(config: NavDPPlannerConfig) -> None:
                 now=now,
                 slam_max_age_s=(config.sensor_gateway_max_age_ms * 1.0e-3),
             )
-            _schedule_navigation_inference(
+            schedule_inference = (
+                iplanner_navigation.schedule if iplanner_navigation is not None
+                else _schedule_navigation_inference
+            )
+            schedule_inference(
                 state,
                 sensor_cycle,
                 config=config,
@@ -361,21 +386,26 @@ def main(config: NavDPPlannerConfig) -> None:
                 send_status=send_status,
             )
 
-            (
-                velocity,
-                zero_action_aborted,
-                emit_heading_target,
-                terminal_heading_status,
-            ) = _compute_control(
-                state,
-                now=now,
-                pose=sensor_cycle.pose,
-                config=config,
-                mpc_solver=mpc_solver,
-                heading_controller=heading_controller,
-                send_metrics=send_metrics,
-                report_event=report_event,
-            )
+            if iplanner_navigation is not None and state.mode == "nav_goal":
+                velocity = iplanner_navigation.control(state, now=now, pose=sensor_cycle.pose, config=config)
+                zero_action_aborted = emit_heading_target = False
+                terminal_heading_status = None
+            else:
+                (
+                    velocity,
+                    zero_action_aborted,
+                    emit_heading_target,
+                    terminal_heading_status,
+                ) = _compute_control(
+                    state,
+                    now=now,
+                    pose=sensor_cycle.pose,
+                    config=config,
+                    mpc_solver=mpc_solver,
+                    heading_controller=heading_controller,
+                    send_metrics=send_metrics,
+                    report_event=report_event,
+                )
             publish_cycle(
                 velocity,
                 zero_action_aborted=zero_action_aborted,
@@ -390,7 +420,8 @@ def main(config: NavDPPlannerConfig) -> None:
     except KeyboardInterrupt:
         pass
     finally:
-        mpc_solver.close()
+        if mpc_solver is not None:
+            mpc_solver.close()
         for _ in range(3):
             output.send_string(
                 build_planner_velocity_message(

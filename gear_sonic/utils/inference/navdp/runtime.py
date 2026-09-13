@@ -237,7 +237,7 @@ def _compute_control(
     now: float,
     pose: Pose2D | None,
     config: NavDPPlannerConfig,
-    mpc_solver: AsyncMpcSolver,
+    mpc_solver: AsyncMpcSolver | None,
     heading_controller: HeadingGoalController,
     send_metrics,
     report_event,
@@ -251,7 +251,7 @@ def _compute_control(
     new_mpc_solution = False
     emit_heading_target = False
     terminal_heading_status: tuple[str, str] | None = None
-    result = mpc_solver.poll_latest()
+    result = mpc_solver.poll_latest() if mpc_solver is not None else None
     if (
         result is not None
         and result.generation == state.generation
@@ -385,6 +385,7 @@ def _refresh_gateway_camera(
     navdp_endpoint: str,
     config: NavDPPlannerConfig,
     report_event,
+    planner_backend: str = "xnavdp",
 ) -> None:
     gateway_camera = gateway.poll_camera()
     if gateway_camera is not None:
@@ -394,17 +395,23 @@ def _refresh_gateway_camera(
         state.latest_camera_timestamp = gateway_camera.source_timestamp_s
     if state.camera_info is None or state.navdp_initialized:
         return
+    planner_name = "iPlanner" if planner_backend == "iplanner" else "NavDP"
     try:
-        _reset_navdp(
-            navdp_endpoint,
-            state.camera_info,
-            stop_threshold=config.stop_threshold,
-        )
+        if planner_backend == "iplanner":
+            from gear_sonic.utils.inference.iplanner.client import reset_iplanner
+
+            reset_iplanner(navdp_endpoint, state.camera_info)
+        else:
+            _reset_navdp(
+                navdp_endpoint,
+                state.camera_info,
+                stop_threshold=config.stop_threshold,
+            )
         state.navdp_initialized = True
         report_event(
             logging.INFO,
             "SERVER_READY",
-            "NavDP server initialized",
+            f"{planner_name} server initialized",
             recovered=bool(state.server_error),
         )
         state.server_error = ""
@@ -414,7 +421,7 @@ def _refresh_gateway_camera(
             report_event(
                 logging.WARNING,
                 "SERVER_UNAVAILABLE",
-                "waiting for NavDP server",
+                f"waiting for {planner_name} server",
                 error=message,
             )
             state.server_error = message

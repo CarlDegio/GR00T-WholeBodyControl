@@ -1,12 +1,12 @@
 # ICRA 实验入口
 
-这里提供 15 个入口，同名参数文件在 `gear_sonic/config/experiments/`。真实运行复用现有 `launch_inference.py` 的 tmux、控制网关和操作界面；**启动脚本后，按 `n` 才开始一次试验和计时**。脚本不自动重复、不自动切换条件。离线语义角色评测例外，它只处理给定图像集合。
+这里提供 16 个入口，同名参数文件在 `gear_sonic/config/experiments/`。真实运行复用现有 `launch_inference.py` 的 tmux、控制网关和操作界面；**启动脚本后，按 `n` 才开始一次试验和计时**。脚本不自动重复、不自动切换条件。离线语义角色评测例外，它只处理给定图像集合。
 
 本次实现包括简单几何接近/居中；不包括 **UniLM-Nav adapted to our platform** 和“定位 + 直接前往”。训练邻域覆盖率暂不计算。
 
 ## 先填写公共配置
 
-配置按以下顺序读取：实验 YAML → 引用当前 `../launch_inference.yaml` → 合并本实验 `runtime_overrides` → 填入任务、条件和实验分支。相机、权重地址及底层控制参数来自同一份现有 agent 配置。每次实际启动保存一份不可随源 YAML 改动而变化的 `runtime.yaml`。
+配置按以下顺序读取：实验 YAML → 引用当前 `../launch_inference.yaml` → 按顺序合并可选 `runtime_overlays` → 合并本实验 `runtime_overrides` → 填入任务、条件和实验分支。相机、权重地址及底层控制参数来自同一份现有 agent 配置。每次实际启动保存一份不可随源 YAML 改动而变化的 `runtime.yaml`。
 
 1. 编辑 `gear_sonic/config/experiments/tasks.yaml`。填写实际服务的 `policy_id`；核对 T1、T2 已有的训练字符串，填写 T3、T4 的 `vla_trained_prompt`。`policy_id` 是人工填写的检查点标识，脚本不能独立核实远端当前加载的权重。
 2. 同文件中的 `vla_prompt` 描述真实物理目标，供 LA 的操作上下文和全部 VA 使用。`vla_trained_prompt` 保留训练时的原文，写入 VLA 初始配置及 `handoff_context`，启动、恢复和再次调用均使用它。导航路线仍单独传给导航规划器。
@@ -38,9 +38,24 @@ bash gear_sonic/scripts/experiments/full_vln.sh --task T1 --case visible_01
 
 每个入口都支持 `--config /absolute/path/method.yaml`、`--task T1`、`--case visible_01`、`--dry-run` 和 `--output /absolute/path/results`。`--config` 接收实验 YAML，公共 agent YAML 通过其中的 `runtime_profile` 引用。相对引用以实验 YAML 所在目录为基准。
 
+LaViRA baseline 使用同一份 `tasks.yaml` 和 `cases_main.yaml`，额外引用
+`gear_sonic/config/baselinelavira.yaml`，启用 LaViRA 自主选点、iPlanner 和 Pure Pursuit。
+相机、对齐、VLA、Sonic 及三个门控沿用 `full_vln`。先在该 baseline 配置的
+`components.iplanner.checkpoint` 填写真实权重路径；相对路径以 `components.iplanner.root` 为基准。
+`--dry-run` 会同时检查 iPlanner 参数及本地源码、提示词、权重、模型配置文件是否存在，缺项会阻止真实启动。
+
+```bash
+bash gear_sonic/scripts/experiments/baselinelavira.sh --task T1 --case visible_01 --dry-run
+bash gear_sonic/scripts/experiments/baselinelavira.sh --task T1 --case visible_01
+```
+
+baseline 的任务路线、操作语义、训练 prompt、策略标识及时间预算均由公共任务/条件配置填写，
+结果以 `baselinelavira_T1_visible_01_<会话编号>` 独立保存，并记录实际 iPlanner 权重路径。
+
 | 分组 | 脚本名（同名 YAML） | 变动 | 默认条件 |
 |---|---|---|---|
 | 表 1 | `full_vln.sh` | 完整 VLN agent | `visible_01` |
+| 表 1 | `baselinelavira.sh` | LaViRA 选点 + iPlanner + Pure Pursuit，共用 BasePose 与 VLA | `visible_01` |
 | 表 1 | `nav_direct_vla.sh` | 导航交接后直接 VLA | `visible_01` |
 | 表 1 | `navila_basepose_vla.sh` | NaVILA 导航，共用 BasePose 与 VLA | `visible_01` |
 | 表 1 | `geometric_vla.sh` | 头部优先、头胸切换的单目标几何接近/居中 | `visible_01` |
