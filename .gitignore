@@ -241,3 +241,31 @@ sonic_release/
 /gear_sonic_deploy/target
 /tools/yoloe26m/weights
 /tools/yoloe26m/config
+
+# Local experiment archive
+/experiment data/
+
+# Local experiment artifacts (keep source, documentation, and test fixtures)
+/Log/
+/experiments/agent_records/
+/experiments/jpeg95_binary_vla/*_60s.json
+/experiments/jpeg_quality_95/quality_*.json
+/experiments/jpeg_quality_95/*.log
+/diagnostics/**/*.tar.zst
+/decoupled_wbc/control/teleop/device/SDKClient_Linux/objects/*.o
+
+# Demo media and generated outputs stay local. Keep editable scripts and notes
+# visible at their existing paths, together with source/edit decision manifests.
+/demo_video/**
+!/demo_video/**/
+!/demo_video/**/*.py
+!/demo_video/**/*.sh
+!/demo_video/**/*.zsh
+!/demo_video/**/*.js
+!/demo_video/**/*.md
+!/demo_video/**/*.yaml
+!/demo_video/**/*.yml
+!/demo_video/**/*.toml
+!/demo_video/**/manifest.json
+!/demo_video/**/edit_decisions.json
+!/demo_video/**/*credit*.txt
