@@ -66,8 +66,8 @@ instance/
 # Scrapy stuff:
 .scrapy
 
-# Sphinx documentation
-data/
+# Local datasets at the repository root
+/data/
 
 # PyBuilder
 .pybuilder/
@@ -214,7 +214,6 @@ xrobotoolkit_sdk.cpython-*-*-*.so
 teleop_vids/
 *.code-workspace
 # Motion/training data (large local datasets, not tracked in git)
-data/
 bones_seed_smpl/
 sonic_release/
 # Training output logs
@@ -222,7 +221,7 @@ logs_rl/
 logs_eval/
 
 # Model checkpoints directory
-models/
+/models/
 
 # Downloaded from HuggingFace (hf download)
 sample_data/
