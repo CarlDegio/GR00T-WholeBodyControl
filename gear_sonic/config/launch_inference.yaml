@@ -1,6 +1,6 @@
 schema: sonic.runtime_profile
 version: 1
-profile: agent_full_current
+profile: agent_unilm_nav_qwen_flash
 endpoints:
   policy_server: {host: 127.0.0.1, port: 29999}
   camera_server: {host: 192.168.123.164, port: 5555}
@@ -28,6 +28,7 @@ ros_topics:
 components:
   launcher:
     sim: false
+    run_mode: agent
     opencv_viewer: true
     keyboard_planner: true
     planner_input: lavira
@@ -40,23 +41,20 @@ components:
   deploy:
     input_type: zmq_manager
     policy_variant: sonic_v1_1  # default | low_latency | sonic_v1_1
-    checkpoint: ''
-    obs_config: ''
-    planner: ''
-    motion_data: ''
+    checkpoint: /home/user/Project/GR00T-WholeBodyControl/gear_sonic_deploy/policy/sonic_v1_1/model
+    obs_config: /home/user/Project/GR00T-WholeBodyControl/gear_sonic_deploy/policy/sonic_v1_1/observation_config.yaml
+    planner: /home/user/Project/GR00T-WholeBodyControl/gear_sonic_deploy/planner/target_vel/V2/planner_sonic.onnx
+    motion_data: /home/user/Project/GR00T-WholeBodyControl/gear_sonic_deploy/reference/example
+    onnxruntime_root: /home/user/Project/.tools/onnxruntime
+    ready_timeout_s: 600.0  # Includes the first C++ build and TensorRT initialization.
     output_type: ''
   vla:
     embodiment_tag: unitree_g1_sonic
-    #prompt: &vla_task_prompt >-
-    #  Approach the tabletop if necessary, then use the right hand to pick up the
-    #  paper ball and place it into the blue plastic basket, use the left hand to
-    #  place another paper ball into the same basket, and finally return both arms
-    #  to the sides of the body.
-    prompt: &vla_task_prompt >-
-       collect the pill bottle
-    # Current prompt:
-    #prompt: &vla_task_prompt >-
-    #  collect the bag and put it into box, then carry the box
+    # Task for UniLM, agent planning/checks, and recording.
+    vla_prompt: >-
+      move forward to approach the bowl on the desk,pick up the bowl, step on the trash bin pedal to hold the lid open,empty the bowl into the bin and put it back to the desk.
+    vla_trained_prompt: >-
+      collect the pill bottle
     inference_hz: 2.0
     action_publish_rate: 50
     action_horizon: 50
@@ -65,13 +63,12 @@ components:
     sensor_gateway_max_age_ms: 1000.0
     sensor_gateway_max_skew_ms: 5.0
   lavira:
-    navigation_mode: object_nav
+    navigation_mode: vln
     mission: >-
-      Search the workspace for a cardboard box on a handcart and approach it.
-    global_target: a cardboard box on a handcart
-    manipulation_prompt: *vla_task_prompt
+      move to the white rubbish bin , turn left, move to the fire extinguisher,move to the refrigerator ,turn right and move to the bowl on the desk
+    global_target: bowl on the desk
     # Reserved legacy/manual alignment text. Production ALIGN target inference
-    # now uses manipulation_prompt; keep this for rollback or manual runs.
+    # uses components.vla.vla_prompt; keep this for rollback or manual runs.
     alignment_prompt: |-
       Use the cardboard box as the distance-and-centering target.
       Use the cardboard box as the yaw-alignment target;
@@ -117,6 +114,32 @@ components:
     # VLA performs a synchronous 3 s initial-pose ramp before acknowledging
     # POSE readiness. Include margin for policy ping and message scheduling.
     vla_start_timeout_seconds: 6.0
+  unilm_nav:
+    enabled: true  # false restores the original BasePose + agent handoff
+    model: qwen3.8-flash
+    base_url: https://ws-6yzgj1m087a053ip.cn-beijing.maas.aliyuncs.com/compatible-mode/v1
+    enable_thinking: false
+    timeout_s: 180.0
+    camera: chest  # use base_pose.dual_chest_* streams and extrinsics (pitch -3 deg)
+    camera_height_m: 1.0
+    history_size: 5
+    sample_hz: 2.0
+    pose_skew_s: 0.1
+    odometry_timeout_s: 0.3
+    position_tolerance_m: 0.05  # stop immediately and latch arrival before final yaw
+    yaw_tolerance_deg: 7.0
+    forward_speed_m_s: 0.4
+    min_angular_speed_rad_s: 0.1
+    max_angular_speed_rad_s: 0.3
+    approach_hold_s: 1.0  # zero velocity after aligning, before each straight step
+    approach_stable_s: 0.3  # final hold window must stay strictly within yaw tolerance
+    walk_duration_s: 1.0  # maximum duration of each straight step; no yaw command
+    walk_pause_s: 0.5  # zero velocity before recomputing the approach heading
+    position_settle_s: 1.0  # hold zero velocity after arrival before final yaw
+    stable_s: 1.0
+    max_goal_distance_m: 3.0
+    urdf_path: decoupled_wbc/control/robot_model/model_data/g1/g1_29dof_with_hand.urdf
+    output_root: outputs/unilm_nav
   base_pose:
     # Standalone/manual BasePose defaults. LaViRA overrides these three values
     # per ALIGN attempt with the two roles inferred by VA.

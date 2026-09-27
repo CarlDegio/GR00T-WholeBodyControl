@@ -44,6 +44,9 @@ if __package__:
         terminate_matching_processes,
     )
     from gear_sonic.scripts.launcher import TmuxSession, bootstrap_venv
+    from gear_sonic.scripts.runtime_environment import (
+        activate, code_directory, environment_root, model_environment, python_path,
+    )
 else:
     from cleanup_inference import (
         FASTLIO_PROCESS_PATTERNS,
@@ -55,6 +58,9 @@ else:
         terminate_matching_processes,
     )
     from launcher import TmuxSession, bootstrap_venv
+    from runtime_environment import (
+        activate, code_directory, environment_root, model_environment, python_path,
+    )
 
 
 def _bootstrap_venv():
@@ -66,7 +72,7 @@ def _bootstrap_venv():
         available = False
     bootstrap_venv(
         available,
-        repo_root=Path(__file__).resolve().parent.parent.parent,
+        repo_root=environment_root(Path(__file__).resolve().parent.parent.parent),
         venv_name=".venv_inference",
         missing_message=(
             "ERROR: tyro is not installed and .venv_inference not found.\n"
@@ -76,6 +82,10 @@ def _bootstrap_venv():
 
 
 _bootstrap_venv()
+
+# Shared environments contain an editable install of the original checkout.
+# Make this checkout authoritative even when launched outside its directory.
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 import tyro
 from gear_sonic.runtime.profile import (  # noqa: E402
@@ -95,6 +105,9 @@ class InferenceLaunchConfig:
     # Deployment mode
     sim: bool = False
     """Run against MuJoCo sim instead of real robot."""
+
+    run_mode: Literal["agent", "unilm_only"] = "agent"
+    """Complete agent or standalone UniLM positioning with the shared bridge."""
 
     opencv_viewer: bool = True
     """Start the standalone OpenCV visualization process under the SensorGateway pane."""
@@ -172,7 +185,7 @@ def _component(config: InferenceLaunchConfig, name: str):
 
 def _depth_anything_required(config: InferenceLaunchConfig) -> bool:
     """Return whether the active navigation input still consumes DA depth."""
-    return bool(config.keyboard_planner and config.planner_input == "lavira")
+    return bool(config.run_mode == "agent" and config.keyboard_planner and config.planner_input == "lavira")
 
 
 DEPLOY_POLICY_PRESETS = {
@@ -248,8 +261,18 @@ def build_deploy_command(config: InferenceLaunchConfig, repo_root: Path) -> str:
     checkpoint, obs_config = resolve_deploy_policy(settings, deploy_dir)
     command_endpoint = _runtime_profile(config).endpoint("cpp_command")
     deploy_mode = "sim" if config.sim else "real"
+    sdk = str(settings.get("onnxruntime_root", "")).strip()
+    sdk_environment = ""
+    if sdk:
+        sdk = str(Path(sdk).expanduser())
+        sdk_environment = (
+            f"export onnxruntime_ROOT={shlex.quote(sdk)} && "
+            f"export LD_LIBRARY_PATH={shlex.quote(sdk + '/lib')}"
+            "${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH} && "
+        )
     command = (
         f"cd {shlex.quote(str(deploy_dir))} && "
+        f"{sdk_environment}"
         f"./deploy.sh "
         f"--yes "
         f"--input-type {shlex.quote(str(settings['input_type']))} "
@@ -269,14 +292,67 @@ def build_deploy_command(config: InferenceLaunchConfig, repo_root: Path) -> str:
     return command + deploy_mode
 
 
+def validate_deploy_dependencies(settings: Any, deploy_dir: Path) -> None:
+    """Validate assets omitted from Git and the explicitly shared C++ SDK."""
+    planner = _deploy_asset_path(
+        deploy_dir, str(settings["planner"]) or "planner/target_vel/V2/planner_sonic.onnx",
+    )
+    motion = _deploy_asset_path(deploy_dir, str(settings["motion_data"]) or "reference/example")
+    missing = []
+    if not planner.is_file():
+        missing.append(f"SONIC planner model: {planner}")
+    else:
+        with planner.open("rb") as stream:
+            if stream.read(64).startswith(b"version https://git-lfs.github.com/spec/v1"):
+                missing.append(f"SONIC planner model is only a Git LFS pointer: {planner}")
+    if not motion.is_dir() or not any(motion.rglob("joint_pos.csv")):
+        missing.append(f"SONIC reference motions: {motion}")
+    sdk = str(settings.get("onnxruntime_root", "")).strip()
+    if sdk:
+        for relative in ("include/onnxruntime_cxx_api.h", "lib/libonnxruntime.so"):
+            path = Path(sdk).expanduser() / relative
+            if not path.is_file():
+                missing.append(f"ONNX Runtime SDK: {path}")
+    if missing:
+        raise FileNotFoundError("C++ deployment dependencies are missing:\n  - " + "\n  - ".join(missing))
+
+
+def build_deploy_pane_command(command: str, log_path: Path) -> str:
+    """Keep compiler/runtime output and expose command failure to tmux."""
+    # Replace the pane's interactive shell; otherwise a failed deploy.sh leaves
+    # a live shell behind and pane_alive() incorrectly reports startup success.
+    pipeline = f"( {command} ) 2>&1 | tee -a {shlex.quote(str(log_path))}"
+    return f"exec /bin/bash -o pipefail -c {shlex.quote(pipeline)}"
+
+
+def wait_for_deploy(config: InferenceLaunchConfig, pane: str, log_path: Path) -> None:
+    """Wait for the C++ output listener; state frames require the later K key."""
+    endpoint = _runtime_profile(config).endpoint("cpp_state")
+    timeout = float(_component(config, "deploy").get("ready_timeout_s", 600.0))
+    if not 0 < timeout < float("inf"):
+        raise ValueError("deploy.ready_timeout_s must be finite and positive")
+    deadline = time.monotonic() + timeout
+    print(f"Waiting for C++ initialization at {endpoint.host}:{endpoint.port}; log: {log_path}", flush=True)
+    while time.monotonic() < deadline:
+        if not _TMUX.pane_alive(pane):
+            raise RuntimeError(f"C++ deploy exited during startup; inspect {log_path}")
+        try:
+            with socket.create_connection((endpoint.host, endpoint.port), timeout=0.25):
+                print("C++ output listener is ready; K still controls activation.", flush=True)
+                return
+        except OSError:
+            time.sleep(0.2)
+    raise RuntimeError(f"C++ deploy did not initialize within {timeout:g}s; inspect {log_path}")
+
+
 def build_vla_inference_command(
     config: InferenceLaunchConfig,
     repo_root: Path,
 ) -> str:
     """Build VLA command using the selected runtime profile."""
     return (
-        f"cd {shlex.quote(str(repo_root))} && "
-        "source .venv_inference/bin/activate && "
+        f"{code_directory(repo_root)}"
+        f"{activate(repo_root, '.venv_inference')}"
         "python -m gear_sonic.utils.inference.vla.service "
         f"--profile {shlex.quote(config.config)}"
     )
@@ -288,8 +364,8 @@ def build_control_gateway_command(
 ) -> str:
     """Build the typed ControlGateway router command."""
     return (
-        f"cd {shlex.quote(str(repo_root))} && "
-        "source .venv_inference/bin/activate && "
+        f"{code_directory(repo_root)}"
+        f"{activate(repo_root, '.venv_inference')}"
         "python -m gear_sonic.runtime.gateway.services.control "
         f"--profile {shlex.quote(config.config)}"
     )
@@ -301,10 +377,10 @@ def build_data_exporter_command(
 ) -> str:
     """Build DataExporter with runtime-profile Gateway inputs only."""
     settings = _component(config, "data_exporter")
-    task_prompt = str(settings["task_prompt"]) or str(_component(config, "vla")["prompt"])
+    task_prompt = str(settings["task_prompt"]) or str(_component(config, "vla")["vla_prompt"])
     command = (
-        f"cd {shlex.quote(str(repo_root))} && "
-        "source .venv_data_collection/bin/activate && "
+        f"{code_directory(repo_root)}"
+        f"{activate(repo_root, '.venv_data_collection')}"
         "python -m gear_sonic.utils.data_collection.service "
         f"--profile {shlex.quote(config.config)} "
         f"--task-prompt {shlex.quote(task_prompt)}"
@@ -321,8 +397,8 @@ def build_operator_console_command(
     repo_root: Path,
 ) -> str:
     return (
-        f"cd {shlex.quote(str(repo_root))} && "
-        "source .venv_inference/bin/activate && "
+        f"{code_directory(repo_root)}"
+        f"{activate(repo_root, '.venv_inference')}"
         "python -m gear_sonic.utils.operator.console "
         f"--profile {shlex.quote(config.config)}"
     )
@@ -332,22 +408,21 @@ def build_planner_input_command(config: InferenceLaunchConfig, repo_root: Path) 
     """Build the worker command for the selected REASEN command source."""
     if config.planner_input == "keyboard":
         return (
-            f"cd {repo_root} && "
-            f"source .venv_teleop/bin/activate && "
+            f"{code_directory(repo_root)}"
+            f"{activate(repo_root, '.venv_teleop')}"
             f"python -m gear_sonic.utils.planner_control.keyboard "
             f"--profile {shlex.quote(config.config)}"
         )
 
-    local_env = "set -a; [ ! -f .env.local ] || . ./.env.local; set +a; "
-    quoted_root = shlex.quote(str(repo_root))
+    local_env = model_environment(repo_root)
     ready_file = shlex.quote(str(DEPTH_ANYTHING_READY_FILE))
     return (
-        f"cd {quoted_root} && "
+        f"{code_directory(repo_root)}"
         f"{local_env}"
         f"timeout {config.depth_anything_ready_timeout_s}s sh -c "
         f"'while [ ! -f {ready_file} ]; do sleep 0.2; done' || "
         "{ echo '[LaViRA] Depth Anything did not become ready' >&2; exit 1; }; "
-        f".venv_inference/bin/python -m gear_sonic.utils.inference.lavira.service "
+        f"{python_path(repo_root)} -m gear_sonic.utils.inference.lavira.service "
         f"--profile {shlex.quote(config.config)}"
     )
 
@@ -358,8 +433,9 @@ def build_base_pose_agent_command(
     """Build the independent ControlGateway-backed Base-Pose agent."""
 
     return (
-        f"cd {shlex.quote(str(repo_root))} && "
-        ".venv_inference/bin/python -m gear_sonic.utils.inference.base_pose.agent "
+        f"{code_directory(repo_root)}"
+        f"{model_environment(repo_root)}"
+        f"{python_path(repo_root)} -m gear_sonic.utils.inference.base_pose.agent "
         f"--profile {shlex.quote(config.config)}"
     )
 
@@ -368,10 +444,9 @@ def build_depth_anything_command(
     config: InferenceLaunchConfig, repo_root: Path
 ) -> str:
     """Build the shared RGB-only metric chest-depth process."""
-    quoted_root = shlex.quote(str(repo_root))
     ready_file = shlex.quote(str(DEPTH_ANYTHING_READY_FILE))
     return (
-        f"PYTHONPATH={quoted_root} {quoted_root}/.venv_depth_anything/bin/python "
+        f"{code_directory(repo_root)}{python_path(repo_root, '.venv_depth_anything')} "
         "-m gear_sonic.utils.inference.lavira.depth_service "
         f"--profile {shlex.quote(config.config)} --ready-file {ready_file}"
     )
@@ -384,7 +459,7 @@ def build_navdp_planner_command(config: InferenceLaunchConfig, repo_root: Path) 
         "unset COLCON_CURRENT_PREFIX AMENT_PREFIX_PATH CMAKE_PREFIX_PATH; "
         "source /opt/ros/humble/setup.bash && "
         f"source {shlex.quote(str(fastlio['workspace']))}/install/setup.bash && "
-        f"cd {shlex.quote(str(repo_root))} && source .venv_teleop/bin/activate && "
+        f"{code_directory(repo_root)}{activate(repo_root, '.venv_teleop')}"
         "python -m gear_sonic.utils.inference.navdp.service "
         f"--profile {shlex.quote(config.config)}"
     )
@@ -399,7 +474,7 @@ def build_planner_velocity_executor_command(
         else ""
     )
     return (
-        f"cd {shlex.quote(str(repo_root))} && source .venv_teleop/bin/activate && "
+        f"{code_directory(repo_root)}{activate(repo_root, '.venv_teleop')}"
         "python -m gear_sonic.utils.planner_control.executor_service "
         f"--profile {shlex.quote(config.config)} "
         f"{orientation_output}"
@@ -502,7 +577,7 @@ def build_sensor_gateway_command(config: InferenceLaunchConfig, repo_root: Path)
         "source /opt/ros/humble/setup.bash && "
         f"export LD_LIBRARY_PATH={shlex.quote(str(fastlio['livox_sdk_lib']))}:$LD_LIBRARY_PATH && "
         f"source {shlex.quote(str(fastlio['workspace']))}/install/setup.bash && "
-        f"cd {shlex.quote(str(repo_root))} && source .venv_teleop/bin/activate && "
+        f"{code_directory(repo_root)}{activate(repo_root, '.venv_teleop')}"
         f"export PYTHONPATH={shlex.quote(str(repo_root))}:$PYTHONPATH; "
     )
     depth_anything_flag = (
@@ -613,7 +688,7 @@ def run_readiness_gate(
         "unset COLCON_CURRENT_PREFIX AMENT_PREFIX_PATH CMAKE_PREFIX_PATH; "
         "source /opt/ros/humble/setup.bash && "
         f"source {shlex.quote(str(fastlio['workspace']))}/install/setup.bash && "
-        f"cd {shlex.quote(str(repo_root))} && source .venv_teleop/bin/activate && "
+        f"{code_directory(repo_root)}{activate(repo_root, '.venv_teleop')}"
         f"python -m gear_sonic.utils.inference.navdp.readiness --stage {stage} "
         f"--profile {shlex.quote(config.config)} "
         f"--timeout {timeout} "
@@ -674,11 +749,11 @@ def _check_prerequisites(config: InferenceLaunchConfig):
 
     repo_root = Path(__file__).resolve().parent.parent.parent
 
-    if not (repo_root / ".venv_inference" / "bin" / "activate").exists():
+    if not (environment_root(repo_root) / ".venv_inference" / "bin" / "activate").exists():
         errors.append(
             ".venv_inference not found. Run: bash install_scripts/install_inference.sh"
         )
-    if not (repo_root / ".venv_teleop" / "bin" / "activate").exists():
+    if not (environment_root(repo_root) / ".venv_teleop" / "bin" / "activate").exists():
         errors.append(".venv_teleop not found. Run: bash install_scripts/install_pico.sh")
 
     depth_anything_required = _depth_anything_required(config)
@@ -688,15 +763,15 @@ def _check_prerequisites(config: InferenceLaunchConfig):
             (Path(str(depth_settings["root"])), "Depth Anything metric source"),
             (Path(str(depth_settings["checkpoint"])), "Depth Anything Base checkpoint"),
             (
-                repo_root / ".venv_depth_anything" / "bin" / "python",
+                environment_root(repo_root) / ".venv_depth_anything" / "bin" / "python",
                 "Depth Anything Python",
             ),
         ):
             if not path.exists():
                 errors.append(f"{label} not found: {path}")
 
-    if config.planner_input == "lavira":
-        errors.extend(_lavira_api_key_errors(repo_root / ".env.local"))
+    if config.run_mode == "agent" and config.planner_input == "lavira":
+        errors.extend(_lavira_api_key_errors(environment_root(repo_root) / ".env.local"))
         lavira = profile.component("lavira")
         navdp = profile.component("navdp")
         fastlio = profile.component("fastlio")
@@ -736,7 +811,41 @@ def _check_prerequisites(config: InferenceLaunchConfig):
                 f"{camera_endpoint.host}:{camera_endpoint.port}"
             )
 
-    if config.base_pose_enabled:
+    unilm = bool(profile.components.get("unilm_nav", {}).get("enabled", False))
+    if config.run_mode == "unilm_only" and not unilm:
+        errors.append("unilm_only requires components.unilm_nav.enabled")
+    if config.base_pose_enabled and unilm:
+        from gear_sonic.utils.inference.base_pose.unilm import UniLMConfig, robot_geometry
+        try:
+            settings = load_component_config(UniLMConfig, "unilm_nav", config.config)
+            robot_geometry(str(repo_root / settings.urdf_path), settings.camera_height_m)
+        except (ValueError, OSError, RuntimeError) as exc:
+            errors.append(f"UniLM configuration: {exc}")
+        if not any(
+            os.environ.get(name, "").strip()
+            or _dotenv_has_nonempty_value(environment_root(repo_root) / ".env.local", name)
+            for name in ("UNILM_NAV_API_KEY", "DASHSCOPE_API_KEY")
+        ):
+            errors.append("UniLM requires DASHSCOPE_API_KEY or UNILM_NAV_API_KEY in the shared environment")
+        calibration = Path(str(profile.component("base_pose")["camera_intrinsics_path"]))
+        if not (repo_root / calibration).is_file():
+            errors.append(f"camera intrinsics missing: {calibration}")
+        inference_python = environment_root(repo_root) / ".venv_inference/bin/python"
+        if inference_python.is_file():
+            check = subprocess.run(
+                [str(inference_python), "-c", "import openai, cv2, numpy, zmq"],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False,
+            )
+            if check.returncode:
+                errors.append("shared inference environment needs openai, cv2, numpy and zmq")
+        if config.run_mode == "unilm_only" and not config.sim:
+            for path in (
+                Path("/opt/ros/humble/setup.bash"),
+                Path(str(profile.component("fastlio")["workspace"])) / "install/setup.bash",
+            ):
+                if not path.is_file():
+                    errors.append(f"UniLM odometry runtime missing: {path}")
+    if config.base_pose_enabled and not unilm:
         base_pose = profile.component("base_pose")
         for key in ("task", "target_prompt", "yaw_align_target_prompt"):
             if not str(base_pose[key]).strip():
@@ -750,7 +859,7 @@ def _check_prerequisites(config: InferenceLaunchConfig):
                 path = repo_root / path
             if not path.is_file():
                 errors.append(f"Base-Pose {label} not found: {path}")
-        inference_python = repo_root / ".venv_inference" / "bin" / "python"
+        inference_python = environment_root(repo_root) / ".venv_inference" / "bin" / "python"
         if inference_python.is_file():
             clip_check = subprocess.run(
                 [str(inference_python), "-c", "import clip"],
@@ -779,17 +888,18 @@ def _check_prerequisites(config: InferenceLaunchConfig):
     else:
         try:
             resolve_deploy_policy(profile.component("deploy"), deploy_dir)
+            validate_deploy_dependencies(profile.component("deploy"), deploy_dir)
         except (ValueError, FileNotFoundError) as exc:
             errors.append(str(exc))
 
     if config.data_exporter:
-        if not (repo_root / ".venv_data_collection" / "bin" / "activate").exists():
+        if not (environment_root(repo_root) / ".venv_data_collection" / "bin" / "activate").exists():
             errors.append(
                 ".venv_data_collection not found (needed for data exporter). Run: "
                 "bash install_scripts/install_data_collection.sh"
             )
 
-    if config.sim and not (repo_root / ".venv_sim" / "bin" / "activate").exists():
+    if config.sim and not (environment_root(repo_root) / ".venv_sim" / "bin" / "activate").exists():
         errors.append(
             ".venv_sim not found. Set up the simulation venv first."
         )
@@ -863,6 +973,8 @@ def _tmux_cleanup_hook(repo_root: Path) -> str:
 
 
 def _worker_pane_names(config: InferenceLaunchConfig) -> tuple[str, ...]:
+    if config.run_mode == "unilm_only":
+        return ("deploy", "vla", "planner_executor", "base_pose")
     names = ["deploy", "vla"]
     if config.keyboard_planner:
         names.extend(("planner_input", "navdp", "planner_executor"))
@@ -963,10 +1075,15 @@ def main(config: InferenceLaunchConfig):
     repo_root = Path(__file__).resolve().parent.parent.parent
     profile = _runtime_profile(config)
 
+    if config.run_mode == "unilm_only":
+        existing = subprocess.run(["tmux", "has-session", "-t", SESSION_NAME], capture_output=True)
+        if existing.returncode == 0:
+            raise RuntimeError("sonic_inference is already running; use B in its control pane, or stop it first")
     _check_prerequisites(config)
     _TMUX.kill()
     _clear_stale_fastlio_processes()
-    _clear_stale_navdp_processes()
+    if config.run_mode == "agent":
+        _clear_stale_navdp_processes()
     _clear_stale_gateway_processes()
 
     print(
@@ -983,8 +1100,8 @@ def main(config: InferenceLaunchConfig):
     if config.sim:
         _TMUX.command("new-window", "-t", SESSION_NAME, "-n", "sim")
         sim_cmd = (
-            f"cd {repo_root} && "
-            f"source .venv_sim/bin/activate && "
+            f"{code_directory(repo_root)}"
+            f"{activate(repo_root, '.venv_sim')}"
             f"python -m gear_sonic.utils.mujoco_sim.service "
             f"--enable-image-publish --enable-offscreen "
             f"--camera-port {camera_endpoint.port}"
@@ -996,10 +1113,17 @@ def main(config: InferenceLaunchConfig):
         _TMUX.command("select-window", "-t", f"{SESSION_NAME}:overview")
 
     # Workers retain independent TTYs and scrollback in the second window.
-    deploy_cmd = build_deploy_command(config, repo_root)
-    _start_in_pane(panes, "deploy", "C++ deploy", deploy_cmd, wait=3.0)
-    if not _TMUX.pane_alive(panes["deploy"]):
-        print("WARNING: C++ deploy pane may have failed to start.")
+    deploy_log = repo_root / "outputs/logs/inference/deploy.log"
+    deploy_log.parent.mkdir(parents=True, exist_ok=True)
+    with deploy_log.open("a") as stream:
+        stream.write(f"\n{time.strftime('%Y-%m-%d %H:%M:%S')} | Launching C++ deploy from {config.config}\n")
+    deploy_cmd = build_deploy_pane_command(build_deploy_command(config, repo_root), deploy_log)
+    _start_in_pane(panes, "deploy", "C++ deploy", deploy_cmd, wait=1.0)
+    try:
+        wait_for_deploy(config, panes["deploy"], deploy_log)
+    except (RuntimeError, ValueError):
+        _TMUX.kill()
+        raise
 
     # The overview window directly hosts the performance, control, and event
     # processes; start both Gateway boundaries before their clients.
@@ -1047,7 +1171,15 @@ def main(config: InferenceLaunchConfig):
         wait=2.0,
     )
 
-    if config.keyboard_planner:
+    if config.run_mode == "unilm_only":
+        command = (
+            f"{code_directory(repo_root)}{python_path(repo_root)} "
+            "-m gear_sonic.utils.inference.base_pose.unilm_runtime "
+            f"--check-ready --profile {shlex.quote(config.config)} --timeout {config.navigation_ready_timeout_s}"
+        )
+        if subprocess.run(["/bin/bash", "-c", command]).returncode:
+            raise RuntimeError("UniLM selected-camera RGB-D / FAST-LIO odometry is not ready")
+    if config.keyboard_planner and config.run_mode == "agent":
         planner_input_cmd = build_planner_input_command(config, repo_root)
         commands = [
             ("planner_input", "LaViRA semantic planner", planner_input_cmd),

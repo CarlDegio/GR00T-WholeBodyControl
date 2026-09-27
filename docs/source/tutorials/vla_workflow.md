@@ -184,7 +184,8 @@ uv run python gr00t/eval/run_gr00t_server.py \
 ### Run Inference
 
 On the inference machine, set `policy_server` and `camera_server` under
-`endpoints`, and set the task under `components.vla.prompt` in
+`endpoints`, and set the agent/UniLM task under `components.vla.vla_prompt`
+and the VLA policy instruction under `components.vla.vla_trained_prompt` in
 `gear_sonic/config/launch_inference.yaml`, then run:
 
 ```bash

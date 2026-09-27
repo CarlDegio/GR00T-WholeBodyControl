@@ -1953,7 +1953,7 @@ def test_manipulation_recovers_in_vla_then_system_completes_after_va_success():
     assert names.count("stop_vla_task") == 1
     start = next(args for name, args in intents if name == "start_vla_task")
     assert start["task"] == static_prompt
-    assert start["handoff_context"] == static_prompt
+    assert "handoff_context" not in start
     assert all(
         call["mission"] == "find the basket and put the bottle in it"
         for call in client.grounding_calls

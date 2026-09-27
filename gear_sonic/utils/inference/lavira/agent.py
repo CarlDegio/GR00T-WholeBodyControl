@@ -612,7 +612,9 @@ def _language_action_context(
     transition_result: Mapping[str, Any] | None,
     manipulation_prompt: str | None = None,
 ) -> str:
-    manipulation_task = str(manipulation_prompt or mission).strip()
+    manipulation_task = str(
+        mission if manipulation_prompt is None else manipulation_prompt
+    ).strip()
     current_todo = todo_list.strip() or (
         "(No TODO exists yet. Create the initial working checklist from the "
         "mission and current visual evidence in this same response.)"
@@ -1282,6 +1284,7 @@ class LaViRAAgent:
         sleep: Callable[[float], None] = time.sleep,
         report_event: EventReporter | None = None,
         report_todo: TodoReporter | None = None,
+        alignment_backend: str = "yoloe",
     ) -> None:
         if navigation_mode not in NAVIGATION_MODES:
             raise ValueError("navigation_mode must be vln or object_nav")
@@ -1321,10 +1324,18 @@ class LaViRAAgent:
         if not str(alignment_head_camera_stream).strip():
             raise ValueError("ALIGN handoff head camera stream is required")
         self.navigation_mode = navigation_mode
+        if alignment_backend not in {"yoloe", "unilm_nav"}:
+            raise ValueError("unsupported alignment backend")
+        self.alignment_backend = alignment_backend
+        self._last_navigation_identity: tuple[int, int] | None = None
         self.mission = mission
         self._configured_global_target = str(global_target).strip()
         self.global_target = self._configured_global_target
-        self.manipulation_prompt = str(manipulation_prompt or mission).strip()
+        # An explicitly empty vla_prompt stays empty; only callers that omit
+        # the separate manipulation task retain the mission default.
+        self.manipulation_prompt = str(
+            mission if manipulation_prompt is None else manipulation_prompt
+        ).strip()
         # Retained for configuration compatibility and manual rollback. The
         # production ALIGN request and handoff use manipulation_prompt plus the
         # roles inferred from it.
@@ -1381,6 +1392,7 @@ class LaViRAAgent:
         """Start one generation with no images or state from an older task."""
 
         self.global_target = self._configured_global_target
+        self._last_navigation_identity = None
         self._segment_id = -1
         self._skill_id = 0
         self._scan_id = 0
@@ -2434,6 +2446,7 @@ class LaViRAAgent:
             "target": target,
             "confidence": float(grounding["confidence"]),
         })
+        self._last_navigation_identity = (skill_id, segment)
         status = self._wait(generation, skill_id, segment)
         move_succeeded = status.get("state") == "reached"
         if move_succeeded:
@@ -2527,6 +2540,41 @@ class LaViRAAgent:
             )
         return entry
 
+    def _unilm_handoff(self, generation: int, strategic_goal: str) -> AgentHistoryEntry:
+        """One automatic final-NAV handoff; no old role/visibility gate."""
+        if not self._global_target_navigation_ready or self._last_navigation_identity is None:
+            raise LaViRAAgentError("unilm_requires_final_navigation")
+        nav_skill, nav_segment = self._last_navigation_identity
+        self._skill_id += 1
+        segment = self._next_segment()
+        self._check_cancelled(generation)
+        self.submit_intent("start_base_pose", {
+            "generation": generation, "skill_id": self._skill_id, "segment_id": segment,
+            "backend": "unilm_nav", "task": self.manipulation_prompt,
+            "observation_source": "navigation",
+            "source_nav_skill_id": nav_skill, "source_nav_segment_id": nav_segment,
+        })
+        status = self._wait(generation, self._skill_id, segment)
+        if status.get("state") != "reached" or status.get("reason") != "aligned":
+            raise LaViRAAgentError(f"unilm_failed:{status.get('reason', status.get('state'))}")
+        self._record(AgentHistoryEntry(
+            self._skill_id, "ALIGN", self.global_target,
+            "aligned", "SATISFIED", "UniLM pose reached and settled",
+        ))
+        self._store_transition("ALIGN", {
+            "mode": "POSTCHECK", "status": "SATISFIED", "transition": "READY_TO_MANIPULATE",
+            "visual_evidence": "UniLM physical pose tracker reached and settled", "confidence": 1.0,
+        })
+        self._skill_id += 1
+        self._check_cancelled(generation)
+        # The old expected condition described navigation. Construct the same
+        # task-completion request from the agent's general manipulation task.
+        return self._manipulate(
+            generation, self._skill_id,
+            f"The manipulation task is physically complete: {self.manipulation_prompt}",
+            strategic_goal,
+        )
+
     def _align(
         self, generation: int, skill_id: int, args: Mapping[str, Any],
         strategic_goal: str,
@@ -2598,7 +2646,6 @@ class LaViRAAgent:
         self.submit_intent("start_vla_task", {
             "generation": generation, "skill_id": skill_id, "window_id": 0,
             "task": self.manipulation_prompt,
-            "handoff_context": self.manipulation_prompt,
         })
         try:
             try:
@@ -2961,6 +3008,13 @@ class LaViRAAgent:
                         target_hint,
                     )
                     self._todo(generation, step, todo)
+                if (
+                    skill == "MOVE_TO" and self.alignment_backend == "unilm_nav"
+                    and self._global_target_navigation_ready
+                ):
+                    entry = self._unilm_handoff(generation, strategic_goal)
+                    self._record(entry)
+                    skill = "MANIPULATE"
                 if skill == "MANIPULATE":
                     result = LaViRATaskResult(
                         generation, "reached", "manipulation_completed", step,

@@ -22,6 +22,7 @@ from gear_sonic.runtime.inference_service import InferenceServiceContext
 from gear_sonic.runtime.queues import discard_queued, replace_latest
 from gear_sonic.runtime.profile import (
     load_component_config,
+    load_runtime_profile,
     parse_component_config,
 )
 from gear_sonic.runtime.telemetry import build_event
@@ -35,6 +36,7 @@ from gear_sonic.utils.inference.lavira.agent import (
 )
 from gear_sonic.utils.inference.lavira.camera import SensorGatewayRGBDCamera
 from gear_sonic.utils.inference.lavira.geometry import MAX_DIRECT_TRAVEL
+from gear_sonic.utils.inference.base_pose.unilm import enabled as unilm_enabled
 
 LOGGER = logging.getLogger("sonic.lavira")
 EventReporter = Callable[..., None]
@@ -75,7 +77,6 @@ class LaviraPlannerConfig:
     alignment_prompt: str
     global_target: str = ""
     navigation_mode: Literal["vln", "object_nav"] = "object_nav"
-    manipulation_prompt: str = ""
     max_steps: int = 20
     history_size: int = 5
     la_model: str = DEFAULT_LA_MODEL
@@ -114,8 +115,6 @@ class LaviraPlannerConfig:
         if not self.mission.strip():
             raise ValueError("components.lavira.mission is required")
         self.global_target = self.global_target.strip()
-        if not self.manipulation_prompt.strip():
-            self.manipulation_prompt = self.mission
         self.alignment_prompt = self.alignment_prompt.strip()
         if not self.alignment_prompt:
             raise ValueError("components.lavira.alignment_prompt is required")
@@ -484,11 +483,14 @@ def _agent(
         la_timeout_seconds=config.la_timeout_seconds,
         va_timeout_seconds=config.va_timeout_seconds,
     )
+    profile = load_runtime_profile(config.profile or None, overlays=config.overlay)
+    alignment_backend = "unilm_nav" if unilm_enabled(profile) else "yoloe"
     return LaViRAAgent(
+        alignment_backend=alignment_backend,
         navigation_mode=config.navigation_mode,
         mission=config.mission,
         global_target=config.global_target,
-        manipulation_prompt=config.manipulation_prompt,
+        manipulation_prompt=profile.component("vla")["vla_prompt"],
         alignment_prompt=config.alignment_prompt,
         max_steps=config.max_steps,
         history_size=config.history_size,

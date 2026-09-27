@@ -307,7 +307,7 @@ def test_build_deploy_command_uses_resolved_v1_1_policy(tmp_path: Path) -> None:
         tmp_path,
         components={
             "launcher": {"sim": True},
-            "deploy": {"policy_variant": "sonic_v1_1"},
+            "deploy": {"policy_variant": "sonic_v1_1", "checkpoint": "", "obs_config": ""},
         },
     )
     command = build_deploy_command(config, tmp_path)
@@ -484,13 +484,17 @@ def test_yaml_contains_every_launch_parameter() -> None:
     profile = load_runtime_profile()
 
     assert profile.component("deploy")["policy_variant"] == "sonic_v1_1"
-    assert vla.prompt.startswith("Grasp the empty cardboard box")
+    assert vla.vla_prompt == (
+        "move forward to approach the blue basket on the desk，pick up the pill bottle, "
+        "and place it inside the blue basket."
+    )
+    assert vla.vla_trained_prompt == "collect the pill bottle"
     assert lavira.navigation_mode == "object_nav"
     assert lavira.mission == (
         "Search the workspace for a cardboard box on a handcart and approach it."
     )
     assert lavira.global_target == "a cardboard box on a handcart"
-    assert lavira.manipulation_prompt == vla.prompt
+    assert "manipulation_prompt" not in profile.component("lavira")
     assert lavira.alignment_prompt == (
         "Use the cardboard box as the distance-and-centering target.\n"
         "Use the cardboard box as the yaw-alignment target;\n"
@@ -500,16 +504,16 @@ def test_yaml_contains_every_launch_parameter() -> None:
     assert lavira.va_model == "qwen3.5-27b"
     assert loaded.base_pose_enabled is True
     assert base_pose.task == (
-        "align distance, centering, and yaw to the cardboard box"
+        "align distance, centering to the cardboard box and yaw to the cardboard box"
     )
-    assert base_pose.target_prompt == "cardboard box"
-    assert base_pose.yaw_align_target_prompt == "cardboard box"
+    assert base_pose.target_prompt == "blue basket"
+    assert base_pose.yaw_align_target_prompt == "desk"
     assert base_pose.dual_chest_depth_stream == "camera/chest_view_depth"
     assert base_pose.raw_min_linear_speed_m_s == pytest.approx(0.35)
     assert base_pose.raw_max_lateral_speed_m_s == pytest.approx(0.4)
     assert base_pose.raw_lateral_pulse_enter_m == pytest.approx(0.10)
     assert base_pose.raw_lateral_pulse_exit_m == pytest.approx(0.10)
-    assert base_pose.raw_lateral_pulse_max_s == pytest.approx(0.35)
+    assert base_pose.raw_lateral_pulse_max_s == pytest.approx(0.40)
     assert base_pose.raw_lateral_pulse_settle_s == pytest.approx(0.50)
     assert base_pose.raw_lateral_pulse_sample_frames == 3
     assert not hasattr(loaded, "base_pose_mode")
@@ -633,6 +637,15 @@ def test_data_exporter_uses_runtime_profile_gateways_only(tmp_path: Path) -> Non
     assert "--data-collection-frequency" not in command
 
 
+@pytest.mark.parametrize("prompt", ["", "Put the bottle into the blue basket."])
+def test_data_exporter_defaults_to_general_task(tmp_path: Path, prompt: str) -> None:
+    config = _profile_config(tmp_path, components={"vla": {"vla_prompt": prompt}})
+    command = build_data_exporter_command(config, Path("/workspace/sonic"))
+    arguments = shlex.split(command)
+    assert arguments[arguments.index("--task-prompt") + 1] == prompt
+    assert "collect the pill bottle" not in command
+
+
 def test_launcher_defaults_match_unified_runtime_profile() -> None:
     config = load_inference_launch_config()
     profile = load_runtime_profile()
@@ -648,6 +661,7 @@ def test_launcher_defaults_match_unified_runtime_profile() -> None:
     assert launcher["navigation_ready_timeout_s"] == config.navigation_ready_timeout_s
     assert set(config.__dict__) == {
         "sim",
+        "run_mode",
         "opencv_viewer",
         "keyboard_planner",
         "planner_input",
@@ -791,9 +805,9 @@ def test_base_pose_agent_uses_gateway_arbitration_and_fixed_task() -> None:
     assert "--raw-chest-fallback-forward-tolerance-m" not in command
     assert "--raw-chest-fallback-lateral-tolerance-m" not in command
     assert "--raw-head-target-distance-m" not in command
-    assert worker.raw_head_target_distance_m == pytest.approx(1.3)
+    assert worker.raw_head_target_distance_m == pytest.approx(1.1)
     assert worker.raw_head_approach_cutoff_m == pytest.approx(1.5)
-    assert worker.raw_chest_target_distance_m == pytest.approx(1.1)
+    assert worker.raw_chest_target_distance_m == pytest.approx(0.9)
     assert worker.raw_chest_approach_cutoff_m == pytest.approx(1.3)
     assert worker.raw_post_stop_sample_frames == 30
     assert "--vision-backend" not in command

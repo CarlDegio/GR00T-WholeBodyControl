@@ -49,20 +49,25 @@ independent YAML booleans: set `la_enable_thinking` or
 
 Every task combines a navigation instruction with a subsequent manipulation
 task. `components.lavira.navigation_mode` selects the navigation prompt and
-must be `vln` or `object_nav`. `mission` contains the navigation instruction,
-and `manipulation_prompt` is the exact static language prompt used by VLA after
-the handoff. The first LA response derives `global_target` from those two task
-texts; the runtime freezes it for that task generation and rejects any later LA
-response that changes it. The default profile uses one YAML anchor so the
-LaViRA and VLA copies cannot drift apart. The default limit is 20 Agent steps.
+must be `vln` or `object_nav`. `mission` contains the navigation instruction.
+`components.vla.vla_prompt` supplies the general manipulation task to UniLM,
+LA, and VA, while `components.vla.vla_trained_prompt` supplies the policy's
+training instruction only to VLA. The first LA response derives `global_target`
+from the navigation mission and general manipulation task; the runtime freezes
+it for that task generation and rejects any later LA response that changes it.
+Both prompts are configured once under `components.vla`, including when using
+overlays. An explicitly empty general prompt stays empty. The default limit
+is 20 Agent steps.
 
 ```yaml
 components:
+  vla:
+    vla_prompt: Move in front of the desk with the blue basket, grasp the medicine bottle, and place it into the blue basket.
+    vla_trained_prompt: collect the pill bottle
   lavira:
     navigation_mode: vln
     mission: Walk forward to the trash can, then turn right and walk to a position near the desk with the blue basket on it.
     global_target: ''  # Filled by the first LA response for each generation.
-    manipulation_prompt: Move in front of the desk with the blue basket, grasp the medicine bottle, and place it into the blue basket.
 ```
 
 ## Cloud request context
@@ -137,8 +142,8 @@ grounding. No rear image is captured, and `behind` is rejected by the runtime
 schema on every step.
 
 ALIGN has empty skill arguments and always uses the front direction. Its VA
-`ALIGN_GROUNDING` request receives the same overall `manipulation_prompt` used
-by VLA and infers two roles directly from that task and the current image. The
+`ALIGN_GROUNDING` request receives the overall `components.vla.vla_prompt`
+and infers two roles directly from that task and the current image. The
 distance-and-centering `target` must be a manipulation object (for example a
 grasped or carried object, destination container, or physical control), not a
 supporting surface. VA prefers a large, regular, readily detectable candidate.
@@ -214,8 +219,10 @@ ControlGateway mode. The harness gates only forward handoffs: a ready NAV may
 either continue with another MOVE_TO or accept ALIGN, while MANIPULATE requires
 `READY_TO_MANIPULATE`. MOVE_TO and ALIGN recovery remain repeatable. VA does not
 directly switch ControlGateway modes. All image context and task-local state are
-cleared when a new task generation starts. VLA receives exactly
-`components.lavira.manipulation_prompt` at task start. During MANIPULATE, VA
+cleared when a new task generation starts. VLA policy observations use
+`components.vla.vla_trained_prompt`; starting or resuming a task cannot replace
+it with agent task or handoff context. During MANIPULATE, VA uses the general
+`components.vla.vla_prompt`. Its
 postchecks run on the LaViRA decision thread without sending `hold_vla_task` or
 `resume_vla_task`; the independent VLA service keeps its 50 Hz POSE action
 stream continuous. Only completion, safety failure, timeout, or cancellation

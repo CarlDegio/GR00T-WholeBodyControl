@@ -181,7 +181,8 @@ class InferenceConfig:
     sensor_gateway_max_age_ms: float = 1000.0
     sensor_gateway_max_skew_ms: float = 5.0
     embodiment_tag: str = "unitree_g1_sonic"
-    prompt: str = "demo"
+    vla_prompt: str = ""
+    vla_trained_prompt: str = "demo"
 
 def load_inference_config(
     profile: str = "",
@@ -834,8 +835,9 @@ def main(config: InferenceConfig):
             window_id=state.task_window_id,
         )
 
-    # Mutable prompt container (single-writer from keyboard, single-reader from inference)
-    language_prompt_ref: list[str] = [config.prompt]
+    # Only the trained instruction conditions the policy. Agent task context
+    # must not overwrite it when starting or resuming manipulation.
+    language_prompt_ref: list[str] = [config.vla_trained_prompt]
 
     command_handler = _VlaCommandHandler(
         state,

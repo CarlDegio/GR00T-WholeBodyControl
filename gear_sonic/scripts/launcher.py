@@ -68,10 +68,10 @@ class TmuxSession:
 
     def pane_alive(self, target: str) -> bool:
         result = self._run(
-            ["tmux", "list-panes", "-t", target, "-F", "#{pane_dead}"],
+            ["tmux", "display-message", "-p", "-t", target, "#{pane_dead}"],
             capture_output=True, text=True,
         )
-        return result.stdout.strip() != "1"
+        return result.returncode == 0 and result.stdout.strip() == "0"
 
     def attach(self) -> bool:
         """Attach and report whether the session remains afterward."""

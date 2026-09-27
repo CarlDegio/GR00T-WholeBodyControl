@@ -707,6 +707,13 @@ def run_base_pose_yolo_agent(config: Any) -> None:
 
 
 def main(config: BasePoseAgentConfig) -> None:
+    from gear_sonic.runtime.profile import load_runtime_profile
+    from gear_sonic.utils.inference.base_pose.unilm import enabled
+    profile = load_runtime_profile(config.profile or None, overlays=config.overlay)
+    if enabled(profile):
+        from gear_sonic.utils.inference.base_pose.unilm_runtime import run
+        run(config)
+        return
     run_base_pose_yolo_agent(config)
 
 

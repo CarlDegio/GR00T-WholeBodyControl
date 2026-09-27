@@ -224,7 +224,7 @@ class ControlGatewayRuntime:
             if action.reason:
                 event_parameters["reason"] = action.reason
             if action.agent_event == "start_base_pose" and agent_parameters:
-                for name in ("target", "yaw_align_target"):
+                for name in ("target", "yaw_align_target", "backend", "task", "observation_source"):
                     if name in agent_parameters:
                         event_parameters[name] = agent_parameters[name]
             self.dispatch_navigation_event(action.agent_event, event_parameters)
@@ -389,16 +389,24 @@ class ControlGatewayRuntime:
         key = command.parameters.get("key")
         if not isinstance(key, str) or len(key) != 1:
             raise ValueError("navigation_key requires one string key")
+        if key.lower() == "n" and self.profile.component("launcher").get("run_mode") == "unilm_only":
+            self.show_command(command, "CONTROL_IGNORED", "Standalone UniLM: use B to position", logging.WARNING)
+            return DispatchDisposition.HANDLED
         action = self.navigation.handle_key(
             key,
             now=time.monotonic(),
             cancel_reason=str(command.parameters.get("reason", "")),
         )
+        parameters = dict(command.parameters)
+        if action.agent_event == "start_base_pose" and self.profile.components.get("unilm_nav", {}).get("enabled"):
+            parameters.setdefault("backend", "unilm_nav")
+            parameters.setdefault("task", self.profile.component("vla")["vla_prompt"])
+            parameters.setdefault("observation_source", "current")
         self.publish_navigation_action(
             action,
             source=command.metadata.source,
             input_key="Space" if key == " " else key.upper(),
-            agent_parameters=command.parameters,
+            agent_parameters=parameters,
         )
         return DispatchDisposition.HANDLED
 
@@ -571,12 +579,21 @@ class ControlGatewayRuntime:
             # Operator-key BasePose start has already been normalized by
             # NavigationControlState and must still reach the consumer.
             return DispatchDisposition.FORWARD_ORIGINAL
-        for name in ("target", "yaw_align_target"):
+        unilm = command.parameters.get("backend") == "unilm_nav"
+        for name in (("task",) if unilm else ("target", "yaw_align_target")):
             value = command.parameters.get(name)
             if not isinstance(value, str) or not value.strip():
                 raise ValueError(
                     f"LaViRA BasePose start requires non-empty {name}"
                 )
+        if unilm:
+            if not self.profile.components.get("unilm_nav", {}).get("enabled", False):
+                raise ValueError("UniLM backend is not enabled")
+            if command.parameters.get("observation_source") != "navigation":
+                raise ValueError("agent UniLM requires navigation observations")
+            for name in ("source_nav_skill_id", "source_nav_segment_id"):
+                if type(command.parameters.get(name)) is not int or command.parameters[name] < 0:
+                    raise ValueError(f"UniLM requires a valid {name}")
         action = self.navigation.accept_base_pose_start(command.parameters)
         self._send_navigation_stop(
             generation=action.generation,
@@ -642,6 +659,8 @@ class ControlGatewayRuntime:
             "base_pose_agent",
             "base-pose status requires base_pose_agent source",
         )
+        if int(command.parameters.get("segment_id", 0)) != self.navigation.segment_id:
+            raise ValueError("stale base-pose segment")
         if not self.navigation.accept_status(
             command.parameters,
             owner="base_pose",

@@ -98,7 +98,8 @@ endpoints:
   camera_server: {host: 192.168.123.164, port: 5555}
 components:
   vla:
-    prompt: pick up the apple
+    vla_prompt: Approach the desk and pick up the apple.
+    vla_trained_prompt: pick up the apple
 ```
 
 ```bash
@@ -211,7 +212,7 @@ python -m gear_sonic.utils.data_collection.service \
 | `--profile` | default runtime profile | YAML source for every communication endpoint |
 | `--overlay` | none | Partial YAML overlay; may be repeated |
 
-Set `embodiment_tag`, `prompt`, `action_publish_rate`, `action_horizon`,
+Set `embodiment_tag`, `vla_prompt`, `vla_trained_prompt`, `action_publish_rate`, `action_horizon`,
 `inference_hz`, Gateway cache limits, and `verbose_timing` once under
 `components.vla` in the selected profile.
 

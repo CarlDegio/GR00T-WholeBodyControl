@@ -232,16 +232,18 @@ class _VlaCommandHandler:
     def _start_task(self, command, identity, active_identity, window_id: int) -> None:
         if identity < active_identity or identity == active_identity:
             return
-        prompt = command.parameters.get("handoff_context")
+        # The task is agent metadata; even an empty task must not replace the
+        # separately configured policy instruction with mission/handoff text.
+        prompt = self.language_prompt_ref[0]
         original_task = command.parameters.get("task")
         if not isinstance(prompt, str) or not prompt.strip():
             self.record_event(
                 logging.ERROR,
                 "VLA_TASK_REJECTED",
-                "Missing VLA handoff context",
+                "Missing VLA trained prompt",
             )
             return
-        if not isinstance(original_task, str) or not original_task.strip():
+        if not isinstance(original_task, str):
             self.record_event(
                 logging.ERROR,
                 "VLA_TASK_REJECTED",
@@ -289,7 +291,6 @@ class _VlaCommandHandler:
                 "PolicyServer was unreachable when MANIPULATE started",
             )
             return
-        self.language_prompt_ref[0] = prompt
         self.state.zmq_frame_counter = 0
         self.invalidate_inference("VLA task started")
         if self.state.cpp_mode == "PLANNER":
@@ -353,9 +354,6 @@ class _VlaCommandHandler:
                 )
             return
         if command.name == "resume_vla_task":
-            prompt = command.parameters.get("handoff_context")
-            if isinstance(prompt, str) and prompt.strip():
-                self.language_prompt_ref[0] = prompt
             if not self.state.pause_loop:
                 return
             self.state.pause_loop = False

@@ -53,7 +53,7 @@ def test_lavira_config_exposes_dual_cloud_agent_roles() -> None:
     )
 
     assert config.navigation_mode == "object_nav"
-    assert config.manipulation_prompt == "find chair"
+    assert not hasattr(config, "manipulation_prompt")
     assert not hasattr(config, "task_type")
     assert not hasattr(config, "question")
     assert config.la_model == "qwen3.8-max"

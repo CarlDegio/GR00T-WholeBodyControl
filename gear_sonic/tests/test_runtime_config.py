@@ -24,7 +24,7 @@ from gear_sonic.utils.inference.base_pose.agent import load_base_pose_config
 def test_default_profile_reproduces_current_topology_and_timing() -> None:
     profile = load_runtime_profile()
 
-    assert profile.name == "agent_full_current"
+    assert profile.name == "agent_unilm_nav_qwen_flash"
     assert set(profile.endpoints) == set(ENDPOINT_SCHEMES)
     assert len({(address.host, address.port) for address in profile.endpoints.values()}) == len(
         profile.endpoints
@@ -37,10 +37,11 @@ def test_default_profile_reproduces_current_topology_and_timing() -> None:
     }
     assert profile.component("vla") == {
         "embodiment_tag": "unitree_g1_sonic",
-        "prompt": (
-            "Grasp the empty cardboard box, lift it, place it securely onto "
-            "the handcart, and release it."
+        "vla_prompt": (
+            "move forward to approach the blue basket on the desk，pick up the pill bottle, "
+            "and place it inside the blue basket."
         ),
+        "vla_trained_prompt": "collect the pill bottle",
         "inference_hz": 2.0,
         "action_publish_rate": 50,
         "action_horizon": 50,
@@ -155,7 +156,7 @@ def test_partial_overlay_changes_only_selected_values(tmp_path) -> None:
             {
                 "endpoints": {"camera_server": {"host": "192.168.123.164"}},
                 "components": {
-                    "vla": {"prompt": "pick up the paper ball"},
+                    "vla": {"vla_trained_prompt": "pick up the paper ball"},
                     "lavira": {
                         "min_confidence": 0.75,
                         "nav_handoff_min_depth_m": 0.4,
@@ -177,10 +178,13 @@ def test_partial_overlay_changes_only_selected_values(tmp_path) -> None:
     assert profile.endpoint("camera_server").port == 5555
     assert profile.endpoint_uri("camera_server") == "tcp://192.168.123.164:5555"
     assert profile.endpoint_uri("xnavdp_http") == "http://127.0.0.1:19999"
-    assert profile.component("vla")["prompt"] == "pick up the paper ball"
+    assert profile.component("vla")["vla_prompt"] == (
+        load_runtime_profile().component("vla")["vla_prompt"]
+    )
+    assert profile.component("vla")["vla_trained_prompt"] == "pick up the paper ball"
     assert profile.component("vla")["action_publish_rate"] == 50
     assert profile.component("launcher")["data_exporter"] is False
-    assert load_inference_config(overlays=(str(overlay),)).prompt == "pick up the paper ball"
+    assert load_inference_config(overlays=(str(overlay),)).vla_trained_prompt == "pick up the paper ball"
     lavira = load_lavira_config(overlays=(str(overlay),))
     assert lavira.min_confidence == 0.75
     assert lavira.nav_handoff_min_depth_m == 0.4
