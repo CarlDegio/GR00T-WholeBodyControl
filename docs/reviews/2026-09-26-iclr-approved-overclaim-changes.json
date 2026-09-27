@@ -1,0 +1,32 @@
+[
+  {
+    "id": "G1a",
+    "old": "We introduce a handoff phase to resolve the observation misalignment and leverage the geometry of the robot and the object as a universal bridge.",
+    "new": "We introduce a handoff phase to reduce observation misalignment and use object-relative geometry as a bridge between navigation and manipulation."
+  },
+  {
+    "id": "G2",
+    "old": "The research question is whether we can develop a universal approach to address the pervasive discrepancy in observation distributions, thereby seamlessly bridging navigation and manipulation skills.",
+    "new": "The research question is whether task-conditioned geometric alignment can reduce the mismatch between the initial observation distribution induced by navigation and that expected by existing manipulation policies, thereby seamlessly bridging navigation and manipulation skills."
+  },
+  {
+    "id": "G4",
+    "old": "Furthermore, we developed a general-purpose loco-manipulation agent system.",
+    "new": "Building on GATE, we develop a practical agentic system that coordinates navigation, geometric alignment, and whole-body manipulation."
+  },
+  {
+    "id": "G8",
+    "old": "We organize the study around three questions: whether geometric handoff improves task completion, whether it supports long-horizon execution, and whether the same principle is applicable across environments, tasks, and robot platforms. The real-world experiments address the first two questions, while the OVMM evaluation examines applicability to a different embodiment and an independently trained RL placement policy. Appendices~\\ref{app:geometry} and~\\ref{app:near_field} provide additional handoff analysis and near-field experiments.",
+    "new": "We study three questions: whether GATE improves navigation-to-manipulation handoff, whether the integrated system supports completion of the four real-world tasks, and whether the geometric handoff design remains effective when adapted to Stretch on OVMM. Additional near-field experiments examine performance under varied initial configurations and scene backgrounds on T1 and T2. Appendices~\\ref{app:geometry} and~\\ref{app:near_field} provide the handoff analyses and near-field evaluation details."
+  },
+  {
+    "id": "G11a",
+    "old": "This method resolves the geometric mismatch between the endpoint of navigation and the initial conditions expected by existing manipulation policies, without requiring additional transition policy training or special annotations.",
+    "new": "GATE uses task-conditioned geometric feedback to reduce mismatch between navigation endpoints and manipulation starting conditions, without additional transition-policy training."
+  },
+  {
+    "id": "G11b",
+    "old": "We further build a dual-agent loco-manipulation system that organizes navigation, alignment, and whole-body manipulation as independent skills, achieving general-purpose manipulation capabilities in open environments. The OVMM evaluation further supports the applicability of GATE to a different embodiment and an independently trained manipulation system. The geometric handoff is integrated while retaining the original RL placement-policy weights, providing evidence of applicability beyond the humanoid setting. In real-world experiments, our approach also outperforms other alternative methods.",
+    "new": "Building on GATE, we develop a practical dual-agent loco-manipulation system that coordinates navigation, alignment, and whole-body manipulation, and evaluate it on four real-world humanoid tasks. The system achieves higher observed task success than the tested baseline configurations. The OVMM evaluation provides additional evidence of the applicability of the geometric handoff design to a different embodiment and an independently trained manipulation system."
+  }
+]

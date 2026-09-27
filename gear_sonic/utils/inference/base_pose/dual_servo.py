@@ -279,6 +279,19 @@ def dual_calibrations_from_config(
     }
 
 
+def _set_target_confidence(config: Any, tracker: Any, stream: str) -> None:
+    name = (
+        "raw_head_target_confidence"
+        if stream == config.dual_head_camera_stream
+        else "raw_chest_target_confidence"
+    )
+    value = getattr(config, name, None)
+    if value is not None:
+        tracker.target_confidence = float(value)
+    elif hasattr(tracker, "confidence"):
+        tracker.target_confidence = tracker.confidence
+
+
 def detect_dual_camera_eligibility(
     config: Any,
     snapshots: Mapping[str, AlignedRGBDSnapshot],
@@ -313,6 +326,7 @@ def detect_dual_camera_eligibility(
             # frames. Reset BoT-SORT so each camera's one-shot eligibility
             # check is frame 1 and can activate a new track immediately.
             tracker.reset_tracking()
+            _set_target_confidence(config, tracker, stream_name)
             instances = list(tracker.track(snapshot.rgb))
             target = _best_instance(instances, 0)
             reuse_target = _prompts_match(
@@ -783,6 +797,7 @@ def run_dual_raw_servo_worker(
                             imgsz=config.raw_yoloe_imgsz,
                             device=config.raw_yoloe_device,
                             yaw_align_target_prompt=yaw_align_target_prompt,
+                            tracking_enabled=getattr(config, "raw_yoloe_tracking", False),
                         )
                     )
                     tracker_yaw_align_target_prompt = yaw_align_target_prompt
@@ -919,6 +934,7 @@ def run_dual_raw_servo_worker(
                 last_inference_timestamp_by_stream: dict[str, float] = {}
                 while gate.is_active(generation) and not stop_event.is_set():
                     try:
+                        _set_target_confidence(config, tracker, attempt.live_stream)
                         tracker.start_all_text(
                             target_prompt=target_prompt,
                         )
@@ -936,7 +952,15 @@ def run_dual_raw_servo_worker(
                                     imgsz=config.raw_yoloe_imgsz,
                                     device=config.raw_yoloe_device,
                                     yaw_align_target_prompt=yaw_align_target_prompt,
+                                    tracking_enabled=getattr(config, "raw_yoloe_tracking", False),
                                 )
+                        if head_monitor_tracker is not None:
+                            monitor_stream = (
+                                stream_names[0]
+                                if attempt.live_stream == stream_names[1]
+                                else stream_names[1]
+                            )
+                            _set_target_confidence(config, head_monitor_tracker, monitor_stream)
                         if attempt.live_stream == stream_names[1]:
                             if head_monitor_tracker is not None:
                                 head_monitor = HeadCameraTextMonitor(

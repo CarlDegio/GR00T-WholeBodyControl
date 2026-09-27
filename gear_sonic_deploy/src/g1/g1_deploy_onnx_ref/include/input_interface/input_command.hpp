@@ -36,6 +36,8 @@
  * is overwritten with the latest value.
  */
 struct CommandMessage {
+  double control_request_id = 0;
+  bool hold_current_upper_body = false;
   bool start = false;     ///< When true, request the control system to start.
   bool stop = false;      ///< When true, request an emergency / graceful stop.
   bool planner = false;   ///< true  → planner mode  (use planner topic for locomotion)
@@ -88,6 +90,7 @@ struct PlannerMessage {
 
   /// Optional upper-body joint target velocities (17 DOF, rad/s).
   std::optional<std::array<double, 17>> upper_body_velocity;
+  bool pose_entry_transition = false; ///< Stationary upper-body ramp before POSE entry.
 
   /// Optional left-hand Dex3 joint positions (7 DOF).
   std::optional<std::array<double, 7>> left_hand_joints;
@@ -105,4 +108,3 @@ struct PlannerMessage {
   /// Used to detect planner timeouts (stale data → fallback to IDLE).
   std::chrono::steady_clock::time_point timestamp{};
 };
-

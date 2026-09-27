@@ -119,6 +119,13 @@ public:
     virtual bool HasUpperBodyControl() const {
       return has_upper_body_control_;
     }
+
+    /// Explicit stationary preparation for switching from planner to POSE.
+    virtual double GetControlRequestId() const { return 0; }
+    virtual bool HoldCurrentUpperBody() const { return false; }
+    virtual bool IsPoseEntryTransition() const {
+      return pose_entry_transition_;
+    }
     
     /// @return True if this interface provides VR 3-point tracking data
     ///         (left wrist, right wrist, head – 9 position + 12 orientation values).
@@ -463,6 +470,7 @@ protected:
     std::atomic<bool> has_hand_joints_{false};        ///< Dex3 hand joint data available.
     std::atomic<bool> has_external_token_state_{false}; ///< External token-state vector available.
     std::atomic<bool> has_upper_body_control_{false}; ///< Upper-body 17-DOF targets available.
+    std::atomic<bool> pose_entry_transition_{false};
 
     // ------------------------------------------------------------------
     // Thread-safe data buffers (written by input threads, read by control loop)

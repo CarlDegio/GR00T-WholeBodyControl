@@ -12,6 +12,7 @@ may repeat, while MANIPULATE is terminal.
 from __future__ import annotations
 
 import base64
+from concurrent.futures import Future
 from dataclasses import asdict, dataclass, field
 import json
 import logging
@@ -122,6 +123,11 @@ class LaViRAAgentError(RuntimeError):
 
 class LaViRAAgentCancelled(LaViRAAgentError):
     """Raised after Space invalidates the active task generation."""
+
+
+class _ManipulationDeadline(TimeoutError):
+    def __init__(self, window_id: int):
+        self.window_id = window_id
 
 
 class _MoveToFacingUnavailable(LaViRAAgentError):
@@ -262,6 +268,8 @@ def _validate_skill_args(
 
 def validate_language_action(
     value: Any, *, expected_global_target: str | None = None,
+    navigation_only: bool = False,
+    observed_directions: set[str] | None = None,
 ) -> dict[str, Any]:
     if not isinstance(value, dict) or set(value) != LA_KEYS:
         raise LaViRAAgentError("LA output has an invalid object schema")
@@ -312,6 +320,15 @@ def validate_language_action(
     result["decision"] = decision
     result["skill"] = None if skill is None else skill.upper()
     _validate_skill_args(result["skill"], result["skill_args"])
+    if (result["skill"] == "MOVE_TO" and observed_directions is not None
+            and result["skill_args"]["view_direction"] not in observed_directions):
+        raise LaViRAAgentError(
+            "MOVE_TO direction has no current observation: "
+            f"{result['skill_args']['view_direction']}; "
+            f"choose from {sorted(observed_directions)}"
+        )
+    if navigation_only and result["skill"] not in {None, "MOVE_TO"}:
+        raise LaViRAAgentError("navigation step only permits MOVE_TO or FAIL")
     return result
 
 
@@ -591,6 +608,27 @@ generic checklist to guide your actions.
 "expected_postcondition":"..."}}"""
 
 
+def _navigation_action_contract() -> str:
+    """The LA controls waypoints within one navigation step, not the mission."""
+    return """You plan one navigation step within an ordered mission.
+Return EXECUTE with skill MOVE_TO, or FAIL with skill null. ALIGN and MANIPULATE
+are scheduled by the runtime in their own operation step and are not LA actions
+in this request. The runtime completes this navigation step after fresh target
+visibility and depth checks; you cannot finish the whole mission.
+Maintain a Markdown TODO checklist of navigation waypoints only. Create it in
+the first response, then preserve runtime-completed MOVE_TO lines exactly.
+Select the first unfinished waypoint. Turns belong in view_direction, never
+in a separate TODO item. Use only the supplied front, front_right, right, left,
+front_left views; never infer a rear view. Keep global_target unchanged for this
+navigation step. Intermediate landmarks do not complete the final target.
+MOVE_TO skill_args must contain exactly view_direction and a nonempty target.
+FAIL requires skill=null and skill_args={}. Return strict JSON with exactly:
+{"global_target":"...","progress_analysis":"...",
+"updated_todo_list":"- [ ] ...","reasoning":"...",
+"decision":"EXECUTE|FAIL","skill":"MOVE_TO|null","skill_args":{},
+"expected_postcondition":"..."}"""
+
+
 def _language_action_context(
     mission: str,
     navigation_mode: str,
@@ -600,6 +638,7 @@ def _language_action_context(
     observation_mode: str,
     transition_result: Mapping[str, Any] | None,
     manipulation_prompt: str | None = None,
+    navigation_only: bool = False,
 ) -> str:
     manipulation_task = str(manipulation_prompt or mission).strip()
     current_todo = todo_list.strip() or (
@@ -649,11 +688,22 @@ def _language_action_context(
             "value for the rest of the task generation."
         )
     )
+    operation_context = (
+        "**SCOPE**: Only the current navigation step. The runtime schedules subsequent operations."
+        if navigation_only else (
+            "**MANIPULATION TASK AFTER NAVIGATION**:\n"
+            + json.dumps(manipulation_task, ensure_ascii=False)
+        )
+    )
+    if navigation_only:
+        global_target_instruction = (
+            "Return the given GLOBAL TARGET unchanged for this navigation step."
+            if frozen_global_target else "Infer the destination of this navigation step from MISSION."
+        )
     return f"""**MISSION**: {json.dumps(mission, ensure_ascii=False)}
 {global_target_context}
 **NAVIGATION MODE**: {navigation_mode}. {navigation_guidance}
-**MANIPULATION TASK AFTER NAVIGATION**:
-{json.dumps(manipulation_task, ensure_ascii=False)}
+{operation_context}
 
 **Current TODO List**:
 {current_todo}
@@ -681,6 +731,7 @@ def language_action_prompt(
     observation_mode: str,
     transition_result: Mapping[str, Any] | None,
     manipulation_prompt: str | None = None,
+    navigation_only: bool = False,
 ) -> str:
     """Return the complete LA prompt in cache-friendly contract-first order."""
 
@@ -693,8 +744,10 @@ def language_action_prompt(
         observation_mode,
         transition_result,
         manipulation_prompt,
+        navigation_only,
     )
-    return f"{_language_action_contract()}\n\n{context}"
+    contract = _navigation_action_contract() if navigation_only else _language_action_contract()
+    return f"{contract}\n\n{context}"
 
 
 def _va_context(
@@ -943,9 +996,13 @@ class LaViRAClient:
         request = dict(kwargs)
         for attempt in range(3):
             self._save_request_context(request_kind, attempt + 1, request)
+            demo = getattr(self, "demo_recorder", None)
+            ticket = demo.begin(request_kind, attempt + 1, request) if demo else None
             try:
                 completion = client.chat.completions.create(**request)
             except Exception as exc:
+                if demo:
+                    demo.finish(ticket, error=str(exc))
                 last_error = exc
                 if attempt < 2:
                     LOGGER.warning(
@@ -958,10 +1015,17 @@ class LaViRAClient:
                     time.sleep(10.0)
                 continue
             if response_parser is None:
+                if demo:
+                    demo.finish(ticket, completion=completion)
                 return completion
             try:
-                return response_parser(completion)
+                result = response_parser(completion)
+                if demo:
+                    demo.finish(ticket, completion=completion, result=result)
+                return result
             except LaViRAAgentError as exc:
+                if demo:
+                    demo.finish(ticket, completion=completion, error=str(exc))
                 last_error = exc
                 if attempt < 2:
                     LOGGER.warning(
@@ -1038,9 +1102,23 @@ class LaViRAClient:
         move_to_views: Sequence["MoveToView"],
         transition_result: Mapping[str, Any] | None = None,
         manipulation_prompt: str | None = None,
+        navigation_only: bool = False,
+        available_skills: Mapping[str, Any] | None = None,
+        alignment_mode: str = "dual",
     ) -> dict[str, Any]:
+        if available_skills is not None:
+            from .flexible import request_flexible_action
+            return request_flexible_action(
+                self, mission=mission, navigation_mode=navigation_mode,
+                global_target=global_target, current_step=current_step,
+                todo_list=todo_list, scan_views=scan_views, move_to_views=move_to_views,
+                transition_result=transition_result, available_skills=available_skills,
+                alignment_mode=alignment_mode,
+            )
         content: list[dict[str, Any]] = [
-            {"type": "text", "text": _language_action_contract()},
+            {"type": "text", "text": (
+                _navigation_action_contract() if navigation_only else _language_action_contract()
+            )},
             {"type": "text", "text": _language_action_context(
                 mission,
                 navigation_mode,
@@ -1050,6 +1128,7 @@ class LaViRAClient:
                 "panorama" if len(scan_views) == 5 else "front",
                 transition_result,
                 manipulation_prompt,
+                navigation_only,
             )},
             {"type": "text", "text": (
                 f"Navigation Task: {json.dumps(mission, ensure_ascii=False)}\n\n"
@@ -1086,10 +1165,16 @@ class LaViRAClient:
                     self._content(completion, role="LA"), role="LA",
                 ),
                 expected_global_target=global_target,
+                navigation_only=navigation_only,
+                observed_directions={view.direction for view in scan_views},
             ),
             messages=self._messages(
                 content, enable_thinking=self.la_enable_thinking,
                 system_instruction=(
+                    "Only plan MOVE_TO waypoints for the current navigation step. "
+                    "Keep its global_target fixed. Operation alignment, VLA execution "
+                    "and mission completion are controlled by the runtime."
+                    if navigation_only else (
                     "ALIGN is forbidden until navigation has completed "
                     "successfully for that GLOBAL TARGET and the latest "
                     "harness transition is READY_TO_ALIGN. Reaching an "
@@ -1107,6 +1192,7 @@ class LaViRAClient:
                             f"{json.dumps(global_target, ensure_ascii=False)} "
                             "unchanged. "
                         )
+                    )
                     )
                 ),
             ),
@@ -1239,6 +1325,20 @@ class LaViRATaskResult:
     navigation_mode: str
 
 
+@dataclass
+class _OperationContext:
+    generation: int
+    operation_id: str
+    alignment: Mapping[str, Any]
+    completion_kind: str
+    alignment_skill_id: int | None = None
+    alignment_segment_id: int = -1
+    aligned_pose: tuple[float, float, float] | None = None
+    aligned_yaw: float = 0.0
+    aligned_at: float = 0.0
+    consumed: bool = False
+
+
 class LaViRAAgent:
     """Execute a unified manipulation mission without publishing direct velocity."""
 
@@ -1263,6 +1363,7 @@ class LaViRAAgent:
         manipulation_max_windows: int = 36,
         manipulation_timeout_seconds: float = 180.0,
         vla_start_timeout_seconds: float = 25.0,
+        operation_alignment_max_age_seconds: float = 30.0,
         heading_settle_seconds: float = 1.0,
         heading_settle_samples: int = 30,
         heading_settle_bad_sample_threshold: int = 12,
@@ -1287,6 +1388,8 @@ class LaViRAAgent:
             or manipulation_max_windows <= 0
             or manipulation_timeout_seconds <= 0
             or vla_start_timeout_seconds <= 0
+            or not math.isfinite(float(operation_alignment_max_age_seconds))
+            or operation_alignment_max_age_seconds <= 0
             or not math.isfinite(float(heading_settle_seconds))
             or heading_settle_seconds < 0
             or heading_settle_samples <= 0
@@ -1320,6 +1423,7 @@ class LaViRAAgent:
         # production ALIGN request and handoff use manipulation_prompt plus the
         # roles inferred from it.
         self.alignment_prompt = str(alignment_prompt).strip()
+        self.base_pose_parameters = {}
         self.max_steps = int(max_steps)
         self.history_size = min(5, int(history_size))
         self.min_confidence = float(min_confidence)
@@ -1340,6 +1444,7 @@ class LaViRAAgent:
         self.manipulation_max_windows = int(manipulation_max_windows)
         self.manipulation_timeout_seconds = float(manipulation_timeout_seconds)
         self.vla_start_timeout_seconds = float(vla_start_timeout_seconds)
+        self.operation_alignment_max_age_seconds = float(operation_alignment_max_age_seconds)
         self.heading_settle_seconds = float(heading_settle_seconds)
         self.heading_settle_samples = int(heading_settle_samples)
         self.heading_settle_bad_sample_threshold = int(
@@ -1367,6 +1472,11 @@ class LaViRAAgent:
         self._latest_transition: dict[str, Any] | None = None
         self._global_target_navigation_ready = False
         self._next_observation_mode = "panorama"
+        self.vla_task_parameters: dict[str, Any] = {}
+        self.manipulation_postcondition = ""
+        self.vla_handoff_timeout_seconds = 15.0
+        self._operation: _OperationContext | None = None
+        self._navigation_only_prompt = False
 
     def _reset_task_context(self) -> None:
         """Start one generation with no images or state from an older task."""
@@ -1381,6 +1491,111 @@ class LaViRAAgent:
         self._latest_transition = None
         self._global_target_navigation_ready = False
         self._next_observation_mode = "panorama"
+        self._operation = None
+
+    def reset_step_context(self, target: str) -> None:
+        """Reset perception for a new step, preserving monotonic controller IDs."""
+        identifiers = self._skill_id, self._segment_id, self._scan_id
+        self._configured_global_target = target
+        self._reset_task_context()
+        self._skill_id, self._segment_id, self._scan_id = identifiers
+
+    def run_navigation(self, generation: int) -> LaViRATaskResult:
+        self._navigation_only_prompt = True
+        try:
+            # Explicit base dispatch avoids recursing into MissionAgent.run().
+            return LaViRAAgent.run(self, generation, reset_context=False,
+                                   navigation_only=True, subtask=True)
+        finally:
+            self._navigation_only_prompt = False
+
+    def run_operation(self, generation: int, *, operation_id: str,
+                      alignment: Mapping[str, Any], completion_kind: str) -> LaViRATaskResult:
+        """One mandatory fresh ALIGN followed by one VLA execution and handoff."""
+        operation = _OperationContext(generation, operation_id, dict(alignment), completion_kind)
+        self._operation = operation
+        steps = 0
+        try:
+            self._check_cancelled(generation)
+            self._latest_transition = None
+            self._todo(generation, 0, f"- [ ] ALIGN {operation_id}\n- [ ] SKILL {operation_id}")
+            attempts = min(int(alignment.get("max_attempts", 3)), self.max_steps - 1)
+            if attempts <= 0:
+                raise LaViRAAgentError("operation_requires_budget_for_align_and_skill")
+            for attempt in range(1, attempts + 1):
+                self._check_cancelled(generation)
+                self._skill_id += 1
+                steps += 1
+                self._validate_transition_gate("ALIGN")
+                self._event(logging.INFO, "OPERATION_ALIGN_STARTED", "Aligning current operation",
+                            generation=generation, operation_id=operation_id,
+                            skill_id=self._skill_id, attempt=attempt)
+                entry = self._align(generation, self._skill_id, {},
+                                    f"Align for this operation: {self.manipulation_prompt}")
+                self._check_cancelled(generation)
+                self._record(entry)
+                if (entry.controller_state == "aligned" and entry.va_result == "SATISFIED"
+                    and self._latest_transition
+                    and self._latest_transition.get("transition") == "READY_TO_MANIPULATE"):
+                    operation.alignment_skill_id = self._skill_id
+                    operation.alignment_segment_id = self._segment_id
+                    operation.aligned_pose = self._fastlio_pose()
+                    operation.aligned_yaw = self._sonic_yaw()
+                    operation.aligned_at = self.monotonic()
+                    self._todo(generation, steps, f"- [x] ALIGN {operation_id}\n- [ ] SKILL {operation_id}")
+                    break
+                self._event(logging.WARNING, "OPERATION_ALIGN_RETRY", "Current operation needs fresh alignment",
+                            generation=generation, operation_id=operation_id,
+                            skill_id=self._skill_id, attempt=attempt)
+            else:
+                raise LaViRAAgentError(f"operation_alignment_failed:{operation_id}")
+            self._skill_id += 1
+            steps += 1
+            self._validate_transition_gate("MANIPULATE")
+            entry = self._manipulate(generation, self._skill_id, self.manipulation_postcondition,
+                                     f"Execute this operation only: {self.manipulation_prompt}")
+            self._record(entry)
+            timed_out = entry.controller_state == "timeout_continued"
+            suffix = " (timeout; continued without success confirmation)" if timed_out else ""
+            self._todo(generation, steps, f"- [x] ALIGN {operation_id}\n- [x] SKILL {operation_id}{suffix}")
+            result = LaViRATaskResult(generation, "reached",
+                                     "manipulation_timeout_continued" if timed_out else "manipulation_completed", steps,
+                                     self._skill_id, max(0, self._segment_id), self.navigation_mode)
+        except LaViRAAgentCancelled:
+            result = LaViRATaskResult(generation, "stopped", "operator_cancelled", steps,
+                                     self._skill_id, max(0, self._segment_id), self.navigation_mode)
+        except Exception as exc:
+            LOGGER.exception("Operation failed: %s", operation_id, extra={"runtime_event_emitted": True})
+            result = LaViRATaskResult(generation, "failed", str(exc), steps,
+                                     self._skill_id, max(0, self._segment_id), self.navigation_mode)
+        finally:
+            self._operation = None
+        self._event(logging.INFO if result.state == "reached" else logging.WARNING,
+                    "GOAL_COMPLETED" if result.state == "reached" else "GOAL_STOPPED",
+                    "Operation finished", operation_id=operation_id, **asdict(result))
+        return result
+
+    def _check_operation_alignment(self, generation: int) -> _OperationContext:
+        operation = self._operation
+        self._check_cancelled(generation)
+        if (operation is None or operation.generation != generation or operation.consumed
+            or operation.alignment_skill_id is None or operation.aligned_pose is None):
+            raise LaViRAAgentError("handoff_gate:current_operation_not_aligned")
+        x, y, _ = self._fastlio_pose()
+        yaw = self._sonic_yaw()
+        displacement = math.hypot(x - operation.aligned_pose[0], y - operation.aligned_pose[1])
+        yaw_delta = abs(math.remainder(yaw - operation.aligned_yaw, 2 * math.pi))
+        age = self.monotonic() - operation.aligned_at
+        if (displacement > 0.1 or yaw_delta > self.heading_settle_tolerance_rad
+            or age > self.operation_alignment_max_age_seconds):
+            self._event(logging.WARNING, "OPERATION_ALIGNMENT_INVALIDATED",
+                        "Operation alignment is too old or the robot moved after alignment",
+                        generation=generation, operation_id=operation.operation_id,
+                        age_seconds=age, max_age_seconds=self.operation_alignment_max_age_seconds,
+                        displacement_m=displacement, max_displacement_m=0.1,
+                        yaw_delta_rad=yaw_delta, max_yaw_delta_rad=self.heading_settle_tolerance_rad)
+            raise LaViRAAgentError("handoff_gate:operation_alignment_expired_or_moved")
+        return operation
 
     def _event(
         self,
@@ -1900,6 +2115,13 @@ class LaViRAAgent:
     def _validate_transition_gate(self, skill: str) -> None:
         """Gate forward handoffs while allowing same-stage recovery calls."""
 
+        if self._operation is not None:
+            if skill == "ALIGN":
+                return  # Fresh local target/depth checks run in _align before BasePose.
+            if skill == "MANIPULATE":
+                self._check_operation_alignment(self._operation.generation)
+                return
+            raise LaViRAAgentError("operation_only_allows_align_then_manipulate")
         if skill == "ALIGN" and not self._global_target_navigation_ready:
             raise LaViRAAgentError(
                 "handoff_gate:global_target_navigation_not_ready_for_ALIGN"
@@ -1967,8 +2189,14 @@ class LaViRAAgent:
     def _alignment_ground(
         self, *, generation: int, skill_id: int, image: np.ndarray,
     ) -> dict[str, Any]:
+        prompt = self.manipulation_prompt
+        if self._operation is not None and self._operation.alignment:
+            prompt += "\nAlignment requirements for this operation: " + json.dumps(
+                {key: value for key, value in self._operation.alignment.items() if key != "max_attempts"},
+                ensure_ascii=False,
+            )
         result = self.client.alignment_grounding(
-            manipulation_prompt=self.manipulation_prompt,
+            manipulation_prompt=prompt,
             direction="front",
             image_bgr=image,
         )
@@ -2010,22 +2238,57 @@ class LaViRAAgent:
         strategic_stop: bool,
         window_id: int | None = None,
         image_bgr: np.ndarray | None = None,
+        deadline: float | None = None,
     ) -> dict[str, Any]:
-        result = validate_postcheck(self.client.postcheck(
+        capture_options = {}
+        if deadline is not None:
+            self._check_manipulation_deadline(generation, skill_id, deadline, window_id)
+            capture_options["timeout_ms"] = max(1, min(
+                getattr(self.camera, "timeout_ms", 15000),
+                int((deadline - self.monotonic()) * 1000),
+            ))
+        try:
+            image = image_bgr if image_bgr is not None else self.camera.capture_rgb(
+                camera_stream=self.alignment_head_camera_stream if skill == "MANIPULATE" else "chest_view",
+                **capture_options,
+            )
+        except Exception:
+            if deadline is not None:
+                self._check_manipulation_deadline(generation, skill_id, deadline, window_id)
+            raise
+        request = dict(
             mission=self.manipulation_prompt, global_target=self.global_target,
             strategic_goal=strategic_goal,
             strategic_stop=strategic_stop,
             expected_postcondition=expected,
             skill=skill,
-            image_bgr=(
-                self.camera.capture_rgb(
-                    camera_stream=(
-                        self.alignment_head_camera_stream
-                        if skill == "MANIPULATE" else "chest_view"
-                    ),
-                ) if image_bgr is None else image_bgr
-            ),
-        ), skill=skill)
+            image_bgr=image,
+        )
+        if deadline is None:
+            response = self.client.postcheck(**request)
+        else:
+            self._check_manipulation_deadline(generation, skill_id, deadline, window_id)
+            # Only the cloud request runs in this daemon. It cannot emit intents,
+            # mutate agent context or publish a late verdict after the next step.
+            response_future = Future()
+            finished = threading.Event()
+            postcheck = self.client.postcheck
+
+            def query():
+                try:
+                    response_future.set_result(postcheck(**request))
+                except Exception as exc:
+                    response_future.set_exception(exc)
+                finally:
+                    finished.set()
+
+            threading.Thread(target=query, name="mission-va-postcheck", daemon=True).start()
+            while not finished.is_set():
+                self._check_manipulation_deadline(generation, skill_id, deadline, window_id)
+                finished.wait(min(0.05, max(0.0, deadline - self.monotonic())))
+            self._check_manipulation_deadline(generation, skill_id, deadline, window_id)
+            response = response_future.result()
+        result = validate_postcheck(response, skill=skill)
         self._event(
             logging.INFO if result["status"] == "SATISFIED" else logging.WARNING,
             "VA_POSTCHECK",
@@ -2050,10 +2313,9 @@ class LaViRAAgent:
 
         self._latest_transition = {"executed_skill": skill, **dict(result)}
         if skill == "MOVE_TO":
-            self._next_observation_mode = (
-                "front" if result["transition"] == "READY_TO_ALIGN"
-                else "panorama"
-            )
+            # Reaching a waypoint does not mean the next action is ALIGN.
+            # Scan around the arrival heading before selecting a grounding view.
+            self._next_observation_mode = "panorama"
         elif skill == "ALIGN":
             self._next_observation_mode = (
                 "panorama"
@@ -2390,6 +2652,7 @@ class LaViRAAgent:
         self, generation: int, skill_id: int, args: Mapping[str, Any],
         strategic_goal: str,
     ) -> AgentHistoryEntry:
+        self._last_navigation_identity = None
         direction = str(args["view_direction"])
         target = str(args["target"])
         self._face_scan_direction(generation, skill_id, direction)
@@ -2438,6 +2701,8 @@ class LaViRAAgent:
         status = self._wait(generation, skill_id, segment)
         move_succeeded = status.get("state") == "reached"
         if move_succeeded:
+            # Preserve the translation segment before facing changes segment_id.
+            self._last_navigation_identity = (generation, skill_id, segment)
             try:
                 self._face_move_to_goal(generation, skill_id, status)
             except (_MoveToFacingUnavailable, _HeadingTerminalError):
@@ -2535,8 +2800,15 @@ class LaViRAAgent:
     ) -> AgentHistoryEntry:
         if args:
             raise LaViRAAgentError("ALIGN skill_args must be empty")
+        if self._operation is not None:
+            self._scan_anchor_yaw = self._sonic_yaw()
         self._face_scan_direction(generation, skill_id, "front")
-        alignment_image = self.camera.capture_rgb(camera_stream="ego_view") if getattr(self, "head_only", False) else self.camera.capture_rgb()
+        snapshot = None
+        if self._operation is not None:
+            snapshot = self._capture_va_snapshot(generation, skill_id, self._segment_id)
+            alignment_image = snapshot.rgb_bgr
+        else:
+            alignment_image = self.camera.capture_rgb(camera_stream="ego_view") if getattr(self, "head_only", False) else self.camera.capture_rgb()
         grounding = self._alignment_ground(
             generation=generation,
             skill_id=skill_id,
@@ -2544,6 +2816,14 @@ class LaViRAAgent:
         )
         target = str(grounding["target"]["name"])
         yaw_align_target = str(grounding["yaw_align_target"]["name"])
+        self._check_cancelled(generation)
+        if snapshot is not None and grounding["status"] == "FOUND":
+            local, _ = self._single_view_nav_handoff(
+                target=target, grounding={"status": "FOUND", "bbox_2d": grounding["target"]["bbox_2d"]},
+                snapshot=snapshot,
+            )
+            if local["status"] != "SATISFIED":
+                raise LaViRAAgentError(f"alignment_requires_navigation:{local['visual_evidence']}")
         if grounding["status"] != "FOUND":
             post = self._align_handoff(
                 generation=generation,
@@ -2560,6 +2840,8 @@ class LaViRAAgent:
             )
         segment = self._next_segment()
         self.submit_intent("start_base_pose", {
+            **({"operation_id": self._operation.operation_id} if self._operation else {}),
+            **({"base_pose": dict(self.base_pose_parameters)} if self.base_pose_parameters else {}),
             "generation": generation,
             "skill_id": skill_id,
             "segment_id": segment,
@@ -2594,7 +2876,19 @@ class LaViRAAgent:
         ready, reason = self.readiness(generation, skill_id)
         if not ready:
             raise LaViRAAgentError(f"manipulate_gate:{reason}")
+        operation_parameters = {}
+        if self._operation is not None:
+            operation = self._check_operation_alignment(generation)
+            operation_parameters = {
+                "operation_id": operation.operation_id,
+                "alignment_skill_id": operation.alignment_skill_id,
+                "alignment_segment_id": operation.alignment_segment_id,
+                "completion_kind": operation.completion_kind,
+            }
+            operation.consumed = True
         self.submit_intent("start_vla_task", {
+            **self.vla_task_parameters,
+            **operation_parameters,
             "generation": generation, "skill_id": skill_id, "window_id": 0,
             "task": self.manipulation_prompt,
             "handoff_context": getattr(self, "vla_trained_prompt", self.manipulation_prompt),
@@ -2649,6 +2943,54 @@ class LaViRAAgent:
         strategic_goal: str,
     ) -> AgentHistoryEntry:
         self._start_manipulation(generation, skill_id)
+        timeout = self.vla_task_parameters.get("timeout_seconds")
+        deadline = None if timeout is None else self.monotonic() + timeout
+        try:
+            return self._manipulate_active(generation, skill_id, expected, strategic_goal, deadline)
+        except _ManipulationDeadline as exc:
+            if self.vla_task_parameters.get("on_timeout") != "continue":
+                self.submit_intent("stop_vla_task", {
+                    "generation": generation, "skill_id": skill_id,
+                    "window_id": exc.window_id, "reason": "timeout",
+                })
+                raise LaViRAAgentError("manipulate_timeout") from exc
+            self._event(logging.WARNING, "SKILL_TIMEOUT_CONTINUING",
+                        "VLA time limit reached; continuing without success confirmation",
+                        generation=generation, skill_id=skill_id, timeout_seconds=timeout)
+            return self._finish_manipulation(
+                generation, skill_id, exc.window_id,
+                "VLA time limit reached; physical success is unconfirmed.", reason="timeout_continue",
+            )
+
+    def _check_manipulation_deadline(self, generation, skill_id, deadline, window_id):
+        self._check_cancelled(generation)
+        failure = self.poll_failure(generation, skill_id)
+        if failure is not None:
+            reason = str(failure.get("reason", "safety_failure"))
+            self.submit_intent("stop_vla_task", {
+                "generation": generation, "skill_id": skill_id,
+                "window_id": window_id, "reason": reason,
+            })
+            raise LaViRAAgentError(f"manipulate_safety:{reason}")
+        if self.monotonic() >= deadline:
+            raise _ManipulationDeadline(window_id)
+
+    def _manipulate_active(self, generation, skill_id, expected, strategic_goal, deadline):
+        if self._operation is not None and self._operation.completion_kind == "manual":
+            self._event(logging.INFO, "SKILL_AWAITING_OPERATOR", "Use :skill_done then Enter to complete this skill",
+                        generation=generation, skill_id=skill_id, operation_id=self._operation.operation_id)
+            try:
+                status = self.wait_status(generation, skill_id, -2, self.manipulation_timeout_seconds)
+                self._check_cancelled(generation)
+                if status.get("state") != "reached" or status.get("reason") != "operator_skill_completed":
+                    raise LaViRAAgentError(f"manual_skill_failed:{status.get('reason', 'unknown')}")
+            except Exception:
+                self.submit_intent("stop_vla_task", {
+                    "generation": generation, "skill_id": skill_id, "window_id": 0,
+                    "reason": "manual_completion_interrupted",
+                })
+                raise
+            return self._finish_manipulation(generation, skill_id, 0, "Operator completed this skill.")
         started = self.monotonic()
         unknown_count = 0
         for window_id in range(1, self.manipulation_max_windows + 1):
@@ -2663,13 +3005,18 @@ class LaViRAAgent:
                 window_id=window_id,
                 max_windows=self.manipulation_max_windows,
             )
-            if self.monotonic() - started > self.manipulation_timeout_seconds:
+            if deadline is not None:
+                self._check_manipulation_deadline(generation, skill_id, deadline, window_id)
+            elif self.monotonic() - started > self.manipulation_timeout_seconds:
                 self.submit_intent("stop_vla_task", {
                     "generation": generation, "skill_id": skill_id,
                     "window_id": window_id, "reason": "timeout",
                 })
                 raise LaViRAAgentError("manipulate_timeout")
-            self.sleep(self.manipulation_window_seconds)
+            self.sleep(self.manipulation_window_seconds if deadline is None else
+                       min(self.manipulation_window_seconds, max(0.0, deadline - self.monotonic())))
+            if deadline is not None:
+                self._check_manipulation_deadline(generation, skill_id, deadline, window_id)
             failure = self.poll_failure(generation, skill_id)
             if failure is not None:
                 self.submit_intent("stop_vla_task", {
@@ -2685,9 +3032,10 @@ class LaViRAAgent:
                 "MANIPULATE", expected, generation=generation,
                 skill_id=skill_id, strategic_goal=strategic_goal,
                 strategic_stop=True, window_id=window_id,
+                **({"deadline": deadline} if deadline is not None else {}),
             )
-            # VA runs on the LaViRA thread while the independent VLA service
-            # keeps publishing actions.  Never pause the POSE stream merely to
+            # The independent VLA service keeps publishing actions during VA
+            # checks (deadline-bound requests use a worker). Never pause POSE to
             # wait for a visual verdict; only completion, failure, timeout, or
             # cancellation is allowed to stop continuous manipulation.
             self._check_cancelled(generation)
@@ -2707,6 +3055,7 @@ class LaViRAAgent:
                     "MANIPULATE", expected, generation=generation,
                     skill_id=skill_id, strategic_goal=strategic_goal,
                     strategic_stop=True, window_id=window_id,
+                    **({"deadline": deadline} if deadline is not None else {}),
                 )
                 self._check_cancelled(generation)
                 failure = self.poll_failure(generation, skill_id)
@@ -2737,17 +3086,7 @@ class LaViRAAgent:
             else:
                 unknown_count = 0
             if post["transition"] == "TASK_COMPLETE":
-                # The gateway records completion now and delays the actual
-                # VLA stop / PLANNER handoff by five seconds.
-                self.submit_intent("stop_vla_task", {
-                    "generation": generation, "skill_id": skill_id,
-                    "window_id": window_id,
-                    "reason": "postcondition_satisfied",
-                })
-                return AgentHistoryEntry(
-                    skill_id, "MANIPULATE", self.global_target, "completion_confirmed",
-                    "SATISFIED", post["visual_evidence"],
-                )
+                return self._finish_manipulation(generation, skill_id, window_id, post["visual_evidence"])
         self.submit_intent("stop_vla_task", {
             "generation": generation, "skill_id": skill_id,
             "window_id": self.manipulation_max_windows,
@@ -2755,6 +3094,36 @@ class LaViRAAgent:
         })
         evidence = str(post["visual_evidence"])
         raise LaViRAAgentError(f"manipulate_window_limit:{evidence}")
+
+    def _finish_manipulation(self, generation, skill_id, window_id, evidence, *, reason="postcondition_satisfied"):
+        # Existing gateway timing and C++ handoff remain unchanged.
+        self._check_cancelled(generation)
+        failure = self.poll_failure(generation, skill_id)
+        if failure is not None:
+            self.submit_intent("stop_vla_task", {
+                "generation": generation, "skill_id": skill_id,
+                "window_id": window_id, "reason": str(failure.get("reason", "safety_failure")),
+            })
+            raise LaViRAAgentError(f"manipulate_safety:{failure.get('reason', 'unknown')}")
+        self.submit_intent("stop_vla_task", {
+            **self.vla_task_parameters,
+            "generation": generation, "skill_id": skill_id,
+            "window_id": window_id, "reason": reason,
+            **({"completion_settle_seconds": 0.0} if reason == "timeout_continue" else {}),
+        })
+        if self.vla_task_parameters.get("continue_mission"):
+            timeout = self.vla_handoff_timeout_seconds + self.vla_task_parameters.get("completion_settle_seconds", 5.0)
+            try:
+                status = self.wait_status(generation, skill_id, -1, timeout)
+            except TimeoutError as exc:
+                raise LaViRAAgentError("planner_handoff_status_timeout") from exc
+            self._check_cancelled(generation)
+            if status.get("state") != "ready" or status.get("reason") != "planner_ready":
+                raise LaViRAAgentError(f"vla_handoff_failed:{status.get('reason', 'unknown')}")
+        timed_out = reason == "timeout_continue"
+        return AgentHistoryEntry(skill_id, "MANIPULATE", self.global_target,
+                                 "timeout_continued" if timed_out else "completion_confirmed",
+                                 "UNKNOWN" if timed_out else "SATISFIED", evidence)
 
     def _plan_next_step(self, generation, step, todo):
         panorama = self._next_observation_mode == "panorama"
@@ -2807,30 +3176,42 @@ class LaViRAAgent:
             anchor_pose=list(scan_views[0].reference_pose),
         )
         expected_global_target = self.global_target or None
-        la = validate_language_action(
-            self.client.language_action(
-                mission=self.mission,
-                navigation_mode=self.navigation_mode,
-                global_target=expected_global_target,
-                current_step=step,
-                todo_list=todo,
-                scan_views=tuple(scan_views),
-                move_to_views=tuple(self._recent_move_to_views),
-                transition_result=self._latest_transition,
-                manipulation_prompt=self.manipulation_prompt,
-            ),
-            expected_global_target=expected_global_target,
+        return self._request_language_action(
+            mission=self.mission, navigation_mode=self.navigation_mode,
+            global_target=expected_global_target, current_step=step,
+            todo_list=todo, scan_views=tuple(scan_views),
+            move_to_views=tuple(self._recent_move_to_views),
+            transition_result=self._latest_transition,
+            manipulation_prompt=self.manipulation_prompt,
         )
-        return la
 
-    def run(self, generation: int) -> LaViRATaskResult:
+    def _request_language_action(self, **kwargs):
+        return validate_language_action(
+            self.client.language_action(
+                **({"navigation_only": True} if self._navigation_only_prompt else {}), **kwargs,
+            ),
+            expected_global_target=kwargs["global_target"],
+            navigation_only=self._navigation_only_prompt,
+            observed_directions={view.direction for view in kwargs["scan_views"]},
+        )
+
+    def _continue_after_manipulation(self, generation, step, entry, todo):
+        """Single tasks terminate; flexible missions return an updated TODO."""
+        return None
+
+    def _mission_completion_reason(self):
+        return "mission_completed"
+
+    def run(self, generation: int, *, reset_context=True, navigation_only=False,
+            subtask=False) -> LaViRATaskResult:
         step = 0
-        self._reset_task_context()
+        if reset_context:
+            self._reset_task_context()
         try:
             self._check_cancelled(generation)
             self._event(
                 logging.INFO,
-                "TASK_STARTED",
+                "GOAL_STARTED" if subtask else "TASK_STARTED",
                 "LaViRA manipulation task started",
                 generation=generation,
                 navigation_mode=self.navigation_mode,
@@ -2847,6 +3228,16 @@ class LaViRAAgent:
                 self._check_cancelled(generation)
                 self._skill_id += 1
                 la = self._plan_next_step(generation, step, todo)
+                # Only the flexible LA schema permits COMPLETE. The original
+                # single-task schema still rejects it before any action.
+                if la["decision"] == "COMPLETE":
+                    self._check_cancelled(generation)
+                    result = LaViRATaskResult(
+                        generation, "reached", self._mission_completion_reason(), step,
+                        self._skill_id, max(0, self._segment_id), self.navigation_mode,
+                    )
+                    self._event(logging.INFO, "TASK_COMPLETED", "Whole mission finished", **asdict(result))
+                    return result
                 if not self.global_target:
                     self.global_target = str(la["global_target"]).strip()
                     self._event(
@@ -2925,7 +3316,7 @@ class LaViRAAgent:
                     else:
                         entry = self._manipulate(
                             generation, self._skill_id,
-                            la["expected_postcondition"], strategic_goal,
+                            self.manipulation_postcondition or la["expected_postcondition"], strategic_goal,
                         )
                 except Exception as exc:
                     self._event(
@@ -2972,15 +3363,25 @@ class LaViRAAgent:
                         target_hint,
                     )
                     self._todo(generation, step, todo)
-                if skill == "MANIPULATE":
+                if skill == "MANIPULATE" or (navigation_only and self._global_target_navigation_ready):
+                    if skill == "MANIPULATE":
+                        continued_todo = self._continue_after_manipulation(generation, step, entry, todo)
+                        if continued_todo is not None:
+                            todo = continued_todo
+                            self._todo(generation, step, todo)
+                            continue
+                    timed_out = entry.controller_state == "timeout_continued"
+                    reason = ("navigation_completed" if navigation_only else
+                              "manipulation_timeout_continued" if timed_out else "manipulation_completed")
                     result = LaViRATaskResult(
-                        generation, "reached", "manipulation_completed", step,
+                        generation, "reached", reason, step,
                         self._skill_id, max(0, self._segment_id),
                         self.navigation_mode,
                     )
                     self._event(
                         logging.INFO,
-                        "TASK_COMPLETED",
+                        "GOAL_COMPLETED" if subtask else "TASK_COMPLETED",
+                        "LaViRA operation timed out; continuing mission" if timed_out else
                         "LaViRA manipulation task completed after VA confirmation",
                         **asdict(result),
                     )
@@ -2993,7 +3394,7 @@ class LaViRAAgent:
             )
             self._event(
                 logging.WARNING,
-                "TASK_CANCELLED",
+                "GOAL_CANCELLED" if subtask else "TASK_CANCELLED",
                 "LaViRA manipulation task cancelled",
                 **asdict(result),
             )
@@ -3009,7 +3410,7 @@ class LaViRAAgent:
             )
             self._event(
                 logging.ERROR,
-                "TASK_FAILED",
+                "GOAL_FAILED" if subtask else "TASK_FAILED",
                 "LaViRA manipulation task failed",
                 **asdict(result),
             )

@@ -12,8 +12,10 @@ from typing import Any, TYPE_CHECKING
 import numpy as np
 
 from gear_sonic.runtime.protocol.pose import pack_latent_action_message
+from gear_sonic.runtime.protocol.cpp_control import build_gripper_command, build_gripper_release_command
 from gear_sonic.runtime.telemetry import VLA_TIMING_SEGMENTS
 from gear_sonic.utils.inference.vla.inference import calculate_latency_compensated_index
+from gear_sonic.utils.inference.vla.handoff import PlannerHandoff
 
 if TYPE_CHECKING:
     from gear_sonic.runtime.inference_service import InferenceServiceContext
@@ -89,8 +91,14 @@ class _VlaRuntimeState:
     pause_loop: bool = True
     cpp_loop_running: bool = False
     cpp_mode: str = "OFF"
+    cpp_request_id: int = 0
+    hold_current_upper_body: bool = False
+    handoff: PlannerHandoff | None = None
     initial_pose_left_hand_closed: bool = False
     initial_pose_right_hand_closed: bool = False
+    # Keep the last streamed hand targets while paused; only a manual key or
+    # an explicit body-mode transition reclaims the demo latch.
+    grippers_follow_policy: bool = False
     cached_action_chunk: Any = None
     action_chunk_index: int = 0
     last_inference_request_time: float = 0.0
@@ -165,6 +173,8 @@ class _VlaCommandHandler:
         fail_active_task,
         publish_task_status,
         trained_prompt: str | None = None,
+        read_cpp_state=lambda: None,
+        monotonic=time.monotonic,
     ) -> None:
         self.state = state
         self.control_listener = control_listener
@@ -183,12 +193,15 @@ class _VlaCommandHandler:
         self.fail_active_task = fail_active_task
         self.publish_task_status = publish_task_status
         self.trained_prompt = trained_prompt
+        self.read_cpp_state = read_cpp_state
+        self.monotonic = monotonic
         self.handlers = {
             "set_prompt": self._set_prompt,
             "select_pose_mode": self._select_pose_mode,
             "select_planner_mode": self._select_planner_mode,
             "toggle_policy_pause": self._toggle_policy_pause,
             "toggle_control_loop": self._toggle_control_loop,
+            "toggle_grippers": self._toggle_grippers,
             "toggle_left_hand_initial_pose": self._toggle_left_hand,
             "toggle_right_hand_initial_pose": self._toggle_right_hand,
         }
@@ -203,6 +216,21 @@ class _VlaCommandHandler:
         handler = self.handlers.get(command.name)
         if handler is not None:
             handler(command)
+
+    def tick(self):
+        pending = self.state.handoff
+        if pending is None:
+            return
+        now = self.monotonic()
+        result = pending.update(self.read_cpp_state(), now)
+        if result and now - pending.last_publish >= 0.5:
+            pending.last_publish = now
+            self.task_status_intent.send("vla_handoff_status", {
+                "generation": self.state.task_generation, "skill_id": self.state.task_skill_id,
+                "segment_id": -1, "state": result,
+                "reason": "planner_ready" if result == "ready" else "planner_handoff_timeout",
+                "cpp_request_id": pending.request_id,
+            })
 
     def _handle_task_command(self, command) -> None:
         generation = int(command.parameters.get("generation", -1))
@@ -222,6 +250,7 @@ class _VlaCommandHandler:
         if generation < self.state.task_generation:
             return
         self.state.task_generation = generation
+        self.state.handoff = None
         self.state.task_skill_id = 0
         self.state.task_window_id = 0
         self.state.task_active = False
@@ -276,6 +305,7 @@ class _VlaCommandHandler:
             )
             return
         self.state.task_generation, self.state.task_skill_id = identity
+        self.state.handoff = None
         self.state.task_window_id = 0
         self.state.task_active = True
         self.state.task_stream_hold_active = False
@@ -285,6 +315,13 @@ class _VlaCommandHandler:
             except queue.Empty:
                 break
         self.inference_failed_event.clear()
+        self.invalidate_inference("VLA backend selection")
+        try:
+            if hasattr(self.policy, "select"):
+                self.policy.select(command.parameters.get("skill_key", ""))
+        except ValueError as exc:
+            self.fail_active_task("vla_backend_unavailable", str(exc))
+            return
         if not self.policy.ping(timeout_ms=1000):
             self.fail_active_task(
                 "vla_policy_unreachable",
@@ -373,6 +410,28 @@ class _VlaCommandHandler:
         self.state.task_stream_hold_active = False
         self.state.pause_loop = True
         self.invalidate_inference(f"VLA task stopped at window {window_id}")
+        if command.parameters.get("continue_mission"):
+            posture = command.parameters.get("navigation_upper_body", "default")
+            exit_policy = command.parameters.get("exit_policy")
+            if exit_policy is not None:
+                if not isinstance(exit_policy, str) or exit_policy not in {"hold", "default"}:
+                    self.fail_active_task("invalid_exit_policy", str(exit_policy))
+                    return
+                if command.parameters.get("reason") in {"postcondition_satisfied", "timeout_continue"}:
+                    # Upper-layer policy maps onto existing independent targets.
+                    # Keep the manual keys, publication and C++ control unchanged.
+                    posture = "hold_current" if exit_policy == "hold" else "default"
+                    if exit_policy == "default":
+                        self.state.initial_pose_left_hand_closed = False
+                        self.state.initial_pose_right_hand_closed = False
+            if posture not in {"default", "hold_current"}:
+                self.fail_active_task("invalid_navigation_upper_body", str(posture))
+                return
+            self.state.hold_current_upper_body = posture == "hold_current"
+            sent = self.send_cpp_control_command(start=True, planner=True)
+            self.state.handoff = PlannerHandoff(self.state.cpp_request_id if sent else 0,
+                                                self.monotonic() + 10.0)
+            return
         if self.state.cpp_mode == "POSE":
             self.send_cpp_control_command(start=True, planner=True)
 
@@ -391,6 +450,13 @@ class _VlaCommandHandler:
             )
 
     def _select_pose_mode(self, _command) -> None:
+        policy = getattr(self, "policy", None)
+        if getattr(policy, "disabled", False):
+            self.record_event(logging.WARNING, "SMOKE_VLA_BACKENDS_DISABLED", "POSE is disabled in VLA smoke mode")
+            return
+        if hasattr(policy, "ready") and not policy.ready():
+            self.record_event(logging.WARNING, "VLA_PREWARM_PENDING", "Wait for VLA_BACKENDS_WARMED before POSE")
+            return
         self.state.zmq_frame_counter = 0
         self.invalidate_inference("entering POSE mode")
         if self.state.cpp_mode == "PLANNER":
@@ -413,6 +479,13 @@ class _VlaCommandHandler:
             )
 
     def _toggle_policy_pause(self, _command) -> None:
+        policy = getattr(self, "policy", None)
+        if getattr(policy, "disabled", False):
+            self.record_event(logging.WARNING, "SMOKE_VLA_BACKENDS_DISABLED", "Policy inference is disabled in VLA smoke mode")
+            return
+        if hasattr(policy, "ready") and not policy.ready():
+            self.record_event(logging.WARNING, "VLA_PREWARM_PENDING", "Wait for VLA_BACKENDS_WARMED before POSE")
+            return
         if self.state.cpp_mode == "PLANNER":
             self.record_event(
                 logging.WARNING,
@@ -458,12 +531,36 @@ class _VlaCommandHandler:
                 "Planner mode active; remote VLA inference is suspended",
             )
 
+    def _claim_manual_grippers(self) -> bool:
+        if _pose_policy_is_active(self.state.cpp_loop_running, self.state.cpp_mode, self.state.pause_loop):
+            self.record_event(
+                logging.WARNING, "MANUAL_GRIPPERS_BLOCKED",
+                "Pause VLA before taking manual gripper control",
+            )
+            return False
+        self.state.grippers_follow_policy = False
+        return True
+
+    def _toggle_grippers(self, _command) -> None:
+        if not _VlaCommandHandler._claim_manual_grippers(self):
+            return
+        closed = not (
+            self.state.initial_pose_left_hand_closed
+            and self.state.initial_pose_right_hand_closed
+        )
+        self.state.initial_pose_left_hand_closed = closed
+        self.state.initial_pose_right_hand_closed = closed
+
     def _toggle_left_hand(self, _command) -> None:
+        if not _VlaCommandHandler._claim_manual_grippers(self):
+            return
         self.state.initial_pose_left_hand_closed = (
             not self.state.initial_pose_left_hand_closed
         )
 
     def _toggle_right_hand(self, _command) -> None:
+        if not _VlaCommandHandler._claim_manual_grippers(self):
+            return
         self.state.initial_pose_right_hand_closed = (
             not self.state.initial_pose_right_hand_closed
         )
@@ -613,6 +710,14 @@ def _schedule_vla_inference(
         pass
 
 
+def _publish_manual_grippers(state: _VlaRuntimeState, zmq_socket) -> None:
+    """Refresh manual targets only while they own the grippers."""
+    if not state.grippers_follow_policy:
+        zmq_socket.send(build_gripper_command(
+            state.initial_pose_left_hand_closed, state.initial_pose_right_hand_closed,
+        ))
+
+
 def _publish_cached_action(
     state: _VlaRuntimeState,
     *,
@@ -661,6 +766,15 @@ def _publish_cached_action(
                 right_hand_joints=right_hand_joints,
             )
         )
+        if not state.pause_loop:
+            # Publish valid model hand data before releasing the manual latch.
+            # Repeat the idempotent release with each frame to tolerate packet loss.
+            zmq_socket.send(build_gripper_release_command())
+            state.grippers_follow_policy = True
+            # Manual toggles after a pause start from the last model open/closed
+            # state, rather than a stale target from before VLA execution.
+            state.initial_pose_left_hand_closed = bool(left_hand_joints[0] >= 0.5)
+            state.initial_pose_right_hand_closed = bool(right_hand_joints[0] >= 0.5)
 
     state.action_chunk_index = min(
         state.action_chunk_index + 1,

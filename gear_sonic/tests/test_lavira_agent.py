@@ -886,7 +886,7 @@ def test_each_la_step_gets_panorama_and_consecutive_move_to_are_supported():
     assert len(client.la_calls[0]["scan_views"]) == 5
     names = [name for name, _ in intents]
     assert names.count("navigation_goal") == 3
-    assert names.count("navigation_heading_goal") == 5 * 3 + 3 + 3
+    assert names.count("navigation_heading_goal") == 5 * 4 + 3 + 3
     heading_deltas = [
         args["heading_delta_rad"]
         for name, args in intents if name == "navigation_heading_goal"
@@ -1469,7 +1469,35 @@ def test_align_retry_and_align_can_return_to_move_to():
     assert agent._history[1].controller_state == "target_not_found"
 
 
-def test_ready_nav_allows_another_move_and_uses_front_observation():
+@pytest.mark.parametrize("flexible", [False, True])
+def test_la_retries_direction_without_current_image(tmp_path, flexible):
+    requests = []
+    replies = iter([
+        {**move("basket", direction), "updated_todo_list": "- [ ] Move to basket"}
+        for direction in ("right", "front")
+    ])
+
+    def create(**kwargs):
+        requests.append(kwargs)
+        return SimpleNamespace(choices=[SimpleNamespace(
+            message=SimpleNamespace(content=json.dumps(next(replies))))])
+
+    cloud = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=create)))
+    client = LaViRAClient(la_client=cloud, va_client=cloud,
+                         la_base_url="https://example.invalid", va_base_url="https://example.invalid",
+                         request_context_dir=tmp_path)
+    result = client.language_action(
+        mission="move to the basket", navigation_mode="vln", global_target="basket",
+        current_step=2, todo_list="", move_to_views=(),
+        scan_views=(ScanView(2, "front", np.zeros((8, 8, 3), np.uint8), (0, 0, 0), 0),),
+        **({"available_skills": {}} if flexible else {}),
+    )
+    assert result["skill_args"]["view_direction"] == "front"
+    assert len(requests) == 2
+    assert "MOVE_TO direction has no current observation" in requests[1]["messages"][0]["content"]
+
+
+def test_ready_nav_scans_before_selecting_another_move():
     agent, _camera, client, intents, _waited = build_agent(
         [move(), move("another landmark"), decision(None, result="FAIL")],
         groundings=[grounding() for _ in range(6)],
@@ -1480,7 +1508,7 @@ def test_ready_nav_allows_another_move_and_uses_front_observation():
     assert result.reason.startswith("la_fail")
     assert len(client.la_calls[0]["scan_views"]) == 5
     assert [view.direction for view in client.la_calls[1]["scan_views"]] == [
-        "front",
+        "front", "front_right", "right", "left", "front_left",
     ]
     assert [name for name, _args in intents].count("navigation_goal") == 2
 
@@ -2303,10 +2331,10 @@ def test_structured_events_cover_panorama_three_skills_and_completion():
         for event in events
         if event["code"] == "SKILL_STARTED"
     ] == ["MOVE_TO", "ALIGN", "MANIPULATE"]
-    assert sum(event["code"] == "PANORAMA_COMPLETED" for event in events) == 1
+    assert sum(event["code"] == "PANORAMA_COMPLETED" for event in events) == 2
     assert sum(
         event["code"] == "FRONT_OBSERVATION_COMPLETED" for event in events
-    ) == 2
+    ) == 1
     handoff_events = [
         event for event in events
         if event["code"] in {
@@ -2322,5 +2350,5 @@ def test_structured_events_cover_panorama_three_skills_and_completion():
     assert [event["fields"]["transition"] for event in postcheck_events] == [
         "TASK_COMPLETE",
     ]
-    assert [name for name, _args in intents].count("navigation_heading_goal") == 8
+    assert [name for name, _args in intents].count("navigation_heading_goal") == 13
     assert events[-1]["code"] == "TASK_COMPLETED"

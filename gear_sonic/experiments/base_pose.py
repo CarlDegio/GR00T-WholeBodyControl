@@ -66,6 +66,7 @@ def tracker_for(config, target, yaw):
         imgsz=config.raw_yoloe_imgsz,
         device=config.raw_yoloe_device,
         yaw_align_target_prompt=yaw,
+        tracking_enabled=getattr(config, "raw_yoloe_tracking", False),
     )
     tracker.start_all_text(target_prompt=target)
     return tracker

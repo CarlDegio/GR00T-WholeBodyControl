@@ -15,6 +15,8 @@ CONSOLE_COMMAND_NAMES = {
     "g": "complete_agent_success",
     "h": "complete_agent_failure",
     "i": "select_pose_mode",
+    "j": "toggle_grippers",
+    "skill_done": "complete_skill",
     "k": "toggle_control_loop",
     "o": "select_planner_mode",
     "p": "toggle_policy_pause",
@@ -22,7 +24,7 @@ CONSOLE_COMMAND_NAMES = {
     "]": "toggle_right_hand_initial_pose",
 }
 PROMPT_PREFIX = "prompt:"
-NAVIGATION_KEYS = frozenset({"w", "a", "s", "d", "q", "e", "n", "b", " "})
+NAVIGATION_KEYS = frozenset({"w", "a", "s", "d", "q", "e", "n", "m", "t", "b", " "})
 MANUAL_NAVIGATION_VELOCITIES = {
     "w": (0.3, 0.0, 0.0),
     "s": (-0.3, 0.0, 0.0),
@@ -207,6 +209,16 @@ class NavigationControlState:
         self.lavira_task_active = False
         self.task_started_at: float | None = None
         self.window_id = 0
+        self.alignment_ticket: tuple[int, int, int, str] | None = None
+        self.pending_operation_id = ""
+        self.operation_id = ""
+        self.manual_completion_pending = False
+
+    def _clear_operation(self) -> None:
+        self.alignment_ticket = None
+        self.pending_operation_id = ""
+        self.operation_id = ""
+        self.manual_completion_pending = False
 
     @property
     def owner(self) -> str | None:
@@ -235,16 +247,17 @@ class NavigationControlState:
         normalized = key.lower()
         if normalized not in NAVIGATION_KEYS:
             raise ValueError(f"unsupported navigation key: {key!r}")
-        if normalized in {"n", "b"}:
+        if normalized in {"n", "m", "t", "b"}:
             if self.mode != "listen_wasd":
                 return self._busy()
             self.generation += 1
+            self._clear_operation()
             self.skill_id = 0
-            self.segment_id = -1 if normalized == "n" else 0
+            self.segment_id = -1 if normalized in {"n", "m", "t"} else 0
             self.window_id = 0
             self.manual_velocity = (0.0, 0.0, 0.0)
             self.manual_deadline = 0.0
-            is_lavira = normalized == "n"
+            is_lavira = normalized in {"n", "m", "t"}
             self.lavira_task_active = is_lavira
             self.task_started_at = float(now) if is_lavira else None
             self.mode = "lavira_pending" if is_lavira else "base_pose_inference"
@@ -256,6 +269,7 @@ class NavigationControlState:
             )
         if normalized == " ":
             self.generation += 1
+            self._clear_operation()
             self.skill_id = 0
             self.segment_id = 0
             self.window_id = 0
@@ -302,6 +316,7 @@ class NavigationControlState:
             and float(now) >= self.manual_deadline
         ):
             self.generation += 1
+            self._clear_operation()
             self.skill_id = 0
             self.manual_velocity = (0.0, 0.0, 0.0)
             self.manual_deadline = 0.0
@@ -330,6 +345,7 @@ class NavigationControlState:
             raise ValueError("stale or unexpected navigation goal")
         self.skill_id = skill_id
         self.segment_id = segment_id
+        self._clear_operation()
         self.mode = "lavira_nav"
         return NavigationControlAction(
             generation,
@@ -387,6 +403,8 @@ class NavigationControlState:
             raise ValueError("stale or unexpected BasePose start")
         self.skill_id = skill_id
         self.segment_id = segment_id
+        self._clear_operation()
+        self.pending_operation_id = str(parameters.get("operation_id", ""))
         self.mode = "base_pose_inference"
         return NavigationControlAction(
             generation,
@@ -403,14 +421,28 @@ class NavigationControlState:
         skill_id = int(parameters.get("skill_id", 0))
         if generation != self.generation or not self.lavira_task_active:
             return False
+        if self.mode == "lavira_handoff":
+            return name == "stop_vla_task" and skill_id == self.skill_id
         if name == "start_vla_task":
             if self.mode == "lavira_manipulate" and skill_id == self.skill_id:
-                return True
+                return parameters.get("operation_id", "") == self.operation_id
             if self.mode != "lavira_pending" or skill_id < self.skill_id:
                 return False
+            operation_id = parameters.get("operation_id", "")
+            if operation_id or self.pending_operation_id:
+                ticket = (generation, parameters.get("alignment_skill_id"),
+                          parameters.get("alignment_segment_id"), operation_id)
+                completion_kind = parameters.get("completion_kind")
+                if (ticket != self.alignment_ticket or skill_id <= self.skill_id
+                    or not isinstance(completion_kind, str)
+                    or completion_kind not in {"visual", "manual"}):
+                    return False
             if skill_id > self.skill_id:
                 self.segment_id = 0
             self.skill_id = skill_id
+            self.alignment_ticket = None
+            self.operation_id = str(operation_id)
+            self.manual_completion_pending = bool(operation_id) and parameters.get("completion_kind") == "manual"
             self.window_id = int(parameters.get("window_id", 0))
             self.mode = "lavira_manipulate"
             return True
@@ -421,6 +453,25 @@ class NavigationControlState:
             return False
         self.window_id = window_id
         return name in {"hold_vla_task", "resume_vla_task", "stop_vla_task"}
+
+    def complete_skill(self) -> dict[str, object] | None:
+        """Complete only the current manually supervised VLA operation, once."""
+        if not self.lavira_task_active or self.mode != "lavira_manipulate" or not self.manual_completion_pending:
+            return None
+        self.manual_completion_pending = False
+        return {"generation": self.generation, "skill_id": self.skill_id, "segment_id": -2,
+                "operation_id": self.operation_id, "state": "reached", "reason": "operator_skill_completed"}
+
+    def accept_vla_handoff(self, parameters: Mapping[str, object]) -> bool:
+        if (int(parameters.get("generation", -1)), int(parameters.get("skill_id", -1))) != (
+            self.generation, self.skill_id
+        ) or not self.lavira_task_active:
+            return False
+        if self.mode not in {"lavira_handoff", "lavira_pending"}:
+            return False
+        if parameters.get("state") == "ready":
+            self.mode = "lavira_pending"
+        return True
 
     def accept_base_pose_velocity(
         self,
@@ -452,7 +503,7 @@ class NavigationControlState:
         elif motion_profile == "yoloe_servo":
             unsafe = (
                 abs(vx) > 0.400001
-                or abs(vy) > 0.400001
+                or abs(vy) > 0.500001
                 or abs(wz) > 0.300001
                 or (abs(vx) > 0.000001 and abs(vy) > 0.000001)
             )
@@ -503,13 +554,23 @@ class NavigationControlState:
             return False
         if owner is not None and self.owner != owner:
             return False
+        if owner == "base_pose" and self.pending_operation_id:
+            if int(payload.get("segment_id", -1)) != self.segment_id:
+                return False
         if owner == "lavira" and not agent_final:
             if int(payload.get("segment_id", 0)) != self.segment_id:
                 return False
             if self.mode != "lavira_nav":
                 return False
         if payload.get("state") in {"reached", "failed", "stopped"}:
+            if owner == "base_pose":
+                self.alignment_ticket = (
+                    (self.generation, self.skill_id, self.segment_id, self.pending_operation_id)
+                    if self.pending_operation_id and payload.get("state") == "reached"
+                    and payload.get("reason") == "aligned" else None
+                )
             if owner == "lavira" and agent_final:
+                self._clear_operation()
                 self.mode = "lavira_completing" if defer_vla_stop else "listen_wasd"
                 self.lavira_task_active = False
                 self.task_started_at = None

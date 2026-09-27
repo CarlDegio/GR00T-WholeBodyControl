@@ -3,7 +3,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field, replace
 import logging
 import math
 from pathlib import Path
@@ -12,6 +12,8 @@ import time
 from typing import Any, Callable, Mapping
 
 import zmq
+
+from gear_sonic.utils.inference.base_pose.alignment_overrides import OVERRIDE_FIELDS, validate_alignment_overrides
 
 from gear_sonic.camera.calibration import DEFAULT_CAMERA_INTRINSICS_PATH
 from gear_sonic.runtime.profile import (
@@ -85,6 +87,9 @@ class BasePoseAgentConfig:
     raw_yoloe_model_path: str = "tools/yoloe26m/weights/yoloe-26m-seg.pt"
     raw_yoloe_device: str = "0"
     raw_yoloe_confidence: float = 0.25
+    raw_yoloe_tracking: bool = field(default=False, metadata={"profile_optional": True})
+    raw_head_target_confidence: float | None = None
+    raw_chest_target_confidence: float | None = None
     raw_yoloe_imgsz: int = 640
     raw_diagnostic_image_interval_frames: int = 5
     raw_head_target_distance_m: float = 1.00
@@ -93,13 +98,14 @@ class BasePoseAgentConfig:
     raw_chest_approach_cutoff_m: float = 1.30
     raw_forward_tolerance_m: float = 0.10
     raw_lateral_tolerance_m: float = 0.10
+    raw_stable_frames: int = field(default=5, metadata={"profile_optional": True})
     raw_lateral_pulse_enter_m: float = 0.10
     raw_lateral_pulse_exit_m: float = 0.20
     raw_lateral_pulse_max_s: float = 0.20
     raw_lateral_pulse_settle_s: float = 0.50
     raw_lateral_pulse_sample_frames: int = 3
     raw_min_linear_speed_m_s: float = 0.40
-    raw_max_lateral_speed_m_s: float = 0.40
+    raw_max_lateral_speed_m_s: float = 0.50
     raw_min_yaw_speed_rad_s: float = 0.10
     raw_yaw_tolerance_deg: float = 8.0
     raw_yaw_coarse_speed_rad_s: float = 0.30
@@ -113,6 +119,12 @@ class BasePoseAgentConfig:
     raw_post_stop_deviation_frames: int = 10
 
     def __post_init__(self) -> None:
+        if type(self.raw_stable_frames) is not int or self.raw_stable_frames <= 0:
+            raise ValueError("raw_stable_frames must be a positive integer")
+        for name in ("raw_head_target_confidence", "raw_chest_target_confidence"):
+            value = getattr(self, name)
+            if value is not None and (not math.isfinite(value) or not 0.0 < value <= 1.0):
+                raise ValueError(f"{name} must be in (0, 1]")
         self.target_prompt = str(self.target_prompt).strip()
         if not self.target_prompt:
             raise ValueError("target_prompt must be non-empty")
@@ -234,6 +246,7 @@ class GatewayRawServoAdapter:
         self.report_metrics = report_metrics
         self.monotonic = monotonic
         self.pulse_recorder = pulse_recorder
+        self._default_alignment = {name: getattr(config, name) for name in OVERRIDE_FIELDS}
         self._publish_enabled = False
         self._terminal_reported = True
         self.task_generation = 0
@@ -357,6 +370,7 @@ class GatewayRawServoAdapter:
         target: object | None = None,
         yaw_align_target: object | None = None,
         reference_bbox: object | None = None,
+        base_pose: object | None = None,
         now: float | None = None,
     ) -> bool:
         timestamp = self.monotonic() if now is None else float(now)
@@ -389,6 +403,18 @@ class GatewayRawServoAdapter:
                 clear_gateway_owner=True,
             )
             return False
+        try:
+            settings = {**self._default_alignment,
+                        **validate_alignment_overrides({} if base_pose is None else base_pose)}
+            # Validate the effective pair against the profile's approach cutoffs.
+            replace(self.runtime.config, **settings)
+        except ValueError as exc:
+            self._reject_start(
+                generation=requested_generation, skill_id=requested_skill_id,
+                segment_id=requested_segment_id, reason=f"invalid_base_pose:{exc}",
+                clear_gateway_owner=True,
+            )
+            return False
         if target is not None:
             normalized_target = str(target).strip()
             if not normalized_target:
@@ -413,6 +439,10 @@ class GatewayRawServoAdapter:
                 )
                 return False
             self.runtime.config.yaw_align_target_prompt = normalized_yaw_align_target
+        # Every invocation starts from the profile defaults, so a bin override
+        # cannot leak into a later bag alignment or manual start.
+        for name, setting in settings.items():
+            setattr(self.runtime.config, name, setting)
         self.task_generation = requested_generation
         self.skill_id = requested_skill_id
         self.segment_id = requested_segment_id
@@ -568,6 +598,9 @@ def run_base_pose_yolo_agent(config: Any) -> None:
     experiment_profile = load_runtime_profile(config.profile or None, overlays=config.overlay)
     experiment = settings(experiment_profile)
     config.minimal_logging = bool(experiment)
+    if experiment.get("alignment") == "unilm_nav":
+        from gear_sonic.utils.inference.base_pose.unilm_runtime import run
+        return run(config)
     if experiment.get("alignment") == "geometric":
         return run_geometric_service(config, experiment_profile)
     # Keep all scalar diagnostics in experiments, without copying/saving RGB frames.
@@ -743,6 +776,7 @@ def run_base_pose_yolo_agent(config: Any) -> None:
                         target=command.parameters.get("target"),
                         yaw_align_target=command.parameters.get("yaw_align_target"),
                         reference_bbox=command.parameters.get("reference_bbox"),
+                        base_pose=command.parameters.get("base_pose"),
                     )
                 else:
                     reason = str(

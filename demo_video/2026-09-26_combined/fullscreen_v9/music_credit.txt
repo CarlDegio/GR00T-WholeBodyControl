@@ -1,0 +1,5 @@
+Music: "Calm Piano 1 (Vaporware)" / "Vaporware"
+Artist: The Cynic Project / cynicmusic.com / pixelsphere.org
+Source: https://opengameart.org/content/calm-piano-1-vaporware
+License: CC0 1.0 — https://creativecommons.org/publicdomain/zero/1.0/
+Edit: crossfaded repeat, trimmed to video, normalized to -24 LUFS, 2s fade-in / 4s fade-out.

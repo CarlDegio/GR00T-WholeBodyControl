@@ -88,6 +88,22 @@ def test_reverse_pulses_have_opposite_signed_displacements(recording):
     assert [r["total_displacement"]["left_m"] for r in rows] == pytest.approx([0.03, -0.03])
 
 
+def test_untracked_targets_keep_pulse_timing_without_claiming_visual_displacement(recording):
+    recorder, clock = recording
+    frame(recorder, 10.0, track=None, right=0)
+    send(recorder, clock, 10.0, .4, token=10.0)
+    frame(recorder, 10.2, track=None, right=.8)
+    send(recorder, clock, 10.2)
+    frame(recorder, 10.7, track=None, right=.8)
+    clock[0] = 10.7
+    recorder.tick()
+    (row,) = read(recorder)
+    assert row['pulse_duration_s'] == pytest.approx(.2)
+    for phase in ('pulse_displacement', 'wait_displacement', 'total_displacement'):
+        assert 'missing_reason' in row[phase]
+        assert 'planar_m' not in row[phase]
+
+
 @pytest.mark.parametrize("change", ["camera", "target", "lost", "stale"])
 def test_unreliable_visual_boundaries_are_missing_not_zero(recording, change):
     recorder, clock = recording

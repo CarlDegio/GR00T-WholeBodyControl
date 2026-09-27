@@ -40,7 +40,7 @@ def settings(profile):
     return dict(profile.components.get("experiment", {}))
 
 
-def resolve(path, task_id="T1", case_id=None):
+def resolve(path, task_id="T1", case_id=None, *, mission_path=None):
     path = Path(path).resolve()
     spec = read_yaml(path)
     if spec.get("schema") != "sonic.experiment.v1":
@@ -50,6 +50,7 @@ def resolve(path, task_id="T1", case_id=None):
         "method",
         "table",
         "runtime_profile",
+        "runtime_overlays",
         "tasks_file",
         "cases_file",
         "default_case",
@@ -65,6 +66,15 @@ def resolve(path, task_id="T1", case_id=None):
     }
     if unknown:
         raise ValueError(f"Unknown experiment fields: {sorted(unknown)}")
+    mission_overlay = read_yaml(mission_path) if mission_path is not None else None
+    # Named missions own their task identity, including when --task is omitted
+    # or a stale command still passes another task number.
+    identity = (mission_overlay or {}).get("components", {}).get("mission_metadata", {})
+    if not isinstance(identity, dict):
+        raise ValueError("mission_metadata must be a mapping")
+    task_id = identity.get("task_id", task_id)
+    if task_id not in {"T1", "T2", "T3", "T4"}:
+        raise ValueError(f"Invalid mission task_id: {task_id!r}")
     tasks = read_yaml(path.parent / spec["tasks_file"])
     task = merge(tasks["defaults"], tasks["tasks"][task_id])
     cases = read_yaml(path.parent / spec["cases_file"])["cases"]
@@ -72,6 +82,8 @@ def resolve(path, task_id="T1", case_id=None):
     case = copy.deepcopy(cases[case_id])
     method = spec["method"]
     missing = []
+    if mission_overlay is not None and method not in {"full_vln", "nav_direct_vla", "geometric_vla", "baselinelavira", "unilm_nav"}:
+        raise ValueError("--mission is supported by full_vln, nav_direct_vla, geometric_vla, baselinelavira and unilm_nav")
 
     def required(value, label):
         if value is None or not str(value).strip() or str(value).startswith("REQUIRED"):
@@ -96,17 +108,36 @@ def resolve(path, task_id="T1", case_id=None):
         for key in ("layout_id", "start_id"):
             required(case.get(key), f"{case_id}.{key}")
     runtime_path = (path.parent / spec["runtime_profile"]).resolve()
-    runtime = merge(read_yaml(runtime_path), spec.get("runtime_overrides", {}))
+    overlays = spec.get("runtime_overlays", [])
+    if not isinstance(overlays, list) or any(not isinstance(p, str) or not p.strip() for p in overlays):
+        raise ValueError("runtime_overlays must be a list of YAML paths relative to the experiment config")
+    runtime = read_yaml(runtime_path)
+    for overlay in overlays:
+        runtime = merge(runtime, read_yaml(path.parent / overlay))
+    runtime = merge(runtime, spec.get("runtime_overrides", {}))
+    if mission_overlay is not None:
+        runtime = merge(runtime, mission_overlay)
     c = runtime["components"]
-    c["lavira"].update(
-        mission=mission or "REQUIRED",
-        global_target=task["global_target"],
-        manipulation_prompt=semantic or "REQUIRED",
-        navigation_mode=nav,
-        manipulation_timeout_seconds=float(task["vla_timeout_s"]),
-        nav_handoff_max_depth_m=3.0,
-    )
-    c["vla"]["prompt"] = trained or "REQUIRED"
+    flexible = c["lavira"].get("flexible_mission", False)
+    if mission_overlay is not None and flexible is not True:
+        raise ValueError("--mission requires flexible_mission: true")
+    if flexible:
+        # The whole mission and each skill's fixed prompt belong to the mission
+        # overlay, not the legacy single-operation task/route templates.
+        missing = [key for key in missing if key in {f"{case_id}.layout_id", f"{case_id}.start_id"}]
+        task.update(vla_prompt=c["lavira"].get("mission", ""), vla_trained_prompt=None,
+                    policy_id=None)
+        c["lavira"]["manipulation_timeout_seconds"] = float(task["vla_timeout_s"])
+    else:
+        c["lavira"].update(
+            mission=mission or "REQUIRED",
+            global_target=task["global_target"],
+            manipulation_prompt=semantic or "REQUIRED",
+            navigation_mode=nav,
+            manipulation_timeout_seconds=float(task["vla_timeout_s"]),
+            nav_handoff_max_depth_m=3.0,
+        )
+        c["vla"]["prompt"] = trained or "REQUIRED"
     c["launcher"].update(
         base_pose_enabled=spec.get("alignment", "dual") != "none", data_exporter=False, slam_debug=False
     )
@@ -136,6 +167,7 @@ def resolve(path, task_id="T1", case_id=None):
         navila=merge(tasks.get("navila", {}), spec.get("navila", {})),
         gate_under_test=spec.get("gate_under_test"),
         minimal_logging=True,
+        flexible_mission=flexible,
         source_config=str(path),
         models=dict(
             policy_id=task["policy_id"],
@@ -145,9 +177,25 @@ def resolve(path, task_id="T1", case_id=None):
             yoloe=c["base_pose"]["raw_yoloe_model_path"],
         ),
     )
+    if flexible:
+        experiment.update(
+            nearfield_entries=copy.deepcopy(identity.get("nearfield_entries", {})),
+            mission=c["lavira"]["mission"], skills=copy.deepcopy(c["lavira"].get("skills", {})),
+            mission_source=str(Path(mission_path).resolve()) if mission_path else str(runtime_path),
+        )
+        experiment["models"]["vla_backends"] = copy.deepcopy(c["vla"].get("backends", {}))
+    if experiment["alignment"] == "unilm_nav":
+        experiment["models"].pop("yoloe", None)
+        experiment["models"]["unilm_nav"] = copy.deepcopy(c.get("unilm_nav", {}))
+    if c.get("navigation_policy", {}).get("backend") == "iplanner":
+        checkpoint = Path(c["iplanner"]["checkpoint"]).expanduser()
+        if not checkpoint.is_absolute():
+            checkpoint = Path(c["iplanner"]["root"]).expanduser() / checkpoint
+        experiment["models"].pop("navdp_checkpoint", None)
+        experiment["models"].update(navigation_policy="iplanner", iplanner_checkpoint=str(checkpoint))
     experiment["geometric"].setdefault("both_lost_frames", 20)
     experiment["geometric"]["target"] = task.get("geometry_target", "")
-    if experiment["alignment"] not in {"dual", "head", "none", "geometric"} or experiment["entry_stage"] not in {
+    if experiment["alignment"] not in {"dual", "head", "none", "geometric", "unilm_nav"} or experiment["entry_stage"] not in {
         "navigation",
         "alignment",
         "manipulation",
@@ -188,7 +236,7 @@ def resolve(path, task_id="T1", case_id=None):
     if disturbance.get("enabled"):
         required(disturbance.get("description"), f"{case_id}.perturbation.description")
         required(disturbance.get("amplitude"), f"{case_id}.perturbation.amplitude")
-    if experiment["alignment"] == "geometric":
+    if experiment["alignment"] == "geometric" and not flexible:
         required(experiment["geometric"]["target"], f"{task_id}.geometry_target")
     c["experiment"] = experiment
     runtime["profile"] = f"icra_{method}_{task_id}_{case_id}"
@@ -200,20 +248,31 @@ def launch(default_name, argv=None):
     parser.add_argument("--config", type=Path, default=CONFIGS / f"{default_name}.yaml")
     parser.add_argument("--task", choices=("T1", "T2", "T3", "T4"), default="T1")
     parser.add_argument("--case")
+    parser.add_argument("--mission", type=Path, help="Flexible mission overlay shared by the main methods")
+    parser.add_argument("--demo", action="store_true", help="Cache demo video until trial end and save full LA/VA evidence")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--manifest", type=Path, help="Offline semantic sample manifest")
     parser.add_argument("--output", type=Path, default=ROOT.parent / "outputs" / "experiments")
     args = parser.parse_args(argv)
-    profile, missing = resolve(args.config, args.task, args.case)
+    profile, missing = resolve(args.config, args.task, args.case, mission_path=args.mission)
+    if args.demo:
+        if profile["components"]["experiment"]["table"] == "semantic":
+            parser.error("--demo requires a live experiment, not semantic_roles")
+        profile["components"]["experiment"]["demo"] = True
     # Validate the compiled worker profiles without connecting to any service.
     from gear_sonic.scripts.launch_inference import load_inference_launch_config
     from gear_sonic.utils.inference.base_pose.agent import load_base_pose_config
     from gear_sonic.utils.inference.lavira.service import load_lavira_config
     from gear_sonic.utils.inference.vla.service import load_inference_config
+    from gear_sonic.runtime.profile import load_runtime_profile
+    from gear_sonic.utils.inference.lavira.mission import validate_mission_profile
+    from gear_sonic.utils.inference.iplanner.config import load_iplanner_server_config, navigation_backend
 
     with tempfile.TemporaryDirectory(prefix="sonic-experiment-validate-") as directory:
         validation_path = Path(directory) / "runtime.yaml"
         validation_path.write_text(yaml.safe_dump(profile))
+        compiled = load_runtime_profile(validation_path)
+        validate_mission_profile(compiled)
         for loader in (
             load_inference_launch_config,
             load_base_pose_config,
@@ -221,6 +280,25 @@ def launch(default_name, argv=None):
             load_inference_config,
         ):
             loader(str(validation_path))
+        if profile["components"]["experiment"]["alignment"] == "unilm_nav":
+            from gear_sonic.runtime.profile import load_component_config
+            from gear_sonic.utils.inference.base_pose.unilm import UniLMConfig, robot_geometry
+
+            unilm = load_component_config(UniLMConfig, "unilm_nav", str(validation_path))
+            if not unilm.enabled:
+                raise ValueError("unilm_nav experiment requires components.unilm_nav.enabled")
+            robot_geometry(unilm.urdf_path, unilm.camera_height_m)
+        if navigation_backend(compiled) == "iplanner":
+            from gear_sonic.utils.inference.iplanner.control import load_navigation_config
+
+            experiment = profile["components"]["experiment"]
+            launcher = profile["components"]["launcher"]
+            if (experiment["navigation_backend"] != "lavira" or experiment["entry_stage"] != "navigation"
+                    or not launcher["keyboard_planner"] or launcher["planner_input"] != "lavira"):
+                raise ValueError("iPlanner requires the LaViRA planner and a navigation entry stage")
+            server = load_iplanner_server_config(compiled)
+            load_navigation_config(compiled)
+            missing.extend(f"{label}: {path}" for path, label in server.required_assets() if not path.is_file())
     exp = profile["components"]["experiment"]
     if exp["table"] == "semantic" and (args.manifest is None or not args.manifest.is_file()):
         missing.append("--manifest (existing offline sample manifest)")
@@ -253,9 +331,11 @@ def launch(default_name, argv=None):
     if missing:
         parser.error("Fill required experiment inputs before launch: " + ", ".join(missing))
     session_id = uuid.uuid4().hex[:12]
-    run_dir = (args.output / f"{exp['method']}_{args.task}_{exp['case_id']}_{session_id}").resolve()
+    run_dir = (args.output / f"{exp['method']}_{exp['task_id']}_{exp['case_id']}_{session_id}").resolve()
     run_dir.mkdir(parents=True)
     exp.update(session_id=session_id, run_dir=str(run_dir))
+    if exp["alignment"] == "unilm_nav":
+        profile["components"]["unilm_nav"]["output_root"] = str(run_dir / "unilm_nav")
     exp["config_sha256"] = hashlib.sha256(json.dumps(profile, sort_keys=True).encode()).hexdigest()
     exp["git_commit"] = subprocess.run(
         ["git", "rev-parse", "HEAD"], cwd=ROOT.parent, capture_output=True, text=True

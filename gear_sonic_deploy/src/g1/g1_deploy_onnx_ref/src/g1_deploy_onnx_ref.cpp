@@ -46,6 +46,7 @@
  *   --policy-fp16         | Use FP16 for policy TensorRT engine
  */
 #include <cmath>
+#include "planner_upper_body_hold.hpp"
 #include <cuda_runtime_api.h>
 #include <memory>
 #include <mutex>
@@ -205,6 +206,8 @@ class G1Deploy {
     bool has_upper_body_data_ = false;
     std::array<double, 17> upper_body_joint_positions_buffer_;
     std::array<double, 17> upper_body_joint_velocities_buffer_;
+    PlannerUpperBodyHold planner_upper_body_hold_;
+    bool demo_controls_ = false;
     std::vector<double> token_state_data_;  // Token buffer (size from config)
     
     // =========================================================================
@@ -2274,7 +2277,8 @@ class G1Deploy {
       double dex1_open_q = 5.5,
       double dex1_close_q = 0.0,
       double dex1_kp = 5.0,
-      double dex1_kd = 0.05)
+      double dex1_kd = 0.05,
+      bool demo_controls = false)
       : time_(0.0),
         publish_dt_(0.002),
         control_dt_(0.02),
@@ -2296,6 +2300,8 @@ class G1Deploy {
         model_path(model_file_path),
         planner_path(planner_file_path) {
       
+      demo_controls_ = demo_controls;
+
       // Initialize ChannelFactory
       ChannelFactory::Instance()->Init(0, networkInterface);
 
@@ -2615,7 +2621,8 @@ class G1Deploy {
       }
       else if (input_type == "zmq_manager") {
         input_interface_ = std::make_unique<ZMQManager>(
-          zmq_host, zmq_port, zmq_topic, "command", "planner", zmq_conflate, zmq_verbose
+          zmq_host, zmq_port, zmq_topic, "command", "planner", zmq_conflate, zmq_verbose,
+          demo_controls_
         );
         std::cout << "Initialized ZMQ manager" << std::endl;
         std::cout << "  Host: " << zmq_host << ":" << zmq_port << std::endl;
@@ -3128,6 +3135,33 @@ class G1Deploy {
       std::tie(has_right_hand_data_, right_hand_joint_buffer_) = input_interface_->GetHandPose(false);
       std::tie(has_upper_body_data_, upper_body_joint_positions_buffer_) = input_interface_->GetUpperBodyJointPositions();
       std::tie(std::ignore, upper_body_joint_velocities_buffer_) = input_interface_->GetUpperBodyJointVelocities();
+
+      // Only demo planner inputs use the standing upper-body reference.
+      // Collection keeps the upstream planner/PICO upper-body targets intact.
+      // POSE entry explicitly supplies a stationary smooth ramp before switching
+      // encoders; overriding that ramp would cause a jump when the lock releases.
+      // Explicit streamed upper-body references remain available in POSE mode.
+      if (PlannerUpperBodyHold::ShouldHold(
+          demo_controls_,
+          planner_ && planner_->planner_state_.enabled && planner_->planner_state_.initialized,
+          has_upper_body_data_, input_interface_->IsPoseEntryTransition())) {
+        const auto measured = low_state_buffer_.GetDataWithTime().data;
+        if (!measured) return false;
+        PlannerUpperBodyHold::Joints current{}, target{};
+        for (size_t i = 0; i < current.size(); ++i) {
+          const int index = upper_body_joint_isaaclab_order_in_mujoco_index[i];
+          current[i] = measured->motor_state()[index].q();
+          target[i] = default_angles[index];
+        }
+        const double now = std::chrono::duration<double>(
+            std::chrono::steady_clock::now().time_since_epoch()).count();
+        planner_upper_body_hold_.Update(current, target, now,
+            upper_body_joint_positions_buffer_, upper_body_joint_velocities_buffer_,
+            input_interface_->HoldCurrentUpperBody());
+        has_upper_body_data_ = true;
+      } else {
+        planner_upper_body_hold_.Reset();
+      }
 
       auto last_update_time = input_interface_->GetLastUpdateTime();
       if (last_update_time.has_value()) {
@@ -4128,6 +4162,13 @@ class G1Deploy {
           // Publish output data (state logger data, robot config, command/motion data) to all output interfaces
           for (auto& output_interface : output_interfaces_) {
             if (output_interface) {
+              if (demo_controls_) {
+                const bool planner_active = planner_ && planner_->planner_state_.enabled;
+                const bool control_ready = operator_state.start && operator_state.play && !operator_state.stop
+                    && (!planner_active || planner_->planner_state_.initialized);
+                output_interface->SetControlStatus(operator_state.start ? (planner_active ? 1.0 : 2.0) : 0.0,
+                    control_ready, input_interface_->GetControlRequestId());
+              }
               output_interface->publish(
                 vr_3point_position_buffer_, vr_3point_orientation_buffer_, vr_3point_compliance_buffer_,
                 left_hand_joint_buffer_, right_hand_joint_buffer_, init_ref_data_root_rot_array_,
@@ -4291,6 +4332,7 @@ int main(int argc, char const* argv[]) {
     std::cout << "  --zmq-topic <topic>: ZMQ topic/prefix (default: pose)" << std::endl;
     std::cout << "  --zmq-conflate: enable ZMQ CONFLATE (default: disabled)" << std::endl;
     std::cout << "  --zmq-verbose: enable ZMQ subscriber verbose logs" << std::endl;
+    std::cout << "  --demo-controls: enable demo posture override, manual gripper latch and handoff status (default: OFF)" << std::endl;
     std::cout << "  --zmq-out-port <port>: ZMQ port for output (default: 5557)" << std::endl;
     std::cout << "  --zmq-out-topic <topic>: ZMQ topic/prefix for output (default: g1_debug)" << std::endl;
     std::cout << "  --logs-dir <path>: optional logs output base directory (default: logs/<timestamp>/)" << std::endl;
@@ -4345,6 +4387,7 @@ int main(int argc, char const* argv[]) {
   std::string zmq_topic = "pose";
   bool zmq_conflate = false;  // default off; enable with --zmq-conflate
   bool zmq_verbose = false;
+  bool demo_controls = false;
   bool enableMotionRecording = false;  // default off; enable with --enable-motion-recording
   int zmq_out_port = 5557;
   std::string zmq_out_topic = "g1_debug";
@@ -4359,6 +4402,9 @@ int main(int argc, char const* argv[]) {
     if (std::string(argv[i]) == "--disable-crc-check") {
       disableCrcCheck = true;
       std::cout << "[INFO] CRC checking disabled for MuJoCo simulation" << std::endl;
+    } else if (std::string(argv[i]) == "--demo-controls") {
+      demo_controls = true;
+      std::cout << "[INFO] Demo controls enabled" << std::endl;
     } else if (std::string(argv[i]) == "--obs-config") {
       if (i + 1 < argc) {
         obsConfigPath = argv[i + 1];
@@ -4670,7 +4716,8 @@ int main(int argc, char const* argv[]) {
     dex1_open_q,
     dex1_close_q,
     dex1_kp,
-    dex1_kd
+    dex1_kd,
+    demo_controls
   );
   std::cout << "[DEBUG] G1Deploy object created successfully!" << std::endl;
   

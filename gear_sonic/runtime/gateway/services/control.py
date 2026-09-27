@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from enum import Enum, auto
 import json
 import logging
+import math
 import time
 from typing import Callable, Mapping
 
@@ -138,11 +139,13 @@ class ControlGatewayRuntime:
             "navigation_key": self._handle_navigation_key,
             "complete_agent_success": self._handle_complete_agent_result,
             "complete_agent_failure": self._handle_complete_agent_result,
+            "complete_skill": self._handle_complete_skill,
             "lavira_depth_request": self._handle_lavira_depth_request,
             "lavira_rgbd_captured": self._handle_lavira_rgbd_captured,
             "navigation_goal": self._handle_navigation_goal,
             "navigation_heading_goal": self._handle_navigation_heading_goal,
             "navigation_agent_status": self._handle_navigation_agent_status,
+            "vla_handoff_status": self._handle_vla_handoff_status,
             "start_base_pose": self._handle_start_base_pose,
             "base_pose_velocity": self._handle_base_pose_velocity,
             "base_pose_status": self._handle_base_pose_status,
@@ -247,6 +250,9 @@ class ControlGatewayRuntime:
             }
             if action.reason:
                 event_parameters["reason"] = action.reason
+            if action.agent_event == "start_navigation" and agent_parameters and agent_parameters.get("nearfield"):
+                event_parameters["nearfield"] = True
+                event_parameters["nearfield_key"] = agent_parameters.get("nearfield_key", "m")
             if action.agent_event == "start_base_pose" and agent_parameters:
                 for name in ("target", "yaw_align_target"):
                     if name in agent_parameters:
@@ -324,14 +330,14 @@ class ControlGatewayRuntime:
             and command.metadata.source == "operator_console"
             and command.name in {
                 "toggle_control_loop", "select_planner_mode", "toggle_policy_pause",
-                "toggle_left_hand_initial_pose", "toggle_right_hand_initial_pose", "set_prompt",
+                "toggle_grippers", "toggle_left_hand_initial_pose", "toggle_right_hand_initial_pose", "set_prompt",
             }
         ):
             action = self.navigation.handle_key(" ", now=time.monotonic(), cancel_reason=command.name)
             self.publish_navigation_action(action, source=command.metadata.source)
         if self.experiment.active and command.metadata.source == "operator_console" and command.name in {
             "toggle_control_loop", "select_pose_mode", "select_planner_mode", "toggle_policy_pause",
-            "toggle_left_hand_initial_pose", "toggle_right_hand_initial_pose", "set_prompt",
+            "toggle_grippers", "toggle_left_hand_initial_pose", "toggle_right_hand_initial_pose", "set_prompt",
         }:
             self.experiment.recorder.write(
                 "intervention", generation=self.experiment.active[0], command=command.name,
@@ -395,10 +401,11 @@ class ControlGatewayRuntime:
                     window_id=pending.parameters.get("window_id"),
                 )
                 self.dispatch_navigation_event("stop_vla_task", pending.parameters)
-                action = self.navigation.handle_key(
-                    " ", now=time.monotonic(), cancel_reason="post_completion_delay_elapsed",
-                )
-                self.publish_navigation_action(action, source="va_completion")
+                if not pending.parameters.get("continue_mission"):
+                    action = self.navigation.handle_key(
+                        " ", now=time.monotonic(), cancel_reason="post_completion_delay_elapsed",
+                    )
+                    self.publish_navigation_action(action, source="va_completion")
                 self.experiment.recorder.write(
                     "vla_completion_delay_ended", generation=pending.generation,
                     skill_id=pending.skill_id, reason="elapsed",
@@ -458,14 +465,21 @@ class ControlGatewayRuntime:
         key = command.parameters.get("key")
         if not isinstance(key, str) or len(key) != 1:
             raise ValueError("navigation_key requires one string key")
-        if key.lower() == "n" and self.pending_vla_completion is not None:
-            cancel = self.navigation.handle_key(" ", now=time.monotonic(), cancel_reason="restarted_with_n")
+        nearfield = key.lower() in {"m", "t"}
+        if nearfield:
+            from gear_sonic.experiments.nearfield import nearfield_experiment
+            # Validate the selected operation before cancelling or moving.
+            nearfield_experiment(self.experiment.recorder.config, start_key=key.lower())
+        start_key = key.lower() in {"n", "m", "t"}
+        restart_reason = f"restarted_with_{key.lower()}"
+        if start_key and self.pending_vla_completion is not None:
+            cancel = self.navigation.handle_key(" ", now=time.monotonic(), cancel_reason=restart_reason)
             self.publish_navigation_action(cancel, source="experiment_restart")
-        if key.lower() == "n" and self.experiment.active:
+        if start_key and self.experiment.active:
             previous = self.experiment.active[0]
-            self.experiment.recorder.write("intervention", generation=previous, command="restart_with_n")
-            self.experiment.finish(previous, "cancelled", "restarted_with_n")
-            cancel = self.navigation.handle_key(" ", now=time.monotonic(), cancel_reason="restarted_with_n")
+            self.experiment.recorder.write("intervention", generation=previous, command=f"restart_with_{key.lower()}")
+            self.experiment.finish(previous, "cancelled", restart_reason)
+            cancel = self.navigation.handle_key(" ", now=time.monotonic(), cancel_reason=restart_reason)
             self.publish_navigation_action(cancel, source="experiment_restart")
         old_generation = self.navigation.generation
         action = self.navigation.handle_key(
@@ -474,7 +488,7 @@ class ControlGatewayRuntime:
             cancel_reason=str(command.parameters.get("reason", "")),
         )
         if action.agent_event == "start_navigation":
-            self.experiment.start(action.generation)
+            self.experiment.start(action.generation, **({"nearfield": True, "nearfield_key": key.lower()} if nearfield else {}))
         elif action.agent_event == "cancel_navigation":
             self.experiment.recorder.write("intervention", generation=old_generation, command="operator_cancel")
             self.experiment.finish(old_generation, "cancelled", "operator_cancel")
@@ -482,7 +496,7 @@ class ControlGatewayRuntime:
             action,
             source=command.metadata.source,
             input_key="Space" if key == " " else key.upper(),
-            agent_parameters=command.parameters,
+            agent_parameters={**command.parameters, "nearfield": nearfield, "nearfield_key": key.lower()},
         )
         return DispatchDisposition.HANDLED
 
@@ -686,11 +700,12 @@ class ControlGatewayRuntime:
         generation = int(command.parameters["generation"])
         self.experiment.finish(generation, str(command.parameters.get("state", "failed")),
                                str(command.parameters.get("reason", "")))
-        if not defer_stop and (self.experiment.config or pending is not None):
+        if not defer_stop:
             # A model exception can leave a VLA or BasePose worker active.
-            # Invalidate that generation on every experimental terminal result.
-            action = self.navigation.handle_key(" ", now=time.monotonic(), cancel_reason="experiment_terminal")
-            self.publish_navigation_action(action, source="experiment_terminal")
+            # Invalidate that generation on every terminal result.
+            reason = "experiment_terminal" if self.experiment.config else "mission_terminal"
+            action = self.navigation.handle_key(" ", now=time.monotonic(), cancel_reason=reason)
+            self.publish_navigation_action(action, source=reason)
         if not defer_stop:
             self._send_navigation_stop(
                 generation=generation,
@@ -745,7 +760,10 @@ class ControlGatewayRuntime:
             # Operator-key BasePose start has already been normalized by
             # NavigationControlState and must still reach the consumer.
             return DispatchDisposition.FORWARD_ORIGINAL
-        for name in ("target", "yaw_align_target"):
+        unilm = command.parameters.get("backend") == "unilm_nav"
+        if unilm and self.profile.components.get("experiment", {}).get("alignment") != "unilm_nav":
+            raise ValueError("UniLM alignment requires the unilm_nav experiment profile")
+        for name in (("task",) if unilm else ("target", "yaw_align_target")):
             value = command.parameters.get(name)
             if not isinstance(value, str) or not value.strip():
                 raise ValueError(
@@ -762,6 +780,16 @@ class ControlGatewayRuntime:
         )
         return DispatchDisposition.HANDLED
 
+    def _handle_complete_skill(self, command: OperatorCommand) -> DispatchDisposition:
+        self._require_source(command, "operator_console", "skill completion requires operator_console")
+        payload = self.navigation.complete_skill()
+        if payload is not None:
+            self.dispatch_navigation_event("skill_completion", payload)
+            self.show_command(command, "SKILL_COMPLETED_BY_OPERATOR", "Current skill completion accepted", **payload)
+        else:
+            self.show_command(command, "SKILL_COMPLETION_IGNORED", "No active skill awaiting manual completion")
+        return DispatchDisposition.HANDLED
+
     def _handle_vla_task(
         self,
         command: OperatorCommand,
@@ -771,31 +799,47 @@ class ControlGatewayRuntime:
             "lavira_agent",
             "VLA task command requires lavira_agent source",
         )
+        if "exit_policy" in command.parameters:
+            value = command.parameters["exit_policy"]
+            if not isinstance(value, str) or value not in {"hold", "default"}:
+                raise ValueError("exit_policy must be hold or default")
+        timeout_continue = command.name == "stop_vla_task" and command.parameters.get("reason") == "timeout_continue"
+        if timeout_continue and not command.parameters.get("continue_mission"):
+            raise ValueError("timeout_continue requires a continuing mission")
         if not self.navigation.accept_vla_command(
             command.name, command.parameters
         ):
             raise ValueError("stale or unexpected VLA task command")
-        if command.name == "stop_vla_task" and command.parameters.get("reason") == "postcondition_satisfied":
-            # Close the task clock at VA completion, while the independent VLA
-            # service keeps inferring and publishing for five more seconds.
-            # Keep navigation ownership until the timer or an operator cancels
-            # it; terminal-result cleanup must not cut this interval short.
-            duration_s = 5.0
+        if command.name == "stop_vla_task" and (command.parameters.get("reason") == "postcondition_satisfied" or timeout_continue):
+            if self.navigation.mode == "lavira_handoff":
+                # A retransmission must never extend the settle timer or restart a handoff.
+                return DispatchDisposition.HANDLED
+            # Keep navigation ownership through settling and mode confirmation.
+            # Legacy single-trial runs still close their clock at VA confirmation.
+            continuing = bool(command.parameters.get("continue_mission", False))
+            duration_s = 0.0 if timeout_continue else float(command.parameters.get("completion_settle_seconds", 5.0))
+            if not math.isfinite(duration_s) or not 0 <= duration_s <= 30:
+                raise ValueError("invalid VLA completion settle duration")
             generation, skill_id = self.navigation.generation, self.navigation.skill_id
             self.pending_vla_completion = PendingVlaCompletion(
                 generation, skill_id, time.monotonic() + duration_s, dict(command.parameters),
             )
-            self.navigation.accept_status(
-                {**command.parameters, "state": "reached"}, owner="lavira", defer_vla_stop=True,
-            )
-            self.experiment.finish(generation, "reached", "manipulation_completed")
+            if continuing:
+                self.navigation.mode = "lavira_handoff"
+            else:
+                self.navigation.accept_status(
+                    {**command.parameters, "state": "reached"}, owner="lavira", defer_vla_stop=True,
+                )
+                self.experiment.finish(generation, "reached", "manipulation_completed")
             self.experiment.recorder.write(
                 "vla_completion_delay_started", generation=generation, skill_id=skill_id,
                 window_id=command.parameters.get("window_id"), duration_s=duration_s,
             )
             self.show_command(
                 command, "VLA_COMPLETION_DELAY_STARTED",
-                "VA confirmed completion; continuing VLA for 5 seconds before PLANNER",
+                "Skill timeout accepted; returning to PLANNER" if timeout_continue else
+                "Skill completion accepted; settling before PLANNER handoff",
+                reason=command.parameters.get("reason"),
                 duration_s=duration_s,
             )
             return DispatchDisposition.HANDLED
@@ -809,6 +853,14 @@ class ControlGatewayRuntime:
                 segment_id=self.navigation.segment_id,
             )
         self.dispatch_navigation_event(command.name, dict(command.parameters))
+        return DispatchDisposition.HANDLED
+
+    def _handle_vla_handoff_status(self, command: OperatorCommand) -> DispatchDisposition:
+        self._require_source(command, "vla_service", "VLA handoff requires vla_service source")
+        # No ack can release navigation while the configured completion delay is active.
+        if self.pending_vla_completion is not None or not self.navigation.accept_vla_handoff(command.parameters):
+            return DispatchDisposition.HANDLED
+        self.dispatch_navigation_event("vla_handoff_status", dict(command.parameters))
         return DispatchDisposition.HANDLED
 
     def _handle_base_pose_velocity(
@@ -843,6 +895,9 @@ class ControlGatewayRuntime:
             "base_pose_agent",
             "base-pose status requires base_pose_agent source",
         )
+        if (self.profile.components.get("experiment", {}).get("alignment") == "unilm_nav"
+                and int(command.parameters.get("segment_id", -1)) != self.navigation.segment_id):
+            raise ValueError("stale base-pose segment")
         if not self.navigation.accept_status(
             command.parameters,
             owner="base_pose",

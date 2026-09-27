@@ -66,6 +66,10 @@ public:
     /// Virtual destructor for correct polymorphic cleanup.
     virtual ~OutputInterface() = default;
 
+    void SetControlStatus(double mode, bool ready, double request_id) {
+      output_data_map_["control_status"] = {mode, ready ? 1.0 : 0.0, request_id};
+    }
+
     /**
      * @brief Publish the current robot state and target data.
      *
@@ -293,4 +297,3 @@ protected:
 };
 
 #endif // OUTPUT_INTERFACE_HPP
-

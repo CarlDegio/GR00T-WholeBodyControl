@@ -61,11 +61,11 @@ def main() -> None:
     router = OperatorConsoleRouter()
     print(f"[OperatorCLI] ControlGateway: {endpoint}")
     print(
-        "Keys: k=start/stop, i=pose, o=planner, p=pause, [/]=hands; "
+        "Keys: k=start/stop, i=pose, o=planner, p=pause, j=both grippers open/close, [/]=left/right; "
         "g=agent success + stand, h=agent failure + stand; "
-        "PLANNER: w/a/s/d/q/e manual, n=LaViRA, b=BasePose, space=cancel "
+        "PLANNER: w/a/s/d/q/e manual, n=LaViRA, m=ALIGN+VLA (T4 pick bag), t=T4 throw bag, b=BasePose, space=cancel "
         "(single-key, no Enter); "
-        ": enters a full command line"
+        ": enters a full command line; :skill_done + Enter completes the current manual skill"
     )
     time.sleep(0.2)
     try:

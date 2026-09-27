@@ -1,0 +1,30 @@
+{
+  "source": "/home/user/Project/GR00T-WholeBodyControl/demo_video/2026-09-26_combined/exports/Full_demo_combined_v4_redacted.mp4",
+  "output": "/home/user/Project/GR00T-WholeBodyControl/demo_video/2026-09-26_combined/exports/Full_demo_combined_v5_redacted.mp4",
+  "fps": 60,
+  "frames": 10774,
+  "header_height": 72,
+  "accent": "#70DFC5",
+  "privacy": "All video pixels sourced from redacted v4",
+  "sections": [
+    {
+      "name": "manipulation",
+      "start_frame": 300,
+      "frames": 1112,
+      "title": "Whole Body Manipulation"
+    },
+    {
+      "name": "gate",
+      "start_frame": 1412,
+      "frames": 1306,
+      "title": "GATE"
+    },
+    {
+      "name": "ovmm",
+      "start_frame": 2718,
+      "frames": 600,
+      "title": "GATE vs Official RL on OVMM"
+    }
+  ],
+  "unchanged_tail_start_frame": 3318
+}

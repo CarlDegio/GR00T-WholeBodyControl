@@ -1,0 +1,86 @@
+{
+  "playback_speed": 2.0,
+  "clips": {
+    "t1_op_a": {
+      "source": 1,
+      "ranges": [
+        [
+          0.0,
+          16.266667
+        ]
+      ],
+      "kind": "operation",
+      "source_frames": 488,
+      "retain_entire_source": true
+    },
+    "t1_op_b": {
+      "source": 2,
+      "ranges": [
+        [
+          0.0,
+          25.366667
+        ]
+      ],
+      "kind": "operation",
+      "source_frames": 761,
+      "retain_entire_source": true
+    },
+    "other_op_a": {
+      "source": 4,
+      "ranges": [
+        [
+          0.0,
+          17.033333
+        ]
+      ],
+      "kind": "operation",
+      "source_frames": 511,
+      "retain_entire_source": true
+    },
+    "other_op_b": {
+      "source": 5,
+      "ranges": [
+        [
+          0.0,
+          9.566667
+        ]
+      ],
+      "kind": "operation",
+      "source_frames": 287,
+      "retain_entire_source": true
+    },
+    "t1_full": {
+      "source": 3,
+      "ranges": [
+        [
+          0.0,
+          64.448333
+        ]
+      ],
+      "kind": "alignment_operation",
+      "source_frames": 1933,
+      "retain_entire_source": true
+    },
+    "other_full": {
+      "source": 6,
+      "ranges": [
+        [
+          0.0,
+          53.466667
+        ]
+      ],
+      "kind": "alignment_operation",
+      "source_frames": 1604,
+      "retain_entire_source": true
+    }
+  },
+  "notes": [
+    "All six sources retained from their original first frame through their last frame.",
+    "No head, interior or tail trimming. No overlapping crossfade and no fade hiding tail frames.",
+    "All original frames retained and presented at 60 fps (nominal 2x for 30 fps sources).",
+    "Unverified alignment/manipulation transition removed; combined label used throughout.",
+    "Layout and task positions unchanged; no audio."
+  ],
+  "revision": "v2_full_continuous",
+  "output_fps": 60
+}

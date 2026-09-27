@@ -1,0 +1,57 @@
+# Example only: edit targets and trained task prompts for the actual scene.
+# Start the matching PolicyServers separately; this overlay does not start them.
+# The first operation starts nearby and still performs its own BasePose alignment.
+components:
+  deploy:
+    demo_controls: true
+  vla:
+    default_skill: model_a
+    prewarm_backends: true
+    backends:
+      model_a:
+        host: 127.0.0.1
+        port: 29999
+        prompt: collect the pill bottle
+      model_b:
+        host: 127.0.0.1
+        port: 30000
+        prompt: collect the rubbish
+  lavira:
+    skills:
+      skill_a:
+        backend: model_a
+        prompt: collect the pill bottle
+        completion: {kind: manual}
+        completion_settle_seconds: 0.0
+        exit: hold
+      skill_b:
+        backend: model_b
+        prompt: collect the rubbish
+        completion: {kind: manual}
+        completion_settle_seconds: 0.0
+        exit: hold
+      skill_c:
+        backend: model_a
+        prompt: collect the pill bottle
+        completion: {kind: manual}
+        completion_settle_seconds: 0.0
+        exit: default
+    mission_steps:
+      - id: a
+        type: skill
+        skill: skill_a
+        align: {target: the blue basket next to the pill bottle}
+      - id: move_b
+        type: navigate
+        target: the table with paper balls and a blue basket
+      - id: b
+        type: skill
+        skill: skill_b
+        align: {target: the blue basket next to the paper balls}
+      - id: c
+        type: skill
+        skill: skill_c
+        align: {target: the blue basket next to the second pill bottle}
+      - id: return_to_door
+        type: navigate
+        target: the door

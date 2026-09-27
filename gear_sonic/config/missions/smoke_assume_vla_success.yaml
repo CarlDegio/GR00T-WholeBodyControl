@@ -1,0 +1,6 @@
+# Apply AFTER bag_then_bin.yaml. Real robot, real LA/VA, navigation and ALIGN.
+# Skip both VLA operations after successful alignment; no PolicyServers needed.
+# The local VLA service stays running for planner relay, with backends disabled.
+components:
+  lavira:
+    smoke_assume_vla_success: true

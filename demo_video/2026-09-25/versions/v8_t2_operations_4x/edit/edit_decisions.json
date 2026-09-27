@@ -1,0 +1,157 @@
+{
+  "playback_speed": 2.0,
+  "clips": {
+    "t1_op_a": {
+      "source": 1,
+      "ranges": [
+        [
+          0.0,
+          16.266667
+        ]
+      ],
+      "kind": "operation",
+      "source_frames": 488,
+      "retain_entire_source": true
+    },
+    "t1_op_b": {
+      "source": 2,
+      "ranges": [
+        [
+          0.0,
+          25.366667
+        ]
+      ],
+      "kind": "operation",
+      "source_frames": 761,
+      "retain_entire_source": true
+    },
+    "other_op_a": {
+      "source": 4,
+      "ranges": [
+        [
+          0.0,
+          17.033333
+        ]
+      ],
+      "kind": "operation",
+      "source_frames": 511,
+      "retain_entire_source": true
+    },
+    "other_op_b": {
+      "source": 5,
+      "ranges": [
+        [
+          0.0,
+          9.566667
+        ]
+      ],
+      "kind": "operation",
+      "source_frames": 287,
+      "retain_entire_source": true
+    },
+    "t1_full": {
+      "source": 3,
+      "ranges": [
+        [
+          0.0,
+          62.448333000000005
+        ]
+      ],
+      "kind": "alignment_operation",
+      "source_frames": 1933,
+      "retain_entire_source": false,
+      "trim_tail_source_seconds": 2,
+      "retained_frames": 1873
+    },
+    "other_full": {
+      "source": 6,
+      "ranges": [
+        [
+          0.0,
+          51.466667
+        ]
+      ],
+      "kind": "alignment_operation",
+      "source_frames": 1604,
+      "retain_entire_source": false,
+      "trim_tail_source_seconds": 2,
+      "retained_frames": 1544
+    },
+    "t2_full": {
+      "source": 8,
+      "ranges": [
+        [
+          8.0,
+          36.0
+        ],
+        [
+          46.0,
+          90.033333
+        ]
+      ],
+      "keep_frame_ranges": [
+        [
+          240,
+          1080
+        ],
+        [
+          1380,
+          2701
+        ]
+      ],
+      "source_frames": 2701,
+      "retained_frames": 2161,
+      "kind": "alignment_operation",
+      "retain_entire_source": false,
+      "removed_source_ranges": [
+        [
+          0,
+          8
+        ],
+        [
+          36,
+          46
+        ]
+      ]
+    },
+    "t2_op_a": {
+      "source": 9,
+      "ranges": [
+        [
+          0.0,
+          53.8
+        ]
+      ],
+      "source_frames": 1614,
+      "kind": "operation",
+      "retain_entire_source": true,
+      "playback_speed": 4.0,
+      "source_fps": 30,
+      "frame_sampling": "At 60 fps retain every other source frame; preserve first and last source frames, replacing the penultimate sample with the last source frame when necessary."
+    },
+    "t2_op_b": {
+      "source": 10,
+      "ranges": [
+        [
+          0.0,
+          36.833333
+        ]
+      ],
+      "source_frames": 1105,
+      "kind": "operation",
+      "retain_entire_source": true,
+      "playback_speed": 4.0,
+      "source_fps": 30,
+      "frame_sampling": "At 60 fps retain every other source frame; preserve first and last source frames, replacing the penultimate sample with the last source frame when necessary."
+    }
+  },
+  "notes": [
+    "T1 and T4 retain the previously requested 2-second source-tail trims.",
+    "T2 replaced with source 08; only user-requested cuts [0,8) and [36,46) seconds applied.",
+    "T2 retained [8,36) and [46,end), with a direct cut and no overlap or transition.",
+    "Layout, task positions, 2x speed, 60 fps, captions, silent audio and operation-only page unchanged.",
+    "T2 operation takes source 09 then 10, full duration, 4x speed; other tasks and alignment page unchanged."
+  ],
+  "revision": "v8_t2_operations_4x",
+  "output_fps": 60
+}

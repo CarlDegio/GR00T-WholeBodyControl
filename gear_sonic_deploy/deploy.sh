@@ -212,6 +212,7 @@ show_usage() {
     echo "  --input-type TYPE       Set the input type (default: zmq_manager)"
     echo "  --output-type TYPE      Set the output type (default: ros2)"
     echo "  --zmq-host HOST         Set the ZMQ host (default: localhost)"
+    echo "  --demo-controls         Enable demo posture override, gripper latch and handoff status (default: OFF)"
     echo "  --hand-type TYPE        Set hand backend: dex3, dex1, or none (default: dex3)"
     echo "  --dex1-open-q VALUE     Dex1 open position in rad (forwarded to deploy binary)"
     echo "  --dex1-close-q VALUE    Dex1 close position in rad (forwarded to deploy binary)"
@@ -334,6 +335,10 @@ while [[ $# -gt 0 ]]; do
             fi
             EXTRA_PASSTHROUGH_ARGS+=("$1" "$2")
             shift 2
+            ;;
+        --demo-controls)
+            EXTRA_PASSTHROUGH_ARGS+=("$1")
+            shift
             ;;
         sim|real)
             INTERFACE_MODE="$1"

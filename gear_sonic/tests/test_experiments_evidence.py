@@ -296,6 +296,22 @@ def test_known_four_task_macro_failure_time_and_pending_labels(tmp_path):
     assert pending["methods"]["full_vln"]["mean_sr"] is None
 
 
+def test_mixed_nearfield_trials_keep_separate_method_results(tmp_path):
+    events = log_events(tmp_path, successes=(True, False, True))
+    events[0]["experiment"]["method"] = "near_dual"
+    starts = [e for e in events if e["type"] == "trial_start"]
+    starts[0].update(method="near_dual", trigger="n")
+    starts[1].update(method="near_vla", trigger="m")
+    # Older trials without a per-trial method still use the session method.
+    rows = trial_rows(events)
+    assert [r["method"] for r in rows] == ["near_dual", "near_vla", "near_dual"]
+    report = summarize([events])
+    assert report["methods"]["near_dual"]["tasks"]["T1"]["sr"]["k"] == 2
+    assert report["methods"]["near_dual"]["tasks"]["T1"]["sr"]["n"] == 2
+    assert report["methods"]["near_vla"]["tasks"]["T1"]["sr"]["k"] == 0
+    assert report["methods"]["near_vla"]["tasks"]["T1"]["sr"]["n"] == 1
+
+
 def test_actual_action_required_late_actions_and_interventions_do_not_inflate_sr(tmp_path):
     events = log_events(tmp_path, successes=(True,))
     action = next(e for e in events if e["type"] == "vla_first_action")

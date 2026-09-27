@@ -1,0 +1,25 @@
+{
+  "output": "/home/user/Project/GR00T-WholeBodyControl/demo_video/2026-09-26_combined/exports/Full_demo_combined_v8_redacted.mp4",
+  "previous": "/home/user/Project/GR00T-WholeBodyControl/demo_video/2026-09-26_combined/exports/Full_demo_combined_v7_redacted.mp4",
+  "redacted_footage_source": "/home/user/Project/GR00T-WholeBodyControl/demo_video/2026-09-26_combined/exports/Full_demo_combined_v6_redacted.mp4",
+  "frames": 10774,
+  "left_viewport": [
+    0,
+    0,
+    1428,
+    1080
+  ],
+  "sidebar": [
+    1428,
+    0,
+    492,
+    1080
+  ],
+  "titles": [
+    "Long-Horizon Task in an Open Environment",
+    "Complex Multi-Step Manipulation Task"
+  ],
+  "all_annotations": "right sidebar",
+  "original_task_prompt_removed": true,
+  "color_grade": "unchanged from v7"
+}

@@ -13,4 +13,7 @@ gates:
   nav: true
   align: true
   completion: true
-runtime_overrides: {}
+runtime_overrides:
+  components:
+    base_pose:
+      raw_yoloe_confidence: 0.15

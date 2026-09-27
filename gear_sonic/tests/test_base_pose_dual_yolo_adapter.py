@@ -117,7 +117,7 @@ def test_base_pose_config_exposes_only_dual_camera_mode() -> None:
     assert config.raw_post_stop_deviation_frames == 10
     assert config.raw_diagnostic_image_interval_frames == 5
     assert config.raw_min_linear_speed_m_s == pytest.approx(0.4)
-    assert config.raw_max_lateral_speed_m_s == pytest.approx(0.4)
+    assert config.raw_max_lateral_speed_m_s == pytest.approx(0.5)
 
 
 @pytest.mark.parametrize(

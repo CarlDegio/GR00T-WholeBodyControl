@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import shlex
 import subprocess
 import sys
 import types
@@ -15,6 +16,7 @@ sys.modules.setdefault("tyro", types.ModuleType("tyro"))
 
 import gear_sonic.scripts.launch_data_collection as data_collection_launcher
 from gear_sonic.scripts.launch_data_collection import DataCollectionLaunchConfig
+from gear_sonic.runtime.profile import default_runtime_profile_path
 
 
 def _load(path: str | Path | None = None) -> DataCollectionLaunchConfig:
@@ -72,6 +74,54 @@ def test_default_yaml_contains_every_launch_parameter() -> None:
     assert loaded.runtime_profile == "gear_sonic/config/launch_inference.yaml"
     assert loaded.pico_video is True
     assert loaded.camera_viewer is True
+
+
+def test_collection_launch_ignores_demo_settings_in_shared_runtime_profile(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    payload = yaml.safe_load(default_runtime_profile_path().read_text(encoding="utf-8"))
+    profile_path = tmp_path / "runtime.yaml"
+    config = _load()
+    config.runtime_profile = str(profile_path)
+    pane_commands: dict[int, str] = {}
+    tmux_commands: list[list[str]] = []
+    monkeypatch.setattr(data_collection_launcher, "_check_prerequisites", lambda **_kw: None)
+    monkeypatch.setattr(data_collection_launcher, "_kill_existing_session", lambda: None)
+    monkeypatch.setattr(data_collection_launcher, "_create_tmux_session", lambda: None)
+    monkeypatch.setattr(data_collection_launcher, "_get_local_ip", lambda: "127.0.0.1")
+    monkeypatch.setattr(data_collection_launcher.time, "sleep", lambda _seconds: None)
+    monkeypatch.setattr(
+        data_collection_launcher.subprocess, "run",
+        lambda command, **_kw: tmux_commands.append(command),
+    )
+    monkeypatch.setattr(
+        data_collection_launcher, "_send_to_pane",
+        lambda pane, command, **_kw: pane_commands.update({pane: command}),
+    )
+    monkeypatch.setattr(data_collection_launcher, "_check_pane_alive", lambda _pane: True)
+    monkeypatch.setattr(
+        data_collection_launcher, "_tmux_session",
+        lambda: types.SimpleNamespace(attach=lambda: False),
+    )
+
+    launches = []
+    for demo_controls in (False, True):
+        payload["components"]["deploy"]["demo_controls"] = demo_controls
+        profile_path.write_text(yaml.safe_dump(payload), encoding="utf-8")
+        pane_commands.clear()
+        tmux_commands.clear()
+        data_collection_launcher.main(config)
+        launches.append((pane_commands.copy(), tmux_commands.copy()))
+
+    assert launches[0] == launches[1]
+    deploy_args = shlex.split(pane_commands[0])
+    assert "./deploy.sh" in deploy_args
+    assert "--demo-controls" not in deploy_args
+    assert deploy_args[deploy_args.index("--input-type") + 1] == "zmq_manager"
+    assert deploy_args[deploy_args.index("--dex1-kp") + 1] == "1.0"
+    assert "gear_sonic.utils.teleop.pico_manager --manager" in pane_commands[1]
+    assert "gear_sonic.utils.data_collection.service" in pane_commands[2]
+    assert any("gear_sonic.runtime.gateway.services.control" in " ".join(cmd) for cmd in tmux_commands)
 
 
 def test_loader_rejects_unknown_launch_field(tmp_path: Path) -> None:

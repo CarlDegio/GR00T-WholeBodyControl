@@ -1,0 +1,88 @@
+# One whole prompt, one LA loop, freely interleaved navigation and VLA calls.
+# Start both PolicyServers separately. Edit mission for the actual route/task.
+# Skill descriptions identify capabilities, not an ordered list of subtasks.
+# vla_trained_prompt is verified training text; preserve it verbatim.
+# Merge this overlay with launch_inference.yaml using prepare_mission.
+components:
+  mission_metadata:
+    task_id: T4
+    nearfield_entries:
+      m:
+        skill: pick_bag
+        expected_postcondition: The white gift bag has been grasped and is held by the robot.
+        milestones: [stable_bag_grasp]
+      t:
+        skill: step_bin
+        expected_postcondition: The white gift bag has been released inside the green rubbish bin.
+        milestones: [bag_in_bin_released]
+  deploy:
+    demo_controls: true
+  lavira:
+    flexible_mission: true
+    # Fresh ALIGN may wait for LA inference; independent of the VLA start ACK timeout.
+    operation_alignment_max_age_seconds: 30.0
+    # 在这里填写整段导航＋操作描述；下面只是当前任务示例。
+    # LA 自己拆分 TODO、选择路标和 VLA，可先操作、连续操作或操作后继续导航。
+    mission: >-
+      move to the white gift bag on the desk,pick up the white gift bag,move to the green rubbish bin while carrying the white gift bag,step on the pedal to open the trash can,then throw the bag in.
+    navigation_mode: vln
+    global_target: ""  # LA derives the current destination from the whole mission.
+    manipulation_prompt: ""  # ALIGN uses the selected skill's vla_prompt for VA.
+    skills:
+      pick_bag:
+        backend: bag_vla
+        base_pose:
+          raw_head_target_confidence: 0.1
+          raw_chest_target_confidence: 0.1
+        geometry_target: white gift bag
+        # 可编辑：供 LA 选择技能，并供 VA 推理该操作的对齐目标；不是执行顺序。
+        vla_prompt: "move forward to the white gift bag on the desk"
+        # pi05_g1_sonic_full_collect_bag/pi05_g1_sonic_full_collect_bag_77/29999
+        # Source: /mnt/g1_training_dataset/CollectBag/meta/tasks.jsonl
+        # Dataset's actual task text is "collect the pill bottle" despite its name.
+        vla_trained_prompt: &bag_trained_prompt "collect the pill bottle"
+        completion: {kind: visual}
+        # LA derives the operation's expected_postcondition from the whole mission.
+        # Starts when the VLA service acknowledges active execution; NAV and
+        # ALIGN have their own budgets. A timeout is NOT a success annotation.
+        timeout_seconds: 40.0
+        on_timeout: continue
+        completion_settle_seconds: 0.0
+        exit: hold
+      step_bin:
+        backend: bin_vla
+        # 2026-09-25 afternoon bin tuning; distances measured by each camera.
+        # Applied only to this skill, in both the full mission and the t entry.
+        base_pose:
+          raw_head_target_distance_m: 1.25
+          raw_chest_target_distance_m: 0.9
+          raw_head_target_confidence: 0.3
+          raw_chest_target_confidence: 0.3
+          raw_lateral_tolerance_m: 0.12
+          raw_stable_frames: 3
+        geometry_target: green rubbish bin
+        vla_prompt: "move forward to the green rubbish bin,step on the pedal to open the trash can, then throw the bag in."
+        # pi05_g1_sonic_full_throw_bag_big/pi05_g1_sonic_full_collect_bag_big_187/29999
+        # ThrowBagBig, training run uoxpkyg4: all 215896 frames use task_index=0,
+        # mapped to "collect the pill bottle" (verified 2026-09-25).
+        # Model uses head + wrist cameras; serve with the throw_bag_big config.
+        vla_trained_prompt: &bin_trained_prompt "collect the pill bottle"
+        # Use the original single-task Agent's VA completion check here too.
+        # It inherits the normal manipulation timeout (180 s in the base profile).
+        completion: {kind: visual}
+        completion_settle_seconds: 0.0
+        # Preserve the carried bag; default would open both grippers.
+        exit: hold
+  vla:
+    default_skill: bag_vla
+    prewarm_backends: true
+    backends:
+      bag_vla:
+        host: 127.0.0.1
+        port: 29999
+        # Same trained string for warmup and default manual POSE inference.
+        prompt: *bag_trained_prompt
+      bin_vla:
+        host: 127.0.0.1
+        port: 30000
+        prompt: *bin_trained_prompt

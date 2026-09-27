@@ -1,0 +1,31 @@
+{
+  "source_video": "/home/user/Project/GR00T-WholeBodyControl/demo_video/2026-09-26_combined/exports/Full_demo_combined_v4_redacted.mp4",
+  "time_seconds": 4,
+  "font": "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+  "font_sizes": [
+    66,
+    62
+  ],
+  "options": [
+    {
+      "id": "A_cyan",
+      "color": "#64D8F2",
+      "path": "/home/user/Project/GR00T-WholeBodyControl/demo_video/2026-09-26_combined/title_color_previews/A_cyan.png"
+    },
+    {
+      "id": "B_champagne",
+      "color": "#F2CE83",
+      "path": "/home/user/Project/GR00T-WholeBodyControl/demo_video/2026-09-26_combined/title_color_previews/B_champagne.png"
+    },
+    {
+      "id": "C_mint",
+      "color": "#7FE0BE",
+      "path": "/home/user/Project/GR00T-WholeBodyControl/demo_video/2026-09-26_combined/title_color_previews/C_mint.png"
+    },
+    {
+      "id": "D_lavender",
+      "color": "#C0AEF2",
+      "path": "/home/user/Project/GR00T-WholeBodyControl/demo_video/2026-09-26_combined/title_color_previews/D_lavender.png"
+    }
+  ]
+}

@@ -1,0 +1,101 @@
+{
+  "playback_speed": 2.0,
+  "clips": {
+    "t1_op_a": {
+      "source": 1,
+      "ranges": [
+        [
+          0.0,
+          16.266667
+        ]
+      ],
+      "kind": "operation",
+      "source_frames": 488,
+      "retain_entire_source": true
+    },
+    "t1_op_b": {
+      "source": 2,
+      "ranges": [
+        [
+          0.0,
+          25.366667
+        ]
+      ],
+      "kind": "operation",
+      "source_frames": 761,
+      "retain_entire_source": true
+    },
+    "other_op_a": {
+      "source": 4,
+      "ranges": [
+        [
+          0.0,
+          17.033333
+        ]
+      ],
+      "kind": "operation",
+      "source_frames": 511,
+      "retain_entire_source": true
+    },
+    "other_op_b": {
+      "source": 5,
+      "ranges": [
+        [
+          0.0,
+          9.566667
+        ]
+      ],
+      "kind": "operation",
+      "source_frames": 287,
+      "retain_entire_source": true
+    },
+    "t1_full": {
+      "source": 3,
+      "ranges": [
+        [
+          0.0,
+          62.448333000000005
+        ]
+      ],
+      "kind": "alignment_operation",
+      "source_frames": 1933,
+      "retain_entire_source": false,
+      "trim_tail_source_seconds": 2,
+      "retained_frames": 1873
+    },
+    "other_full": {
+      "source": 6,
+      "ranges": [
+        [
+          0.0,
+          51.466667
+        ]
+      ],
+      "kind": "alignment_operation",
+      "source_frames": 1604,
+      "retain_entire_source": false,
+      "trim_tail_source_seconds": 2,
+      "retained_frames": 1544
+    },
+    "t2_full": {
+      "source": 7,
+      "ranges": [
+        [
+          0.0,
+          106.666667
+        ]
+      ],
+      "kind": "alignment_operation",
+      "source_frames": 3200,
+      "retain_entire_source": true
+    }
+  },
+  "notes": [
+    "Only requested source tail trims: T1 full cumulative 2 seconds (60 frames); T4 full 2 seconds (60 frames).",
+    "Original first frames and all interior footage retained.",
+    "Other four clips, layout, 2x speed, 60 fps, labels and silent audio unchanged.",
+    "T2 added top-right in alignment page only; full original clip retained at 2x, including original first/last frames."
+  ],
+  "revision": "v5_add_t2_alignment_operation",
+  "output_fps": 60
+}

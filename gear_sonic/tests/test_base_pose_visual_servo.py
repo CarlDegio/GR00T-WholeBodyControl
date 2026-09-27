@@ -1819,14 +1819,14 @@ def test_vertical_recenter_uses_only_configured_forward_speed() -> None:
     assert command.velocity == pytest.approx((0.22, 0.0, 0.0))
 
 
-def test_default_axis_speeds_keep_vx_at_point_three_and_vy_at_point_four() -> None:
+def test_default_axis_speeds_keep_vx_at_point_three_and_vy_at_point_five() -> None:
     controller = VisualServoController()
 
     vx, _ = controller._enforce_min_linear_speed(0.1, 0.0)
     _, vy = controller._enforce_min_linear_speed(0.0, 0.1)
 
     assert vx == math.nextafter(0.3, math.inf)
-    assert vy == math.nextafter(0.4, math.inf)
+    assert vy == math.nextafter(0.5, math.inf)
 
 
 def test_vertical_recenter_exits_at_eighty_percent_box_bottom() -> None:

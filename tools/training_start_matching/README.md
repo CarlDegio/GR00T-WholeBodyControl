@@ -1,0 +1,26 @@
+# Chest-camera training-start matching
+
+Offline evaluation from exact first-frame chest RGB, reviewed Astra low corner annotations, camera intrinsics, and a known trapezoid. The current confirmed geometry uses the existing **body corners below the projecting rim**: upper width 26 cm, lower width 23 cm, side length 8.5 cm. The metric measures camera-to-basket geometry; it does not train a model.
+
+From the repository root, reproduce the current revision:
+
+```sh
+.venv_inference/bin/python tools/training_start_matching/run.py \
+  --analysis-root outputs/analysis/training_start_matching_20260912/revisions/visible04_off_frame
+```
+
+The runner performs synthetic coordinate/pose checks, planar PnP and pixel-annotation sensitivity, a geometry-sign diagnostic, both reference comparisons, scientific figures, the annotation gallery, a report, and source/artifact validation. It stops on a failed stage. `paths.py` resolves the prepared directory using `TRAINING_START_MATCHING_ROOT`, which the runner sets. The current revision also stores an executable snapshot in `pipeline/`.
+
+Inputs are `preflight.json`, `analysis_config.json`, `samples.json`, frozen intrinsics and source images, the `jobs/` manifests, and reviewed `annotations/` JSONL. This revision keeps the original annotation files, geometry and shared video/frame files, and adds a separate layer estimating previously null bottle-occluded corners. `provenance/annotation_reuse.json`, `geometry_confirmation.json` and `occlusion_revision.json` record the source and revision rules. The intermediate outer-rim annotation task was superseded and is not read. `--prepare` re-extracts first frames and requires the original source paths; ordinary metric reproduction does not need it.
+
+The current prepared cohort contains 238 training episodes (`0..237`), 93 in the inclusive `>=145` subset, 19 formal trials and 18 started trials. It adds six user-confirmed September 10 trials to the previous 13; five new smoke trials stay excluded, and the new geometric case `2456b817d0a3-g1` is corrected to `visible_04`. All six new images now yield valid poses after the user accepted a same-pixel-scale off-frame estimate of C=(334,482), radius 7 px, for Full VLN `visible_04`. This point remains inferred and never becomes strict-valid. All old annotations, poses, trial distances, training scales and thresholds remain unchanged. A new study needs its own frozen cohort and accounting. Methods and results are not provided to annotators. This runner reads completed Astra low annotations; it does not schedule agents or infer missing pixels.
+
+For this extension, use the prepared inputs without `--prepare`: the original 250 anonymous IDs are retained and six new IDs appended. `new_batch_*.jsonl` hold primary annotations; `new_repeat.jsonl` holds an independent six-image repeat; `new_review_overrides.jsonl` resolves one visual disagreement. `cohort_extension` in `analysis_config.json` declares the expected cohort and source revision. The runner validates original image and annotation hashes, unchanged previous poses and per-trial matches, all exact first-policy-input events, smoke exclusions, user labels and corrected case IDs. See the [current report](../../outputs/analysis/training_start_matching_20260912/revisions/visible04_off_frame/report.md) and [prepared-directory README](../../outputs/analysis/training_start_matching_20260912/revisions/visible04_off_frame/README.md).
+
+Primary estimates include explicitly flagged inferred or unstable candidates. Strict sensitivity requires four visible corners, no detected planar ambiguity, and declared perturbation stability. Missing geometry remains in the trial denominator and is reported separately. Training KDE uses only observable training poses with shared axes, covariance and color scaling. The state is camera lateral position, wall-normal distance and optical-forward heading; it is not robot-base pose or ground-plane yaw, and it omits camera height and pitch from the primary matching distance.
+
+The dimension-only revision removed the earlier negative-wall-Y anomaly without imposing positive Y as a selection constraint. The current occlusion layer introduces one uncertain oblique training candidate with a negative Y; it is explicitly marked in the figures and excluded from strict results. A separate training estimate exceeds the unchanged reprojection threshold and is omitted from the reference. Exact results, nearest-image pairs, sample accounting, sensitivity and limitations are in the prepared directory's `report.md`. See [the repository note](../../docs/training_start_matching.md) for paper-use scope.
+
+药瓶遮挡补估版本在原复核层之后加载 `occlusion_batch_*.jsonl`，仅补先前为空的角点，已有点保持不变。新增图中空心菱形表示推断位置；原版产物保持不变，报告给出两版比较与残余几何异常。
+
+The confirmed off-frame revision adds `annotations/off_frame_estimates.jsonl` after the other layers. `off_frame_revision.approved_points` accepts only the exact user-confirmed coordinate/radius and inferred provenance; the original 640×480 image size and camera calibration remain unchanged. All other unapproved out-of-image coordinates are still rejected. The runner checks that the other 255 annotations/poses and 18 trial results, training reference, and strict membership remain unchanged. The prior missing-corner revision remains at `outputs/analysis/training_start_matching_20260912`.

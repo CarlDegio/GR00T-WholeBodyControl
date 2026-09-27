@@ -54,6 +54,7 @@
 
 #include "input_interface.hpp"
 #include "input_command.hpp"
+#include "manual_gripper_latch.hpp"
 #include "zmq_endpoint_interface.hpp"
 #include "zmq_packed_message_subscriber.hpp"
 #include "../localmotion_kplanner.hpp"  // For LocomotionMode enum
@@ -87,7 +88,8 @@ class ZMQManager : public InputInterface {
       const std::string& command_topic = "command",
       const std::string& planner_topic = "planner",
       bool zmq_conflate = false,
-      bool zmq_verbose = false
+      bool zmq_verbose = false,
+      bool demo_controls = false
     ) : InputInterface(), 
         zmq_host_(zmq_host), 
         zmq_port_(zmq_port), 
@@ -95,7 +97,9 @@ class ZMQManager : public InputInterface {
         command_topic_(command_topic),
         planner_topic_(planner_topic),
         zmq_conflate_(zmq_conflate), 
-        zmq_verbose_(zmq_verbose) {
+        zmq_verbose_(zmq_verbose),
+        demo_controls_(demo_controls),
+        manual_grippers_(demo_controls) {
       
       type_ = InputType::NETWORK;
       active_mode_ = ManagedMode::PLANNER;  // Default to planner mode
@@ -281,6 +285,8 @@ class ZMQManager : public InputInterface {
 
           // Clear valid flag - next callback will start fresh accumulation
           active_mode_ = new_mode;
+          control_request_id_ = latest_command_.control_request_id;
+          hold_current_upper_body_ = latest_command_.hold_current_upper_body;
           latest_command_.valid = false;
         }
       }
@@ -381,6 +387,8 @@ class ZMQManager : public InputInterface {
     }
 
     // Forward getters to pose interface when in streamed motion mode
+    double GetControlRequestId() const override { return control_request_id_; }
+    bool HoldCurrentUpperBody() const override { return hold_current_upper_body_; }
     bool HasVR3PointControl() const override {
       if ((active_mode_ == ManagedMode::STREAMED_MOTION || (!is_planner_ready_ && switch_from_teleop_to_planner_)) && pose_interface_) {
         return pose_interface_->HasVR3PointControl();
@@ -389,6 +397,7 @@ class ZMQManager : public InputInterface {
     }
 
     bool HasHandJoints() const override {
+      if (manual_grippers_.IsActive()) return true;
       if ((active_mode_ == ManagedMode::STREAMED_MOTION || (!is_planner_ready_ && switch_from_teleop_to_planner_)) && pose_interface_) {
         return pose_interface_->HasHandJoints();
       }
@@ -424,6 +433,8 @@ class ZMQManager : public InputInterface {
     }
 
     std::pair<bool, std::array<double, 7>> GetHandPose(bool is_left) const override {
+      const auto manual = manual_grippers_.GetHandPose(is_left);
+      if (manual.first) return manual;
       if ((active_mode_ == ManagedMode::STREAMED_MOTION || (!is_planner_ready_ && switch_from_teleop_to_planner_)) && pose_interface_) {
         return pose_interface_->GetHandPose(is_left);
       }
@@ -673,7 +684,32 @@ class ZMQManager : public InputInterface {
         const std::vector<ZMQPackedMessageSubscriber::BufferView>& bufs) {
       
       if (hdr.fields.empty() || bufs.empty()) return;
+
+      // Explicit handover from demo/manual control to the VLA POSE hand stream.
+      // This command never starts or changes body control. Collection ignores it.
+      for (size_t i = 0; i < hdr.fields.size(); ++i) {
+        if (hdr.fields[i].name != "release_manual_grippers") continue;
+        if (!demo_controls_) return;
+        if (hdr.fields.size() != 1 || bufs.size() != 1 ||
+            hdr.fields[i].dtype != "u8" || bufs[i].size != 1) return;
+        const auto value = *static_cast<const uint8_t*>(bufs[i].data);
+        if (value == 1) manual_grippers_.Release();
+        return;
+      }
       
+      // Independent, idempotent Dex1 hand command: never changes locomotion.
+      // A single atomic stores both targets; mode switches do not reset it.
+      for (size_t i = 0; i < hdr.fields.size(); ++i) {
+        if (hdr.fields[i].name != "manual_grippers") continue;
+        if (!demo_controls_) continue;
+        if (i >= bufs.size() || hdr.fields[i].dtype != "u8" || bufs[i].size != 2) return;
+        uint8_t targets[2];
+        std::memcpy(targets, bufs[i].data, sizeof(targets));
+        if (targets[0] > 1 || targets[1] > 1) return;
+        manual_grippers_.Set(targets[0] != 0, targets[1] != 0);
+        return;
+      }
+
       int start_idx = -1, stop_idx = -1, planner_idx = -1;
       for (size_t i = 0; i < hdr.fields.size(); ++i) {
         if (hdr.fields[i].name == "start") start_idx = static_cast<int>(i);
@@ -690,6 +726,24 @@ class ZMQManager : public InputInterface {
       cmd.valid = true;
       
       bool needs_swap = hdr.NeedsByteSwap();
+
+      // The collection protocol keeps ignoring unknown demo extension fields.
+      for (size_t i = 0; demo_controls_ && i < hdr.fields.size() && i < bufs.size(); ++i) {
+        if (hdr.fields[i].name == "control_request_id") {
+          if (hdr.fields[i].dtype != "f64" || bufs[i].size != sizeof(double)) return;
+          std::memcpy(&cmd.control_request_id, bufs[i].data, sizeof(double));
+          if (needs_swap) cmd.control_request_id = byte_swap(cmd.control_request_id);
+          if (!std::isfinite(cmd.control_request_id) || cmd.control_request_id < 0
+              || cmd.control_request_id >= 9007199254740992.0
+              || std::floor(cmd.control_request_id) != cmd.control_request_id) return;
+        } else if (hdr.fields[i].name == "hold_current_upper_body") {
+          if (hdr.fields[i].dtype != "u8" || bufs[i].size != 1) return;
+          uint8_t value = 0;
+          std::memcpy(&value, bufs[i].data, 1);
+          if (value > 1) return;
+          cmd.hold_current_upper_body = value != 0;
+        }
+      }
       
       // Decode start
       const auto& start_buf = bufs[start_idx];
@@ -758,6 +812,8 @@ class ZMQManager : public InputInterface {
       latest_command_.start = latest_command_.start || cmd.start;
       latest_command_.stop = latest_command_.stop || cmd.stop;
       latest_command_.planner = cmd.planner;  // Overwrite (mode should be latest)
+      latest_command_.control_request_id = cmd.control_request_id;
+      latest_command_.hold_current_upper_body = cmd.hold_current_upper_body;
       latest_command_.valid = true;
       
       if constexpr (DEBUG_LOGGING) {
@@ -774,6 +830,7 @@ class ZMQManager : public InputInterface {
       int mode_idx = -1, movement_idx = -1, facing_idx = -1;
       int speed_idx = -1, height_idx = -1;
       int upper_body_position_idx = -1, upper_body_velocity_idx = -1;
+      int pose_entry_transition_idx = -1;
       int left_hand_joints_idx = -1, right_hand_joints_idx = -1;
       int vr_position_idx = -1, vr_orientation_idx = -1, vr_compliance_idx = -1;
 
@@ -786,6 +843,7 @@ class ZMQManager : public InputInterface {
         else if (f.name == "height") height_idx = static_cast<int>(i);
         else if (f.name == "upper_body_position") upper_body_position_idx = static_cast<int>(i);
         else if (f.name == "upper_body_velocity") upper_body_velocity_idx = static_cast<int>(i);
+        else if (f.name == "pose_entry_transition") pose_entry_transition_idx = static_cast<int>(i);
         else if (f.name == "left_hand_joints") left_hand_joints_idx = static_cast<int>(i);
         else if (f.name == "right_hand_joints") right_hand_joints_idx = static_cast<int>(i);
         else if (f.name == "vr_position") vr_position_idx = static_cast<int>(i);
@@ -1195,8 +1253,20 @@ class ZMQManager : public InputInterface {
       }
 
       // Update buffer directly (no queue) and set timestamp
+      if (demo_controls_ && pose_entry_transition_idx >= 0) {
+        const auto& field = hdr.fields[pose_entry_transition_idx];
+        const auto& buffer = bufs[pose_entry_transition_idx];
+        if (field.dtype != "u8" || buffer.size != 1) {
+          std::cerr << "[ZMQManager] Invalid pose_entry_transition flag" << std::endl;
+          return;
+        }
+        msg.pose_entry_transition = *static_cast<const uint8_t*>(buffer.data) != 0
+            && msg.mode == 0 && msg.movement == std::array<double, 3>{0.0, 0.0, 0.0}
+            && msg.upper_body_position.has_value() && msg.upper_body_velocity.has_value();
+      }
       std::lock_guard<std::mutex> lock(planner_mutex_);
       latest_planner_message_ = msg;
+      pose_entry_transition_ = msg.pose_entry_transition;
       latest_planner_message_.timestamp = std::chrono::steady_clock::now();
     }
     
@@ -1212,6 +1282,7 @@ class ZMQManager : public InputInterface {
     std::string planner_topic_;      ///< Topic for planner movement commands.
     bool zmq_conflate_;              ///< ZMQ conflate option for pose topic.
     bool zmq_verbose_;               ///< Verbose logging flag.
+    const bool demo_controls_;       ///< Explicit demo opt-in; collection leaves this off.
     
     // ------------------------------------------------------------------
     // Owned sub-components
@@ -1241,6 +1312,8 @@ class ZMQManager : public InputInterface {
     bool emergency_stop_ = false;  ///< Set by 'O'/'o' keyboard shortcut.
     bool report_temperature_flag_ = false;  ///< Set by 'F'/'f' keyboard shortcut.
     bool start_control_ = false;   ///< Start request from command message.
+    double control_request_id_ = 0;
+    bool hold_current_upper_body_ = false;
     bool stop_control_ = false;    ///< Stop request from command message.
 
     /// True once the planner has been initialised and is generating motions.
@@ -1248,6 +1321,8 @@ class ZMQManager : public InputInterface {
     /// True when transitioning from streamed-motion (teleop) back to planner mode;
     /// used to keep forwarding VR/hand data from the pose interface until planner is ready.
     bool switch_from_teleop_to_planner_ = false;
+
+    ManualGripperLatch manual_grippers_;
 
     /// Tracks the previous frame's VR-3-point state to detect enable/disable transitions
     /// and automatically toggle encoder mode accordingly.

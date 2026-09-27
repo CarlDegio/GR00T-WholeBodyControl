@@ -39,6 +39,8 @@ components:
     navigation_ready_timeout_s: 60.0
   deploy:
     input_type: zmq_manager
+    # Demo inference only; launch_data_collection does not use deploy settings here.
+    demo_controls: true
     policy_variant: sonic_v1_1  # default | low_latency | sonic_v1_1
     checkpoint: ''
     obs_config: ''
@@ -46,17 +48,11 @@ components:
     motion_data: ''
     output_type: ''
   vla:
+    # Optional backends/default_skill/prewarm_backends: see missions/two_skills.yaml.
+    # Without a registry this uses the existing policy_server endpoint.
     embodiment_tag: unitree_g1_sonic
-    #prompt: &vla_task_prompt >-
-    #  Approach the tabletop if necessary, then use the right hand to pick up the
-    #  paper ball and place it into the blue plastic basket, use the left hand to
-    #  place another paper ball into the same basket, and finally return both arms
-    #  to the sides of the body.
-    prompt: &vla_task_prompt >-
-       collect the pill bottle
-    # Current prompt:
-    #prompt: &vla_task_prompt >-
-    #  collect the bag and put it into box, then carry the box
+    # T3 manual inference; preserve the trained prompt from t3_bowl_to_bin.yaml (29999).
+    prompt: &vla_task_prompt "collect the pill bottle"
     inference_hz: 2.0
     action_publish_rate: 50
     action_horizon: 50
@@ -65,26 +61,16 @@ components:
     sensor_gateway_max_age_ms: 1000.0
     sensor_gateway_max_skew_ms: 5.0
   lavira:
-    navigation_mode: object_nav
+    # Manual/single-operation T3 defaults; the full_vln mission adds its skill registry.
+    navigation_mode: vln
     mission: >-
-      Search the workspace for a cardboard box on a handcart and approach it.
-    global_target: a cardboard box on a handcart
-    manipulation_prompt: *vla_task_prompt
-    # Reserved legacy/manual alignment text. Production ALIGN target inference
-    # now uses manipulation_prompt; keep this for rollback or manual runs.
+      move to the white rubbish bin , turn left, move to the fire extinguisher,move to the refrigerator ,turn right and move to the bowl on the desk, then move forward to approach the bowl on the desk,pick up the bowl, step on the trash bin pedal to hold the lid open,empty the bowl into the bin and put it back to the desk.
+    global_target: bowl on the desk
+    manipulation_prompt: >-
+      move forward to approach the bowl on the desk,pick up the bowl, step on the trash bin pedal to hold the lid open,empty the bowl into the bin and put it back to the desk.
     alignment_prompt: |-
-      Use the cardboard box as the distance-and-centering target.
-      Use the cardboard box as the yaw-alignment target;
-      align yaw to one visible straight edge of that same cardboard box.
-    # Current LaViRA settings:
-    # navigation_mode: vln
-    # mission: >-
-    #   Walk straight to the black trash can，and then turn left and explore the empty space in front of you,and then walk to the refrigerator ,and then turn left and finally walk to a position beside the desk with the blue basket.
-    # global_target: ''  # Inferred and frozen from the first LA response.
-    # alignment_prompt: |-
-    #   Use the blue basket as the distance-and-centering target.
-    #   Use the desk as the yaw-alignment target;
-    #   align yaw to one visible straight edge of that same desk.
+      Use the bowl as the distance-and-centering target.
+      Use the desk as the yaw-alignment target.
     max_steps: 50
     history_size: 5
     la_model: qwen3.8-max
@@ -120,10 +106,9 @@ components:
   base_pose:
     # Standalone/manual BasePose defaults. LaViRA overrides these three values
     # per ALIGN attempt with the two roles inferred by VA.
-    task: >-
-      align distance, centering to the cardboard box and yaw to the cardboard box
+    task: align distance and centering to bowl and yaw to desk
     target_prompt: bowl
-    yaw_align_target_prompt:  desk
+    yaw_align_target_prompt: desk
     planner_hz: 20.0
     final_stop_count: 3
     sensor_gateway_request_timeout_ms: 100
@@ -154,25 +139,29 @@ components:
     raw_yoloe_model_path: tools/yoloe26m/weights/yoloe-26m-seg.pt
     raw_yoloe_device: '0'
     raw_yoloe_confidence: 0.25
+    # Use per-frame segmentation directly; no BoT-SORT track ID is required.
+    raw_yoloe_tracking: false
+    raw_head_target_confidence: 0.3
+    raw_chest_target_confidence: 0.15
     raw_yoloe_imgsz: 640
     # Save annotated head/chest RGB every N control frames; 0 disables images.
-    raw_diagnostic_image_interval_frames: 5
+    raw_diagnostic_image_interval_frames: 0
     # Head camera target distance from the target
     raw_head_target_distance_m: 1.1
     # Head camera ignores edge yaw above this distance and approaches by bbox.
     raw_head_approach_cutoff_m: 1.5
     raw_chest_target_distance_m: 0.9
     # Chest position ignores head edge yaw above this distance and approaches.
-    raw_chest_approach_cutoff_m: 1.2
+    raw_chest_approach_cutoff_m: 1.1
     raw_forward_tolerance_m: 0.10
-    raw_lateral_tolerance_m: 0.10
+    raw_lateral_tolerance_m: 0.08
     raw_lateral_pulse_enter_m: 0.10
     raw_lateral_pulse_exit_m: 0.10
     raw_lateral_pulse_max_s: 0.40
     raw_lateral_pulse_settle_s: 0.50
     raw_lateral_pulse_sample_frames: 3
     raw_min_linear_speed_m_s: 0.40
-    raw_max_lateral_speed_m_s: 0.40
+    raw_max_lateral_speed_m_s: 0.4
     raw_min_yaw_speed_rad_s: 0.10
     raw_yaw_tolerance_deg: 3
     raw_yaw_coarse_speed_rad_s: 0.30
@@ -193,7 +182,7 @@ components:
     mpc_hz: 10.0
     mpc_result_timeout_s: 0.3
     heading_preview_s: 0.5
-    goal_tolerance_m: 2.0
+    goal_tolerance_m: 1.5
     stop_threshold: -4.0
     request_timeout_s: 10.0
     sensor_gateway_poll_hz: 20.0

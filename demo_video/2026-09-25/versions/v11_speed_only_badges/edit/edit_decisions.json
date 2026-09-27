@@ -1,0 +1,209 @@
+{
+  "clips": {
+    "t1_op_a": {
+      "source": 1,
+      "ranges": [
+        [
+          0.0,
+          16.266667
+        ]
+      ],
+      "kind": "operation",
+      "source_frames": 488,
+      "retain_entire_source": true,
+      "playback_speed": 2.5
+    },
+    "t1_op_b": {
+      "source": 2,
+      "ranges": [
+        [
+          0.0,
+          25.366667
+        ]
+      ],
+      "kind": "operation",
+      "source_frames": 761,
+      "retain_entire_source": true,
+      "playback_speed": 2.5
+    },
+    "other_op_a": {
+      "source": 4,
+      "ranges": [
+        [
+          0.0,
+          17.033333
+        ]
+      ],
+      "kind": "operation",
+      "source_frames": 511,
+      "retain_entire_source": true,
+      "playback_speed": 1.5
+    },
+    "other_op_b": {
+      "source": 5,
+      "ranges": [
+        [
+          0.0,
+          9.566667
+        ]
+      ],
+      "kind": "operation",
+      "source_frames": 287,
+      "retain_entire_source": true,
+      "playback_speed": 1.5
+    },
+    "t1_full": {
+      "source": 3,
+      "ranges": [
+        [
+          0.0,
+          62.448333000000005
+        ]
+      ],
+      "kind": "alignment_operation",
+      "source_frames": 1933,
+      "retain_entire_source": false,
+      "trim_tail_source_seconds": 2,
+      "retained_frames": 1873,
+      "playback_speed": 3
+    },
+    "other_full": {
+      "source": 6,
+      "ranges": [
+        [
+          0.0,
+          51.466667
+        ]
+      ],
+      "kind": "alignment_operation",
+      "source_frames": 1604,
+      "retain_entire_source": false,
+      "trim_tail_source_seconds": 2,
+      "retained_frames": 1544,
+      "playback_speed": 2
+    },
+    "t2_full": {
+      "source": 8,
+      "ranges": [
+        [
+          8.0,
+          36.0
+        ],
+        [
+          46.0,
+          90.033333
+        ]
+      ],
+      "keep_frame_ranges": [
+        [
+          240,
+          1080
+        ],
+        [
+          1380,
+          2701
+        ]
+      ],
+      "source_frames": 2701,
+      "retained_frames": 2161,
+      "kind": "alignment_operation",
+      "retain_entire_source": false,
+      "removed_source_ranges": [
+        [
+          0,
+          8
+        ],
+        [
+          36,
+          46
+        ]
+      ],
+      "playback_speed": 3
+    },
+    "t2_op_a": {
+      "source": 9,
+      "ranges": [
+        [
+          0.0,
+          53.8
+        ]
+      ],
+      "source_frames": 1614,
+      "kind": "operation",
+      "retain_entire_source": true,
+      "playback_speed": 5,
+      "source_fps": 30
+    },
+    "t2_op_b": {
+      "source": 10,
+      "ranges": [
+        [
+          0.0,
+          36.833333
+        ]
+      ],
+      "source_frames": 1105,
+      "kind": "operation",
+      "retain_entire_source": true,
+      "playback_speed": 5,
+      "source_fps": 30
+    },
+    "t3_op_a": {
+      "source": 11,
+      "ranges": [
+        [
+          0.0,
+          29.833333
+        ]
+      ],
+      "source_frames": 895,
+      "kind": "operation",
+      "retain_entire_source": true,
+      "playback_speed": 4,
+      "source_fps": 30
+    },
+    "t3_op_b": {
+      "source": 12,
+      "ranges": [
+        [
+          0.0,
+          40.5
+        ]
+      ],
+      "source_frames": 1215,
+      "kind": "operation",
+      "retain_entire_source": true,
+      "playback_speed": 4,
+      "source_fps": 30
+    },
+    "t3_full": {
+      "source": 13,
+      "ranges": [
+        [
+          0.0,
+          53.4
+        ]
+      ],
+      "source_frames": 1602,
+      "kind": "alignment_operation",
+      "retain_entire_source": true,
+      "playback_speed": 3,
+      "source_fps": 30
+    }
+  },
+  "notes": [
+    "Operation speeds T1–T4: 2.5x, 5x, 4x, 1.5x.",
+    "Alignment + manipulation speeds T1–T4: 3x, 3x, 3x, 2x.",
+    "All prior source ranges and cuts retained. No additional cuts.",
+    "Lower-left badges show only speed. English headings, layout and hold-last-frame behavior preserved."
+  ],
+  "revision": "v11_speed_only_badges",
+  "output_fps": 60,
+  "presentation": {
+    "language": "English",
+    "end_behavior": "Hold each task last frame until page end, keeping its speed badge.",
+    "global_top_right_speed_summary": false,
+    "per_panel_speed_badges": true,
+    "per_panel_badge_content": "Playback speed only"
+  }
+}

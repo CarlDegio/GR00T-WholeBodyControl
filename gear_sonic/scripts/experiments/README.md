@@ -1,12 +1,12 @@
 # ICRA 实验入口
 
-这里提供 15 个入口，同名参数文件在 `gear_sonic/config/experiments/`。真实运行复用现有 `launch_inference.py` 的 tmux、控制网关和操作界面；**启动脚本后，按 `n` 才开始一次试验和计时**。脚本不自动重复、不自动切换条件。离线语义角色评测例外，它只处理给定图像集合。
+这里提供 17 个入口，同名参数文件在 `gear_sonic/config/experiments/`。真实运行复用现有 `launch_inference.py` 的 tmux、控制网关和操作界面；**启动脚本后，按 `n` 才开始一次试验和计时**。脚本不自动重复、不自动切换条件。离线语义角色评测例外，它只处理给定图像集合。
 
-本次实现包括简单几何接近/居中；不包括 **UniLM-Nav adapted to our platform** 和“定位 + 直接前往”。训练邻域覆盖率暂不计算。
+本次实现包括简单几何接近/居中和 **UniLM-Nav adapted to our platform**；不包括“定位 + 直接前往”。训练邻域覆盖率暂不计算。
 
 ## 先填写公共配置
 
-配置按以下顺序读取：实验 YAML → 引用当前 `../launch_inference.yaml` → 合并本实验 `runtime_overrides` → 填入任务、条件和实验分支。相机、权重地址及底层控制参数来自同一份现有 agent 配置。每次实际启动保存一份不可随源 YAML 改动而变化的 `runtime.yaml`。
+配置按以下顺序读取：实验 YAML → 引用当前 `../launch_inference.yaml` → 合并 `runtime_overlays` 和本实验 `runtime_overrides` → 填入任务、条件和实验分支。相机、权重地址及底层控制参数来自同一份现有 agent 配置。每次实际启动保存一份不可随源 YAML 改动而变化的 `runtime.yaml`。
 
 1. 编辑 `gear_sonic/config/experiments/tasks.yaml`。填写实际服务的 `policy_id`；核对 T1、T2 已有的训练字符串，填写 T3、T4 的 `vla_trained_prompt`。`policy_id` 是人工填写的检查点标识，脚本不能独立核实远端当前加载的权重。
 2. 同文件中的 `vla_prompt` 描述真实物理目标，供 LA 的操作上下文和全部 VA 使用。`vla_trained_prompt` 保留训练时的原文，写入 VLA 初始配置及 `handoff_context`，启动、恢复和再次调用均使用它。导航路线仍单独传给导航规划器。
@@ -38,9 +38,62 @@ bash gear_sonic/scripts/experiments/full_vln.sh --task T1 --case visible_01
 
 每个入口都支持 `--config /absolute/path/method.yaml`、`--task T1`、`--case visible_01`、`--dry-run` 和 `--output /absolute/path/results`。`--config` 接收实验 YAML，公共 agent YAML 通过其中的 `runtime_profile` 引用。相对引用以实验 YAML 所在目录为基准。
 
+### 自由顺序、多次 VLA
+
+`full_vln.sh`、`nav_direct_vla.sh`、`geometric_vla.sh`、`baselinelavira.sh`、`unilm_nav.sh` 均支持
+`--mission /path/to/mission-overlay.yaml`，直接加载整段任务和技能注册表，无需先运行
+`prepare_mission`。例如，在仓库根目录任选一个入口：
+
+```bash
+bash gear_sonic/scripts/experiments/full_vln.sh --mission gear_sonic/config/missions/bag_then_bin.yaml --case visible_01
+bash gear_sonic/scripts/experiments/nav_direct_vla.sh --mission gear_sonic/config/missions/bag_then_bin.yaml --case visible_01
+bash gear_sonic/scripts/experiments/geometric_vla.sh --mission gear_sonic/config/missions/bag_then_bin.yaml --case visible_01
+bash gear_sonic/scripts/experiments/baselinelavira.sh --mission gear_sonic/config/missions/bag_then_bin.yaml --case visible_01
+bash gear_sonic/scripts/experiments/unilm_nav.sh --mission gear_sonic/config/missions/bag_then_bin.yaml --case visible_01
+```
+
+末尾加 `--dry-run` 只校验，不启动硬件。两个模型服务仍须提前启动，看到
+`VLA_BACKENDS_WARMED` 并完成机器人就绪后按 `n`。不传 `--mission` 时保留原单任务流程。
+
+这些方法使用同一个 LA 循环、整段 `mission`、技能选择、模型切换、固定训练 prompt、
+VA 操作完成判断及 PLANNER 交接。原三种方法只替换**每一次**操作前的 ALIGN；
+`unilm_nav` 也替换每次 ALIGN；`baselinelavira` 使用完整对齐，只替换导航模型和轨迹跟踪控制器：
+
+- `full_vln`：原双相机 BasePose 对齐和 VA 就绪门控。
+- `baselinelavira`：与 `full_vln` 相同的 Agent、BasePose 和 VLA 流程；导航改用
+  iPlanner + Pure Pursuit。沿用源分支的 2.0 m 到达容差、0.3–0.4 m/s 前进速度、
+  0.5 rad/s 最大转速、0.5 m 前视距离和 60 s 单段时限。参数位于
+  `gear_sonic/config/baselinelavira.yaml`。`--dry-run` 同时检查 iPlanner 本地源码、配置和权重。
+- `unilm_nav`：导航仍为 NavDP；每次 ALIGN 使用当前技能的语义 `vla_prompt` 和胸部 RGB-D，
+  经过选帧、交互点定位、基座位姿预测三次 VLM 推理后执行位姿控制。无额外 ALIGN VA；
+  必须真实 reached/aligned 才能启动对应 VLA。详见 [UniLM 配置说明](../../../docs/unilm_nav.md)。
+- `geometric_vla`：简单几何接近/居中；每个 `lavira.skills.<key>.geometry_target`
+  指定当前技能的 YOLOE 目标。袋子示例为 `white gift bag`，桶为 `green rubbish bin`。
+  不调用语义角色/朝向对齐。保持原几何分支规则：记录 ALIGN VA，但超时、丢失目标或
+  VA 不满足也可以继续 VLA，日志不会将其伪记为对齐成功。
+- `nav_direct_vla`：ALIGN 仅选择本次技能并准备交接，不运行对齐控制器、目标 grounding
+  或 ALIGN VA；随后直接执行所选 VLA。LA 仍按同一协议选择 ALIGN/MANIPULATE，顺序不写死。
+
+支持先操作、操作之间导航、连续操作和重复调用同一技能。每次操作独立选择 checkpoint
+后端与 `vla_trained_prompt`；前一次操作完成或配置允许的超时继续不会结束整条试验。
+操作超时由该技能的 `timeout_seconds/on_timeout` 管理，未填写时使用任务的
+`vla_timeout_s`；`total_timeout_s` 仍约束整条任务。空格、`n` 重启和 `g/h` 作用于整条试验。
+
+使用 mission 时，任务内容来自 overlay，不再使用条件模板的导航路线或单任务 prompt。
+`--task/--case` 仍决定归档标签、布局/起点、整轮预算及人工成功标注的 milestones；应按实际
+实验维护 `tasks.yaml` 和条件文件，不能把不同物理任务仅因同一标签混入同一统计组。
+上面 T1/visible_01 仅演示 CLI。模型地址、提示词和技能表随本次 `runtime.yaml` 冻结保存。
+
+每次 VLA 记录独立 `vla_operation`，关联逻辑技能、后端、两种 prompt、对齐动作和几何目标。
+首帧、离线 mask 按当前操作关联，不沿用上一操作的对象；正常的第二次对齐不计作重试。
+整轮只有一个 trial，最终系统 COMPLETE 和单技能超时继续均不替代独立物理成功标注。
+显式 `mission_steps`、其他消融入口及 smoke overlay 不与这一实验模式混用。
+
 | 分组 | 脚本名（同名 YAML） | 变动 | 默认条件 |
 |---|---|---|---|
 | 表 1 | `full_vln.sh` | 完整 VLN agent | `visible_01` |
+| 表 1 | `unilm_nav.sh` | NavDP 导航 + 胸部 UniLM VLM 位姿对齐 | `visible_01` |
+| 表 1 | `baselinelavira.sh` | 同一 Agent，iPlanner + Pure Pursuit 导航 | `visible_01` |
 | 表 1 | `nav_direct_vla.sh` | 导航交接后直接 VLA | `visible_01` |
 | 表 1 | `navila_basepose_vla.sh` | NaVILA 导航，共用 BasePose 与 VLA | `visible_01` |
 | 表 1 | `geometric_vla.sh` | 头部优先、头胸切换的单目标几何接近/居中 | `visible_01` |
@@ -79,6 +132,61 @@ bash gear_sonic/scripts/experiments/full_vln.sh --task T1 --case visible_01
 **门控关闭**：仍保存 VA 观测和建议，与实际执行决定分开。NAV 门控关闭时，只在最终目标的导航结束候选后放行，中间探索步不冒充阶段结束。ALIGN 门控关闭时，控制器到达终止状态后放行；尚未找到角色、尚未启动控制器的状态仍重试。完成门控关闭时，VA 在旁路运行，执行到首个有效动作后固定 180 s 停止并记录完成候选；阻塞或迟到的 VA 回复不延长操作时间，迟到结果不再计入有效门控决定。所有分支保留底层保护、取消和总时限。
 
 ## 日志、首帧与人工标注
+
+### Full VLN 的近场入口：`m`
+
+参考 `agent_full` 分支 T1/T2 的 `near_dual` 入口，在同一个 Full VLN 会话内选择：
+
+- `n`：完整 mission，包含导航和 LA 重新规划。
+- `m`：从当前站位直接进行 VA 目标推理、头胸双相机对齐、VLA 操作和完成判断；T4 执行第一个 `pick_bag`（拿袋子）。完成后结束这一轮，不扫描五视角、不执行导航、不继续整段 mission。
+- `t`：T4 的第二个 `step_bin`（踩开桶盖并扔袋子），同样只进行该技能的对齐和操作。此键原先未占用；T1–T3 未配置 `t`，按下会拒绝启动。
+
+```bash
+bash gear_sonic/scripts/experiments/full_vln.sh --mission gear_sonic/config/missions/t1_bottle_to_basket.yaml --demo
+# 或把 YAML 换成 t2_bag_and_box.yaml；机器人就绪并处于 PLANNER 后，在 operator 控制台按 m。
+```
+
+`m` 使用当前 YAML 的操作描述、训练 prompt、模型后端和对齐调参；支持 T1/T2/T3 单技能 mission，及原单任务 Full VLN 配置。T4 的按键映射及单段完成条件写在 `bag_then_bin.yaml` 的 `mission_metadata.nearfield_entries`：`m → pick_bag`、`t → step_bin`。拿袋子的 40 s 超时在独立近场模式下记为失败并结束，不自动跳到扔袋子；拿袋结束保留 `exit: hold` 夹爪设置。目标未找到或对齐未通过时沿用近场重试与超时，不退回导航。
+
+带 `--demo` 时，`m`、`t` 与 `n` 都从 `trial_start` 开始缓存整轮头胸视频，对齐 mask、框、线使用同一录制/绘制链路，结束后导出。取消或重新按 `m`/`t`/`n` 会结束旧轮并保存；不加 `--demo` 不录制视频。文件仍在本会话 `demo/<trial_id>/video/head.mp4`、`chest.mp4`。
+
+每轮独立记录入口：`m`/`t` 的 `trial_start.experiment_override` 标明 `method: near_dual`、`table: nearfield`、`entry_stage: alignment`、`parent_method: full_vln`，保留任务编号和当前条件，并记录 `start_key`、`nearfield_skill`。T4 每段只使用本段里程碑；不会记作完整导航试验或自动产生导航成功。重新按 `n` 恢复原 Full VLN 配置。
+
+### Demo 录制（仅 `--demo` 开启）
+
+```bash
+bash gear_sonic/scripts/experiments/full_vln.sh --mission gear_sonic/config/missions/bag_then_bin.yaml --demo
+```
+
+由 `n` 开始完整任务，或在 Full VLN 下由 `m`/`t` 开始近场任务；`trial_end`（正常结束、失败、取消、重启等）触发保存。
+内置 mission YAML 自带任务编号；`bag_then_bin.yaml` 自动记为 T4，并覆盖旧命令中的 `--task`。
+T1–T3 的对应配置和来源见 [mission 配置说明](../../config/missions/README.md)。
+未指定带任务编号的 mission 时，`--task` 仍默认 T1。
+不加 `--demo` 时不会启动 demo 录制进程或额外保存模型请求，原有实验记录保持不变。
+Demo 录制独立于可视化窗口，关闭窗口不影响它；原数采录制按键不控制 demo 录制。
+
+每轮目录：`outputs/experiments/<session>/demo/<trial_id>/`。
+
+- `request_*.json`、`model_images/`：每次 LA/VA 实际请求的文字、模型参数和传输图像。图像从原始 data URL 提取，按 SHA-256 去重；JSON 的图像 URL 位置改为带相对路径、MIME 和哈希的引用。LA 包含本轮五视角／前视角以及实际使用的历史图，附可获得的取图时间与视角标签。
+- `events.jsonl` 仍在会话根目录：增加 `demo_model_request` / `demo_model_response`，以 request_id 关联每次尝试、原始回复、完整解析决策和错误；保留 `TODO_UPDATED`、`LA_DECISION`、取图阶段事件及完整参数。VA `check.inputs` 保存文字参数。
+- `video/head.mp4`、`chest.mp4`：整轮头胸画面，对齐阶段烧录与现有可视化相同的 mask、框、参考线；按可视化当前状态显示，不额外运行视觉模型。
+- `video/*.mjpeg`、各路 `*.jsonl`、`overlays.jsonl`、`manifest.json`：可重新导出的原始压缩帧、字节索引、时间戳及叠加状态。
+
+运行时最多以 30 Hz 读取现有 JPEG，不缓存 RGB 数组，不实时编码 H.264；重复源帧不重复保存，相同的连续 JPEG 共用一份字节。mask 和线作为压缩元数据缓存，结束后复用现有绘图函数烧录。通常全轮缓存到结束；压缩图像缓存超过 2 GiB 时应急写出 JPEG 并释放内存，最终视频仍在结束后生成。这个上限不含其他进程、少量索引和编码器内存。
+
+所有 demo 入口（包括 `n`、`m`、`t`）只录制头胸两路，不采集、缓存或导出 XNavDP 的两路可视化。实时可视化仍可使用；已有历史文件保留，`--render` 重导出旧 manifest 时也只处理头胸视频。已启动的录制进程需在下次启动时加载此改动。
+
+每轮结束先保存可恢复的 JPEG 和索引，释放缓存，再在录制进程的后台线程逐路生成视频（每个编码器限 2 个线程）。下一轮可以继续缓存，但导出仍会占用少量 CPU；正式拍摄前需实机验证录制吞吐。事件 `demo_video_saved` 表示导出完成，日志在 `/tmp/sonic_demo_recorder.log`。
+
+所有视频以 `trial_start` 为零点，用本机单调时间保持真实时长，输出 30 FPS；源时间戳另外保留。源帧不足会重复上一帧，超过 1.5 秒无新帧则显示 `NO FRESH FRAME`，不会把断流时间删掉。录制程序并不保证源相机满帧采集；缺失流与读取失败次数写入 manifest。
+
+重新导出（不连接机器人、不调用模型）：
+
+```bash
+.venv_inference/bin/python -m gear_sonic.experiments.demo_video --render /absolute/path/demo/TRIAL_ID/video/manifest.json
+```
+
+正常终止录制进程会尝试保存当前轮；断电或强制 KILL 仍会丢失尚在内存的部分，这是结束后保存模式的边界。已完整落盘的 manifest 可独立恢复导出。手持相机的视频仍需另外拍摄并留下同步标记。
 
 每次脚本启动生成 `outputs/experiments/<方法>_<任务>_<条件>_<会话编号>/`：
 

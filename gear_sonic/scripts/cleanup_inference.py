@@ -18,6 +18,7 @@ NAVDP_PROCESS_PATTERNS = (
     r"(^|/)(python|python3) -m gear_sonic\.utils\.inference\.navdp\.service( |$)",
     r"(^|/)(python|python3) -m eval\.src\.policy_server( |$)",
     r"(^|/)(python|python3) ([^ ]*/)?gear_sonic/scripts/navdp_planner\.py( |$)",
+    r"(^|/)(python|python3) -m gear_sonic\.utils\.inference\.iplanner\.server( |$)",
 )
 
 POLICY_PROCESS_PATTERNS = (

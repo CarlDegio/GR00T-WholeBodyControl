@@ -91,6 +91,8 @@ class VyPulseRecorder:
         after = next((f for f in frames if f["camera_timestamp_s"] >= timestamp), None)
         if before is None or after is None:
             return {"missing_reason": "no visual frames bracketing boundary"}
+        if before["target_track_id"] is None or after["target_track_id"] is None:
+            return {"missing_reason": "target identity is unavailable without tracking"}
         if before["epoch"] != epoch or after["epoch"] != epoch:
             return {"missing_reason": "camera/target changed or tracking interrupted"}
         lo, hi = before["camera_timestamp_s"], after["camera_timestamp_s"]

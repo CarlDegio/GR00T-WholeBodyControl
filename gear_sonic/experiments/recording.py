@@ -12,6 +12,14 @@ import uuid
 from .config import settings
 
 EVENTS = {
+    "UNILM_COMPLETED",
+    "UNILM_FAILED",
+    "IPLANNER_PLAN_ACCEPTED",
+    "IPLANNER_CONTROL",
+    "MISSION_OPERATION_COMPLETED",
+    "MISSION_OPERATION_TIMEOUT_CONTINUED",
+    "SKILL_TIMEOUT_CONTINUING",
+    "OPERATION_ALIGNMENT_INVALIDATED",
     "TASK_ACCEPTED",
     "TASK_STARTED",
     "TASK_COMPLETED",
@@ -38,6 +46,11 @@ EVENTS = {
     "GEOMETRIC_FINISHED",
 }
 OMIT = {"skill_args", "expected_postcondition", "mission", "manipulation_prompt", "max_steps", "todo_list"}
+DEMO_EVENTS = {
+    "LA_DECISION", "GLOBAL_TARGET_FROZEN", "TODO_UPDATED",
+    "PANORAMA_STARTED", "PANORAMA_COMPLETED", "PANORAMA_FAILED",
+    "FRONT_OBSERVATION_STARTED", "FRONT_OBSERVATION_COMPLETED", "FRONT_OBSERVATION_FAILED",
+}
 
 
 def read_events(path):
@@ -90,7 +103,8 @@ class Recorder:
         return event
 
     def runtime(self, component, code, **fields):
-        if code not in EVENTS:
+        demo = self.config.get("demo", False)
+        if code not in EVENTS and not (demo and code in DEMO_EVENTS):
             return
         generation = fields.pop("generation", None)
         if generation is None or int(generation) < 0:
@@ -100,5 +114,5 @@ class Recorder:
             generation=generation,
             component=component,
             code=code,
-            **{k: v for k, v in fields.items() if k not in OMIT},
+            **{k: v for k, v in fields.items() if demo or k not in OMIT},
         )

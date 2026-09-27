@@ -16,6 +16,8 @@ from .recording import Recorder, read_events
 
 METHOD_LABELS = {
     "full_vln": "Full agent",
+    "baselinelavira": "LaViRA + iPlanner + BasePose + VLA",
+    "baselinelavira": "BaselineLAVIRA",
     "full_objectnav": "Full agent（目标搜索）",
     "nav_direct_vla": "导航后直接 VLA",
     "navila_basepose_vla": "NaVILA + BasePose + VLA",
@@ -44,9 +46,10 @@ def complete_mean(values):
 
 
 def trial_rows(events):
-    session = next(e["experiment"] for e in events if e["type"] == "session")
+    session_config = next(e["experiment"] for e in events if e["type"] == "session")
     rows = []
     for start in (e for e in events if e["type"] == "trial_start"):
+        session = merge(session_config, start.get("experiment_override", {}))
         trial = [e for e in events if e.get("trial_id") == start["trial_id"]]
         end = next((e for e in trial if e["type"] == "trial_end"), None)
         end_ns = end.get("completed_monotonic_ns", end["monotonic_ns"]) if end else None
@@ -61,9 +64,24 @@ def trial_rows(events):
             runtime = [e for e in runtime if e["monotonic_ns"] <= end_ns]
         skill_starts = [e for e in runtime if e["code"] == "SKILL_STARTED"]
         align_count = sum(e.get("skill") == "ALIGN" for e in skill_starts)
+        align_retries = max(0, align_count - 1)
+        if session.get("flexible_mission"):
+            # Each operation needs its own preparation; those are not retries.
+            attempts = align_retries = 0
+            for event in runtime:
+                if event["code"] == "SKILL_STARTED" and event.get("skill") == "ALIGN":
+                    align_retries += int(attempts > 0)
+                    attempts += 1
+                elif event["code"] == "SKILL_COMPLETED" and event.get("skill") == "MANIPULATE":
+                    attempts = 0
+            if session["alignment"] == "none":
+                align_count = align_retries = 0
         nav_retries = 0
         recovery_needed = False
         for event in runtime:
+            if (session.get("flexible_mission") and event["code"] == "SKILL_COMPLETED"
+                and event.get("skill") == "MANIPULATE"):
+                recovery_needed = False
             if event["code"] == "SKILL_STARTED" and event.get("skill") == "MOVE_TO" and recovery_needed:
                 nav_retries += 1
                 recovery_needed = False
@@ -81,10 +99,13 @@ def trial_rows(events):
             and (completion is None or (e["monotonic_ns"] - start["monotonic_ns"]) / 1e9 < completion)
             for e in trial
         )
-        if intervention and success is True:
+        if intervention and success is True and annotations.get("success_basis") != "user_confirmed_physical_result":
             success = False
-        progress = annotations.get("progress")
-        progress = progress / len(session["task"]["milestones"]) if progress is not None else None
+        progress_numerator = annotations.get("progress")
+        progress_denominator = annotations.get("progress_denominator", len(session["task"]["milestones"]))
+        if progress_denominator <= 0:
+            raise ValueError(f"Invalid progress denominator for {start['trial_id']}")
+        progress = progress_numerator / progress_denominator if progress_numerator is not None else None
         duration = (
             session["task"]["total_timeout_s"] if success is False else completion if success is True else None
         )
@@ -114,18 +135,24 @@ def trial_rows(events):
 
         row = dict(
             trial_id=start["trial_id"],
-            method=session["method"],
+            method=start.get("method", session["method"]),
+            flexible_mission=session.get("flexible_mission", False),
+            mission=session.get("mission"),
             table=session["table"],
             repeat=1 + len(rows),
             entry_stage=session["entry_stage"],
-            task_id=session["task_id"],
-            case_id=session["case_id"],
+            nearfield_skill=session.get("nearfield_skill"),
+            start_key=start.get("start_key"),
+            task_id=annotations.get("task_id", session["task_id"]),
+            case_id=condition.get("case_id", session["case_id"]),
             visibility=condition.get("visibility"),
             nearfield_group=condition.get("nearfield_group"),
             condition=condition,
             success=success,
             physical_success=annotations.get("success"),
             progress=progress,
+            progress_numerator=progress_numerator,
+            progress_denominator=progress_denominator if progress_numerator is not None else None,
             time_s=duration,
             completion_time_s=completion,
             actual_runtime_s=(end_ns - start["monotonic_ns"]) / 1e9
@@ -140,7 +167,7 @@ def trial_rows(events):
             vla_first_inference_s=first_time("vla_first_inference"),
             vla_first_action_s=first_time("vla_first_action"),
             align_attempts=align_count,
-            align_retries=max(0, align_count - 1),
+            align_retries=align_retries,
             nav_retries=nav_retries,
             alignment_timeout=any(
                 ("timeout" in str(e.get("reason", "")) or "max_run" in str(e.get("reason", "")))

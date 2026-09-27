@@ -231,7 +231,8 @@ def load_component_config(
     selection_fields = {"profile", "overlay", "config"}
     expected = config_fields - selection_fields
     unknown = set(values) - expected
-    missing = expected - set(values)
+    optional = {item.name for item in fields(config_type) if item.metadata.get("profile_optional")}
+    missing = expected - set(values) - optional
     if unknown:
         raise ValueError(
             f"runtime component {component!r} has unknown fields: "

@@ -1,0 +1,100 @@
+# T2: Full VLN task, with BasePose parameters from the 2026-09-24 nearfield run.
+# One skill covers the whole manipulation; LA may navigate/reason again at any time.
+# Start the matching PolicyServer on port 29999. Preserve its trained prompt verbatim.
+# Source runtime and task identity are metadata; shared services use the base profile.
+components:
+  mission_metadata:
+    task_id: T2
+    source_runtime: outputs/experiments/full_vln_T2_invisible_02_4bf9ed5e8da0/runtime.yaml
+  deploy:
+    demo_controls: true
+  # BasePose reference: outputs/nearfield_experiments/T2/align_vla/near_dual_T2_nominal_01_a6b8fda7622a/runtime.yaml
+  # Camera-specific target confidence per user: head 0.10, chest 0.10.
+  base_pose:
+    planner_hz: 20.0
+    final_stop_count: 3
+    sensor_gateway_request_timeout_ms: 100
+    sensor_gateway_max_age_ms: 1000.0
+    sensor_gateway_max_skew_ms: 5.0
+    camera_timeout_ms: 15000
+    camera_intrinsics_path: gear_sonic/config/camera_intrinsics.json
+    camera_pitch_deg: -38.0
+    camera_roll_deg: 0.0
+    camera_yaw_deg: 0.0
+    camera_forward_offset_m: 0.0
+    camera_lateral_offset_m: 0.0
+    dual_head_camera_stream: ego_view
+    dual_head_depth_stream: camera/ego_view_depth
+    dual_chest_camera_stream: chest_view
+    dual_chest_depth_stream: camera/chest_view_depth
+    dual_chest_camera_pitch_deg: -3.0
+    dual_chest_camera_roll_deg: 0.0
+    dual_chest_camera_yaw_deg: 0.0
+    dual_chest_camera_forward_offset_m: 0.0
+    dual_chest_camera_lateral_offset_m: 0.0
+    dual_match_tolerance_frames: 30
+    dual_head_reacquire_frames: 1
+    dual_head_release_missing_frames: 3
+    dual_rgbd_buffer_size: 8
+    dual_rgbd_poll_hz: 60.0
+    raw_yoloe_model_path: tools/yoloe26m/weights/yoloe-26m-seg.pt
+    raw_yoloe_device: '0'
+    raw_yoloe_confidence: 0.25
+    raw_yoloe_tracking: false
+    raw_yoloe_imgsz: 640
+    raw_head_target_distance_m: 1.1
+    raw_head_approach_cutoff_m: 1.5
+    raw_chest_target_distance_m: 1.15
+    raw_chest_approach_cutoff_m: 1.2
+    raw_forward_tolerance_m: 0.1
+    raw_lateral_tolerance_m: 0.1
+    raw_min_linear_speed_m_s: 0.4
+    raw_max_lateral_speed_m_s: 0.4
+    raw_min_yaw_speed_rad_s: 0.1
+    raw_yaw_tolerance_deg: 3
+    raw_yaw_coarse_speed_rad_s: 0.3
+    raw_yaw_trim_speed_rad_s: 0.1
+    raw_forward_recenter_yaw_speed_rad_s: 0.3
+    raw_horizontal_guard_fraction: 0.25
+    raw_horizontal_recovery_fraction: 0.3
+    raw_camera_stale_s: 0.4
+    raw_max_run_s: 180.0
+    raw_post_stop_sample_frames: 30
+    raw_post_stop_deviation_frames: 10
+    target_prompt: cardboard box
+    yaw_align_target_prompt: cardboard box
+    task: align distance and centering to cardboard box and yaw to cardboard box
+    raw_head_target_confidence: 0.10
+    raw_chest_target_confidence: 0.10
+  lavira:
+    flexible_mission: true
+    operation_alignment_max_age_seconds: 30.0
+    mission: >-
+      Move to the black cabinet,turn left,move to the white rubbish bin,
+      move forward into the open area, move to the refrigerator, turn left,
+      and move to the cardboard box. Then move forward to approach the cardboard box,
+      pick up the bag and put it into the cardboard box, then carry the cardboard box
+      to the open area and place it on the ground.
+    navigation_mode: vln
+    global_target: ''
+    manipulation_prompt: ''
+    skills:
+      bag_and_box:
+        backend: bag_and_box_vla
+        geometry_target: cardboard box
+        vla_prompt: move forward to approach the cardboard box,pick up the bag and put it into the cardboard box, then carry the cardboard box to the open area and place it on the ground.
+        vla_trained_prompt: collect the bag and put it into box, then carry the box
+        completion:
+          kind: visual
+        timeout_seconds: 180.0
+        on_timeout: fail
+        completion_settle_seconds: 0.0
+        exit: default
+  vla:
+    default_skill: bag_and_box_vla
+    prewarm_backends: true
+    backends:
+      bag_and_box_vla:
+        host: 127.0.0.1
+        port: 29999
+        prompt: collect the bag and put it into box, then carry the box

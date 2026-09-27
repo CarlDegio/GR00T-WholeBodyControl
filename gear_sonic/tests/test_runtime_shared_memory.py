@@ -98,3 +98,32 @@ def test_external_reader_does_not_unlink_producer_owned_memory() -> None:
         assert result.stdout.strip() == "28.0"
         assert "resource_tracker" not in result.stderr
         np.testing.assert_array_equal(read_shared_memory_frame(frame), values)
+
+
+def test_concurrent_external_readers_keep_tracker_and_producer_memory_intact() -> None:
+    values = np.arange(8, dtype=np.float32)
+    child_code = """
+import concurrent.futures
+import json
+import sys
+from gear_sonic.runtime.protocol import SharedMemoryFrame
+from gear_sonic.runtime.gateway.shared_memory import read_shared_memory_frame
+
+frame = SharedMemoryFrame.from_dict(json.loads(sys.argv[1]))
+def read_repeatedly(_):
+    for _ in range(200):
+        assert read_shared_memory_frame(frame).sum() == 28
+with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
+    list(pool.map(read_repeatedly, range(8)))
+"""
+    with SharedMemoryRing("concurrent-readers", slot_count=2, slot_size_bytes=values.nbytes) as ring:
+        frame = ring.write(values, received_ns=1)
+        result = subprocess.run(
+            [sys.executable, "-c", child_code, json.dumps(frame.to_dict())],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        assert result.stderr == ""
+        np.testing.assert_array_equal(read_shared_memory_frame(frame), values)

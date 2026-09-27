@@ -1,0 +1,25 @@
+--- remote-before/root.tex
++++ restored/root.tex
+@@ -64,7 +64,7 @@
+ 
+ The central challenge lies in the handoff failures between navigation and manipulation. A navigation controller may stop near the target object while leaving the robot too far away, laterally displaced, poorly oriented, or unable to observe all relevant objects. An existing manipulation policy can therefore receive an unfavorable initial observation even when navigation has reached its own goal. The research question is whether task-conditioned geometric alignment can reduce the mismatch between the initial observation distribution induced by navigation and that expected by existing manipulation policies, thereby seamlessly bridging navigation and manipulation skills.
+ 
+-Our key insight is that the object that determines where the robot should stand need not be the structure that determines how it should orient itself for manipulation. For example, when placing a bottle into a basket on a table, the basket provides a position reference, while a table edge provides an orientation reference. We therefore formulate navigation-to-manipulation handoff through two distinct geometric reference roles: a position reference and an orientation reference, selected according to the manipulation instruction and allowed to refer to the same or different objects. This formulation explicitly separates the two roles while preserving their task-dependent relationship. We instantiate it as \textbf{GATE}, an intermediate alignment skill in which an MLLM selects the references and a geometric feedback controller regulates distance, lateral offset, and heading before handing control to the manipulation policy. GATE thus converts task semantics into explicit geometric constraints on the manipulation starting state, without requiring additional transition-policy training or changes to the downstream manipulation policy.
++We use object-relative geometry to represent spatial conditions relevant to the manipulation handoff, including distance, lateral offset, and orientation. Through experiments, we validate the essential factors---distance, lateral error, and orientation---and design a general-purpose base-pose controller accordingly. To apply it to loco-manipulation tasks, we design it as an intermediate alignment skill called \textbf{GATE}. The backend MLLM agent selects the target object based on the image and instruction, after which the controller performs feedback control by estimating the geometric relationship between the target object and the robot.
+ 
+ Building on GATE, we develop a practical agentic system that coordinates navigation, geometric alignment, and whole-body manipulation. Drawing inspiration from LaViRA, we adopt a dual-agent architecture. The high-level language agent analyzes the instruction, history, and current observation to determine an overall strategy, including which direction to take, which skill to use, and how to manage the TODO list. A high-frequency vision agent handles low-level tasks, including grounding and state monitoring. Navigation, alignment, and manipulation are encapsulated as independent skills and converted into motor commands through a unified low-level motion control algorithm.
+ 
+@@ -73,11 +73,11 @@
+ Our work is organized around three contributions:
+ \begin{itemize}
+ 
+-\item \textbf{GATE: handoff through distinct position and orientation references.} We introduce a task-conditioned geometric handoff formulation that assigns position and orientation to separate reference roles. GATE realizes this formulation through semantic reference selection and closed-loop geometric control, without additional transition-policy training. 
++\item \textbf{GATE: geometric alignment for handoff.} We address navigation-to-manipulation handoff failure with object-aware geometry relations, closed-loop base adjustment, and readiness checks, without additional training or special annotations.
+ 
+ \item \textbf{Agentic humanoid loco-manipulation.} We develop an agentic loco-manipulation system that coordinates navigation, alignment, and humanoid manipulation. The system exhibits robust generalization across diverse workspaces and tasks in real-world settings.
+ 
+-\item \textbf{Long-horizon execution and transfer evaluation.} We evaluate the agentic system on real-world humanoid tasks, improve the overall success rate from from 35.0\% to 82.5\%, and we examine the applicability of GATE on the OVMM benchmark. These experiments assess the geometric handoff principle across different embodiments and downstream manipulation policies.
++\item \textbf{Long-horizon execution and transfer evaluation.} We evaluated the agentic system on real-world humanoid tasks and examine the applicability of GATE in OVMM benchmark. These experiments test the methods across different embodiments and downstream manipulation polices. 
+ \end{itemize}
+ 
+ \section{Related Work}

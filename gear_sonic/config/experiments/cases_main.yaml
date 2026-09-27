@@ -41,22 +41,22 @@ cases:
       T3: null
       T4: null
   visible_05:
-    layout_id: null
-    start_id: null
+    layout_id: t1_layout_03
+    start_id: t1_start_02
     visibility: visible
     initial_path_distance_m: null
     navigation_instructions:
-      T1: null
+      T1: Move to the black garbage bin, turn left and move forward to the front of the table with blue basket 
       T2: null
       T3: null
       T4: null
   visible_06:
-    layout_id: null
-    start_id: null
-    visibility: visible
+    layout_id: t1_layout_03
+    start_id: t1_start_03
+    visibility: not visible
     initial_path_distance_m: null
     navigation_instructions:
-      T1: null
+      T1: 
       T2: null
       T3: null
       T4: null

@@ -1,0 +1,31 @@
+{
+  "source": "/home/user/Project/GR00T-WholeBodyControl/demo_video/2026-09-26_combined/exports/Full_demo_combined_v6_redacted.mp4",
+  "output": "/home/user/Project/GR00T-WholeBodyControl/demo_video/2026-09-26_combined/exports/Full_demo_combined_v7_redacted.mp4",
+  "title": "Geometry-Aligned Task Execution bridge",
+  "labels": [
+    "Long-Horizon Task in an Open Environment",
+    "Complex Multi-Step Manipulation Task"
+  ],
+  "single_labels": true,
+  "tasks": {
+    "t2": {
+      "start": 3318,
+      "frames": 3762,
+      "title": "Task: Bag Placement & Box Transport",
+      "edit": "T2_20260926_v8",
+      "session": "full_vln_T2_visible_01_c84114bf87cc",
+      "epoch": 1790333745.0,
+      "grade": "eq=contrast=1.025:saturation=1.05:gamma=1.012,colorbalance=gm=-0.009:bm=0.012"
+    },
+    "t4": {
+      "start": 7080,
+      "frames": 3574,
+      "title": "Task: Pick Up the Bag & Dispose of It",
+      "edit": "T4_20260926_v7",
+      "session": "full_vln_T4_visible_01_0fce0b283641",
+      "epoch": 1790342419.0,
+      "grade": "eq=contrast=1.025:saturation=0.97:gamma=1.012,colorbalance=rm=-0.012:bm=0.020:bh=0.020"
+    }
+  },
+  "total_frames": 10774
+}

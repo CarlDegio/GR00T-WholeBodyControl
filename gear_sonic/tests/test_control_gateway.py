@@ -607,20 +607,26 @@ def test_base_pose_velocity_rejects_stale_or_unsafe_commands() -> None:
         )
 
 
-def test_yoloe_base_pose_profile_allows_bounded_single_axis_lateral_servo() -> None:
+@pytest.mark.parametrize("vy", [0.5, -0.5])
+def test_yoloe_base_pose_profile_allows_bounded_single_axis_lateral_servo(vy) -> None:
     state = NavigationControlState()
     started = state.handle_key("b", now=1.0)
 
     action = state.accept_base_pose_velocity(
         {
             "generation": started.generation,
-            "velocity": [0.0, 0.4, -0.3],
+            "velocity": [0.0, vy, -0.3],
             "motion_profile": "yoloe_servo",
         },
         now=1.1,
     )
 
-    assert action.velocity == pytest.approx((0.0, 0.4, -0.3))
+    assert action.velocity == pytest.approx((0.0, vy, -0.3))
+    with pytest.raises(ValueError, match="safety envelope"):
+        state.accept_base_pose_velocity(
+            {"generation": started.generation, "velocity": [0.0, vy * 1.02, 0.0],
+             "motion_profile": "yoloe_servo"}, now=1.15,
+        )
     with pytest.raises(ValueError, match="safety envelope"):
         state.accept_base_pose_velocity(
             {

@@ -30,12 +30,12 @@ tasks:
     objectnav_instruction: Search the workspace for the trash bin and approach it.
     milestones: [stable_bowl_grasp, lid_open_for_pouring, contents_in_bin]
   T4:
-    vla_prompt: Pick up the object on top of the bedside cabinet, open the drawer, place the object inside, and release it.
+    vla_prompt: Pick up the white gift bag on the desk, carry it to the green rubbish bin, step on the pedal to open the lid, and throw the bag in.
     vla_trained_prompt: null
-    global_target: bedside cabinet
-    geometry_target: bedside cabinet
-    objectnav_instruction: Search the workspace for the bedside cabinet and approach it.
-    milestones: [stable_object_grasp, drawer_open, object_in_drawer_released]
+    global_target: white gift bag
+    geometry_target: white gift bag
+    objectnav_instruction: Search the workspace for the white gift bag on the desk and approach it.
+    milestones: [stable_bag_grasp, bag_in_bin_released]
 geometric:
   distance_m: 1.1
   longitudinal_tolerance_m: 0.1

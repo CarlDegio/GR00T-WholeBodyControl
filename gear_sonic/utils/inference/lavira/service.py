@@ -3,7 +3,7 @@
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 import json
 import logging
 import math
@@ -105,10 +105,29 @@ class LaviraPlannerConfig:
     manipulation_max_windows: int = 36
     manipulation_timeout_seconds: float = 180.0
     vla_start_timeout_seconds: float = 25.0
+    operation_alignment_max_age_seconds: float = field(default=30.0, metadata={"profile_optional": True})
+    mission_steps: list[dict] = field(default_factory=list, metadata={"profile_optional": True})
+    skills: dict[str, dict] = field(default_factory=dict, metadata={"profile_optional": True})
+    flexible_mission: bool = field(default=False, metadata={"profile_optional": True})
+    smoke_assume_vla_success: bool = field(default=False, metadata={"profile_optional": True})
     profile: str = ""
     overlay: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
+        from .mission import parse_mission_steps, parse_skill_definitions
+        if type(self.flexible_mission) is not bool:
+            raise ValueError("flexible_mission must be a boolean")
+        if type(self.smoke_assume_vla_success) is not bool:
+            raise ValueError("smoke_assume_vla_success must be a boolean")
+        if self.smoke_assume_vla_success and not self.flexible_mission:
+            raise ValueError("smoke_assume_vla_success requires flexible_mission")
+        if self.flexible_mission:
+            if self.mission_steps or self.global_target.strip():
+                raise ValueError("flexible_mission requires no mission_steps or fixed global_target")
+            if not parse_skill_definitions(self.skills, flexible=True):
+                raise ValueError("flexible_mission requires a VLA skill catalog")
+        else:
+            parse_mission_steps(self.mission_steps, skills=self.skills)
         if self.navigation_mode not in {"vln", "object_nav"}:
             raise ValueError("components.lavira.navigation_mode must be vln or object_nav")
         if not self.mission.strip():
@@ -136,6 +155,8 @@ class LaviraPlannerConfig:
             or self.manipulation_max_windows <= 0
             or self.manipulation_timeout_seconds <= 0
             or self.vla_start_timeout_seconds <= 0
+            or not math.isfinite(float(self.operation_alignment_max_age_seconds))
+            or self.operation_alignment_max_age_seconds <= 0
             or not math.isfinite(float(self.heading_settle_seconds))
             or self.heading_settle_seconds < 0
             or self.heading_settle_samples <= 0
@@ -168,6 +189,12 @@ def parse_lavira_config(args: list[str] | None = None) -> LaviraPlannerConfig:
 
 
 @dataclass(frozen=True)
+class NearfieldRequest:
+    generation: int
+    start_key: str = "m"
+
+
+@dataclass(frozen=True)
 class WorkerResult:
     generation: int
     result: LaViRATaskResult | None
@@ -190,7 +217,7 @@ class LaviraPlannerRuntime:
         self.generation = 0
         self.state = "listen_wasd"
         self.pending_generation: int | None = None
-        self.requests: queue.Queue[int | None] = queue.Queue(maxsize=1)
+        self.requests: queue.Queue[int | NearfieldRequest | None] = queue.Queue(maxsize=1)
         self.results: queue.Queue[WorkerResult] = queue.Queue(maxsize=1)
         self.stop_event = threading.Event()
         self._condition = threading.Condition()
@@ -279,7 +306,10 @@ class LaviraPlannerRuntime:
             reason=reason,
         )
 
-    def start_navigation(self, generation: int) -> bool:
+    def start_navigation(self, generation: int, *, nearfield=False, nearfield_key="m") -> bool:
+        if nearfield:
+            from gear_sonic.experiments.nearfield import nearfield_experiment
+            nearfield_experiment(getattr(self, "experiment", {}), start_key=nearfield_key)
         with self._condition:
             if generation <= self.generation or self.pending_generation is not None:
                 self._event(
@@ -295,7 +325,7 @@ class LaviraPlannerRuntime:
             self.pending_generation = generation
             self.state = "nav"
             self._terminal_status.clear()
-            replace_latest(self.requests, generation)
+            replace_latest(self.requests, NearfieldRequest(generation, nearfield_key) if nearfield else generation)
             self._condition.notify_all()
         LOGGER.info(
             "NAV generation=%s navigation_mode=%s mission=%s",
@@ -353,6 +383,8 @@ class LaviraPlannerRuntime:
         )
         if state in {"reached", "failed", "stopped"} or (
             channel == "vla_task_status" and state == "active"
+        ) or (
+            channel == "vla_handoff_status" and state == "ready"
         ):
             with self._condition:
                 self._terminal_status[(generation, skill_id, segment_id)] = payload
@@ -378,6 +410,13 @@ class LaviraPlannerRuntime:
                 if self.is_cancelled(generation):
                     raise LaViRAAgentCancelled("operator_cancelled")
                 status = self._terminal_status.pop(key, None)
+                if status is None and int(segment_id) in {-1, -2}:
+                    # Safety failures can arrive on the active VLA window while
+                    # we await the dedicated handoff channel.
+                    for other, failure in tuple(self._terminal_status.items()):
+                        if other[:2] == key[:2] and failure.get("state") in {"failed", "stopped"}:
+                            status = self._terminal_status.pop(other)
+                            break
                 if status is not None:
                     return status
                 remaining = deadline - time.monotonic()
@@ -452,15 +491,15 @@ class LaviraPlannerRuntime:
 
 
 def run_agent_worker(
-    factory: Callable[[], LaViRAAgent], runtime: LaviraPlannerRuntime
+    factory: Callable[..., LaViRAAgent], runtime: LaviraPlannerRuntime
 ) -> None:
     if getattr(runtime, "experiment", None):
-        def run_trial(generation):
+        def run_trial(generation, nearfield=False, nearfield_key="m"):
             trial_agent = None
             try:
                 if runtime.is_cancelled(generation):
                     return
-                trial_agent = factory()
+                trial_agent = factory(nearfield=True, nearfield_key=nearfield_key) if nearfield else factory()
                 item = WorkerResult(generation, trial_agent.run(generation), None)
             except Exception as exc:
                 item = WorkerResult(generation, None, str(exc))
@@ -469,12 +508,14 @@ def run_agent_worker(
                     trial_agent.camera.close()
             runtime.publish_worker_result(item)
         while not runtime.stop_event.is_set():
-            generation = runtime.requests.get()
-            if generation is None:
+            request = runtime.requests.get()
+            if request is None:
                 break
+            nearfield = isinstance(request, NearfieldRequest)
+            generation = request.generation if nearfield else request
             # Each trial owns its model clients and camera cursor. A cancelled
             # request may finish late without delaying or changing the next trial.
-            threading.Thread(target=run_trial, args=(generation,), daemon=True,
+            threading.Thread(target=run_trial, args=(generation, nearfield, request.start_key if nearfield else "m"), daemon=True,
                              name=f"experiment-agent-{generation}").start()
         return
     agent: LaViRAAgent | None = None
@@ -508,6 +549,7 @@ def _agent(
     config: LaviraPlannerConfig,
     sensor_gateway: str,
     runtime: LaviraPlannerRuntime,
+    *, nearfield=False, nearfield_key="m",
 ) -> LaViRAAgent:
     camera = SensorGatewayRGBDCamera(
         sensor_gateway,
@@ -530,16 +572,42 @@ def _agent(
     from gear_sonic.experiments.config import settings
     from gear_sonic.experiments.agent import ExperimentAgent
     experiment = settings(load_runtime_profile(config.profile or None, overlays=config.overlay))
+    if nearfield:
+        from gear_sonic.experiments.nearfield import nearfield_experiment
+        experiment = nearfield_experiment(experiment, start_key=nearfield_key)
     agent_type = ExperimentAgent if experiment else LaViRAAgent
     extra = {"experiment": experiment} if experiment else {}
+    if config.flexible_mission and not nearfield:
+        from .flexible import FlexibleMissionAgent
+        from .mission import parse_skill_definitions, validate_mission_profile
+        profile = load_runtime_profile(config.profile or None, overlays=config.overlay)
+        validate_mission_profile(profile)
+        skills = parse_skill_definitions(config.skills,
+                                         backends=profile.component("vla").get("backends", {}), flexible=True)
+        agent_type, extra = FlexibleMissionAgent, {
+            "skills": skills, "smoke_assume_vla_success": config.smoke_assume_vla_success,
+        }
+        if experiment:
+            from gear_sonic.experiments.flexible import FlexibleExperimentAgent
+            agent_type = FlexibleExperimentAgent
+            extra["experiment"] = experiment
+    if config.mission_steps:
+        from .mission import MissionAgent, parse_mission_steps
+        if experiment:
+            raise ValueError("mission_steps cannot be combined with single-trial experiment overlays")
+        profile = load_runtime_profile(config.profile or None, overlays=config.overlay)
+        steps = parse_mission_steps(config.mission_steps,
+                                    backends=profile.component("vla").get("backends", {}),
+                                    skills=config.skills)
+        agent_type, extra = MissionAgent, {"mission_steps": steps}
     if experiment:
         client.save_request_context = False
-    return agent_type(
+    agent = agent_type(
         **extra,
         navigation_mode=config.navigation_mode,
-        mission=config.mission,
-        global_target=config.global_target,
-        manipulation_prompt=config.manipulation_prompt,
+        mission=experiment["mission"] if nearfield else config.mission,
+        global_target=experiment["task"].get("geometry_target", "") if nearfield else config.global_target,
+        manipulation_prompt=experiment["task"]["vla_prompt"] if nearfield else config.manipulation_prompt,
         alignment_prompt=config.alignment_prompt,
         max_steps=config.max_steps,
         history_size=config.history_size,
@@ -564,8 +632,9 @@ def _agent(
         cancelled=runtime.is_cancelled,
         manipulation_window_seconds=config.manipulation_window_seconds,
         manipulation_max_windows=config.manipulation_max_windows,
-        manipulation_timeout_seconds=config.manipulation_timeout_seconds,
+        manipulation_timeout_seconds=experiment["task"]["vla_timeout_s"] if nearfield else config.manipulation_timeout_seconds,
         vla_start_timeout_seconds=config.vla_start_timeout_seconds,
+        operation_alignment_max_age_seconds=config.operation_alignment_max_age_seconds,
         poll_failure=runtime.pop_failure,
         nav_handoff_min_depth_m=config.nav_handoff_min_depth_m,
         nav_handoff_max_depth_m=config.nav_handoff_max_depth_m,
@@ -573,6 +642,10 @@ def _agent(
         report_event=runtime.report_agent_event,
         report_todo=runtime.report_todo,
     )
+    if nearfield:
+        agent.vla_task_parameters = experiment.get("nearfield_vla_parameters", {})
+        agent.manipulation_postcondition = experiment.get("nearfield_expected_postcondition", "")
+    return agent
 
 
 def main(config: LaviraPlannerConfig) -> None:
@@ -617,10 +690,9 @@ def main(config: LaviraPlannerConfig) -> None:
         report_event=report_event,
     )
     runtime.experiment = service.experiment.config
-    experiment_intents = queue.Queue()
-    if runtime.experiment:
-        # Keep the ZMQ socket and command sequence owned by the service thread.
-        runtime.submit_intent = lambda name, parameters: experiment_intents.put((name, dict(parameters)))
+    pending_intents = queue.Queue()
+    # Keep the ZMQ socket and command sequence owned by the service thread.
+    runtime.submit_intent = lambda name, parameters: pending_intents.put((name, dict(parameters)))
     control_gateway = ControlGatewaySubscriber(
         profile.endpoint_uri("control_gateway_dispatch"),
         context=context,
@@ -630,15 +702,18 @@ def main(config: LaviraPlannerConfig) -> None:
             "navigation_status",
             "base_pose_status",
             "vla_task_status",
+            "vla_handoff_status",
+            "skill_completion",
         },
     )
     worker = threading.Thread(
         target=run_agent_worker,
         args=(
-            lambda: _agent(
+            lambda nearfield=False, nearfield_key="m": _agent(
                 config,
                 profile.endpoint_uri("sensor_gateway_metadata"),
                 runtime,
+                nearfield=nearfield, nearfield_key=nearfield_key,
             ),
             runtime,
         ),
@@ -658,18 +733,19 @@ def main(config: LaviraPlannerConfig) -> None:
             if command is not None:
                 generation = int(command.parameters.get("generation", -1))
                 if command.name == "start_navigation":
-                    runtime.start_navigation(generation)
+                    runtime.start_navigation(generation, nearfield=command.parameters.get("nearfield", False),
+                                             nearfield_key=command.parameters.get("nearfield_key", "m"))
                 elif command.name == "cancel_navigation":
                     runtime.cancel(generation, str(command.parameters.get("reason") or "operator_stop"))
                 elif command.name in {
-                    "navigation_status", "base_pose_status", "vla_task_status"
+                    "navigation_status", "base_pose_status", "vla_task_status", "vla_handoff_status", "skill_completion"
                 }:
                     runtime.accept_status(
                         command.parameters,
                         channel=command.name,
                     )
-            while not experiment_intents.empty():
-                name, parameters = experiment_intents.get_nowait()
+            while not pending_intents.empty():
+                name, parameters = pending_intents.get_nowait()
                 if not runtime.is_cancelled(int(parameters.get("generation", -1))):
                     intent.send(name, parameters)
             runtime.tick()

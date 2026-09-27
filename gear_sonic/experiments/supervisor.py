@@ -22,13 +22,18 @@ class ExperimentSupervisor:
         self.step = None
         self.last_step_publish = 0.0
 
-    def start(self, generation):
+    def start(self, generation, *, nearfield=False, nearfield_key="m"):
+        from .nearfield import nearfield_experiment
+
+        config = nearfield_experiment(self.recorder.config, start_key=nearfield_key) if nearfield else self.recorder.config
         if not self.config:
             return
         if self.active:
             old_generation = self.active[0]
-            self.recorder.write("intervention", generation=old_generation, command="restart_with_n")
-            self.finish(old_generation, "cancelled", "restarted_with_n")
+            key = nearfield_key if nearfield else "n"
+            self.recorder.write("intervention", generation=old_generation, command=f"restart_with_{key}")
+            self.finish(old_generation, "cancelled", f"restarted_with_{key}")
+        self.config = config
         self.active = (generation, self.clock() + self.config["task"]["total_timeout_s"])
         self.vla_identity = self.vla_deadline = self.step = None
         self.recorder.write(
@@ -37,6 +42,7 @@ class ExperimentSupervisor:
             task_id=self.config["task_id"],
             method=self.config["method"],
             condition=self.config["condition"],
+            **({"experiment_override": self.config, "start_key": nearfield_key} if nearfield else {}),
         )
         from .snapshots import record_pose_async
 
@@ -88,6 +94,12 @@ class ExperimentSupervisor:
         if nav.mode != "lavira_manipulate" or identity[1] != nav.skill_id:
             return
         self.vla_identity = identity
+        if self.config.get("flexible_mission"):
+            # Flexible operations enforce their own per-skill deadline and may
+            # deliberately continue after timeout. Only the whole-trial clock
+            # belongs here; no old VLA deadline may interrupt subsequent NAV.
+            self.vla_deadline = None
+            return
         duration = self.config["task"][
             "vla_timeout_s" if self.config["gates"]["completion"] else "fixed_manipulation_s"
         ]

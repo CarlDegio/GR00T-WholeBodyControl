@@ -57,8 +57,8 @@ def test_every_profile_loads_strict_runtime_components(tmp_path, method, task):
         assert not missing
 
 
-def test_fifteen_dry_runs_do_not_launch_or_create_results(tmp_path, capsys, monkeypatch):
-    assert len(METHODS) == 15
+def test_all_dry_runs_do_not_launch_or_create_results(tmp_path, capsys, monkeypatch):
+    assert "baselinelavira" in METHODS
     monkeypatch.setattr(
         "gear_sonic.experiments.config.subprocess.run", lambda *a, **k: pytest.fail("dry-run invoked a process")
     )

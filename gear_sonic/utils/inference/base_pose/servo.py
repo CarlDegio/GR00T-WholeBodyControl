@@ -108,7 +108,7 @@ class RawServoCalibration:
 
 @dataclass(frozen=True)
 class TrackedInstance:
-    track_id: int
+    track_id: int | None
     class_index: int
     confidence: float
     bbox_xyxy: tuple[float, float, float, float]
@@ -172,7 +172,7 @@ class RawServoObservation:
     target: TargetGeometry
     yaw_align_geometry: YawAlignGeometry | None
     camera_timestamp: float
-    target_track_id: int
+    target_track_id: int | None
     yaw_align_target_track_id: int | None
     target_bbox_xyxy: tuple[float, float, float, float] = (0.0, 0.0, 640.0, 480.0)
     image_width: int = 640
@@ -241,7 +241,7 @@ def validate_raw_servo_dependencies(config: Any) -> None:
 
 
 class YoloePersistentTracker:
-    """YOLOE-26M segmentation plus persistent BoT-SORT IDs."""
+    """YOLOE-26M segmentation with optional persistent BoT-SORT IDs."""
 
     def __init__(
         self,
@@ -251,6 +251,7 @@ class YoloePersistentTracker:
         imgsz: int = 640,
         device: str = "0",
         yaw_align_target_prompt: str = DEFAULT_YAW_ALIGN_TARGET_TEXT_PROMPT,
+        tracking_enabled: bool = False,
     ):
         path = Path(model_path).resolve()
         if not path.is_file():
@@ -272,6 +273,14 @@ class YoloePersistentTracker:
             raise RuntimeError("raw YOLOE servo requires a CUDA GPU")
         self.model = YOLOE(str(path))
         self.confidence = float(confidence)
+        self.target_confidence = self.confidence
+        self.tracking_enabled = tracking_enabled
+        # Run before Ultralytics' tracking callback so a newly detected target
+        # below BoT-SORT's default 0.25 can also receive a track ID.
+        if self.tracking_enabled:
+            self.model.add_callback(
+                "on_predict_postprocess_end", self._configure_tracking_thresholds
+            )
         self.imgsz = int(imgsz)
         self.device = device
         self.yaw_align_target_prompt = str(yaw_align_target_prompt).strip()
@@ -296,6 +305,12 @@ class YoloePersistentTracker:
         self._inference_stream.wait_stream(
             self._torch.cuda.current_stream(device=self._resident_device)
         )
+
+    def _configure_tracking_thresholds(self, predictor: Any) -> None:
+        threshold = min(0.25, self.confidence, self.target_confidence)
+        for tracker in getattr(predictor, "trackers", ()):
+            tracker.args.track_high_thresh = threshold
+            tracker.args.new_track_thresh = threshold
 
     def reset_tracking(self) -> None:
         """Clear predictor and BoT-SORT state while preserving class embeddings."""
@@ -351,24 +366,32 @@ class YoloePersistentTracker:
         from ultralytics.utils import ops
 
         bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
-        result = self.model.track(
-            bgr,
-            persist=True,
-            tracker="botsort.yaml",
+        inference_options = dict(
             device=self.device,
             imgsz=self.imgsz,
-            conf=self.confidence,
+            conf=min(self.confidence, self.target_confidence),
             half=True,
             quantize=16,
             verbose=False,
             save=False,
-        )[0]
-        if result.boxes is None or result.masks is None or result.boxes.id is None:
+        )
+        if self.tracking_enabled:
+            result = self.model.track(
+                bgr, persist=True, tracker="botsort.yaml", **inference_options,
+            )[0]
+        else:
+            result = self.model.predict(bgr, **inference_options)[0]
+        if result.boxes is None or result.masks is None:
+            return []
+        if self.tracking_enabled and result.boxes.id is None:
             return []
         boxes = result.boxes.xyxy.detach().cpu().numpy()
         classes = result.boxes.cls.detach().cpu().numpy().astype(int)
         confidences = result.boxes.conf.detach().cpu().numpy()
-        ids = result.boxes.id.detach().cpu().numpy().astype(int)
+        ids = (
+            result.boxes.id.detach().cpu().numpy().astype(int)
+            if self.tracking_enabled else [None] * len(boxes)
+        )
         mask_data = result.masks.data
         scaled = ops.scale_masks(
             mask_data[:, None], rgb.shape[:2], padding=True, mode="nearest"
@@ -379,9 +402,12 @@ class YoloePersistentTracker:
             class_index = int(classes[index])
             if class_index < 0 or class_index >= len(self.class_names):
                 continue
+            threshold = self.target_confidence if class_index == 0 else self.confidence
+            if float(confidences[index]) < threshold:
+                continue
             instances.append(
                 TrackedInstance(
-                    track_id=int(track_id),
+                    track_id=None if track_id is None else int(track_id),
                     class_index=class_index,
                     confidence=float(confidences[index]),
                     bbox_xyxy=tuple(float(item) for item in boxes[index]),
@@ -933,7 +959,7 @@ class VisualServoController:
         missing_tolerance_frames: int = 30,
         max_run_s: float = 180.0,
         min_linear_speed_m_s: float = 0.30,
-        max_lateral_speed_m_s: float = 0.40,
+        max_lateral_speed_m_s: float = 0.50,
         lateral_pulse_enter_m: float = 0.10,
         lateral_pulse_exit_m: float = 0.20,
         lateral_pulse_max_s: float = 0.20,
@@ -1495,7 +1521,7 @@ class VisualServoController:
     ) -> tuple[float, float]:
         # The physical controller has different effective dead zones on its
         # forward and lateral axes. Keep nonzero vx at the configured forward
-        # minimum while retaining the configured 0.4 m/s lateral command.
+        # minimum while retaining the configured lateral command magnitude.
         if 0.0 < abs(vx) < self.min_linear_speed_m_s:
             vx = math.copysign(
                 math.nextafter(self.min_linear_speed_m_s, math.inf), vx
@@ -2727,7 +2753,7 @@ class RawServoRuntime:
             target_distance_m=config.raw_head_target_distance_m,
             forward_tolerance_m=config.raw_forward_tolerance_m,
             lateral_tolerance_m=config.raw_lateral_tolerance_m,
-            stable_frames=5,
+            stable_frames=getattr(config, "raw_stable_frames", 5),
             max_run_s=config.raw_max_run_s,
             min_linear_speed_m_s=config.raw_min_linear_speed_m_s,
             max_lateral_speed_m_s=config.raw_max_lateral_speed_m_s,
@@ -2983,6 +3009,8 @@ class RawServoRuntime:
         chest_stream = self.config.dual_chest_camera_stream
         active_stream = self.active_camera_stream
         chest_camera_active = active_stream == chest_stream
+        self.controller.stable_frames_required = getattr(self.config, "raw_stable_frames", 5)
+        self.controller.lateral_tolerance_m = self.config.raw_lateral_tolerance_m
         self.controller.chest_approach_only = chest_camera_active
         self.controller.target_distance_m = self._target_distance_for_stream(
             active_stream

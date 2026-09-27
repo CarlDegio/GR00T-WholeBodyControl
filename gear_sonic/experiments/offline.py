@@ -235,6 +235,13 @@ def enrich_snapshots(profile_path):
                 and e.get("trial_id") == event["trial_id"]
                 and e.get("skill_id") == event["skill_id"]
             )
+            operation = next((
+                e for e in events if e["type"] == "vla_operation"
+                and e.get("trial_id") == event["trial_id"]
+                and e.get("skill_id") == event["skill_id"]
+            ), None)
+            if recorder.config.get("flexible_mission") and operation is None:
+                raise ValueError("Missing per-operation metadata; cannot infer skill from an earlier operation")
             candidates = [
                 e
                 for e in events
@@ -243,11 +250,12 @@ def enrich_snapshots(profile_path):
                 and e.get("kind") == "alignment_grounding"
                 and (e.get("result") or {}).get("status") == "FOUND"
                 and e["monotonic_ns"] < first_inference
+                and (operation is None or e.get("skill_id") == operation["alignment_skill_id"])
             ]
             roles = candidates[-1]["result"] if candidates else None
             source = "control_alignment" if roles else "offline_semantic_selection"
             if recorder.config["alignment"] == "geometric":
-                target = recorder.config["geometric"]["target"]
+                target = operation["geometry_target"] if operation else recorder.config["geometric"]["target"]
                 roles = dict(status="FOUND", target={"name": target}, yaw_align_target={"name": target})
                 source = "control_geometric_centering"
             if roles is None:
@@ -255,7 +263,8 @@ def enrich_snapshots(profile_path):
                 camera_name = "ego_view" if recorder.config["alignment"] == "head" else "chest_view"
                 image = cv2.imread(str(metadata.parent / data["cameras"][camera_name]["rgb"]))
                 roles = client.alignment_grounding(
-                    manipulation_prompt=recorder.config["task"]["vla_prompt"], direction="front", image_bgr=image
+                    manipulation_prompt=operation["vla_prompt"] if operation else recorder.config["task"]["vla_prompt"],
+                    direction="front", image_bgr=image
                 )
             results = {}
             for name in ("ego_view", "chest_view"):

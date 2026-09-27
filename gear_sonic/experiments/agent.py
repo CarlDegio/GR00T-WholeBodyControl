@@ -17,7 +17,7 @@ from .recording import Recorder, read_events
 
 
 class RecordedCamera:
-    """Associate VA images with their capture time, without archiving LA scans."""
+    """Associate inference images with capture time; archival is opt-in."""
 
     def __init__(self, camera):
         self.camera = camera
@@ -66,9 +66,31 @@ class RecordedVisualClient:
     def __getattr__(self, key):
         return getattr(self.client, key)
 
+    def demo_context(self):
+        return dict(generation=self.agent.generation, skill_id=self.agent._skill_id,
+                    **getattr(self.context, "demo", {}))
+
+    def language_action(self, **kwargs):
+        if not self.agent.experiment.get("demo"):
+            return self.client.language_action(**kwargs)
+        views = []
+        for group in ("scan_views", "move_to_views"):
+            for view in kwargs.get(group, ())[-5:]:
+                views.append(dict(
+                    group=group,
+                    **{k: v for k, v in vars(view).items() if k != "image_bgr"},
+                    observation=self.agent.camera.observations.get(id(view.image_bgr),
+                        {"missing_reason": "capture_timestamp_unavailable"}),
+                ))
+        self.context.demo = dict(stage="LA", step=kwargs.get("current_step"), views=views)
+        try:
+            return self.client.language_action(**kwargs)
+        finally:
+            self.context.demo = {}
+
     def _call(self, kind, **kwargs):
         generation, skill = self.agent.generation, self.agent._skill_id
-        if "mission" in kwargs:
+        if "mission" in kwargs and not self.agent.experiment.get("flexible_mission"):
             kwargs["mission"] = self.agent.experiment["task"]["vla_prompt"]
         started = time.time_ns()
         fields = dict(
@@ -86,6 +108,10 @@ class RecordedVisualClient:
             for e in self.check_events
         )
         image = kwargs.get("image_bgr")
+        if self.agent.experiment.get("demo"):
+            fields["inputs"] = {k: v for k, v in kwargs.items() if k != "image_bgr"}
+            self.context.demo = dict(stage=fields["stage"], camera=fields["camera"],
+                                     inputs=fields["inputs"])
         if image is not None:
             fields["observation"] = self.agent.camera.observations.get(
                 id(image), {"missing_reason": "capture_timestamp_unavailable"}
@@ -98,6 +124,8 @@ class RecordedVisualClient:
                     fields["image"] = str(path)
                 else:
                     fields["image_missing_reason"] = "image_write_failed"
+        if self.agent.experiment.get("demo"):
+            self.context.demo["observation"] = fields.get("observation")
         try:
             result = getattr(self.client, kind)(**kwargs)
         except Exception as exc:
@@ -133,11 +161,15 @@ class ExperimentAgent(LaViRAAgent):
     def __init__(self, *, experiment, **kwargs):
         super().__init__(**kwargs)
         self.experiment = experiment
+        self.base_pose_parameters = dict(experiment.get("nearfield_base_pose", {}))
         self.recorder = Recorder(SimpleNamespace(components={"experiment": experiment}))
         self.vla_trained_prompt = experiment["task"]["vla_trained_prompt"]
         self.head_only = experiment["alignment"] == "head"
         self.camera = RecordedCamera(self.camera)
         self.client = RecordedVisualClient(self.client, self)
+        if experiment.get("demo"):
+            from .demo_evidence import DemoModelRecorder
+            self.client.client.demo_recorder = DemoModelRecorder(self.recorder, self.client.demo_context)
         self.generation = -1
         self.navila = NavilaClient(experiment["navila"]) if experiment["navigation_backend"] == "navila" else None
         self._perturbation_requested = False
@@ -288,8 +320,9 @@ class ExperimentAgent(LaViRAAgent):
         )
         if allow:
             self._global_target_navigation_ready = True
-            direct = self.experiment["alignment"] == "none"
-            if direct or not enabled or self.navila is not None:
+            flexible = self.experiment.get("flexible_mission", False)
+            direct = self.experiment["alignment"] == "none" and not flexible
+            if not flexible and (direct or not enabled or self.navila is not None):
                 self.forced_skill = "MANIPULATE" if direct else "ALIGN"
             self._store_transition(
                 "MOVE_TO", {**result, "transition": "READY_TO_MANIPULATE" if direct else "READY_TO_ALIGN"}
@@ -336,7 +369,7 @@ class ExperimentAgent(LaViRAAgent):
             check_ids=self.client.check_ids(self.generation, kwargs["skill_id"], "ALIGN"),
         )
         if allow:
-            if (
+            if not self.experiment.get("flexible_mission") and (
                 not enabled
                 or geometric
                 or self.navila is not None
@@ -349,9 +382,35 @@ class ExperimentAgent(LaViRAAgent):
         return result
 
     def _align(self, generation, skill_id, args, strategic_goal):
+        if self.experiment["alignment"] == "unilm_nav":
+            self._check_cancelled(generation)
+            segment = self._next_segment()
+            parameters = dict(generation=generation, skill_id=skill_id, segment_id=segment,
+                              backend="unilm_nav", task=self.manipulation_prompt,
+                              observation_source="current")
+            source = getattr(self, "_last_navigation_identity", None)
+            if source is not None and source[0] == generation:
+                parameters.update(observation_source="navigation",
+                                  source_nav_skill_id=source[1], source_nav_segment_id=source[2])
+            self._last_navigation_identity = None
+            operation = getattr(self, "_operation", None)
+            if operation is not None:
+                parameters["operation_id"] = operation.operation_id
+            self.submit_intent("start_base_pose", parameters)
+            status = self._wait(generation, skill_id, segment)
+            if status.get("state") != "reached" or status.get("reason") != "aligned":
+                raise LaViRAAgentError(f"unilm_failed:{status.get('reason')}")
+            evidence = "UniLM VLM-selected pose reached; physical position/yaw controller confirmed alignment."
+            self._store_transition("ALIGN", dict(status="SATISFIED", transition="READY_TO_MANIPULATE",
+                                                  visual_evidence=evidence))
+            self.recorder.write("gate", generation=generation, skill_id=skill_id, gate="align",
+                                enabled=True, applied="allow", va_recommendation=None,
+                                controller_aligned=True, controller_state="aligned", backend="unilm_nav")
+            return AgentHistoryEntry(skill_id, "ALIGN", self.global_target, "aligned", "SATISFIED", evidence)
         if self.experiment["alignment"] != "geometric":
             return super()._align(generation, skill_id, args, strategic_goal)
-        target = self.experiment["geometric"]["target"]
+        target = (self.skills[self._active_vla_skill]["geometry_target"]
+                  if self.experiment.get("flexible_mission") else self.experiment["geometric"]["target"])
         segment = self._next_segment()
         self.submit_intent(
             "start_base_pose",

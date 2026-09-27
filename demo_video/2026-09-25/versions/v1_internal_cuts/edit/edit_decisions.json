@@ -1,0 +1,93 @@
+{
+  "playback_speed": 2.0,
+  "clips": {
+    "t1_op_a": {
+      "source": 1,
+      "ranges": [
+        [
+          0.3,
+          6.6
+        ],
+        [
+          7.5,
+          15.5
+        ]
+      ],
+      "kind": "operation"
+    },
+    "t1_op_b": {
+      "source": 2,
+      "ranges": [
+        [
+          0.3,
+          9.5
+        ],
+        [
+          14.8,
+          23.4
+        ]
+      ],
+      "kind": "operation"
+    },
+    "other_op_a": {
+      "source": 4,
+      "ranges": [
+        [
+          2.9,
+          14.6
+        ]
+      ],
+      "kind": "operation"
+    },
+    "other_op_b": {
+      "source": 5,
+      "ranges": [
+        [
+          0.1,
+          9.35
+        ]
+      ],
+      "kind": "operation"
+    },
+    "t1_full": {
+      "source": 3,
+      "ranges": [
+        [
+          7.6,
+          31.8
+        ],
+        [
+          41.3,
+          49.4
+        ],
+        [
+          53.8,
+          62.2
+        ]
+      ],
+      "kind": "alignment_operation",
+      "operation_source_start": 41.3
+    },
+    "other_full": {
+      "source": 6,
+      "ranges": [
+        [
+          19.1,
+          31.1
+        ],
+        [
+          40.2,
+          49.4
+        ]
+      ],
+      "kind": "alignment_operation",
+      "operation_source_start": 40.2
+    }
+  },
+  "notes": [
+    "Waiting removed by visual review; source time preserved in this edit list.",
+    "No motion synthesis, reversing or unlabeled looping.",
+    "No audio: source room audio removed for this comparison preview.",
+    "Task numbering pending user confirmation; source mapping remains unmodified."
+  ]
+}

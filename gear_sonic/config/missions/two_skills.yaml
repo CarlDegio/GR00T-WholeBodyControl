@@ -1,0 +1,38 @@
+# Example overlay: start the two matching policy servers separately before inference.
+# Edit targets/prompts/postconditions for the actual scene and trained checkpoints.
+components:
+  deploy:
+    demo_controls: true
+  vla:
+    default_skill: collect_pill
+    prewarm_backends: true
+    backends:
+      collect_pill:
+        host: 127.0.0.1
+        port: 29999
+        prompt: collect the pill bottle
+      collect_rubbish:
+        host: 127.0.0.1
+        port: 30000
+        prompt: collect the rubbish
+  lavira:
+    mission_steps:
+      - name: collect_pill_at_table
+        mission: Approach the table with the pill bottle and blue basket.
+        global_target: the table with the pill bottle and blue basket
+        skill_key: collect_pill
+        manipulation_prompt: collect the pill bottle
+        expected_postcondition: The pill bottle is inside the blue basket.
+        completion_settle_seconds: 5.0
+        navigation_upper_body: default
+      - name: collect_rubbish_at_table
+        mission: Approach the table with the paper balls and blue basket.
+        global_target: the table with the paper balls and blue basket
+        skill_key: collect_rubbish
+        manipulation_prompt: collect the rubbish
+        expected_postcondition: The paper balls are inside the blue basket.
+        completion_settle_seconds: 5.0
+        navigation_upper_body: default
+      - name: return_to_door
+        mission: Return to the door.
+        global_target: the door

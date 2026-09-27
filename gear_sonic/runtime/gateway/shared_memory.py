@@ -13,6 +13,7 @@ from gear_sonic.runtime.protocol import MessageMetadata, SharedMemoryFrame
 
 _TOKEN_SIZE = struct.calcsize("<Q")
 _OWNED_SHARED_MEMORY_NAMES: set[str] = set()
+_READER_ATTACHMENT_LOCK = threading.Lock()
 
 
 class FrameOverwrittenError(RuntimeError):
@@ -161,12 +162,14 @@ class SharedMemoryRing:
 def read_shared_memory_frame(frame: SharedMemoryFrame) -> np.ndarray:
     """Copy one frame and reject a slot that was concurrently overwritten."""
 
-    memory = shared_memory.SharedMemory(name=frame.shared_memory, create=False)
-    if frame.shared_memory not in _OWNED_SHARED_MEMORY_NAMES:
-        # Python <=3.12 registers every SharedMemory attachment for unlink on
-        # process exit. Readers do not own gateway memory, so unregister this
-        # attachment while retaining ordinary close() semantics.
-        resource_tracker.unregister(memory._name, "shared_memory")
+    # The tracker keeps a set, not a reference count. Concurrent attachments
+    # must not interleave REGISTER, REGISTER, UNREGISTER, UNREGISTER for one
+    # name. Serialize attachment bookkeeping; frame copies remain concurrent.
+    with _READER_ATTACHMENT_LOCK:
+        memory = shared_memory.SharedMemory(name=frame.shared_memory, create=False)
+        if frame.shared_memory not in _OWNED_SHARED_MEMORY_NAMES:
+            # Readers do not own gateway memory and must not unlink it on exit.
+            resource_tracker.unregister(memory._name, "shared_memory")
     try:
         token_offset = frame.offset_bytes - _TOKEN_SIZE
         if token_offset < 0:

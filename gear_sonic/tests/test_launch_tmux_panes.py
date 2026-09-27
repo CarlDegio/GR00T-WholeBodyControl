@@ -85,6 +85,8 @@ def test_startup_clears_only_stale_navdp_processes(monkeypatch) -> None:
         ["pkill", "-TERM", "-f"],
         ["pkill", "-TERM", "-f"],
         ["pkill", "-TERM", "-f"],
+        ["pkill", "-TERM", "-f"],
+        ["pkill", "-KILL", "-f"],
         ["pkill", "-KILL", "-f"],
         ["pkill", "-KILL", "-f"],
         ["pkill", "-KILL", "-f"],
@@ -93,6 +95,7 @@ def test_startup_clears_only_stale_navdp_processes(monkeypatch) -> None:
         "gear_sonic\\.utils\\.inference\\.navdp\\.service" in command[-1]
         or "eval\\.src\\.policy_server" in command[-1]
         or "gear_sonic/scripts/navdp_planner\\.py" in command[-1]
+        or "gear_sonic\\.utils\\.inference\\.iplanner\\.server" in command[-1]
         for command in commands
     )
 
@@ -319,6 +322,47 @@ def test_build_deploy_command_uses_resolved_v1_1_policy(tmp_path: Path) -> None:
     assert command.endswith("sim")
 
 
+@pytest.mark.parametrize("demo_controls", ["missing", False, True])
+def test_deploy_demo_controls_require_explicit_opt_in(
+    tmp_path: Path, demo_controls: object,
+) -> None:
+    deploy_dir = tmp_path / "gear_sonic_deploy"
+    _write_deploy_policy_files(
+        deploy_dir, "policy/release/model", "policy/release/observation_config.yaml",
+    )
+    config = _profile_config(
+        tmp_path, components={"deploy": {"policy_variant": "default"}},
+    )
+    profile_path = Path(config.config)
+    payload = yaml.safe_load(profile_path.read_text(encoding="utf-8"))
+    if demo_controls == "missing":
+        payload["components"]["deploy"].pop("demo_controls", None)
+    else:
+        payload["components"]["deploy"]["demo_controls"] = demo_controls
+    profile_path.write_text(yaml.safe_dump(payload), encoding="utf-8")
+
+    command = build_deploy_command(config, tmp_path)
+
+    assert ("--demo-controls" in shlex.split(command)) is (demo_controls is True)
+
+
+@pytest.mark.parametrize("demo_controls", ["false", "true", 0, 1, None])
+def test_deploy_rejects_ambiguous_demo_controls(
+    tmp_path: Path, demo_controls: object,
+) -> None:
+    _write_deploy_policy_files(
+        tmp_path / "gear_sonic_deploy",
+        "policy/release/model", "policy/release/observation_config.yaml",
+    )
+    config = _profile_config(
+        tmp_path,
+        components={"deploy": {"policy_variant": "default", "demo_controls": demo_controls}},
+    )
+
+    with pytest.raises(ValueError, match="deploy.demo_controls must be a boolean"):
+        build_deploy_command(config, tmp_path)
+
+
 def test_dotenv_key_check_does_not_require_loading_secret(tmp_path: Path) -> None:
     env_file = tmp_path / ".env.local"
     env_file.write_text(
@@ -506,7 +550,7 @@ def test_yaml_contains_every_launch_parameter() -> None:
     assert base_pose.yaw_align_target_prompt == "cardboard box"
     assert base_pose.dual_chest_depth_stream == "camera/chest_view_depth"
     assert base_pose.raw_min_linear_speed_m_s == pytest.approx(0.35)
-    assert base_pose.raw_max_lateral_speed_m_s == pytest.approx(0.4)
+    assert base_pose.raw_max_lateral_speed_m_s == pytest.approx(0.5)
     assert base_pose.raw_lateral_pulse_enter_m == pytest.approx(0.10)
     assert base_pose.raw_lateral_pulse_exit_m == pytest.approx(0.10)
     assert base_pose.raw_lateral_pulse_max_s == pytest.approx(0.35)
@@ -688,7 +732,7 @@ def test_navdp_stack_commands_use_ros_topics_and_official_xnavdp_server() -> Non
     navdp = load_runtime_profile().component("navdp")
     assert navdp["root"] == "/home/user/Project/NavDP/baselines/x-navdp"
     assert str(navdp["checkpoint"]).endswith("/x-navdp_posttrain.ckpt")
-    assert "python -m eval.src.policy_server" in server
+    assert '"$CONDA_PREFIX/bin/python" -m eval.src.policy_server' in server
     assert "--embodiment humanoid" in server
     assert "--real" in server
     assert "--no-visualization" in server
@@ -715,6 +759,57 @@ def test_navdp_stack_commands_use_ros_topics_and_official_xnavdp_server() -> Non
     assert f"--profile {default_launch_config_path()}" in fastlio_supervisor
     assert "--control-gateway-endpoint" not in fastlio_supervisor
     assert "mid360_reasan_open3d.py" not in " ".join((planner, server))
+
+
+@pytest.mark.parametrize("backend", ["xnavdp", "iplanner"])
+def test_navdp_server_uses_conda_python_with_an_inherited_venv(tmp_path, monkeypatch, backend):
+    import os
+    import json
+    from types import SimpleNamespace
+    from gear_sonic.scripts import launch_inference as launcher
+
+    # Emulate conda run setting CONDA_PREFIX but leaving venv/bin first on PATH.
+    conda_bin = tmp_path / "conda env" / "bin"
+    conda_bin.mkdir(parents=True)
+    (conda_bin / "python").symlink_to(sys.executable)
+    wrong_bin = tmp_path / "venv" / "bin"
+    wrong_bin.mkdir(parents=True)
+    (wrong_bin / "python").write_text("#!/bin/sh\nexit 99\n")
+    (wrong_bin / "python").chmod(0o755)
+    conda = wrong_bin / "conda"
+    conda.write_text('#!/bin/sh\nshift 4\nexec "$@"\n')
+    conda.chmod(0o755)
+    module = tmp_path / "eval" / "src"
+    module.mkdir(parents=True)
+    (module.parent / "__init__.py").touch()
+    (module / "__init__.py").touch()
+    (module / "policy_server.py").write_text(
+        "import sys, os, json\n"
+        "print(json.dumps(dict(python=sys.executable, args=sys.argv[1:], "
+        "overrides=[os.environ.get(k) for k in ['VIRTUAL_ENV','PYTHONHOME','PYTHONPATH']]), sort_keys=True))\n"
+    )
+    checkpoint = tmp_path / "checkpoint with spaces.ckpt"
+    profile = SimpleNamespace(endpoint=lambda name: SimpleNamespace(port=19999),
+                              components={"navigation_policy": {"backend": backend}},
+                              component=lambda name: {"root": str(tmp_path), "checkpoint": str(checkpoint)})
+    if backend == "iplanner":
+        from gear_sonic.utils.inference.iplanner.config import IPlannerServerConfig
+
+        (tmp_path / "iplanner_server.py").write_text((module / "policy_server.py").read_text())
+        monkeypatch.setattr(launcher, "load_iplanner_server_config", lambda _: IPlannerServerConfig(
+            root=str(tmp_path), checkpoint=str(checkpoint), model_config="model.yaml", conda_env="navdp", device="cpu",
+        ))
+    monkeypatch.setattr(launcher, "_runtime_profile", lambda config: profile)
+    env = {**os.environ, "CONDA_PREFIX": str(conda_bin.parent),
+           "PATH": str(wrong_bin) + ":" + os.environ["PATH"],
+           "VIRTUAL_ENV": str(wrong_bin.parent), "PYTHONHOME": "/invalid", "PYTHONPATH": "/invalid"}
+    result = subprocess.run(["/bin/bash", "--noprofile", "--norc", "-c",
+                             build_navdp_server_command(InferenceLaunchConfig())],
+                            env=env, text=True, capture_output=True, check=True)
+    payload = json.loads(result.stdout)
+    assert payload["python"] == str(conda_bin / "python")
+    assert payload["overrides"] == [None, None, None]
+    assert payload["args"][payload["args"].index("--checkpoint") + 1] == str(checkpoint)
 
 
 def test_depth_anything_is_an_independent_rgb_only_shared_service() -> None:

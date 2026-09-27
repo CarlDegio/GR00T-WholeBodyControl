@@ -14,7 +14,7 @@ The keyboard planner sidecar sends ``planner`` topic only — no ``command`` ove
 Uses msgpack-numpy over ZMQ REQ/REP to communicate with an OpenPI policy server.
 """
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import logging
 import math
 import queue
@@ -42,6 +42,7 @@ from gear_sonic.runtime.telemetry import VLA_TIMING_SEGMENTS
 from gear_sonic.runtime.protocol.array_message import unpack_array_message
 from gear_sonic.runtime.protocol.cpp_control import (
     build_command_message,
+    build_gripper_command,
     build_planner_message,
 )
 from gear_sonic.runtime.protocol.pose import (
@@ -54,10 +55,12 @@ from gear_sonic.utils.inference.vla.ingress import VlaSensorGatewayIngress
 from gear_sonic.utils.math3d.quaternions import yaw_from_quaternion_wxyz
 from gear_sonic.utils.math3d.orientation import compute_projected_gravity
 from gear_sonic.utils.inference.vla.poses import (
-    UPPER_BODY_MUJOCO_INDICES,
+    measured_upper_body_from_state,
     VLA_INITIAL_UPPER_BODY_RAD,
+    sample_upper_body_transition,
 )
 from gear_sonic.utils.inference.vla.safety import VlaSafetyGate
+from gear_sonic.utils.inference.vla.backends import Backend, PolicyRouter, parse_backends
 from gear_sonic.utils.inference.vla.runtime import (
     _VlaCommandHandler,
     _VlaRuntimeState,
@@ -66,6 +69,7 @@ from gear_sonic.utils.inference.vla.runtime import (
     _enforce_active_task_safety,
     _pose_policy_is_active,
     _publish_cached_action,
+    _publish_manual_grippers,
     _schedule_vla_inference,
     _should_schedule_vla_inference,
     _stream_hold_is_active,
@@ -182,6 +186,14 @@ class InferenceConfig:
     sensor_gateway_max_skew_ms: float = 5.0
     embodiment_tag: str = "unitree_g1_sonic"
     prompt: str = "demo"
+    backends: dict = field(default_factory=dict, metadata={"profile_optional": True})
+    default_skill: str = field(default="", metadata={"profile_optional": True})
+    prewarm_backends: bool = field(default=True, metadata={"profile_optional": True})
+
+    def __post_init__(self):
+        backends = parse_backends(self.backends)
+        if self.default_skill and self.default_skill not in backends:
+            raise ValueError(f"unknown default VLA skill: {self.default_skill}")
 
 def load_inference_config(
     profile: str = "",
@@ -486,8 +498,17 @@ def _inference_worker_loop(
     prepare_for_generation=None,
     infer_for_generation=None,
     generation_is_current=None,
+    startup=None,
 ):
     """Persistent worker thread for async inference."""
+    if startup is not None:
+        busy_event.set()
+        try:
+            startup()
+        except Exception as exc:
+            _report_event(event_callback, logging.ERROR, "VLA_PREWARM_FAILED", str(exc))
+        finally:
+            busy_event.clear()
     while not stop_event.is_set():
         try:
             try:
@@ -575,9 +596,13 @@ def main(config: InferenceConfig):
 
     robot_model = instantiate_g1_robot_model(waist_location="lower_and_upper_body")
 
-    n1_policy = _MsgpackNumpyPolicyClient(
-        host=policy_endpoint.host,
-        port=policy_endpoint.port,
+    backends = parse_backends(config.backends)
+    backends.setdefault("", Backend(policy_endpoint.host, policy_endpoint.port, config.prompt))
+    smoke_assume_success = profile.component("lavira").get("smoke_assume_vla_success", False) is True
+    n1_policy = PolicyRouter(
+        backends, config.default_skill, _MsgpackNumpyPolicyClient,
+        require_warmup=bool(config.backends) and config.prewarm_backends,
+        disabled=smoke_assume_success,
     )
     def activate_vla_metrics() -> None:
         service.publish_metrics(
@@ -586,13 +611,16 @@ def main(config: InferenceConfig):
             activate=True,
         )
 
-    if not n1_policy.ping(timeout_ms=1000):
+    if smoke_assume_success:
+        record_event(logging.WARNING, "SMOKE_VLA_BACKENDS_DISABLED",
+                     "VLA backend connections and POSE entry disabled; planner relay remains active", smoke=True)
+    elif not n1_policy.ping(timeout_ms=1000):
         record_event(
             logging.WARNING,
             "POLICY_UNREACHABLE",
             "PolicyServer is not reachable; inference will fail until it recovers",
-            host=policy_endpoint.host,
-            port=policy_endpoint.port,
+            host=backends[config.default_skill].host,
+            port=backends[config.default_skill].port,
         )
 
     gateway_ingress = VlaSensorGatewayIngress(
@@ -639,6 +667,7 @@ def main(config: InferenceConfig):
             "toggle_control_loop",
             "select_planner_mode",
             "toggle_policy_pause",
+            "toggle_grippers",
             "toggle_left_hand_initial_pose",
             "toggle_right_hand_initial_pose",
             "set_prompt",
@@ -659,9 +688,6 @@ def main(config: InferenceConfig):
     loop_rate = config.action_publish_rate
     loop_period = 1.0 / loop_rate
 
-    def _current_upper_body_planner_order(body_q: np.ndarray) -> np.ndarray:
-        return np.array([body_q[i] for i in UPPER_BODY_MUJOCO_INDICES], dtype=np.float32)
-
     def publish_initial_pose():
         # Initial pose publishing in PLANNER mode
         if state.cpp_mode != "PLANNER" or not state.cpp_loop_running:
@@ -680,17 +706,13 @@ def main(config: InferenceConfig):
         target_ub = np.array(VLA_INITIAL_UPPER_BODY_RAD, dtype=np.float32)
 
         state_msg = gateway_ingress.read_state(clear=False)
-        start_ub = None
-        if state_msg is not None and "body_q" in state_msg:
-            body_q = np.asarray(state_msg["body_q"], dtype=np.float32)
-            assert body_q.shape[0] == 29, "body_q must have shape (29,)"
-            start_ub = _current_upper_body_planner_order(body_q)
-
-        if start_ub is None:
+        try:
+            start_ub = measured_upper_body_from_state(state_msg)
+        except ValueError as exc:
             record_event(
                 logging.ERROR,
                 "INITIAL_POSE_FAILED",
-                "Cannot read body state for the initial-pose ramp",
+                f"Cannot read measured body state for the initial-pose ramp: {exc}",
             )
             return False
 
@@ -698,16 +720,12 @@ def main(config: InferenceConfig):
         hold_yaw = math.atan2(hold_facing[1], hold_facing[0])
         LOGGER.info("Holding planner facing %.3f rad during POSE entry", hold_yaw)
 
-        left_hand = (
-            _compute_closed_hand_joints("L")
-            if state.initial_pose_left_hand_closed
-            else np.zeros(7, dtype=np.float32)
-        )
-        right_hand = (
-            _compute_closed_hand_joints("R")
-            if state.initial_pose_right_hand_closed
-            else np.zeros(7, dtype=np.float32)
-        )
+        # Dex1 uses slot zero as the close ratio. The independent manual
+        # latch also holds these targets across the POSE interface handover.
+        left_hand = np.zeros(7, dtype=np.float32)
+        right_hand = np.zeros(7, dtype=np.float32)
+        left_hand[0] = float(state.initial_pose_left_hand_closed)
+        right_hand[0] = float(state.initial_pose_right_hand_closed)
 
         t0 = time.monotonic()
 
@@ -717,9 +735,7 @@ def main(config: InferenceConfig):
             if elapsed >= duration:
                 break
 
-            t = min(max(elapsed / duration, 0.0), 1.0)
-            alpha = t * t * (3.0 - 2.0 * t)
-            q_cmd = (1.0 - alpha) * start_ub + alpha * target_ub
+            q_cmd, dq_cmd = sample_upper_body_transition(start_ub, target_ub, elapsed, duration)
 
             zmq_socket.send(
                 build_planner_message(
@@ -729,7 +745,8 @@ def main(config: InferenceConfig):
                     speed=-1.0,
                     height=-1.0,
                     upper_body_position=q_cmd.tolist(),
-                    upper_body_velocity=zero_vel.tolist(),
+                    upper_body_velocity=dq_cmd.tolist(),
+                    pose_entry_transition=True,
                     left_hand_position=left_hand.tolist(),
                     right_hand_position=right_hand.tolist(),
                 )
@@ -748,6 +765,7 @@ def main(config: InferenceConfig):
                     height=-1.0,
                     upper_body_position=target_ub.tolist(),
                     upper_body_velocity=zero_vel.tolist(),
+                    pose_entry_transition=True,
                     left_hand_position=left_hand.tolist(),
                     right_hand_position=right_hand.tolist(),
                 )
@@ -777,7 +795,16 @@ def main(config: InferenceConfig):
             elif start and not planner and state.cpp_mode != "POSE":
                 planner_heading_alignment.clear()
 
-            cmd_msg = build_command_message(start=start, stop=not start, planner=planner)
+            # Establish the same manual hand latch before any mode transition.
+            state.grippers_follow_policy = False
+            zmq_socket.send(build_gripper_command(
+                state.initial_pose_left_hand_closed,
+                state.initial_pose_right_hand_closed,
+            ))
+            state.cpp_request_id = max(state.cpp_request_id + 1, time.monotonic_ns() // 1000)
+            cmd_msg = build_command_message(start=start, stop=not start, planner=planner,
+                                           request_id=state.cpp_request_id,
+                                           hold_current_upper_body=state.hold_current_upper_body)
             # This is a low-frequency state transition sent over PUB/SUB.
             # A single packet can be lost during subscriber reconnects or a
             # busy mode transition, while the Python side would otherwise
@@ -829,6 +856,7 @@ def main(config: InferenceConfig):
     result_queue = queue.Queue(maxsize=1)
     inference_failures: queue.SimpleQueue[str] = queue.SimpleQueue()
     inference_failed_event = threading.Event()
+    inference_context = {0: (n1_policy.snapshot(), backends[config.default_skill].prompt)}
 
     def report_inference_failure(reason: str) -> None:
         if inference_failed_event.is_set():
@@ -838,6 +866,8 @@ def main(config: InferenceConfig):
     def invalidate_inference(reason: str):
         """Invalidate cached, queued, and currently-running inference work."""
         state.inference_generation += 1
+        inference_context.clear()
+        inference_context[state.inference_generation] = (n1_policy.snapshot(), language_prompt_ref[0])
         state.cached_action_chunk = None
         state.action_chunk_index = 0
         state.last_inference_request_time = 0.0
@@ -879,18 +909,9 @@ def main(config: InferenceConfig):
         )
 
     # Mutable prompt container (single-writer from keyboard, single-reader from inference)
-    language_prompt_ref: list[str] = [config.prompt]
+    language_prompt_ref: list[str] = [backends[config.default_skill].prompt]
 
     command_policy = n1_policy
-    if service.experiment.config:
-        from types import SimpleNamespace
-        def ping_experiment_policy(*, timeout_ms):
-            probe = _MsgpackNumpyPolicyClient(n1_policy.host, n1_policy.port, timeout_ms=timeout_ms)
-            try:
-                return probe.ping()
-            finally:
-                probe.close()
-        command_policy = SimpleNamespace(ping=ping_experiment_policy)
 
     command_handler = _VlaCommandHandler(
         state,
@@ -909,25 +930,54 @@ def main(config: InferenceConfig):
         activate_vla_metrics=activate_vla_metrics,
         fail_active_task=fail_active_task,
         publish_task_status=publish_task_status,
-        trained_prompt=service.experiment.config.get("task", {}).get("vla_trained_prompt"),
+        trained_prompt=(None if service.experiment.config.get("flexible_mission") else
+                        service.experiment.config.get("task", {}).get("vla_trained_prompt")),
+        read_cpp_state=lambda: gateway_ingress.read_state(clear=False),
     )
 
     inference_stop_event = threading.Event()
     inference_busy_event = threading.Event()
+
+    def prepare_for_epoch(epoch):
+        context = inference_context.get(epoch)
+        if context is None or epoch != state.inference_generation:
+            return None
+        return prepare_observation_from_sensors(gateway_ingress, robot_model, context[1])
+
+    def infer_for_epoch(epoch, observation):
+        context = inference_context.get(epoch)
+        if context is None:
+            return None
+        return n1_policy.infer(context[0], observation,
+            current=lambda: epoch == state.inference_generation,
+            run=lambda policy, obs: run_policy_inference_and_process(
+                policy, obs, event_callback=record_event,
+                failure_callback=lambda reason: report_inference_failure(reason)
+                    if epoch == state.inference_generation else None))
+
+    def prewarm():
+        if smoke_assume_success or not config.backends or not config.prewarm_backends:
+            return
+        deadline = time.monotonic() + 60.0
+        while not inference_stop_event.is_set():
+            prepared = prepare_observation_from_sensors(gateway_ingress, robot_model, config.prompt)
+            if prepared is not None:
+                # Warm each configured model and the selected manual default.
+                keys = list(dict.fromkeys([*config.backends, config.default_skill]))
+                n1_policy.warmup(prepared[0], stopped=inference_stop_event.is_set, keys=keys)
+                record_event(logging.INFO, "VLA_BACKENDS_WARMED", "Resident VLA backends prewarmed",
+                             skills=sorted(n1_policy.warmed))
+                return
+            if time.monotonic() >= deadline:
+                raise TimeoutError("VLA prewarm requires fresh camera and robot state")
+            inference_stop_event.wait(0.1)
 
     prepare_experiment_observation, infer_experiment_observation = _build_experiment_inference_callbacks(
         state,
         prepare_observation=lambda **kwargs: prepare_observation_from_sensors(
             gateway_ingress, robot_model, language_prompt_ref[0], **kwargs
         ),
-        run_inference=lambda epoch, observation: run_policy_inference_and_process(
-            policy=n1_policy,
-            observation=observation,
-            event_callback=record_event,
-            failure_callback=lambda reason: (
-                report_inference_failure(reason) if epoch == state.inference_generation else None
-            ),
-        ),
+        run_inference=infer_for_epoch,
         first_observation=first_observation,
     )
 
@@ -949,24 +999,16 @@ def main(config: InferenceConfig):
             result_queue,
             inference_stop_event,
             inference_busy_event,
-            lambda: prepare_observation_from_sensors(
-                sensor_gateway=gateway_ingress,
-                robot_model=robot_model,
-                language_prompt=language_prompt_ref[0],
-            ),
-            lambda obs: run_policy_inference_and_process(
-                policy=n1_policy,
-                observation=obs,
-                event_callback=record_event,
-                failure_callback=report_inference_failure,
-            ),
+            None,  # All requests use the epoch-scoped callbacks below.
+            None,
         ),
         kwargs={
             "event_callback": record_event,
             "failure_callback": report_inference_failure,
-            "prepare_for_generation": prepare_experiment_observation if service.experiment.config else None,
-            "infer_for_generation": infer_experiment_observation if service.experiment.config else None,
-            "generation_is_current": (lambda epoch: epoch == state.inference_generation) if service.experiment.config else None,
+            "prepare_for_generation": prepare_experiment_observation if service.experiment.config else prepare_for_epoch,
+            "infer_for_generation": infer_experiment_observation if service.experiment.config else infer_for_epoch,
+            "generation_is_current": lambda epoch: epoch == state.inference_generation,
+            "startup": prewarm,
         },
         daemon=True,
     )
@@ -976,6 +1018,8 @@ def main(config: InferenceConfig):
         while True:
             t_start = time.monotonic()
             command_handler.handle_next()
+            command_handler.tick()
+            _publish_manual_grippers(state, zmq_socket)
             flush_events()
 
             if _consume_task_failure(
@@ -1063,7 +1107,7 @@ def main(config: InferenceConfig):
 
     finally:
         inference_stop_event.set()
-        inference_worker_thread.join(timeout=1.0)
+        inference_worker_thread.join(timeout=max(b.timeout_ms for b in backends.values()) / 1000.0 + 2.0)
         first_observation.close()
         planner_relay_sub.close()
         zmq_socket.close()
@@ -1072,7 +1116,8 @@ def main(config: InferenceConfig):
         control_listener.close()
         task_status_intent.close()
         zmq_context.term()
-        n1_policy.close()
+        if not inference_worker_thread.is_alive():
+            n1_policy.close()
         service.close()
         LOGGER.info("Shutdown complete")
 

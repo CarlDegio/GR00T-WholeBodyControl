@@ -1,0 +1,17 @@
+{
+  "output": "/home/user/Project/GR00T-WholeBodyControl/demo_video/2026-09-26_combined/exports/Full_demo_combined_v9_redacted_music.mp4",
+  "previous": "/home/user/Project/GR00T-WholeBodyControl/demo_video/2026-09-26_combined/exports/Full_demo_combined_v8_redacted.mp4",
+  "frames": 10774,
+  "main_viewport": [
+    0,
+    0,
+    1920,
+    1080
+  ],
+  "annotations": "Independent floating cards over the full-screen main footage",
+  "original_task_prompt_removed": true,
+  "music": "Vaporware \u2014 The Cynic Project",
+  "music_license": "CC0",
+  "music_source": "https://opengameart.org/content/calm-piano-1-vaporware",
+  "music_target_lufs": -24
+}

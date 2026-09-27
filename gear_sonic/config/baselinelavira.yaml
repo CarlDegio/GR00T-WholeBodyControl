@@ -1,0 +1,23 @@
+# Applied over the current launch_inference.yaml by the baseline entrypoints.
+# Camera, BasePose, VLA, FAST-LIO and SONIC settings are inherited.
+profile: baselinelavira
+components:
+  navigation_policy:
+    backend: iplanner
+  iplanner:
+    root: /home/user/Project/uni-lavira-code/real-world-code/unitree_g1/iplanner
+    checkpoint: checkpoints/iplanner.pth
+    model_config: configs/iplanner.yaml
+    conda_env: navdp
+    device: cuda
+  iplanner_navigation:
+    target_speed: 0.4
+    min_forward_speed: 0.3
+    max_forward_speed: 0.4
+    max_yaw_speed: 0.5
+    lookahead_dist: 0.5
+    goal_tolerance: 2.0
+    safe_distance: 0.0
+    replan_interval: 0.1
+    max_execution_time: 60.0
+    yaw_bias: 0.0
