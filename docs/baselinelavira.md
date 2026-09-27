@@ -9,42 +9,40 @@ baseline 的代码、配置、启动入口和公共模块接入已迁出。
 iPlanner 源码和 checkpoint 仍使用下面列出的外部路径。
 新实验默认写入新工作目录的 `outputs/experiments/`；历史实验数据仍在原目录。
 
-在当前 Groot 流程中，将导航部分替换为本地
-`uni-lavira-code/real-world-code/unitree_g1` 的 LaViRA 方法：
+当前 LA/VA 使用 `agent_full` 的完整实现，导航轨迹模型和控制器使用本地
+`uni-lavira-code/real-world-code/unitree_g1` 的 iPlanner 与 Pure Pursuit：
 
 ```text
-现有相机 → LaViRA LA 方向/策略 → LaViRA VA 自主选择导航物体/区域
-        → bbox 底边中心 + 深度 → iPlanner → Pure Pursuit
+现有相机 → agent_full LA 指定目标和方向 → VA 定位该目标
+        → bbox 中心 + 多帧深度 → iPlanner → Pure Pursuit
         → 现有 Planner Executor → SONIC
 ```
 
-LA 根据原版导航提示词维护 TODO、选择方向和策略；VA 根据全局目标和策略
-独立选择下一步导航物体或区域。全局目标可见时优先选择它，否则选择策略
-中的地标/区域。MOVE_TO 不再先调用原来的“指定物体 grounding”来生成目标。
-原版依然输出 bbox；区别在于导航目标由 VA 自主选择。
+2026-09-13 按用户要求撤回了独立导航提示词和 VA 自主选点适配。
+`lavira/agent.py` 与 `lavira/service.py` 恢复为 `agent_full` 当前工作目录的版本
+（与迁移前共享快照 `5fe5188` 中对应文件一致）；相机、目标投影与实验 Agent
+原本已与该工作目录一致。普通和实验启动均直接构造同一个 `LaViRAClient`，
+不再按 iPlanner 后端切换 LA/VA 客户端或读取外部 `prompts.py`。
 
-导航提示词保留原版策略和选点规则，JSON 输出示例由适配层统一提供：VA 必须
-返回数值型 `confidence`（0–1），缺失、字符串、百分数或越界值不会被补成
-默认置信度。校验重试会明确指出字段问题。LA 的 `global_target` 必须是导航
-终点的物体/区域名称，不能直接复制整句路线或后续操作指令。实验模式下，
-导航 LA/VA 的原始回复及校验错误保存在 `lavira_requests/responses/`，成功和
-失败的回复都保留；这与原有请求文件分开存放。
+LA 在首次决策中同时创建 TODO 和选择动作，每个导航 TODO 对应一个目标。
+提示词要求把转向放在 MOVE_TO 的 `view_direction`，不单列转向 TODO；
+导航 TODO 由 runtime 根据指定目标的新鲜 VA 检查完成，LA 保留已完成行。
+VA 使用 `GROUNDING` 定位 LA 指定的目标，返回 `FOUND` 或 `NOT_FOUND`。
+导航、后验检查、历史和 TODO 使用同一个指定目标，不再被 VA 的描述字段改名。
+初始规划调用次数、全局目标冻结、图像顺序、JSON 校验重试以及
+ALIGN/MANIPULATE 提示词和阶段交接均使用共享实现。
 
-LA 当前视图使用 `CURRENT_VIEW_1` 至 `CURRENT_VIEW_5` 明确标注，
-`chosen_view_index` 必须与 `turn_direction` 的实际角度一致，否则重试。
-历史 MOVE_TO 图片标为 `PAST_MOVE_TO_*`，附带控制结果和观测结果；它们仍是
-旧位置的结果照片，不是原版的轨迹历史图，也不能参与当前视图编号或方向选择。
-VA 明确接收转向后的前视图，策略中的左右描述属于转向前的全景坐标。
-目标、相关地标及有效通道都不可见时，允许 `REOBSERVE` / `bbox_2d: null`，
-沿用现有未找到目标的交接检查和后续观察流程；不能为凑 bbox 选择无关桌子。
-`STOP` 需要可见全局目标的有效框。这些输出约束属于本适配层的修复。
+此次回退针对 LA/VA 和导航目标生成；iPlanner 的到达容差仍为 2.0 m。
+离线检查验证代码与请求的一致性，不代表实机成功率或到达精度已经验证。
+后续模型请求继续写入实验目录的 `lavira_requests/`，使用共享的
+`la_decision`、`va_grounding`、`va_align_grounding` 和 `va_postcheck` 请求类型。
+历史实验的独立导航请求、原始回复及标注保留在原目录中。
 
 `baselinelavira.py` 每次从当前 `gear_sonic/config/launch_inference.yaml`
 读取配置，再叠加 `gear_sonic/config/baselinelavira.yaml`。只新增
 `navigation_policy.backend: iplanner`、iPlanner 服务和导航控制参数；主配置不被改写。
 当前相机选择、RGB-D 对齐、深度来源、全景转向、BasePose 几何对齐、
-VLA、FAST-LIO 及底层 SONIC 均复用现有实现。导航改用原版 LA/VA 提示词，
-模型端点和凭据仍沿用当前配置；ALIGN/MANIPULATE 的提示词及交接流程保持。
+VLA、FAST-LIO 及底层 SONIC 均复用现有实现。LA/VA 模型端点和凭据沿用当前配置。
 
 与 `full_vln` 相同的实验启动入口是
 `gear_sonic/scripts/experiments/baselinelavira.sh`。它读取
@@ -73,7 +71,7 @@ bash gear_sonic/scripts/experiments/baselinelavira.sh --task T1 --case visible_0
 
 实验脚本的 iPlanner 权重和控制参数在 `gear_sonic/config/baselinelavira.yaml`
 中配置，例如将 `components.iplanner.checkpoint` 改成已有权重的绝对路径。
-缺少源码、提示词、权重或模型配置时，`--dry-run` 会显示 `ready: false` 和具体路径。
+缺少 iPlanner 服务源码、权重或模型配置时，`--dry-run` 会显示 `ready: false` 和具体路径。
 
 独立调试入口 `baselinelavira.py` 也保留，其 `--config` 接收完整 runtime 配置：
 
@@ -142,10 +140,9 @@ iPlanner 接口接收现有 SensorGateway 的 BGR 图像和米制深度，仅在
 iPlanner 的 fear 分数与 LaViRA G1 原执行循环一样不作为额外停止阈值。
 非有限、少于两个点或零长度的轨迹按现有推理失败流程处理，不能作为到达证据。
 
-选点采用 VA 所见 RGB 对应的深度帧，从 bbox 底边中心周围 7×7 窗口取
-有效深度的第 30 百分位，投影为机体坐标；保留当前采集流程，但不再使用
-原来的框中心和多帧距离平均。置信度不足、无效深度仍停止本次目标生成，
-不会退回无依据的向前移动。
+目标投影使用与 `agent_full` 相同的 bbox 中心、7×7 深度窗口中位数和
+五帧有效距离平均，至少三帧有效才生成机体坐标目标。置信度不足或无效深度
+按共享流程处理，不使用底边中心单帧第 30 百分位选点。
 
 轨迹控制使用 LaViRA 的 Pure Pursuit，导航期间不创建或调用 MPC：
 
@@ -165,31 +162,19 @@ iPlanner 的 fear 分数与 LaViRA G1 原执行循环一样不作为额外停止
 和 `xnavdp_mpc` 不控制 baseline 的到达判定及速度生成。导航消息、里程计
 新鲜度检查、急停、任务代次隔离及 20 Hz 速度发布仍由现有 Groot 执行链负责。
 
-为保留现有相机和对齐阶段，原版导航提示词的方向集合适配为当前五个视角，
-不允许未采集的后方视角。VA 的 STOP 带有效 bbox 时继续最终接近；进入
-ALIGN 仍需当前 Groot 的双视角全局目标交接验证。该验证仅判断阶段交接，
-不参与选择导航 waypoint。导航历史沿用当前相机结果图，ALIGN/MANIPULATE
-继续使用现有 LA/VA 与 BasePose 流程。
+全景方向、导航历史、指定目标的头部/胸部到达检查、全局目标交接和
+ALIGN/MANIPULATE 使用 `agent_full` 流程。中间地标完成仍不能解锁 ALIGN。
 
 `xnavdp_http`、`navdp_velocity`、日志组件 `navdp` 和导航消息中的来源名
 保留为兼容接口名称，实际后端由 `navigation_policy.backend` 指定，
 tmux 模型服务窗格及服务日志会显示 iPlanner。服务仍由原 launcher 管理，
 不需要另开原 LaViRA 的机器人驱动或控制程序。
 
-模型、服务和导航提示词直接从本地 Uni-LaViRA 目录读取；轨迹控制公式和
-目标投影方法适配在 `gear_sonic/utils/inference/iplanner/`。
+模型和服务直接从本地 Uni-LaViRA 目录读取；轨迹控制公式适配在
+`gear_sonic/utils/inference/iplanner/`，LA/VA 和目标投影使用 `lavira/` 中的共享代码。
 作者及原始许可见该源码目录及 Groot 的第三方声明。
 
-2026-09-13 对照了官方 [Uni-LaViRA G1 提示词](https://github.com/NJU-R-L-Group-Embodied-Lab/uni-lavira-code/blob/main/real-world-code/unitree_g1/prompts.py)
-及 [控制器](https://github.com/NJU-R-L-Group-Embodied-Lab/uni-lavira-code/blob/main/real-world-code/unitree_g1/robot/robot_controller.py)，
-并检查原目录中 `baselinelavira_T1_visible_02_b58fccf87853` 的实际请求和回复。
-g3 的第二步 LA 在进展分析中写 Image 5 / 左前方 45°，却返回 `left`（90°）；
-转向后的 VA 自述蓝篮桌不可见，仍选了无关电脑桌。前者是模型输出自相矛盾及
-校验缺失，后者同时受到旧 prompt 缺少目标不可见分支、转向前后方向描述混用的影响。
-目前没有确认基础世界/机体旋转矩阵的左右符号写反；离线左右对称及多朝向测试
-用于检查这一点，不能替代实机验证，也不能证明所有偏左现象已经解决。
-
-最小实验日志现在保留 VA 框/深度投影、全景完成、最终朝向，以及
+最小实验日志保留全景完成、最终朝向，以及
 `IPLANNER_PLAN_ACCEPTED` / `IPLANNER_CONTROL`。后两类每秒最多各一条，
 包含规划位姿、请求/执行世界目标、局部/世界轨迹、当前前视点与速度，
 以及目标距离、配置的到达容差、轨迹末端距离。同一条控制记录还保存现有 SONIC

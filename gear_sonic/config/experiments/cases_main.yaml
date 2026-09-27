@@ -12,8 +12,8 @@ cases:
     initial_path_distance_m: null
     navigation_instructions: 
       T1: Move forward to the front of the table with the blue basket
-      T2: null
-      T3: null
+      T2: move forward to the cardboard box
+      T3: move forward to the green trash bin
       T4: null
   visible_02:
     navila_alignment:
@@ -25,8 +25,8 @@ cases:
     initial_path_distance_m: null
     navigation_instructions:
       T1: Move forward to the front of the table with the blue basket
-      T2: null
-      T3: null
+      T2: move forward to the cardboard box
+      T3: move forward to the green trash bin
       T4: null
   visible_03:
     navila_alignment:
@@ -38,8 +38,8 @@ cases:
     initial_path_distance_m: null
     navigation_instructions:
       T1: Move forward to the front of the table with the blue basket
-      T2: null
-      T3: null
+      T2: move forward to the cardboard box
+      T3: move forward to the green trash bin
       T4: null
   visible_04:
     navila_alignment:
@@ -51,8 +51,8 @@ cases:
     initial_path_distance_m: null
     navigation_instructions:
       T1: Move forward to the front of the table with the blue basket
-      T2: null
-      T3: null
+      T2: move forward to the cardboard box
+      T3: move forward to the green trash bin
       T4: null
   visible_05:
     navila_alignment:
@@ -64,8 +64,8 @@ cases:
     initial_path_distance_m: null
     navigation_instructions:
       T1: move to the black rubbish bin,turn right,and move foward to the front of the table with the blue basket.
-      T2: null
-      T3: null
+      T2: move to the green rubbish bin,turn right and move forward to the cardboard box
+      T3: move forward to the bowl on the desk
       T4: null
   visible_06:
     navila_alignment:
@@ -77,8 +77,8 @@ cases:
     initial_path_distance_m: null
     navigation_instructions:
       T1: move to the white rubbish bin ,turn left ,move to the black rubbish bin ,move forward to the open area,and move foward to the front of the table with the blue basket.
-      T2: null
-      T3: null
+      T2: move to the refrigerator,turn left and move forward to the cardboard box
+      T3: move forward to the bowl on the desk
       T4: null
   visible_07:
     navila_alignment:
@@ -90,8 +90,8 @@ cases:
     initial_path_distance_m: null
     navigation_instructions:
       T1: move to the white rubbish bin ,turn left ,move to the black rubbish bin ,move forward to the green rubbish bin,and move foward to the front of the table with the blue basket.
-      T2: null
-      T3: null
+      T2: move to the white rubbish bin,move to the green rubbish bin,and move forward to the cardboard box
+      T3: move forward to the green trash bin
       T4: null
   visible_08:
     navila_alignment:
@@ -103,8 +103,8 @@ cases:
     initial_path_distance_m: null
     navigation_instructions:
       T1: move to the white rubbish bin ,turn left ,move to the black rubbish bin ,move forward to the green rubbish bin,and move foward to the front of the table with the blue basket.
-      T2: null
-      T3: null
+      T2: move to the white rubbish bin,move to the blue basket on a cabinet,and move forward to the cardboard box
+      T3: move forward to the green trash bin
       T4: null
   invisible_01:
     navila_alignment:
@@ -116,8 +116,8 @@ cases:
     initial_path_distance_m: null
     navigation_instructions:
       T1: move to the white rubbish bin ,turn left ,move to the open area ,move forward to the refrigerator,turn left and move forward to the front of the table with the blue basket.
-      T2: null
-      T3: null
+      T2: move to the blue basket on a cabinet,turn right ,move to the green rubbish bin,and move forward to the cardboard box
+      T3: move to the white rubbish bin , turn left, move to the fire extinguisher,move to the refrigerator ,turn right and move to the bowl on the desk
       T4: null
   invisible_02:
     navila_alignment:
@@ -129,8 +129,8 @@ cases:
     initial_path_distance_m: null
     navigation_instructions:
       T1: find and move to the front of the desk with the blue basket
-      T2: null
-      T3: null
+      T2: find and move to the open cardboard box
+      T3: move to the white rubbish bin , turn left, move to the fire extinguisher,move to the refrigerator ,turn right and move to the bowl on the desk
       T4: null
   invisible_03:
     navila_alignment:

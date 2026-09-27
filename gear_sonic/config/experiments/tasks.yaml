@@ -16,18 +16,20 @@ tasks:
     policy_id: a
     milestones: [stable_bottle_grasp, bottle_in_basket_released]
   T2:
-    vla_prompt: Pick up the garbage bag and put it in the box, then lift the box off the handcart and place it in the designated area.
+    vla_prompt: move forward to approach the cardboard box,pick up the bag and put it into the cardboard box, then carry the cardboard box to the open area and place it on the ground.
     vla_trained_prompt: collect the bag and put it into box, then carry the box
     global_target: cardboard box on a handcart
     geometry_target: cardboard box
     objectnav_instruction: Search the workspace for the cardboard box on a handcart and approach it.
+    policy_id: b
     milestones: [stable_bag_grasp, bag_in_box, stable_box_lift, box_off_cart_placed]
   T3:
-    vla_prompt: Pick up the bowl, step on the trash bin pedal to hold the lid open, and empty the bowl into the bin.
-    vla_trained_prompt: null
-    global_target: trash bin
-    geometry_target: trash bin
+    vla_prompt: move forward to approach the bowl on the desk,pick up the bowl, step on the trash bin pedal to hold the lid open,empty the bowl into the bin and put it back to the desk.
+    vla_trained_prompt: collect the pill bottle
+    global_target: bowl on the desk
+    geometry_target: bowl
     objectnav_instruction: Search the workspace for the trash bin and approach it.
+    policy_id: c
     milestones: [stable_bowl_grasp, lid_open_for_pouring, contents_in_bin]
   T4:
     vla_prompt: Pick up the object on top of the bedside cabinet, open the drawer, place the object inside, and release it.

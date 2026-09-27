@@ -1273,8 +1273,6 @@ class LaViRAAgent:
         sleep: Callable[[float], None] = time.sleep,
         report_event: EventReporter | None = None,
         report_todo: TodoReporter | None = None,
-        navigation_waypoint: Callable[..., Mapping[str, Any]] | None = None,
-        navigation_geometry: Callable[..., Mapping[str, Any]] = build_object_nav_geometry_from_frames,
     ) -> None:
         if navigation_mode not in NAVIGATION_MODES:
             raise ValueError("navigation_mode must be vln or object_nav")
@@ -1360,8 +1358,6 @@ class LaViRAAgent:
         self.sleep = sleep
         self.report_event = report_event
         self.report_todo = report_todo
-        self.navigation_waypoint = navigation_waypoint
-        self.navigation_geometry = navigation_geometry
         self._segment_id = -1
         self._skill_id = 0
         self._scan_id = 0
@@ -2401,27 +2397,12 @@ class LaViRAAgent:
         snapshots = self._capture_va_burst(
             generation, skill_id, lease_segment,
         )
-        if self.navigation_waypoint is None:
-            grounding = self._ground(
-                generation=generation, skill_id=skill_id,
-                target=target, direction=direction,
-                image=snapshots[POLICY_FRAME_INDEX].rgb_bgr,
-                strategic_goal=strategic_goal, strategic_stop=False,
-            )
-        else:
-            grounding = self.navigation_waypoint(
-                mission=self.mission, global_target=self.global_target,
-                strategic_goal=strategic_goal,
-                image_bgr=snapshots[POLICY_FRAME_INDEX].rgb_bgr,
-            )
-            if grounding["status"] == "FOUND" and float(grounding["confidence"]) < self.min_confidence:
-                grounding = {**grounding, "status": "NOT_FOUND", "bbox_2d": None, "point_2d": None}
-            target = str(grounding["target_description"])
-            self._event(
-                logging.INFO, "VA_NAVIGATION_WAYPOINT", "LaViRA VA selected the navigation waypoint",
-                generation=generation, skill_id=skill_id, target=target,
-                bbox_2d=grounding["bbox_2d"], action=grounding.get("navigation_action"),
-            )
+        grounding = self._ground(
+            generation=generation, skill_id=skill_id,
+            target=target, direction=direction,
+            image=snapshots[POLICY_FRAME_INDEX].rgb_bgr,
+            strategic_goal=strategic_goal, strategic_stop=False,
+        )
         if grounding["status"] != "FOUND":
             post, _ready_view = self._nav_handoff(
                 generation=generation,
@@ -2441,21 +2422,12 @@ class LaViRAAgent:
             "target": target,
             "confidence": grounding["confidence"], "stop_reasoning": "",
         }
-        geometry = self.navigation_geometry(
+        geometry = build_object_nav_geometry_from_frames(
             policy,
             [(item.depth_mm, item.fx, item.cx) for item in snapshots],
             max_direct_travel=MAX_DIRECT_TRAVEL,
         )
         segment = self._next_segment()
-        if self.navigation_waypoint is not None:
-            snapshot = snapshots[POLICY_FRAME_INDEX]
-            self._event(
-                logging.INFO, "VA_NAVIGATION_GEOMETRY", "VA waypoint projected from its paired depth frame",
-                generation=generation, skill_id=skill_id, segment_id=segment,
-                target=target, bbox_2d=grounding["bbox_2d"],
-                image_shape=list(snapshot.rgb_bgr.shape), fx=snapshot.fx, cx=snapshot.cx,
-                **geometry,
-            )
         self.submit_intent("navigation_goal", {
             "generation": generation, "skill_id": skill_id,
             "segment_id": segment,

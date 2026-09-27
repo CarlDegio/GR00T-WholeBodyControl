@@ -113,6 +113,7 @@ def test_iplanner_prerequisite_paths_do_not_require_xnavdp_weights(tmp_path):
     path = _write_profile(tmp_path, build_profile(root=str(tmp_path), checkpoint="missing.pth"))
     settings = load_iplanner_server_config(load_runtime_profile(path))
     assets = dict((label, path) for path, label in settings.required_assets())
+    assert set(assets) == {"LaViRA iPlanner server", "iPlanner checkpoint", "iPlanner model config"}
     assert assets["iPlanner checkpoint"] == tmp_path / "missing.pth"
     assert not assets["iPlanner checkpoint"].exists()
     assert all("x-navdp" not in str(path) for path in assets.values())

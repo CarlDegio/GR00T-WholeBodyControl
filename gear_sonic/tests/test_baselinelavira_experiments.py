@@ -85,8 +85,7 @@ def test_launch_freezes_baseline_profile_and_model_metadata(tmp_path, monkeypatc
     root.mkdir(parents=True)
     # Placeholder assets only exercise preflight existence checks. The real
     # launcher is replaced below; no weights or model code are executed.
-    for path in (root / "iplanner_server.py", root.parent / "prompts.py",
-                 root / "weights.pth", root / "model.yaml"):
+    for path in (root / "iplanner_server.py", root / "weights.pth", root / "model.yaml"):
         path.touch()
     spec["runtime_overrides"] = {"components": {"iplanner": {
         "root": str(root), "checkpoint": "weights.pth", "model_config": "model.yaml",

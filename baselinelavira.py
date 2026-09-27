@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Launch Groot with LaViRA waypoint selection, iPlanner and pure pursuit."""
+"""Launch Groot with agent_full LA/VA, iPlanner and pure pursuit."""
 
 from __future__ import annotations
 
@@ -78,7 +78,7 @@ def main(argv: list[str] | None = None) -> None:
     load_navigation_config(profile)
     print(f"baselinelavira runtime: {runtime_path}", flush=True)
     if args.dry_run:
-        print("Navigation: LaViRA LA strategy -> VA waypoint -> iPlanner -> Pure Pursuit -> SONIC")
+        print("Navigation: agent_full LA target -> VA grounding -> iPlanner -> Pure Pursuit -> SONIC")
         print(f"iPlanner server: {build_navdp_server_command(config)}")
         print(f"Navigation worker: {build_navdp_planner_command(config, ROOT)}")
         for path, label in settings.required_assets():

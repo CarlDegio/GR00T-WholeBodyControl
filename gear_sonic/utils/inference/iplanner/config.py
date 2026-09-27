@@ -34,7 +34,6 @@ class IPlannerServerConfig:
     def required_assets(self) -> tuple[tuple[Path, str], ...]:
         return (
             (self.asset_path("iplanner_server.py"), "LaViRA iPlanner server"),
-            (self.asset_path("../prompts.py"), "LaViRA navigation prompts"),
             (self.asset_path(self.checkpoint), "iPlanner checkpoint"),
             (self.asset_path(self.model_config), "iPlanner model config"),
         )

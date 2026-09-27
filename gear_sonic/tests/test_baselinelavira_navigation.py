@@ -1,12 +1,8 @@
 from __future__ import annotations
 
-import importlib.util
 from dataclasses import replace
-import json
 import math
-from pathlib import Path
 import queue
-import threading
 from types import SimpleNamespace
 
 import numpy as np
@@ -14,16 +10,12 @@ import pytest
 
 from baselinelavira import BASELINE_OVERLAY, build_profile
 from gear_sonic.runtime.profile import load_runtime_profile
-from gear_sonic.utils.inference.iplanner.agent import IPlannerLaViRAClient
 from gear_sonic.utils.inference.iplanner.control import (
     IPlannerNavigation,
     load_navigation_config,
     pure_pursuit,
     truncate_trajectory,
 )
-from gear_sonic.utils.inference.iplanner.geometry import build_waypoint_geometry
-from gear_sonic.utils.inference.lavira.agent import LaViRAAgent, LaViRAAgentError, LaViRAClient
-from gear_sonic.utils.inference.lavira.geometry import ObjectNavGeometryError
 from gear_sonic.utils.inference.navdp.gateway import load_navdp_planner_config
 from gear_sonic.utils.inference.navdp.navigation import Pose2D
 from gear_sonic.utils.inference.navdp.runtime import _NavDPRuntimeState
@@ -32,27 +24,6 @@ from gear_sonic.utils.inference.navdp.runtime import _NavDPRuntimeState
 @pytest.fixture
 def nav_config():
     return load_navigation_config(load_runtime_profile(overlays=(BASELINE_OVERLAY,)))
-
-
-def test_waypoint_uses_va_selected_area_bottom_and_single_paired_depth():
-    depth = np.full((100, 100), 9000.0)
-    depth[77:84, 47:54] = np.arange(49).reshape(7, 7) * 10 + 1000
-    frames = [(np.full((100, 100), 5000), 100, 50)] * 5
-    frames[2] = (depth, 100, 50)
-    geometry = build_waypoint_geometry(
-        {"action": "NAVIGATE", "bbox_2d": [400, 400, 600, 800]}, frames,
-    )
-    assert geometry["waypoint_pixel"] == [50, 80]
-    assert geometry["goal_x"] == pytest.approx(1.144)
-    assert geometry["goal_y"] == 0
-    # The bbox center and other burst frames deliberately have different depth.
-    assert geometry["goal_x"] != 9.0 and geometry["goal_x"] != 5.0
-
-
-def test_missing_waypoint_depth_does_not_default_to_blind_forward_motion():
-    frames = [(np.zeros((100, 100)), 100, 50)] * 5
-    with pytest.raises(ObjectNavGeometryError, match="no valid aligned depth"):
-        build_waypoint_geometry({"action": "NAVIGATE", "bbox_2d": [400, 400, 600, 800]}, frames)
 
 
 def test_pure_pursuit_selects_half_meter_lookahead_and_applies_configured_speed_range(nav_config):
@@ -234,212 +205,6 @@ def test_replanning_uses_g1_interval_and_the_camera_pose(nav_config, monkeypatch
     assert calls[0][2] is not state.latest_rgb  # Worker owns a stable image copy.
 
 
-@pytest.mark.parametrize("experiment_mode", [False, True])
-def test_agent_factory_wires_autonomous_selection_without_changing_camera(tmp_path, monkeypatch, experiment_mode):
-    import yaml
-    from gear_sonic.experiments.agent import ExperimentAgent
-    from gear_sonic.experiments.config import CONFIGS, resolve
-    from gear_sonic.utils.inference.lavira import service
-
-    path = tmp_path / "runtime.yaml"
-    payload = resolve(CONFIGS / "baselinelavira.yaml")[0] if experiment_mode else build_profile()
-    path.write_text(yaml.safe_dump(payload))
-    config = service.load_lavira_config(str(path))
-    camera = object()
-    monkeypatch.setattr(service, "SensorGatewayRGBDCamera", lambda *a, **kw: camera)
-    monkeypatch.setattr(IPlannerLaViRAClient, "__init__", lambda self, **kw: None)
-    runtime = SimpleNamespace(**{name: (lambda *a, **kw: None) for name in (
-        "submit_intent", "wait_status", "is_cancelled", "pop_failure", "report_agent_event", "report_todo",
-    )})
-    agent = service._agent(config, "inproc://unused", runtime)
-    client = agent.client.client if experiment_mode else agent.client
-    assert (agent.camera.camera if experiment_mode else agent.camera) is camera
-    assert isinstance(client, IPlannerLaViRAClient)
-    assert agent.navigation_waypoint.__self__ is client
-    assert agent.navigation_geometry is build_waypoint_geometry
-    expected_type = ExperimentAgent if experiment_mode else LaViRAAgent
-    assert type(agent)._align is expected_type._align
-    assert type(agent)._manipulate is expected_type._manipulate
-
-
-def _navigation_client(monkeypatch, responses):
-    client = object.__new__(IPlannerLaViRAClient)
-    prompts_path = Path(build_profile()["components"]["iplanner"]["root"]).parent / "prompts.py"
-    if not prompts_path.exists():
-        pytest.skip("local LaViRA navigation prompts unavailable")
-    spec = importlib.util.spec_from_file_location("test_lavira_prompts", prompts_path)
-    client.navigation_prompts = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(client.navigation_prompts)
-    client.navigation_strategy = ""
-    client.navigation_stop = False
-    client.la_client = client.va_client = object()
-    client.la_model = client.va_model = "test"
-    client.la_enable_thinking = client.va_enable_thinking = False
-    client.la_timeout_seconds = client.va_timeout_seconds = 1.0
-    calls = []
-
-    def create(_client, *, response_parser, **kwargs):
-        calls.append(kwargs)
-        text = responses.pop(0)
-        completion = SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content=text))])
-        return response_parser(completion)
-
-    monkeypatch.setattr(client, "_create", create)
-    return client, calls
-
-
-def _current_views(image):
-    return [SimpleNamespace(direction=direction, image_bgr=image) for direction in
-            ("front", "front_right", "right", "left", "front_left")]
-
-
-def test_navigation_uses_original_la_strategy_then_va_autonomous_waypoint(monkeypatch):
-    client, calls = _navigation_client(monkeypatch, [
-        "- [ ] Pass through the opening\n- [ ] Reach the desk",
-        json.dumps(dict(progress_analysis="Opening ahead", updated_todo_list="- [ ] Pass through the opening",
-                        reasoning="Use the open passage to continue along the corridor", turn_direction="front_left",
-                        chosen_view_index=5, stop=False, expected_landmark="doorway", global_target="desk")),
-        json.dumps(dict(action="NAVIGATE", target="open corridor area", bbox_2d=[200, 300, 700, 900],
-                        confidence=0.9, visual_check="Open floor continuing the route", stop_reasoning="")),
-    ])
-    image = np.zeros((100, 100, 3), np.uint8)
-    decision = client.language_action(
-        mission="Follow the corridor and reach the desk", navigation_mode="vln", global_target="desk",
-        current_step=1, todo_list="", scan_views=_current_views(image),
-        move_to_views=[], transition_result=None, manipulation_prompt="Pick up the bottle",
-    )
-    selected = client.navigation_waypoint(
-        mission="Follow the corridor and reach the desk", global_target="desk",
-        strategic_goal="Requested target: 'doorway'", image_bgr=image,
-    )
-    assert decision["skill_args"]["view_direction"] == "front_left"
-    assert selected["target_description"] == "open corridor area"
-    assert [call["request_kind"] for call in calls] == [
-        "la_navigation_todo", "la_navigation", "va_navigation_waypoint",
-    ]
-    text = json.dumps(calls[-1]["messages"])
-    assert "best navigation target" in text and "CURRENT STRATEGY" in text
-    assert "Requested target" not in text
-    assert "Use the open passage" in text
-    monkeypatch.setattr(LaViRAClient, "language_action", lambda self, **kw: {"skill": "ALIGN"})
-    assert client.language_action(transition_result={"transition": "READY_TO_ALIGN"}) == {"skill": "ALIGN"}
-
-
-def test_navigation_prompt_examples_are_valid_complete_json(monkeypatch):
-    client, _ = _navigation_client(monkeypatch, [])
-
-    def follow_example(_client, *, response_parser, **kwargs):
-        text = kwargs["messages"][-1]["content"][-1]["text"]
-        marker = "**JSON FORMAT**:" if kwargs["request_kind"].startswith("va_") else "**JSON RESPONSE FORMAT**:"
-        schema = text.split(marker, 1)[1]
-        example, _ = json.JSONDecoder().raw_decode(schema[schema.index("{"):])
-        if kwargs["request_kind"].startswith("va_"):
-            assert isinstance(example["confidence"], (int, float))
-            assert "best navigation target" in text  # The upstream targeting rules are preserved.
-        else:
-            assert example["global_target"]
-            assert example["turn_direction"] == "front"
-        return response_parser(SimpleNamespace(choices=[SimpleNamespace(
-            message=SimpleNamespace(content=json.dumps(example)),
-        )]))
-
-    monkeypatch.setattr(client, "_create", follow_example)
-    image = np.zeros((10, 10, 3), np.uint8)
-    decision = client.language_action(
-        mission="Find the desk", navigation_mode="vln", global_target=None,
-        current_step=1, todo_list="- [ ] Reach the desk", scan_views=_current_views(image), move_to_views=[],
-        manipulation_prompt="Pick up the bottle",
-    )
-    assert decision["global_target"] != "Pick up the bottle"
-    assert client.navigation_waypoint(mission="Find the desk", global_target="desk",
-                                      strategic_goal="Go forward", image_bgr=image)["confidence"] == 0.85
-
-
-def test_missing_confidence_retries_with_precise_feedback_and_saves_raw_responses(monkeypatch, tmp_path):
-    client, _ = _navigation_client(monkeypatch, [])
-    client.request_context_dir = tmp_path
-    client._request_context_lock = threading.Lock()
-    client._request_context_sequence = 0
-    attempts = []
-
-    def create(**request):
-        attempts.append(request)
-        response = dict(action="NAVIGATE", target="desk", bbox_2d=[100, 200, 700, 900],
-                        visual_check="Desk ahead", stop_reasoning="")
-        if len(attempts) > 1:
-            assert "confidence is missing" in request["messages"][0]["content"]
-            assert "JSON number in [0,1]" in request["messages"][0]["content"]
-            response["confidence"] = 0.82
-        return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content=json.dumps(response)))])
-
-    client.va_client = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=create)))
-    monkeypatch.setattr(client, "_create", LaViRAClient._create.__get__(client))
-    result = client.navigation_waypoint(mission="Find the desk", global_target="desk",
-                                        strategic_goal="Go forward", image_bgr=np.zeros((10, 10, 3), np.uint8))
-    assert len(attempts) == 2
-    assert result["confidence"] == 0.82
-    responses = [json.loads(p.read_text()) for p in sorted((tmp_path / "responses").glob("*.json"))]
-    assert len(responses) == 2
-    assert "confidence" not in json.loads(responses[0]["content"])
-    assert "confidence is missing" in responses[0]["validation_error"]
-    assert json.loads(responses[1]["content"])["confidence"] == 0.82
-    assert responses[1]["validation_error"] is None
-
-
-@pytest.mark.parametrize("confidence", [None, "0.9", 90, True, -0.1, float("nan"), float("inf")])
-def test_invalid_waypoint_confidence_is_never_fabricated_or_allowed(monkeypatch, confidence):
-    client, _ = _navigation_client(monkeypatch, [json.dumps(dict(
-        action="NAVIGATE", target="desk", bbox_2d=[100, 200, 700, 900], confidence=confidence,
-    ))])
-    with pytest.raises(LaViRAAgentError, match="confidence.*JSON number"):
-        client.navigation_waypoint(mission="Find the desk", global_target="desk",
-                                   strategic_goal="Go forward", image_bgr=np.zeros((10, 10, 3), np.uint8))
-
-
-def test_initial_global_target_cannot_copy_the_manipulation_instruction(monkeypatch):
-    manipulation = "Pick up the bottle and place it in the blue basket."
-    client, _ = _navigation_client(monkeypatch, [json.dumps(dict(
-        progress_analysis="Desk visible", updated_todo_list="- [ ] Approach the desk",
-        reasoning="Desk ahead", turn_direction="front", stop=False, expected_landmark="desk",
-        global_target=manipulation.rstrip("."),
-    ))])
-    with pytest.raises(LaViRAAgentError, match="object/area name"):
-        client.language_action(mission="Find the desk", global_target=None, current_step=1,
-                               todo_list="- [ ] Approach the desk",
-                               scan_views=_current_views(np.zeros((10, 10, 3), np.uint8)), move_to_views=[],
-                               manipulation_prompt=manipulation)
-
-
-def test_move_to_submits_va_selected_area_without_object_grounding(monkeypatch):
-    agent = object.__new__(LaViRAAgent)
-    agent.mission, agent.global_target, agent._segment_id = "follow the corridor", "desk", 1
-    agent.min_confidence = 0.5
-    snapshot = SimpleNamespace(rgb_bgr=np.zeros((100, 100, 3), np.uint8),
-                               depth_mm=np.full((100, 100), 2500), fx=100, cx=50)
-    agent.navigation_waypoint = lambda **kw: {
-        "status": "FOUND", "target_description": "open corridor area", "confidence": 0.9,
-        "bbox_2d": [400, 400, 600, 800], "navigation_action": "NAVIGATE",
-    }
-    agent.navigation_geometry = build_waypoint_geometry
-    agent._capture_va_burst = lambda *a: [snapshot] * 5
-    agent._face_scan_direction = lambda *a: None
-    agent._event = lambda *a, **kw: None
-    agent._next_segment = lambda: 2
-    agent._ground = lambda **kw: pytest.fail("baseline must not ground a predetermined object before planning")
-    intents = []
-    agent.submit_intent = lambda *a: intents.append(a)
-
-    def wait(*args):
-        raise InterruptedError("end test after goal submission")
-
-    agent._wait = wait
-    with pytest.raises(InterruptedError):
-        agent._move_to(1, 1, {"view_direction": "front", "target": "doorway"}, "follow the corridor")
-    assert intents[0][0] == "navigation_goal"
-    assert intents[0][1]["target"] == "open corridor area"
-    assert intents[0][1]["goal_base"] == pytest.approx([2.5, 0.0])
-
-
 @pytest.mark.parametrize("yaw", [0.0, math.pi / 2, -math.pi / 2, math.pi - 0.01, -math.pi + 0.01])
 def test_nearby_right_goal_steers_right_in_every_world_heading(nav_config, yaw):
     from gear_sonic.utils.inference.navdp.navigation import base_goal_to_world, local_trajectory_to_world
@@ -456,46 +221,3 @@ def test_nearby_right_goal_steers_right_in_every_world_heading(nav_config, yaw):
     assert velocity[2] < 0  # The original <2m branch returned zero in all these cases.
     mirrored = pure_pursuit([[0, 0], [0.6, 0.16], [1.5, 0.4]], math.hypot(*local_goal), nav_config)[0]
     assert velocity[2] == pytest.approx(-mirrored[2], abs=2e-6)
-
-
-def test_la_cannot_execute_ninety_degree_left_for_chosen_forty_five_degree_view(monkeypatch):
-    client, _ = _navigation_client(monkeypatch, [json.dumps(dict(
-        progress_analysis="The table is in the 45-degree left view, Image 5",
-        updated_todo_list="- [ ] Approach table", reasoning="Turn left to face Image 5",
-        chosen_view_index=5, turn_direction="left", stop=False, expected_landmark="table", global_target="table",
-    ))])
-    with pytest.raises(LaViRAAgentError, match="CURRENT_VIEW_5 requires front_left"):
-        client.language_action(mission="Approach table", global_target="table", current_step=2,
-                               todo_list="- [ ] Approach table", scan_views=_current_views(np.zeros((10, 10, 3), np.uint8)),
-                               move_to_views=[])
-
-
-def test_history_is_labeled_as_old_outcome_and_does_not_renumber_current_views(monkeypatch):
-    client, calls = _navigation_client(monkeypatch, [json.dumps(dict(
-        progress_analysis="Table now to right", updated_todo_list="- [ ] Approach table", reasoning="Use Image 2",
-        chosen_view_index=2, turn_direction="front_right", stop=False, expected_landmark="table", global_target="table",
-    ))])
-    image = np.zeros((10, 10, 3), np.uint8)
-    history = SimpleNamespace(skill_id=1, target="door", image_bgr=image, controller_state="reached",
-                              va_result="SATISFIED", evidence="Doorway crossed")
-    decision = client.language_action(mission="Approach table", global_target="table", current_step=2,
-                                     todo_list="- [ ] Approach table", scan_views=_current_views(image), move_to_views=[history])
-    text = json.dumps(calls[0]["messages"])
-    assert "PAST_MOVE_TO_1" in text and "History Plan" not in text
-    assert "CURRENT_VIEW_2: turn_direction=front_right" in text
-    assert decision["skill_args"]["view_direction"] == "front_right"
-
-
-def test_va_can_request_reobservation_without_inventing_an_unrelated_target(monkeypatch):
-    client, calls = _navigation_client(monkeypatch, [json.dumps(dict(
-        visual_check="Only a computer desk is visible; no basket table or relevant passage",
-        action="REOBSERVE", bbox_2d=None, target="table with blue basket", confidence=0.9, stop_reasoning="",
-    ))])
-    client.navigation_strategy = "Go left. Find the basket table."
-    result = client.navigation_waypoint(mission="Approach basket table", global_target="table with blue basket",
-                                        strategic_goal="Find table", image_bgr=np.zeros((10, 10, 3), np.uint8))
-    assert result["status"] == "NOT_FOUND" and result["bbox_2d"] is None
-    assert result["navigation_action"] == "REOBSERVE"
-    text = json.dumps(calls[0]["messages"])
-    assert "ALREADY been executed" in text and "PRE-TURN panorama" in text
-    assert "Do not substitute an unrelated table" in text
